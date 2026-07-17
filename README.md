@@ -1,4 +1,6 @@
 <!-- GitHub README for the kernel repo (pxq_llama, a fork of ik_llama.cpp). -->
+<p align="center"><img src="banner.png" alt="pxq_llama — the fastest quant for landfill GPUs" width="100%"></p>
+
 # pxq_llama — run PXQ-quantized models (revive your landfill GPUs)
 
 A fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) that adds **PXQ**, a family of
