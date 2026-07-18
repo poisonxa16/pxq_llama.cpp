@@ -1666,19 +1666,19 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             if (params->ffn_gate_inp_type < GGML_TYPE_COUNT && name.find("ffn_gate_inp.weight") != std::string::npos) {
                 new_type = params->ffn_gate_inp_type;
             }
-            if (params->attn_q_type < GGML_TYPE_COUNT && strcmp(tensor->name, "attn_q.weight") == 0) {
+            if (params->attn_q_type < GGML_TYPE_COUNT && name.find("attn_q.weight") != std::string::npos) {
                 new_type = params->attn_q_type;
             }
-            if (params->attn_k_type < GGML_TYPE_COUNT && strcmp(tensor->name, "attn_k.weight") == 0) {
+            if (params->attn_k_type < GGML_TYPE_COUNT && name.find("attn_k.weight") != std::string::npos) {
                 new_type = params->attn_k_type;
             }
-            if (params->attn_v_type < GGML_TYPE_COUNT && strcmp(tensor->name, "attn_v.weight") == 0) {
+            if (params->attn_v_type < GGML_TYPE_COUNT && name.find("attn_v.weight") != std::string::npos) {
                 new_type = params->attn_v_type;
             }
-            if (params->attn_qkv_type < GGML_TYPE_COUNT && strcmp(tensor->name, "attn_qkv.weight") == 0) {
+            if (params->attn_qkv_type < GGML_TYPE_COUNT && name.find("attn_qkv.weight") != std::string::npos) {
                 new_type = params->attn_qkv_type;
             }
-            if (params->attn_output_type < GGML_TYPE_COUNT && strcmp(tensor->name, "attn_output.weight") == 0) {
+            if (params->attn_output_type < GGML_TYPE_COUNT && name.find("attn_output.weight") != std::string::npos) {
                 new_type = params->attn_output_type;
             }
             if (params->ffn_gate_type < GGML_TYPE_COUNT && strcmp(tensor->name, "ffn_gate") == 0) {

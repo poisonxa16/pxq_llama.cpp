@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "pxqu-presets.h"
 
 #include <cstdio>
 #include <cstring>
@@ -582,13 +583,22 @@ int main(int argc, char ** argv) {
             const char * dir = getenv("PXA_PXQU_DIR");
             path = std::string(dir ? dir : "pxa-bench/pxq-universal") + "/" + path + ".tiers";
         }
-        std::ifstream tf(path);
-        if (!tf) { fprintf(stderr, "--pxq-universal: cannot open tier map %s\n", path.c_str()); return 1; }
         std::string line, joined;
-        while (std::getline(tf, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            if (!joined.empty()) joined += ',';
-            joined += line;
+        std::ifstream tf(path);
+        if (tf) {
+            while (std::getline(tf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                if (!joined.empty()) joined += ',';
+                joined += line;
+            }
+        } else {
+            // baked-in preset fallback: works from any cwd on a bare clone
+            const char * baked = pxqu_arg == "12g" ? pxqu_preset_12g
+                               : pxqu_arg == "16g" ? pxqu_preset_16g
+                               : pxqu_arg == "16g-hq" ? pxqu_preset_16g_hq : nullptr;
+            if (!baked) { fprintf(stderr, "--pxq-universal: cannot open tier map %s (and no baked preset for '%s')\n", path.c_str(), pxqu_arg.c_str()); return 1; }
+            joined = baked;
+            path = pxqu_arg + " (baked-in preset)";
         }
         if (joined.empty() || !parse_custom_quants(joined, custom_quants)) {
             fprintf(stderr, "--pxq-universal: bad tier map %s\n", path.c_str());

@@ -59,10 +59,30 @@ PXA_PXQ6_KSPLIT=1 PXA_PXQ6_VECX=1 PXA_PXQ6_GUFUSE=1 PXA_PXQ6_SCATFUSE=1 PXA_PXQ6
 ## Quantize your own
 
 ```bash
-# pure tier:
+# pure tier (one uniform bit-width — "pick your quality"):
 ./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQ3.gguf PXQ3
-# universal (fits a VRAM budget) — reads a tier map from $PXA_PXQU_DIR:
+
+# PXQU — PXQ-Universal ("pick your card"): a knapsack mix of PXQ2/3/6 per expert tensor,
+# sized so the model runs FULL ub2048 prefill on one card. Presets are BAKED IN — this
+# works from a bare clone, no side files:
+./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQU-16.gguf     --pxq-universal 16g PXQ_UNIVERSAL    # 14.0 GB -> fills a 16 GB card (P100/V100)
+./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQU-12.gguf     --pxq-universal 12g PXQ_UNIVERSAL    # 11.6 GB -> fills an 11-12 GB card (1080 Ti)
 ```
+
+**How PXQU works:** the preset is a per-tensor tier map (`pxa-bench/pxq-universal/*.tiers`,
+also compiled into the binary) produced by a Lagrangian-relaxation knapsack over measured
+per-tensor quantization sensitivity: each expert tensor gets the lowest-cost tier (PXQ2/
+PXQ3/PXQ6) such that total size hits the card budget with minimum weighted error. The
+backbone follows the standard PXQ recipe (MXFP4 attention — measured faster than a q6
+backbone on Pascal/Volta at equal size, see `bench/HEAD-TO-HEAD.md`). The shipped presets
+are computed for the Fusion2-35B (qwen35moe, 40-layer/256-expert) layout; for another
+architecture, generate your own map with `pxa-bench/pxq-universal/` tooling and pass the
+file path: `--pxq-universal /path/to/map.tiers`.
+
+Per-tensor overrides (`--attn-qkv-type`, `--attn-output-type`, `--output-tensor-type`,
+`--token-embedding-type`, ...) now work with PXQ tiers (the override matching bug is
+fixed). Note: on Pascal/Volta we measured q6_K attention as a net LOSS for the fast tiers
+(KLD wash at fixed size, 3-5% decode cost) — the defaults are the shipped optimum.
 ⚠ **Do not read-then-rewrite PXQ tensors with mainline `gguf-py`** — its size table can't express the
 E16-row per-row anchor and will silently truncate them. Use the offset-based copy in `tools/` if you
 need to graft/edit a PXQ GGUF.
