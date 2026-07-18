@@ -24,7 +24,6 @@ decode, gate/up fusion) tuned for Pascal/Volta.
 | PXQ6 | 4.27 bpw | 1.0× (−12.6% vs plain 4-bit float) | flagship 4-bit |
 | PXQ3 | 3.27 bpw | ~2.1× | 3-bit, bit-plane packed |
 | PXQ2 | 2.27 bpw | ~4.4× | 2-bit, LM4 codebook |
-| PXQ-UNIVERSAL | mixed | — | per-tensor knapsack {2,3,4}-bit map for a target VRAM budget |
 
 The backbone (attention / router / embeddings) stays MXFP4 (standard mixed-precision). Numerics are
 imatrix-calibrated and gated byte-exact against a reference (Q-G1 byte-parity + Q-G2 wrel).
@@ -63,8 +62,6 @@ PXA_PXQ6_KSPLIT=1 PXA_PXQ6_VECX=1 PXA_PXQ6_GUFUSE=1 PXA_PXQ6_SCATFUSE=1 PXA_PXQ6
 # pure tier:
 ./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQ3.gguf PXQ3
 # universal (fits a VRAM budget) — reads a tier map from $PXA_PXQU_DIR:
-PXA_PXQU_DIR=pxa-bench/pxq-universal \
-./build/bin/llama-quantize --imatrix your.imatrix --pxq-universal 16g model-bf16.gguf out-U16.gguf PXQ_UNIVERSAL
 ```
 ⚠ **Do not read-then-rewrite PXQ tensors with mainline `gguf-py`** — its size table can't express the
 E16-row per-row anchor and will silently truncate them. Use the offset-based copy in `tools/` if you
