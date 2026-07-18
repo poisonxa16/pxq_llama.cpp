@@ -13,6 +13,22 @@ Fidelity: wikitext-2, 100 chunks, bf16 reference ppl 7.0816. Speed: `llama-serve
 `timings`, 200-tok decode (median of 3), prefill over a ~5.8k-token prompt at ub2048, model fully
 GPU-resident, `build-pxqu`, driver 580.142 / CUDA 12.8.1.
 
+> **Engine parity (read this before quoting the speed deltas).** Every number in this document —
+> PXQ *and* IQ_K alike — was measured on the **same binary** (`build-pxqu`, this fork), same flags,
+> same cards, same weights. Two consequences, stated precisely:
+> 1. The PXQ-specific fast kernels (`PXA_PXQ6_*`) apply **only to PXQ-format tensors** — they do
+>    nothing for the IQ_K runs.
+> 2. This fork also carries **format-agnostic** Pascal/Volta engine work on top of upstream
+>    ik_llama.cpp — an sm_60 fp16-GEMM gate fix (the P100 was wrongly excluded from full-rate fp16
+>    cuBLAS), flash-attention improvements, MoE-path fixes, and the qwen35moe graph fusions — and
+>    the IQ_K runs get **all of that too**, since those paths are shared.
+>
+> In other words: the incumbent was **not benchmarked on a handicapped engine**. The IQ_K numbers
+> here are at least what stock upstream ik_llama.cpp would produce on these cards (we have not
+> measured the exact stock-vs-fork delta for IQ_K, so we don't quote one) — and PXQ still wins by
+> the stated margins. The speed comparison is format-vs-format on shared, equally-optimized
+> infrastructure.
+
 ### 3-bit tier — **PXQ3 vs IQ3_K** (the priority pair)
 
 | | file size | bpw | ppl | Mean KLD | top-1 agree | decode (2×P100) | prefill (2×P100) | decode (2×V100) | prefill (2×V100) |
@@ -120,7 +136,7 @@ low-bit dequant, measured in the exact single-card ub2048 regime that is the who
 ## Can the 3–4-bit fidelity gap be closed? (measured backbone experiment)
 
 We tested the cheap idea — bump PXQ's backbone toward IQ_K's precision without touching the fast
-expert kernels:
+expert kernels. First pass (output + token_embd only, MXFP4→q6_K):
 
 | | size | Mean KLD | top-1 |
 |---|---|---|---|
@@ -130,14 +146,33 @@ expert kernels:
 
 Bumping the two logit-critical tensors (output projection + embeddings) MXFP4→q6_K closes **~24%**
 of the gap for +0.2 GB and ~zero speed cost (they're a tiny compute fraction; experts untouched).
-It's modest because the fork's PXQ path currently **forces the attention tensors to MXFP4** and
-ignores `--attn-*-type` — and attn is the bigger logit lever. A small quantizer code change to also
-promote attn (q5/q6) would likely close more, but that's unmeasured and we won't over-claim it. The
-expert-codebook half of the gap (IQ_K's non-linear codebook) is more inherent to PXQ's
-speed-optimized aligned-dequant layout; a mild non-linear code warp could recover part of it at some
-speed cost, but full fidelity parity is at odds with the prefill moat. **Honest bottom line: PXQ's
-edge is speed + single-card ub2k fit + winning at ≤12 GB — not fidelity-per-byte at 3–4 bit, and we
-say so.**
+That left the bigger logit lever untested — attn — because the fork's `--attn-*-type` overrides
+were dead code (a strcmp-vs-prefixed-name bug quietly ignored them). We fixed the bug and ran the
+real experiment: promote the attention backbone to q6_K, like IQ_K does, at a fixed 14.0 GB size
+(PXQU-16):
+
+| | size | Mean KLD | top-1 | decode P100 | prefill P100 | decode V100 | prefill V100 |
+|---|---|---|---|---|---|---|---|
+| PXQU-16 (MXFP4 attn, shipped) | 14.0 GB | 0.107 | 85.6% | 57.7 t/s | 843 t/s | 98.5 t/s | 1900 t/s |
+| PXQU-16 + q6_K attn | 14.0 GB | 0.103 | 85.8% | 54.8 t/s | 854 t/s | 95.4 t/s | 1893 t/s |
+
+At fixed size the result is a **wash on fidelity** (KLD 0.107→0.103, top-1 +0.2 pt — inside
+run-to-run noise) for a **real decode cost**: −5% on P100 (57.7→54.8 t/s), −3% on V100 (98.5→95.4
+t/s), because q6_K attention dequant is slower per-token than MXFP4 on Pascal/Volta. Letting size
+float instead of holding it fixed does close more gap — PXQ3's attn promoted to q6_K (no size cap)
+moves KLD 0.0758→0.0665 for +0.3 GB — but still falls short of IQ3_K's 0.0591, and now costs both
+size and speed.
+
+**Verdict: we closed the loop on our own roadmap item and are publishing the negative result.** At
+matched size, trading MXFP4 attention for q6_K attention is not worth it on this hardware — the
+decode loss outweighs a fidelity gain too small to matter. The **shipped PXQ/PXQU quants
+intentionally keep the faster MXFP4 attention backbone.** The code fix itself (`--attn-*-type`
+overrides now actually work) is committed to the kernel repo, so anyone who wants to make that
+trade for their own use case can. The expert-codebook half of the gap (IQ_K's non-linear codebook)
+is a separate, more inherent difference from PXQ's speed-optimized aligned-dequant layout; a mild
+non-linear code warp could recover part of it at some speed cost, but full fidelity parity is at
+odds with the prefill moat. **Honest bottom line: PXQ's edge is speed + single-card ub2k fit +
+winning at ≤12 GB — not fidelity-per-byte at 3–4 bit, and we say so.**
 
 ## Reproduce
 
