@@ -12,8 +12,21 @@ Models: **https://github.com/poisonxa16/pxq_llama** ← you are here · Weights:
 
 > 💛 Support: **https://ko-fi.com/shatteredrealms1**
 
+## Head-to-head vs upstream ik_llama.cpp
+
+Best config for **both** sides — upstream at its own documented best (its best-fitting IQ_K quant,
+`GGML_CUDA_F16` build), pxq_llama at its documented best (`docs/LEVERS.md`). Same card, same cold
+5.8k-token prompt, temp 0, median of 3. Full methodology + raw runs: [`bench/fair-battle.md`](bench/fair-battle.md).
+
+<p align="center"><img src="bench/fair-battle.svg" alt="pxq_llama vs upstream ik_llama.cpp benchmark" width="100%"></p>
+
 ## Updates — 2026-07-19
 
+- **⭐ Fair battle vs upstream published** (chart above): +59% prefill / +30% decode on P100,
+  +10% / +13% on V100, +24% decode on 1080 Ti — best config for both sides, with a same-quant
+  control (upstream's own IQ_K ggufs on our build: decode +2.7–3.3% everywhere, V100 output
+  bit-identical). Upstream keeps a ~9% cold-prefill edge on the 1080 Ti — printed, not hidden.
+  Full data: `bench/fair-battle.md`.
 - **⭐ Naming: the PXQ tiers are re-laddered by bit class.** The 4-bit quality tier is now **PXQ4**
   (formerly PXQ6) and its HQ variant **PXQ4-HQ** (formerly PXQ6HQ) — the name now tells you the
   bit-width, matching PXQ2/PXQ3. Nothing binary changed: gguf type ids are identical, existing
