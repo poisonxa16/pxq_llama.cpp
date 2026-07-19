@@ -1,34 +1,56 @@
-# Fair battle — pxq_llama vs upstream ik_llama.cpp (2026-07-19)
+# Fair battle — pxq_llama vs upstream ik_llama.cpp (2026-07-19, rev 2)
 
 Best-vs-best per card: upstream at its own documented best (pinned 2026-07-18 HEAD,
-`GGML_CUDA_F16=ON` build per its docs, its best-fitting IQ_K quant, `-fa on`, f16 KV), pxq_llama at
-its documented best (`docs/LEVERS.md` recommended env; `PXA_PXQ_INT8_PREFILL=1` on sm_61). Same 35B
+`GGML_CUDA_F16=ON` build per its docs, its best-fitting IQ_K quant, f16 KV), pxq_llama at its
+documented best (`docs/LEVERS.md` recommended env; `PXA_PXQ_INT8_PREFILL=1` on sm_61). Same 35B
 MoE architecture, same card, same protocol both sides.
 
 **Protocol:** single `/completion`, cold 5,801-token prompt, `n_predict=200`, `temperature=0`,
-`seed=42`, `cache_prompt=false`, median of 3, numbers from server `timings`. Harness:
-`bench/speed-bench.sh`-compatible; runs below are verbatim CSV from the harness.
+`seed=42`, `cache_prompt=false`, median of 3, numbers from server `timings`.
 
-## Headline (best config per side, per metric)
+**Rev 2 (same day):** the first pass ran `-b` = `-ub` and forced `-fa on` for everything. A follow-up
+sweep showed both choices leave real speed on the table **for both engines**: `-b 2048` is
++4–25% prefill, and on these cards **`-fa off` is the cold-prefill regime while `-fa on` is the
+decode regime** (see the regime table — the effect is symmetric, upstream gains from FA-off prefill
+too). Rev 2 gives each side its best regime per metric. Nothing was re-measured for one side only.
+
+## Headline (best config per side, per metric — prefill @ `-fa off`, decode @ `-fa on`, all `-b 2048`)
 
 | card | quant (upstream vs pxq) | prefill t/s | decode t/s |
 |---|---|---|---|
-| Tesla V100 16 GB | IQ3_KS (14.2 GB) vs PXQU-16+q8head (14.1 GB) | 1,155 → **1,269 (+10%)** | 84.5 → **95.5 (+13%)** |
-| Tesla P100 16 GB | IQ3_KS (14.2 GB) vs PXQU-16+q8head (14.1 GB) | 513 → **817 (+59%)** | 44.7 → **58.1 (+30%)** |
-| GTX 1080 Ti 11 GB | IQ2_KS (10.1 GB) vs PXQ2 (10.7 GB) | **703** → 639 (−9%) | 52.2 → **64.6 (+24%)** |
+| Tesla P100 16 GB | IQ3_KS (14.2 GB) vs PXQU-16+q8head (14.1 GB) | 645 → **1,213 (+88%)** | 44.7 → **58.1 (+30%)** |
+| Tesla V100 16 GB | IQ3_KS (14.2 GB) vs PXQU-16+q8head (14.1 GB) | 1,509 → **1,700 (+13%)** | 84.5 → **95.5 (+13%)** |
+| GTX 1080 Ti 11 GB | IQ2_KS (10.1 GB) vs PXQ2 (10.7 GB) | **1,154** → 1,001 (−13%) | 52.2 → **65.4 (+25%)** |
 
-Notes:
-- V100: `ub2048` OOMs on **both** sides (16 GB card, ~14 GB model) — `ub512` is the best fitting
-  config for both. P100: prefill best at `ub2048` for both, decode best at `ub512` for both;
-  each side gets its best per metric.
-- 1080 Ti: upstream genuinely wins cold prefill by ~9% there (its IQ2_KS MMQ path is strong on
-  dp4a cards); pxq_llama wins decode by 24%. Before the int8 tile (`PXA_PXQ_INT8_PREFILL=1`,
-  this release) the PXQ prefill on that card was 251 t/s.
+## Single-config view (chat serving: `-fa on -b 2048`, one server, no regime switching)
+
+| card | upstream (prefill / decode) | pxq_llama (prefill / decode) |
+|---|---|---|
+| P100 | 513 / 44.0 (ub2048) · 44.7 dec best (ub512) | **817 / 56.7** (ub2048) · **58.1** dec best (ub512) |
+| V100 | 1,422 / 82.5 (ub512) | **1,589 / 94.1** (ub512) |
+| 1080 Ti | 739 / 52.2 (ub768) | 667 / **65.4** (ub768) |
+
+## The FA regime split (both engines, measured)
+
+Flash-attention on these pre-Turing cards is a decode win but a cold-prefill loss — for upstream too:
+
+| card / engine | prefill fa-on → fa-off | decode fa-on → fa-off |
+|---|---|---|
+| P100 pxq | 817 → **1,213** (+48%) | **56.7** → 41.1 (−28%) |
+| P100 upstream | 513 → **645** (+26%) | **44.0** → 34.0 (−23%) |
+| V100 pxq | 1,589 → **1,700** (+7%) | **94.1** → 76.6 (−19%) |
+| V100 upstream | 1,422 → **1,509** (+6%) | **82.5** → 69.6 (−16%) |
+| 1080 Ti pxq | 667 → **1,001** (+50%) | **65.4** → 34.2 (−48%) |
+| 1080 Ti upstream | 739 → **1,154** (+56%) | **52.2** → 30.0 (−43%) |
+
+Practical rule either engine's users can apply: prefill-heavy batch work (ingest, embedding prep,
+summarize-once) → `-fa off`; interactive serving → `-fa on`. Measured at 5.8k-token fill; FA-off
+attention memory grows with context, so re-check at your target ctx.
 
 ## Same-quant control (identical gguf on both builds)
 
 pxq_llama running upstream's own IQ_K ggufs — only the arch-level fusions differ
-(`PXA_FUSE_DELTANET=3 PXA_G2_ADDFUSE=1`):
+(`PXA_FUSE_DELTANET=3 PXA_G2_ADDFUSE=1`), matched config both sides:
 
 | card | quant | upstream decode | pxq_llama decode | Δ | output |
 |---|---|---|---|---|---|
@@ -36,24 +58,32 @@ pxq_llama running upstream's own IQ_K ggufs — only the arch-level fusions diff
 | P100 | IQ3_KS @ub2048 | 44.0 | 45.2 | +2.7% | coherent, sha-stable runs |
 | 1080 Ti | IQ2_KS @ub768 | 52.2 | 53.9 | +3.3% | coherent, sha-stable runs |
 
-Prefill on the same quant is within ±5% both ways (536 vs 513 P100; 1,125 vs 1,155 V100;
-686 vs 703 1080 Ti) — the prefill headline above comes from the PXQ tier's fused paths, not from
-penalizing the baseline.
+## Where upstream wins, and why (kept on the chart)
+
+The 1080 Ti cold-prefill loss (−13%) is real: upstream's IQ2_KS MMQ int8 tile is a mature,
+double-buffered, large-tile pipeline and its file is 6% smaller; our sm_61 int8 tile
+(`PXA_PXQ_INT8_PREFILL`, first shipped this release) is a 64-thread single-buffered first cut that
+reaches ~87–95% of it depending on config — and didn't exist at all a release ago (PXQ2 prefill on
+that card was 251 t/s). Decode on the same card is +25% for pxq_llama.
 
 ## Raw harness rows
 
 ```
-vik_V100_IQ3KS_ub512,OK,1154.8,84.5,prefills=[1133.9,1154.8,1157.6],decodes=[84.53,84.44,84.69],sha_stable=True
-vik_V100_IQ3KS_ub2048,REQUEST_FAILED (CUDA out of memory, launch_fattn)
-vik_P100_IQ3KS_ub512,OK,303.1,44.7,prefills=[303.1,302.7,303.1],decodes=[44.70,44.84,44.73],sha_stable=True
-vik_P100_IQ3KS_ub2048,OK,512.6,44.0,prefills=[511.0,512.6,512.8],decodes=[44.02,44.11,43.98],sha_stable=True
-vik_1080Ti_IQ2KS_ub768,OK,702.8,52.2,prefills=[704.3,702.1,702.8],decodes=[52.15,52.21,51.84],sha_stable=True
-pxq_V100_U16q8_ub512,OK,1268.6,95.5,prefills=[1251.3,1268.6,1270.2],decodes=[95.13,95.49,95.51]
-pxq_V100_U16q8_ub2048,OOM (16 GB card, 14.1 GB model — compute buffer does not fit)
-pxq_P100_U16q8_ub512,OK,604.9,58.1,prefills=[602.8,606.1,604.9],decodes=[58.04,58.10,58.08]
-pxq_P100_U16q8_ub2048,OK,816.8,56.7,prefills=[807.3,816.8,818.1],decodes=[56.66,56.72,56.94]
-pxq_1080Ti_PXQ2_ub768,OK,639.0,64.6,prefills=[641.3,636.1,639.0],decodes=[64.50,64.64,64.65]
-samequant_V100_IQ3KS_ub512,OK,1124.5,87.2,decodes=[87.23,87.18,87.38],sha=matches upstream run
-samequant_P100_IQ3KS_ub2048,OK,536.0,45.2,decodes=[45.08,45.26,45.16]
-samequant_1080Ti_IQ2KS_ub768,OK,685.5,53.9,decodes=[53.62,54.08,53.94]
+# rev-1 rows (b = ub, fa on)
+vik_V100_IQ3KS_ub512,OK,1154.8,84.5   | vik_V100_IQ3KS_ub2048,OOM (launch_fattn)
+vik_P100_IQ3KS_ub512,OK,303.1,44.7    | vik_P100_IQ3KS_ub2048,OK,512.6,44.0
+vik_1080Ti_IQ2KS_ub768,OK,702.8,52.2
+pxq_V100_U16q8_ub512,OK,1268.6,95.5   | pxq_V100_U16q8_ub2048,OOM
+pxq_P100_U16q8_ub512,OK,604.9,58.1    | pxq_P100_U16q8_ub2048,OK,816.8,56.7
+pxq_1080Ti_PXQ2_ub768,OK,639.0,64.6
+samequant_V100_IQ3KS_ub512,OK,1124.5,87.2 (sha matches upstream)
+samequant_P100_IQ3KS_ub2048,OK,536.0,45.2
+samequant_1080Ti_IQ2KS_ub768,OK,685.5,53.9
+# rev-2 sweep rows (b 2048; fa as labeled)
+dxV1_pxq_b2048_faon,OK,1588.5,94.1    | dxV2_pxq_b2048_faoff,OK,1699.5,76.6
+dxV3_vik_b2048_faon,OK,1421.9,82.5    | dxV4_vik_b2048_faoff,OK,1508.7,69.6
+dxP1_pxq_ub2048_faoff,OK,1213.1,41.1  | dxP2_vik_ub2048_faoff,OK,645.0,34.0
+dxA_pxq2_b2048_faoff_c6144,OK,1000.6,34.2 | dxB_pxq2_b2048_faon_c8192,OK,667.3,65.4
+dxC_pxq2_b768_faoff_c8192,OK,975.7,33.9
+dxD_vik_iq2ks_b2048_faoff_c6144,OK,1153.6,30.0 | dxE_vik_iq2ks_b2048_faon_c8192,OK,738.8,52.2
 ```

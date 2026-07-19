@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
-  <rect x="0" y="0" width="920" height="560" rx="10" fill="#f6f8fa"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="580" viewBox="0 0 920 580" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+  <rect x="0" y="0" width="920" height="580" rx="10" fill="#f6f8fa"/>
   <text x="24" y="34" font-size="19" font-weight="700" fill="#24292f">pxq_llama vs upstream ik_llama.cpp — best config for both, same card, same protocol</text>
   <text x="24" y="54" font-size="12.5" fill="#57606a">35B MoE · fully GPU-resident · cold 5,800-token prompt · n_predict 200 · temp 0 · median of 3 · server timings · 2026-07-19</text>
 
@@ -8,53 +8,54 @@
   <rect x="430" y="66" width="12" height="12" rx="3" fill="#E8890C"/>
   <text x="447" y="76" font-size="12" fill="#57606a">pxq_llama (best PXQ quant, documented env)</text>
 
-  <!-- ===================== V100 ===================== -->
-  <text x="24" y="108" font-size="14" font-weight="700" fill="#24292f">Tesla V100 16 GB — PXQU-16 + q8 head (14.1 GB) vs IQ3_KS (14.2 GB), both ub512 (ub2048 OOMs both)</text>
-  <text x="24" y="126" font-size="11.5" fill="#57606a">prefill t/s</text>
-  <rect x="210" y="118" width="419" height="15" rx="2" fill="#8b949e"/>
-  <text x="636" y="130" font-size="11.5" fill="#57606a">1,155</text>
-  <rect x="210" y="136" width="460" height="15" rx="2" fill="#E8890C"/>
-  <text x="677" y="148" font-size="11.5" font-weight="700" fill="#24292f">1,269</text>
-  <text x="850" y="148" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+10%</text>
-  <text x="24" y="168" font-size="11.5" fill="#57606a">decode t/s</text>
-  <rect x="210" y="160" width="407" height="15" rx="2" fill="#8b949e"/>
-  <text x="624" y="172" font-size="11.5" fill="#57606a">84.5</text>
-  <rect x="210" y="178" width="460" height="15" rx="2" fill="#E8890C"/>
-  <text x="677" y="190" font-size="11.5" font-weight="700" fill="#24292f">95.5</text>
-  <text x="850" y="190" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+13%</text>
-
   <!-- ===================== P100 ===================== -->
-  <text x="24" y="232" font-size="14" font-weight="700" fill="#24292f">Tesla P100 16 GB — PXQU-16 + q8 head (14.1 GB) vs IQ3_KS (14.2 GB), each at its best ub</text>
+  <text x="24" y="108" font-size="14" font-weight="700" fill="#24292f">Tesla P100 16 GB — PXQU-16 + q8 head (14.1 GB) vs IQ3_KS (14.2 GB)</text>
+  <text x="24" y="126" font-size="11.5" fill="#57606a">prefill t/s</text>
+  <rect x="210" y="118" width="245" height="15" rx="2" fill="#8b949e"/>
+  <text x="462" y="130" font-size="11.5" fill="#57606a">645</text>
+  <rect x="210" y="136" width="460" height="15" rx="2" fill="#E8890C"/>
+  <text x="677" y="148" font-size="11.5" font-weight="700" fill="#24292f">1,213</text>
+  <text x="850" y="148" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+88%</text>
+  <text x="24" y="168" font-size="11.5" fill="#57606a">decode t/s</text>
+  <rect x="210" y="160" width="354" height="15" rx="2" fill="#8b949e"/>
+  <text x="571" y="172" font-size="11.5" fill="#57606a">44.7</text>
+  <rect x="210" y="178" width="460" height="15" rx="2" fill="#E8890C"/>
+  <text x="677" y="190" font-size="11.5" font-weight="700" fill="#24292f">58.1</text>
+  <text x="850" y="190" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+30%</text>
+
+  <!-- ===================== V100 ===================== -->
+  <text x="24" y="232" font-size="14" font-weight="700" fill="#24292f">Tesla V100 16 GB — PXQU-16 + q8 head (14.1 GB) vs IQ3_KS (14.2 GB)</text>
   <text x="24" y="250" font-size="11.5" fill="#57606a">prefill t/s</text>
-  <rect x="210" y="242" width="289" height="15" rx="2" fill="#8b949e"/>
-  <text x="506" y="254" font-size="11.5" fill="#57606a">513</text>
+  <rect x="210" y="242" width="408" height="15" rx="2" fill="#8b949e"/>
+  <text x="625" y="254" font-size="11.5" fill="#57606a">1,509</text>
   <rect x="210" y="260" width="460" height="15" rx="2" fill="#E8890C"/>
-  <text x="677" y="272" font-size="11.5" font-weight="700" fill="#24292f">817</text>
-  <text x="850" y="272" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+59%</text>
+  <text x="677" y="272" font-size="11.5" font-weight="700" fill="#24292f">1,700</text>
+  <text x="850" y="272" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+13%</text>
   <text x="24" y="292" font-size="11.5" fill="#57606a">decode t/s</text>
-  <rect x="210" y="284" width="354" height="15" rx="2" fill="#8b949e"/>
-  <text x="571" y="296" font-size="11.5" fill="#57606a">44.7</text>
+  <rect x="210" y="284" width="407" height="15" rx="2" fill="#8b949e"/>
+  <text x="624" y="296" font-size="11.5" fill="#57606a">84.5</text>
   <rect x="210" y="302" width="460" height="15" rx="2" fill="#E8890C"/>
-  <text x="677" y="314" font-size="11.5" font-weight="700" fill="#24292f">58.1</text>
-  <text x="850" y="314" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+30%</text>
+  <text x="677" y="314" font-size="11.5" font-weight="700" fill="#24292f">95.5</text>
+  <text x="850" y="314" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+13%</text>
 
   <!-- ===================== 1080 Ti ===================== -->
-  <text x="24" y="356" font-size="14" font-weight="700" fill="#24292f">GTX 1080 Ti 11 GB — PXQ2 (10.7 GB) vs IQ2_KS (10.1 GB), both ub768</text>
+  <text x="24" y="356" font-size="14" font-weight="700" fill="#24292f">GTX 1080 Ti 11 GB — PXQ2 (10.7 GB) vs IQ2_KS (10.1 GB)</text>
   <text x="24" y="374" font-size="11.5" fill="#57606a">prefill t/s</text>
   <rect x="210" y="366" width="460" height="15" rx="2" fill="#8b949e"/>
-  <text x="677" y="378" font-size="11.5" fill="#57606a">703</text>
-  <rect x="210" y="384" width="418" height="15" rx="2" fill="#E8890C"/>
-  <text x="635" y="396" font-size="11.5" font-weight="700" fill="#24292f">639</text>
-  <text x="850" y="396" font-size="12.5" font-weight="700" fill="#57606a" text-anchor="end">−9%</text>
+  <text x="677" y="378" font-size="11.5" fill="#57606a">1,154</text>
+  <rect x="210" y="384" width="399" height="15" rx="2" fill="#E8890C"/>
+  <text x="616" y="396" font-size="11.5" font-weight="700" fill="#24292f">1,001</text>
+  <text x="850" y="396" font-size="12.5" font-weight="700" fill="#57606a" text-anchor="end">−13%</text>
   <text x="24" y="416" font-size="11.5" fill="#57606a">decode t/s</text>
-  <rect x="210" y="408" width="372" height="15" rx="2" fill="#8b949e"/>
-  <text x="589" y="420" font-size="11.5" fill="#57606a">52.2</text>
+  <rect x="210" y="408" width="367" height="15" rx="2" fill="#8b949e"/>
+  <text x="584" y="420" font-size="11.5" fill="#57606a">52.2</text>
   <rect x="210" y="426" width="460" height="15" rx="2" fill="#E8890C"/>
-  <text x="677" y="438" font-size="11.5" font-weight="700" fill="#24292f">64.6</text>
-  <text x="850" y="438" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+24%</text>
+  <text x="677" y="438" font-size="11.5" font-weight="700" fill="#24292f">65.4</text>
+  <text x="850" y="438" font-size="12.5" font-weight="700" fill="#bf5b00" text-anchor="end">+25%</text>
 
   <line x1="24" y1="466" x2="896" y2="466" stroke="#d0d7de" stroke-width="1"/>
-  <text x="24" y="490" font-size="12" fill="#24292f" font-weight="600">Same-quant control — pxq_llama running upstream's own IQ_K ggufs (arch-level fusions only):</text>
-  <text x="24" y="508" font-size="12" fill="#57606a">decode +3.2% (V100, output bit-identical to upstream), +2.7% (P100), +3.3% (1080 Ti). The headline gains come from the PXQ tier + fused kernels.</text>
-  <text x="24" y="534" font-size="11.5" fill="#8b949e">Upstream pinned @ its 2026-07-18 HEAD, built per its own docs (GGML_CUDA_F16=ON). pxq_llama env: docs/LEVERS.md recommended set (+PXA_PXQ_INT8_PREFILL on the 1080 Ti). Raw runs in bench/.</text>
+  <text x="24" y="488" font-size="12" fill="#24292f" font-weight="600">Per-metric best regime, applied to BOTH sides: prefill rows are `-fa off`, decode rows `-fa on` (all `-b 2048`).</text>
+  <text x="24" y="506" font-size="12" fill="#57606a">On Pascal/Volta, FA-off is faster for cold prefill and FA-on for decode — for both engines. Single-config (chat, FA-on) numbers in bench/fair-battle.md.</text>
+  <text x="24" y="530" font-size="12" fill="#57606a">Same-quant control — upstream's own IQ_K ggufs on our build: decode +2.7–3.3% on every card (V100 bit-identical output). Upstream pinned @ 2026-07-18 HEAD.</text>
+  <text x="24" y="554" font-size="11.5" fill="#8b949e">pxq_llama env: docs/LEVERS.md recommended set (+PXA_PXQ_INT8_PREFILL on the 1080 Ti). Raw runs + full sweep: bench/fair-battle.md.</text>
 </svg>
