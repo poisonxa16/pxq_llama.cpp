@@ -12,6 +12,39 @@ Models: **https://github.com/poisonxa16/pxq_llama** ← you are here · Weights:
 
 > 💛 Support: **https://ko-fi.com/shatteredrealms1**
 
+## Updates — 2026-07-19
+
+- **⭐ Naming: the PXQ tiers are re-laddered by bit class.** The 4-bit quality tier is now **PXQ4**
+  (formerly PXQ6) and its HQ variant **PXQ4-HQ** (formerly PXQ6HQ) — the name now tells you the
+  bit-width, matching PXQ2/PXQ3. Nothing binary changed: gguf type ids are identical, existing
+  `.gguf` files keep working, and `llama-quantize` accepts the old names (`PXQ6`, `PXQ6HQ`) as
+  aliases forever. The two *legacy* formats that previously used nearby names are retired from the
+  ladder: the MXFP4 slab repack (old "PXQ4") is now **PXQ4-LEGACY**, and **PXQ5** (superseded
+  numerics) is legacy. Env vars (`PXA_PXQ6_*`) and already-published HF artifact filenames
+  (`*-PXQ6.gguf`) keep the old identifier — see `docs/RENAME-MAP.md` for the full mapping.
+- **Fix:** the experimental V100 WMMA prefill kernel (`PXA_PXQ6_WMMA`) was launched with 64 threads
+  instead of its required 256 — enabling it produced garbage output. Fixed; all non-WMMA paths are
+  byte-unchanged. (It remains experimental and off by default: measured honest gain is +0.97% prefill.)
+- **New recommended env:** `PXA_FUSE_DELTANET=3` (bit-exact DeltaNet decode fusion) and a **q8_0
+  output head** in the quant recipe. Measured together: PXQU-16 decode **57.2 → 62.4 t/s (P100)**,
+  **98.5 → 101.3 t/s (V100)**. Late addition, same protocol: **`PXA_G2_ADDFUSE=1`** (bit-exact
+  residual-add fusion) adds **+1.9% (V100)** / **+1.2% (P100)** decode on top.
+- **New docs:** `docs/LEVERS.md` — every `PXA_*` env var with its default, mechanism, measured
+  effect, and gate class (including the documented dead ends); `docs/COOKBOOK.md` — per-card
+  recommended command lines with expected numbers; `docs/KNOWN-ISSUES.md`; `docs/RENAME-MAP.md`.
+- **New (opt-in): int8 DP4A prefill for 10-series cards** — `PXA_PXQ_INT8_PREFILL=1` routes PXQ
+  prefill GEMMs through an int8 dp4a MMQ-style tile on sm_61 (GTX 10-series), where the fp16-family
+  path has no fast dot product. Measured on a 1080 Ti (PXQ2, cold 5.8k-token prompt, `-ub 768`):
+  **251 → 709 t/s prefill (+182%)**, decode untouched, flag-off dispatch byte-identical. Not
+  bit-exact vs the fp16 path (int8 activation quantization; temp-0 output sha-identical in our
+  gates, top-1 logits identical on every spot-check) — hence opt-in, default OFF.
+- **Corrections** to the published speed table (a withdrawn V100 4-bit-flagship row and the 1080 Ti prefill
+  micro-batch annotation): see `bench/README.md`.
+- New env-gated diagnostics/experiments (all default-off): `PXA_EXPERT_LOG` (per-request MoE
+  expert-routing histograms, np1 only), `PXA_PASCAL_DMMV` (documented dead end, measured loss),
+  `PXA_CUDA_GRAPH_V2` + `PXA_CUDA_GRAPH_LOG` (CUDA-graph replay semantics repair; measured neutral
+  -to-negative on our cards — instrumentation honesty, not a speed claim).
+
 ## What's PXQ?
 
 PXQ quantizes MoE **expert** tensors (the bulk of the params) with a learned codebook + **E16-row
@@ -21,7 +54,7 @@ decode, gate/up fusion) tuned for Pascal/Volta.
 
 | type | bits | expert wrel vs 4-bit | notes |
 |---|---|---|---|
-| PXQ6 | 4.27 bpw | 1.0× (−12.6% vs plain 4-bit float) | flagship 4-bit |
+| PXQ4 (formerly PXQ6) | 4.27 bpw | 1.0× (−12.6% vs plain 4-bit float) | flagship 4-bit |
 | PXQ3 | 3.27 bpw | ~2.1× | 3-bit, bit-plane packed |
 | PXQ2 | 2.27 bpw | ~4.4× | 2-bit, LM4 codebook |
 
@@ -47,13 +80,24 @@ cmake --build build --target llama-server llama-quantize llama-perplexity -j
 LD_LIBRARY_PATH=build/bin:build/src:build/ggml/src \
 PXA_PXQ6=1 PXA_PXQ2=1 PXA_PXQ3=1 \
 PXA_PXQ6_KSPLIT=1 PXA_PXQ6_VECX=1 PXA_PXQ6_GUFUSE=1 PXA_PXQ6_SCATFUSE=1 PXA_PXQ6_RAGTAIL=1 \
+PXA_FUSE_DELTANET=3 PXA_G2_ADDFUSE=1 \
 ./build/bin/llama-server -m PXA-Fusion2-35B-PXQ3.gguf \
   -c 8192 -ngl 99 -sm layer -fa on -ctk f16 -ctv f16 -b 512 -ub 512 \
   --jinja --temp 1.0 --top-p 0.95 --top-k 20 --host 0.0.0.0 --port 8080
 ```
 - `PXA_PXQ6/2/3=1` enable the format families (set all three for a UNIVERSAL/mixed model).
+  (Env names keep the internal `PXQ6` identifier for the 4-bit tier — see `docs/RENAME-MAP.md`.)
 - `PXA_PXQ6_{KSPLIT,VECX,GUFUSE,SCATFUSE,RAGTAIL}=1` are the bit-exact fast kernels.
+- `PXA_FUSE_DELTANET=3` (recommended, 2026-07-19) fuses the DeltaNet decode glue kernels —
+  bit-exact, measured +3.7% decode on P100 (part of the 62.4 / 101.3 t/s numbers in `bench/`).
+- `PXA_G2_ADDFUSE=1` (recommended, 2026-07-19) residual-add fusion — bit-exact, +1.9% V100 /
+  +1.2% P100 decode. Full lever reference incl. what NOT to bother with: `docs/LEVERS.md`.
+- `PXA_PXQ_INT8_PREFILL=1` (opt-in, sm_61/GTX-10-series): int8 dp4a prefill tile — +182%
+  prefill on a 1080 Ti at 95% of the native-MMQ ceiling; decode byte-untouched. `=2` lifts the
+  arch gate for testing (do NOT ship on sm_60 — its dp4a is emulated).
 - `PXA_PXQ6_WMMA=1` is an experimental V100 tensor-core prefill path (auto-guarded to 4-bit only).
+  Measured e2e gain after the 2026-07-19 launch fix: +0.97% prefill — kept for experimentation,
+  not part of the recommended env.
 - Vision: `--mmproj mmproj-*.gguf`. MTP (flagship): `--spec-type mtp:n_max=3,p_min=0.5`.
 
 ## Quantize your own
@@ -62,17 +106,25 @@ PXA_PXQ6_KSPLIT=1 PXA_PXQ6_VECX=1 PXA_PXQ6_GUFUSE=1 PXA_PXQ6_SCATFUSE=1 PXA_PXQ6
 # pure tier (one uniform bit-width — "pick your quality"):
 ./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQ3.gguf PXQ3
 
-# PXQU — PXQ-Universal ("pick your card"): a knapsack mix of PXQ2/3/6 per expert tensor,
+# PXQU — PXQ-Universal ("pick your card"): a knapsack mix of PXQ2/3/4 per expert tensor,
 # sized so the model runs FULL ub2048 prefill on one card. Presets are BAKED IN — this
 # works from a bare clone, no side files:
 ./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQU-16.gguf     --pxq-universal 16g PXQ_UNIVERSAL    # 14.0 GB -> fills a 16 GB card (P100/V100)
-./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQU-12.gguf     --pxq-universal 12g PXQ_UNIVERSAL    # 11.6 GB -> fills an 11-12 GB card (1080 Ti)
+./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQU-12.gguf     --pxq-universal 12g PXQ_UNIVERSAL    # 11.6 GB -> fills a 12 GB card
 ```
+
+**⚠ PXQ models must be FULLY GPU-resident** — the CPU MoE op has no PXQ support, so partial
+offload (`-ngl < 99` with PXQ expert layers left on CPU, or `--n-cpu-moe`) aborts. Pick the tier
+that fits your card *entirely*, VRAM headroom included:
+- **16 GB** (P100/V100): PXQU-16 (14.0 GB) or PXQ3.
+- **12 GB**: PXQU-12 (11.6 GB).
+- **11 GB** (1080 Ti): **PXQ2** (10.7 GB) — PXQU-12 does *not* fit an 11 GB card. With
+  `PXA_PXQ_INT8_PREFILL=1` the 1080 Ti gets 709 t/s prefill / 71 t/s decode on PXQ2.
 
 **How PXQU works:** the preset is a per-tensor tier map (`pxa-bench/pxq-universal/*.tiers`,
 also compiled into the binary) produced by a Lagrangian-relaxation knapsack over measured
 per-tensor quantization sensitivity: each expert tensor gets the lowest-cost tier (PXQ2/
-PXQ3/PXQ6) such that total size hits the card budget with minimum weighted error. The
+PXQ3/PXQ4) such that total size hits the card budget with minimum weighted error. The
 backbone follows the standard PXQ recipe (MXFP4 attention — measured faster than a q6
 backbone on Pascal/Volta at equal size, see `bench/HEAD-TO-HEAD.md`). The shipped presets
 are computed for the Fusion2-35B (qwen35moe, 40-layer/256-expert) layout; for another
@@ -83,9 +135,27 @@ Per-tensor overrides (`--attn-qkv-type`, `--attn-output-type`, `--output-tensor-
 `--token-embedding-type`, ...) now work with PXQ tiers (the override matching bug is
 fixed). Note: on Pascal/Volta we measured q6_K attention as a net LOSS for the fast tiers
 (KLD wash at fixed size, 3-5% decode cost) — the defaults are the shipped optimum.
-⚠ **Do not read-then-rewrite PXQ tensors with mainline `gguf-py`** — its size table can't express the
-E16-row per-row anchor and will silently truncate them. Use the offset-based copy in `tools/` if you
-need to graft/edit a PXQ GGUF.
+
+**Imatrix provenance (doctrine): quantizing a merged model? Recompute the imatrix ON the merge.**
+Imatrix rows are *activation statistics of each tensor's input* — they are anchor-specific, not
+weight-specific. In an expert-grafted or blended merge, the grafted tensors now see the *anchor
+model's* residual-stream inputs, so a parent model's imatrix is off-distribution exactly on the
+tensors the merge changed (and PXQ's windowed scale search + anchor fit consume those weights
+directly, so the mismatch concentrates its damage there — we've measured multi-point category
+regressions from this alone). One calibration pass through the merged model itself is cheap
+insurance and removes all guesswork. Corollary: don't confound the fix with a corpus change —
+reuse your standard calibration blend.
+⚠ Run the imatrix capture **full-GPU-resident** — the CPU / partial-offload capture path
+currently crashes (see `docs/KNOWN-ISSUES.md`).
+
+**Recommended (2026-07-19): add `--output-tensor-type q8_0`.** The single lm_head GEMV is a
+surprisingly large slice of the Pascal decode wall (~14% on P100, where int8 is emulated); a q8_0
+head costs only +123 MB over the default and measured **+5.2% decode on P100** (57.2 → 60.2 t/s on
+PXQU-16) with quality ≥ the default head. The updated `bench/` numbers use it.
+
+⚠ **Do not read-then-rewrite PXQ tensors with `gguf-py`** — no gguf-py size table (mainline's *or*
+this fork's) can express the E16-row per-row anchor, so a read-modify-write silently truncates
+them. To edit a PXQ model, re-run `llama-quantize` from the bf16/f16 source instead.
 
 ## License & credits
 **MIT** — this fork inherits the MIT license of its base engines

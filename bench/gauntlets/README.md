@@ -1,7 +1,7 @@
 # Quality gauntlets — factual 11/12 · agentic-hard 9/10 · coding ~19/24
 
 The three capability sets behind the model-card scorecard, plus the runner. All were run
-against the PXQ6 flagship via the OpenAI-compatible server endpoint, temp 0.6 / top_p 0.95 /
+against the PXQ4 flagship (formerly PXQ6) via the OpenAI-compatible server endpoint, temp 0.6 / top_p 0.95 /
 top_k 20, thinking enabled, 20k max tokens.
 
 | file | items | published score | what it probes |

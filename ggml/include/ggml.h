@@ -464,12 +464,13 @@ extern "C" {
         // same slab layout. 4.25 bpw. Native quantize from F32/BF16/Q8_0 (NOT MXFP4-transcodable).
         GGML_TYPE_PXQ5      = 251,
 
-        // PXQ6: PXQ5 numerics (frozen PX16 book) + E16-row two-level scales: per-ROW fp16
+        // PXQ6 (display name "PXQ4" since the 2026-07-19 re-ladder by bpw class; the internal
+        // identifier + numeric id are unchanged): PXQ5 numerics (frozen PX16 book) + E16-row two-level scales: per-ROW fp16
         // anchor (2 B/row via row_meta_size = 128 B header per 64-row panel) x 4-bit EW
         // sub-scale per 16-elem block. 4.25 + 16/K bpw; measured -12.6% wrel vs PXQ5.
-        // CUDA-consumer format, native quantize only (llama-quantize PXQ6).
+        // CUDA-consumer format, native quantize only (llama-quantize PXQ4; old name PXQ6 accepted).
         GGML_TYPE_PXQ6      = 252,
-        // PXQ6HQ: PXQ6 with 4-bit subs per 8-elem block (scale SoA x2, 18 B / 32 elems).
+        // PXQ6HQ (display name "PXQ4-HQ"): PXQ6 with 4-bit subs per 8-elem block (scale SoA x2, 18 B / 32 elems).
         // 4.5 + 16/K bpw; measured -24.7% wrel vs PXQ5.
         GGML_TYPE_PXQ6HQ    = 253,
 

@@ -1815,7 +1815,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 if (tensor->type == GGML_TYPE_PXQ4 || tensor->type == GGML_TYPE_PXQ5 ||
                     tensor->type == GGML_TYPE_PXQ6 || tensor->type == GGML_TYPE_PXQ6HQ ||
                     tensor->type == GGML_TYPE_PXQ2 || tensor->type == GGML_TYPE_PXQ3) {
-                    throw std::runtime_error("cannot requantize from PXQ4/PXQ5/PXQ6/PXQ2/PXQ3 (CUDA-only slab layout, no CPU codec) — PXQ4: pxa-bench/pxq4_repack.py --reverse; PXQ5/PXQ6/PXQ2/PXQ3: requantize from the original F32/BF16/Q8_0 source");
+                    throw std::runtime_error("cannot requantize from a PXQ slab type (PXQ4-LEGACY/PXQ5/PXQ4/PXQ2/PXQ3: CUDA-only slab layout, no CPU codec) — PXQ4-LEGACY: pxa-bench/pxq4_repack.py --reverse; others: requantize from the original F32/BF16/Q8_0 source");
                 }
                 if (tensor->type == GGML_TYPE_F32) {
                     f32_data = (float *) tensor->data;
@@ -1930,7 +1930,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                             new_data = work.data();
                             pxq6_quantize_tensor(f32_data, (uint8_t *)new_data, R, K, E,
                                                  imatrix, imatrix ? K*E : 0, nthread, tier);
-                            LLAMA_LOG_INFO("PXQ6 native quantize (E16-row scales, tier %s) .. ", tier ? "HQ/bs8" : "core/bs16");
+                            LLAMA_LOG_INFO("PXQ4 native quantize (E16-row scales, tier %s) .. ", tier ? "HQ/bs8" : "core/bs16");
                         } break;
                     }
                     new_type = tgt;

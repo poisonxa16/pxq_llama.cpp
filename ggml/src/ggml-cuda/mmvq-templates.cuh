@@ -438,7 +438,7 @@ static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
     if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) { // NVIDIA and AMD older than RDNA2
         nwarps = args.ncols_y <= 4 ? 4 : 2;
     }
-    // PXA 2026-07-11 (run) lever-2: the MoE routed GEMV (ne2>=2) otherwise stays nwarps=1 because the
+    // PXA 2026-07-11 lever-2: the MoE routed GEMV (ne2>=2) otherwise stays nwarps=1 because the
     // expert dim fills gridDim.y. The nwarps>1 reduction path is ALREADY shipped for the non-MoE case
     // above (same reassociation, ~1e-6 class), so extending it to MoE is low-risk. Env-gated for the A/B;
     // set PXA_MMVQ_MOE_NWARPS=2 or 4 to force it. Prove faster + shadow-clean before defaulting.

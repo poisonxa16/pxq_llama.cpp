@@ -30,13 +30,20 @@ static const std::vector<struct quant_option> QUANT_OPTIONS = {
     { "Q5_1",     LLAMA_FTYPE_MOSTLY_Q5_1,     " 4.70G, +0.0349 ppl @ LLaMA-v1-7B", },
     { "Q6_0",     LLAMA_FTYPE_MOSTLY_Q6_0,     " 6.5 bpw quantization",             },
     { "MXFP4",    LLAMA_FTYPE_MOSTLY_MXFP4,    " 4.25 bpw 4-bit float quantization",},
-    { "PXQ4",     LLAMA_FTYPE_MOSTLY_PXQ4,     " 4.25 bpw, MXFP4 numerics in the PXA fused-GEMM slab layout (experts)",},
-    { "PXQ5",     LLAMA_FTYPE_MOSTLY_PXQ5,     " 4.25 bpw, PXA proprietary numerics (learned book + fine scale), slab layout",},
-    { "PXQ6",     LLAMA_FTYPE_MOSTLY_PXQ6,     " 4.27 bpw, PXQ5 numerics + E16-row scales (-12.6% wrel), slab layout",},
-    { "PXQ6HQ",   LLAMA_FTYPE_MOSTLY_PXQ6HQ,   " 4.52 bpw, PXQ6 with bs8 sub-scales (-24.7% wrel), slab layout",},
-    { "PXQ2",     LLAMA_FTYPE_MOSTLY_PXQ2,     " 2.27 bpw, LM4 x E16-row scales (experts; wrel 4.3x PXQ6)",},
-    { "PXQ3",     LLAMA_FTYPE_MOSTLY_PXQ3,     " 3.27 bpw, LM8 bit-plane x E16-row scales (experts; wrel 2.1x PXQ6)",},
-    { "PXQ_UNIVERSAL", LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL, " mixed PXQ2/PXQ3/PXQ6 per-tensor tier map (--pxq-universal)",},
+    // PXQ display names re-laddered by bpw class (2026-07-19): the 4-bit quality tier is now
+    // PXQ4 (formerly PXQ6) and its HQ variant PXQ4-HQ (formerly PXQ6HQ). Old names are accepted
+    // as aliases below. Numeric ftype/gguf ids are UNCHANGED. The legacy MXFP4-repack type that
+    // used to own the name "PXQ4" is now PXQ4-LEGACY.
+    { "PXQ4",     LLAMA_FTYPE_MOSTLY_PXQ6,     " 4.27 bpw, PX16 book + E16-row scales, slab layout (formerly PXQ6)",},
+    { "PXQ4-HQ",  LLAMA_FTYPE_MOSTLY_PXQ6HQ,   " 4.52 bpw, PXQ4 with bs8 sub-scales, slab layout (formerly PXQ6HQ)",},
+    { "PXQ2",     LLAMA_FTYPE_MOSTLY_PXQ2,     " 2.27 bpw, LM4 x E16-row scales (experts; wrel 4.3x PXQ4)",},
+    { "PXQ3",     LLAMA_FTYPE_MOSTLY_PXQ3,     " 3.27 bpw, LM8 bit-plane x E16-row scales (experts; wrel 2.1x PXQ4)",},
+    { "PXQ_UNIVERSAL", LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL, " mixed PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)",},
+    { "PXQ6",     LLAMA_FTYPE_MOSTLY_PXQ6,     " alias for PXQ4 (old display name)",},
+    { "PXQ6HQ",   LLAMA_FTYPE_MOSTLY_PXQ6HQ,   " alias for PXQ4-HQ (old display name)",},
+    { "PXQ4HQ",   LLAMA_FTYPE_MOSTLY_PXQ6HQ,   " alias for PXQ4-HQ",},
+    { "PXQ4-LEGACY", LLAMA_FTYPE_MOSTLY_PXQ4,  " LEGACY: 4.25 bpw, MXFP4 numerics in the PXA fused-GEMM slab layout (was PXQ4 pre-2026-07-19)",},
+    { "PXQ5",     LLAMA_FTYPE_MOSTLY_PXQ5,     " LEGACY: 4.25 bpw, learned book + SE8 scale, slab layout (superseded by PXQ4)",},
     { "IQ2_XXS",  LLAMA_FTYPE_MOSTLY_IQ2_XXS,  " 2.06 bpw quantization",            },
     { "IQ2_XXS_R4",LLAMA_FTYPE_MOSTLY_IQ2_XXS_R4,"IQ2_XXS repacked",            },
     { "IQ2_XS",   LLAMA_FTYPE_MOSTLY_IQ2_XS,   " 2.31 bpw quantization",            },
@@ -176,7 +183,7 @@ static void usage(const char * executable) {
     printf("  --custom-q regex1=type1,regex2=type2...: use this to specify custom quantization type rules.\n\n");
     printf("  --pxq-universal {12g|16g|16g-hq|/path/to/map.tiers}: PXQ-UNIVERSAL per-tensor tier map.\n");
     printf("        Presets resolve to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
-    printf("        The file is '#'-commented lines of regex=type (pxq2|pxq3|pxq6), fed through --custom-q.\n\n");
+    printf("        The file is '#'-commented lines of regex=type (pxq2|pxq3|pxq4; old name pxq6 accepted), fed through --custom-q.\n\n");
     printf("  --repack Repack all tensors to the corresponding _r4/8 variant if available.\n\n");
     printf("  --repack-pattern Comma separated list of regexs to use for matching tensor names to be repacked.\n\n");
     printf("  --symmetric-q40  Use [-7:7] range for Q4_0 quantization (turns off imatrix)\n\n");
@@ -324,6 +331,14 @@ static ggml_type parse_ggml_type(const char * arg) {
         if (name && strcmp(arg, name) == 0) {
             result = type; break;
         }
+    }
+    if (result == GGML_TYPE_COUNT) {
+        // PXQ display-name re-ladder (2026-07-19): old lowercase names stay valid as aliases
+        // in tier maps / --custom-q / --*-type args. Numeric type ids are unchanged.
+        if      (strcmp(arg, "pxq6")    == 0) result = GGML_TYPE_PXQ6;    // now displayed "pxq4"
+        else if (strcmp(arg, "pxq6hq")  == 0) result = GGML_TYPE_PXQ6HQ;  // now displayed "pxq4hq"
+        else if (strcmp(arg, "pxq4-hq") == 0) result = GGML_TYPE_PXQ6HQ;
+        else if (strcmp(arg, "pxq4_hq") == 0) result = GGML_TYPE_PXQ6HQ;
     }
     return result;
 }

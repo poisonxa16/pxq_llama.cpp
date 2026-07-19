@@ -1,7 +1,7 @@
 // pxq6.cuh — PXQ6: E16-row two-level scales + the unified PXA kernel-fastpath family (K0..K6).
 //
-// Spec: pxa-llama-fork/PXQ6-MEGA-OPTIMIZATION-2026-07-17.md (PXACLAW). Deep-dives:
-// PXQ6-KSPLIT-P100-2026-07-17.md (K1) + V100-TENSORCORE-HEADROOM-2026-07-17.md (K6).
+// Spec: PXQ 4-bit-tier optimization notes, 2026-07-17 (internal lab); deep-dives: K1 K-split
+// on P100 + K6 V100 tensor-core headroom (same series).
 //
 // FORMAT (GGML_TYPE_PXQ6 = 252, core tier; GGML_TYPE_PXQ6HQ = 253, bs8 tier):
 //   values : 4-bit codes into the frozen PX16 book (identical to PXQ5)
@@ -123,6 +123,8 @@ PXA_PXQ6_GATE(pxa_pxq6_scatfuse, "PXA_PXQ6_SCATFUSE", "K3 down-GEMM scatter fusi
 PXA_PXQ6_GATE(pxa_pxq6_ragtail,  "PXA_PXQ6_RAGTAIL",  "K4 ragged-tile FMA skip, bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_pipe,     "PXA_PXQ6_PIPE",     "K5 register-prefetch GEMM pipelining, bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_force_prefill, "PXA_PXQ6_FORCE_PREFILL", "TEST ONLY: bypass prefill arch gate")
+PXA_PXQ6_GATE(pxa_g2_redfuse,    "PXA_G2_REDFUSE",    "G2-F1 absorb gateup ksplit-reduce + GLU into the down-mmv x-staging prologue, bit-exact")
+PXA_PXQ6_GATE(pxa_g2_addfuse,    "PXA_G2_ADDFUSE",    "G2-F4 residual-add fusion: ADD+FUSED_RMS_NORM pair + MUL_MULTI_ADD residual epilogue, bit-exact")
 
 // K6 WMMA: 0 = off (default), 1 = fp32-accum fragments, 2 = fp16-accum twin. cc==700 only.
 static inline int pxa_pxq6_wmma() {
@@ -494,6 +496,80 @@ k_pxq6_mmv(const uint8_t * __restrict__ W,
 
     const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride);
     for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
+
+    __shared__ float tab[16];
+    __shared__ float sub[16];
+    __shared__ float2 plut[PAIR ? 256 : 1];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    if (PAIR) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    __syncthreads();
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    float su = 0.f;
+    for (int kb = kseg; kb < kslabs; kb += PXQ4_MMV_KSEG) {
+        su += pxq6_dot32<POL, PAIR, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                          xs + kb*PXQ6_QK, tab, sub, plut);
+    }
+    red[kseg*64 + row] = su;
+    __syncthreads();
+    if (kseg == 0) {
+        float u = 0.f;
+        #pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += red[s*64 + row];
+        float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+        out[p*PXQ6_BM + row] = u;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// G2-F1 REDFUSE (2026-07-19): the down mmv with k_pxq6_gateup_reduce + GLU absorbed into its
+// x-staging prologue. Instead of reading the gateup dst, each block reconstructs it from the
+// KSPLIT partial workspace with EXACTLY the reducer's arithmetic (fixed s = 0..KSEG-1 ascending
+// summation, then bias, then pxq4_glu_apply) => xs[] == the dst the standalone reduce would have
+// written, bit-for-bit; everything after staging is k_pxq6_mmv verbatim => the final output is
+// bit-identical while one kernel launch + one dst HBM round-trip disappear. Redundant reduce
+// compute is per-block (panels x), but ws is tiny (2*KSEG*K floats/slot) and L2-hot.
+// Driver-guarded: only when the gateup dst is SOLE-consumed by this down MUL_MAT_ID, only for
+// the bit-exact KSPLIT=1 form (declined under KSPLIT_GEN).
+// ---------------------------------------------------------------------------------------------
+template <class POL, bool PAIR, bool VECX>
+static __global__ void __launch_bounds__(256)
+k_pxq6_mmv_redfuse(const uint8_t * __restrict__ W,
+                   const float * __restrict__ ws,      // KSPLIT partials; gateup R == our K
+                   char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+                   const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                   const float * __restrict__ bias_u, const size_t bias_u_nb1,
+                   const float * __restrict__ bias_g, const size_t bias_g_nb1,
+                   const int R, const int K, const int n_as, const int n_ids,
+                   const int unary, const float alpha, const float limit) {
+    const int p  = blockIdx.x;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    extern __shared__ float pxq6_smem[];
+    float * xs = pxq6_smem;
+    float * red = pxq6_smem + K;
+
+    // staging prologue = the reducer, verbatim arithmetic (grow -> idx, R_gateup -> K)
+    const float * wsj = ws + ((size_t)iy*n_ids + j)*2*PXQ4_MMV_KSEG*K;
+    for (int idx = threadIdx.x; idx < K; idx += blockDim.x) {
+        float u = 0.f, g = 0.f;
+        #pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) {
+            u += wsj[(size_t)s*K + idx];
+            g += wsj[((size_t)PXQ4_MMV_KSEG + s)*K + idx];
+        }
+        if (bias_u) u += *(const float *)((const char *)bias_u + (size_t)e*bias_u_nb1 + (size_t)idx*sizeof(float));
+        if (bias_g) g += *(const float *)((const char *)bias_g + (size_t)e*bias_g_nb1 + (size_t)idx*sizeof(float));
+        xs[idx] = pxq4_glu_apply(g, u, unary, alpha, limit);
+    }
 
     __shared__ float tab[16];
     __shared__ float sub[16];
@@ -1270,6 +1346,9 @@ typedef void (*pxq6_gateup_fn)(const uint8_t *, const uint8_t *, const char *, s
         const float *, size_t, const float *, size_t, int, int, int, int, float, float);
 typedef void (*pxq6_mmv_fn)(const uint8_t *, const char *, size_t, size_t,
         char *, size_t, size_t, const char *, size_t, size_t, int, int, int);
+typedef void (*pxq6_mmv_redfuse_fn)(const uint8_t *, const float *, char *, size_t, size_t,
+        const char *, size_t, size_t, const float *, size_t, const float *, size_t,
+        int, int, int, int, int, float, float);
 typedef void (*pxq6_gateup_ks_fn)(const uint8_t *, const uint8_t *, const char *, size_t,
         float *, const char *, size_t, size_t, int, int, int, int);
 typedef void (*pxq6_gateup_ksg_fn)(const uint8_t *, const uint8_t *, const char *, size_t,
@@ -1323,6 +1402,7 @@ typedef void (*pxq6_scat_fn)(const uint8_t *, const half *, char *, size_t, size
     }
 PXQ6_PICK_FMT_GU(pxq6_gateup_fn,     pxq6_pick_gateup,            k_pxq6_gateup_mmv)
 PXQ6_PICK_FMT(pxq6_mmv_fn,        pxq6_pick_mmv,               k_pxq6_mmv)
+PXQ6_PICK_FMT(pxq6_mmv_redfuse_fn, pxq6_pick_mmv_redfuse,      k_pxq6_mmv_redfuse)
 PXQ6_PICK_FMT_GU(pxq6_gateup_ks_fn,  pxq6_pick_gateup_ksplit,     k_pxq6_gateup_mmv_ksplit)
 PXQ6_PICK_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen, k_pxq6_gateup_mmv_ksplit_gen)
 PXQ6_PICK_FMT(pxq6_gemm_fn,       pxq6_pick_gemm,              k_pxq6_gemm_grouped)

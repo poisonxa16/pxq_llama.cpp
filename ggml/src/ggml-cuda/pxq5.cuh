@@ -1,6 +1,6 @@
 // pxq5.cuh — PXQ5: the PXA fully-proprietary 4-bit quant (learned numerics + PXQ4 slab layout).
 //
-// Design + measured CPU PoC: pxa-llama-fork/PXQ5-PROPRIETARY-QUANT-DESIGN-2026-07-16.md (PXACLAW).
+// Design + measured CPU PoC: PXQ5 proprietary-quant design notes, 2026-07-16 (internal lab).
 // On real MoE expert weights PXQ5 measures ~32% lower relative-L2 quantization error than MXFP4
 // at the SAME 4.25 bpw (MSE −54%, max-abs −65%); imatrix-weighted quantize −37% on weighted error.
 //

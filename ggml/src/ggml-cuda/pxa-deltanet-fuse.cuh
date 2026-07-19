@@ -1,4 +1,4 @@
-// PXA_FUSE_DELTANET — R2 DeltaNet decode glue-kernel fusion (2026-07-07, run)
+// PXA_FUSE_DELTANET — R2 DeltaNet decode glue-kernel fusion (2026-07-07)
 //
 // The qwen35moe/qwen3next DeltaNet decode path (bs=1) runs a chain of small glue kernels
 // around the fused delta_net_recurrent_f32 core, each paying a ~3-10us execution-latency
@@ -105,7 +105,7 @@ static __global__ void pxa_dn_conv_tail_f32(
 static __global__ void pxa_dn_rms_silu_gate_f32(
         const float * __restrict__ x, const float * __restrict__ w,
         const float * __restrict__ z, float * __restrict__ dst,
-        const int ncols, const float eps) {
+        const int ncols, const float eps, void * __restrict__ vq8 = nullptr) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const float * xr = x + (int64_t)row*ncols;
@@ -132,6 +132,30 @@ static __global__ void pxa_dn_rms_silu_gate_f32(
     for (int c = tid; c < ncols; c += blockDim.x) {
         const float zi = zr[c];
         dr[c] = xr[c]*scale*w[c] * (zi / (1.0f + expf(-zi)));
+    }
+    // G2-F2 QUANTFOLD epilogue: emit the FLAT q8_1 sidecar of dst (bit-identical to
+    // quantize_q8_1 of the flattened output; requires ncols % 32 == 0, driver-guarded).
+    // This row owns flat chunks [row*ncols/32, (row+1)*ncols/32), one warp per chunk.
+    if (vq8) {
+        block_q8_1 * q8 = (block_q8_1 *)vq8;
+        const int wid = tid / WARP_SIZE, lid = tid % WARP_SIZE;
+        for (int cb = wid; cb < ncols/WARP_SIZE; cb += blockDim.x/WARP_SIZE) {
+            const int c = cb*WARP_SIZE + lid;
+            const float zi = zr[c];
+            const float xi = xr[c]*scale*w[c] * (zi / (1.0f + expf(-zi)));
+            float amax = fabsf(xi);
+            float sum  = xi;
+            amax = warp_reduce_max(amax);
+            sum  = warp_reduce_sum(sum);
+            const float d = amax / 127;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+            const int64_t ib = (int64_t)row*(ncols/WARP_SIZE) + cb;
+            q8[ib].qs[lid] = q;
+            if (lid == 0) {
+                reinterpret_cast<half&>(q8[ib].ds.x) = d;
+                reinterpret_cast<half&>(q8[ib].ds.y) = sum;
+            }
+        }
     }
 }
 
@@ -331,10 +355,21 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
 
     const int ncols = (int)F->ne[0];
     const int nrows = (int)ggml_nrows(F);
+    // G2-F2 QUANTFOLD: if a q8_1-GEMV consumer of M follows, emit the sidecar in the same launch
+    void * g2_q8 = nullptr;
+    int64_t g2_padded = 0;
+    if (pxa_g2_quantfold() && (ncols % WARP_SIZE) == 0 &&
+        pxa_g2_normfuse_wanted(ctx, cgraph, i + 1, M, g2_padded)) {
+        g2_q8 = pxa_g2_q8_buf(ctx.device, ctx.stream(), (size_t)(g2_padded/QK8_1)*sizeof(block_q8_1));
+    }
     pxa_dn_rms_silu_gate_f32<<<nrows, 128, 0, ctx.stream()>>>(
             (const float *)F->src[0]->data, (const float *)F->src[1]->data,
-            (const float *)M->src[0]->data, (float *)M->data, ncols, eps);
+            (const float *)M->src[0]->data, (float *)M->data, ncols, eps, g2_q8);
     CUDA_CHECK(cudaGetLastError());
+    if (g2_q8) {
+        auto & sc = pxa_g2_q8sc[ctx.device];
+        sc.t = M; sc.data = M->data; sc.padded = g2_padded; sc.eval = pxa_g2_eval_serial;
+    }
     // F's own dst is deliberately left unwritten: its only consumer is M (verified by the
     // strict delta-net anchor — this exact graph site).
     return true;

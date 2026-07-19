@@ -19,11 +19,12 @@
 #   PXQ2 (b2_e16): wrel 0.3020488067298746
 #   PXQ3 (b3_e16): wrel 0.14353147387217413
 #
-# Usage: python3 pxqu_wrel.py /path/to/pxqu_ref   (run from anywhere; lab paths are absolute)
+# Usage: PXQ_LAB_DIRS=/path/to/lab1:/path/to/lab2 python3 pxqu_wrel.py /path/to/pxqu_ref
+# (pxqu_lab + its weight/imatrix fixtures are the internal calibration lab, not shipped in this
+#  repo — point PXQ_LAB_DIRS at your own checkout; defaults to . and ./pxa-bench)
 import sys, os, subprocess, tempfile, json
-sys.path.insert(0, "/root/pxq-universal-lab/e-row-2bit-experts-mixed")
-sys.path.insert(0, "<local-path>")
-sys.path.insert(0, "/root/pxq5-120b")
+for _d in os.environ.get("PXQ_LAB_DIRS", ".:./pxa-bench").split(":"):
+    if _d: sys.path.insert(0, _d)
 import numpy as np
 import pxqu_lab as lab   # reuses build_sets/load_imatrix/quant_slice/mk_book — the oracle itself
 
@@ -32,7 +33,7 @@ ORACLE = {2: 0.3020488067298746, 3: 0.14353147387217413}
 
 def fp16_snap64(x): return np.asarray(np.float16(x), np.float64)
 
-BOOKS = json.load(open("/root/pxq-universal-lab/e-row-2bit-experts-mixed/books.json"))
+BOOKS = json.load(open(os.environ.get("PXQ_BOOKS_JSON", "books.json")))  # lab codebook file (sha256-pinned in ggml-pxq2-tables.h)
 BOOK = {2: np.array(BOOKS["b2_e16"]["book"], np.float64),
         3: np.array(BOOKS["b3_e16"]["book"], np.float64)}
 SUB16_SNAP = fp16_snap64(lab.SUB16)   # the C code's LUT (PXQ6_SUB16_INIT is fp16-snapped)

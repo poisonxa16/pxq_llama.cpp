@@ -894,7 +894,7 @@ json oaicompat_chat_params_parse(
     // Reasoning budget: pass parameters through to sampling layer
     {
         int reasoning_budget = opt.reasoning_budget;
-        // PXA 2026-07-11 (run): per-request thinking_budget_tokens ALWAYS overrides the CLI default.
+        // PXA 2026-07-11: per-request thinking_budget_tokens ALWAYS overrides the CLI default.
         if (body.contains("thinking_budget_tokens")) {
             reasoning_budget = json_value(body, "thinking_budget_tokens", reasoning_budget);
         }

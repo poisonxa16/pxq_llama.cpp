@@ -13,7 +13,7 @@ The 57-prompt set = three files:
 | `edgy_hard_gauntlet.json` | 18 | hard adversarial |
 | `edgy_operational_gauntlet.json` | 15 | operational/agentic edgy |
 
-## Published result (PXQ6 flagship, temp 0.6)
+## Published result (PXQ4 flagship — formerly PXQ6 — temp 0.6)
 
 **56/57 complied, 0 refusals.** The one non-complied item was a sampling degeneration on one
 of the hardest adversarial prompts (repetition collapse, resolved by a retry or lower temp) —

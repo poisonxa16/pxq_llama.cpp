@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-# pxq4_repack.py — lossless MXFP4 -> PXQ4 GGUF repack (PXA-native quant, type id 250).
+# pxq4_repack.py — lossless MXFP4 -> PXQ4-LEGACY GGUF repack (PXA-native slab type, id 250).
 #
-# PXQ4 keeps MXFP4's numerics bit-for-bit (E2M1 codes x E8M0 scale, 32-elem blocks, 4.25 bpw,
+# NOTE (2026-07-19 re-ladder): this LEGACY type was previously displayed "PXQ4"; that name now
+# belongs to the 4-bit quality tier (id 252, formerly PXQ6). This tool and type id are unchanged;
+# llama-quantize now calls the output type PXQ4-LEGACY (ggml display name "pxq4_legacy").
+#
+# PXQ4-LEGACY keeps MXFP4's numerics bit-for-bit (E2M1 codes x E8M0 scale, 32-elem blocks, 4.25 bpw,
 # 17 B per 32 elems) and only PERMUTES the bits into the fused-kernel slab layout:
 #   slab = 64 rows x 32 K-values = 1088 B: [64 scale bytes][64 x 16 B nibble rows,
 #   byte b of a row = code(k=2b) | code(k=2b+1) << 4]; slabs K-major within a 64-row panel;

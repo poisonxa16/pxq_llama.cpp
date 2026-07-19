@@ -2,8 +2,8 @@
 // Ny>=2 MTP/spec-decode verify batches. Read each routed expert's MXFP4 weights
 // ONCE across the Ny verify tokens instead of once per token.
 //
-// v1 (run 2026-07-06): scalar-F32 Milestone A kernel, host-sync plan readback.
-// v2 (run 2026-07-07): HALF2 kernel (smem-staged coalesced u32 weight loads,
+// v1 (2026-07-06): scalar-F32 Milestone A kernel, host-sync plan readback.
+// v2 (2026-07-07): HALF2 kernel (smem-staged coalesced u32 weight loads,
 //     __hfma2 with FP32-promote-per-block), NO host sync (grid oversubscribed on
 //     a device n_union), shadow-verify mode, and the v1 OPERAND-ORDER FIX:
 //
@@ -16,7 +16,7 @@
 //     that computes silu(up)*clamp(gate) = plausible garbage. v2 binds by name:
 //     up = src0_1, gate = src0_2, and the shadow mode exists to prove it in-graph.
 //
-// v3 / gk6-iqk (2026-07-08, Opus — Tier 2, the BIT-EXACT path): a grouped
+// v3 / gk6-iqk (2026-07-08, Tier 2 — the BIT-EXACT path): a grouped
 //     instantiation of the ENGINE's OWN fused MMVQ. Per distinct expert bin it
 //     calls the identical vec_dot_mxfp4_q8_1 q8_1-integer-dot against the SAME
 //     src1_quantized activations the per-token path uses, with the SAME nwarps=1
@@ -24,7 +24,7 @@
 //     SILU epilogue. No f16, no from-scratch numerics. Result is memcmp==0 vs the
 //     per-token reference BY CONSTRUCTION (only weight/y/dst ADDRESSING differs;
 //     the float accumulation sequence is identical). This is the only kernel that
-//     can pass the exact-equality G2 gate. See pxa-llama-fork/GK5-FIX-IMPL-GUIDE §2.2.
+//     can pass the exact-equality G2 gate. (Internal fix-guide §2.2.)
 //
 // ENV (read once, default OFF — one-line rollback):
 //   PXA_MOE_BATCHED_VERIFY (preferred; legacy alias PXA_MOE_GROUPED):
@@ -39,10 +39,10 @@
 //     ~2x cost; debug only.
 //
 // Correctness provenance (microbench, 2026-07-07, kernel-dev/moe_verify_bench_v5.cu
-// at the REAL heretic dims 256-expert/top-8/d_model 3072/d_ff 1024):
+// at real 122B-class MoE dims (256-expert/top-8/d_model 3072/d_ff 1024):
 //   grouped vs per-application on the SAME kernel = BIT-EXACT (memcmp==0);
-//   half2 vs FP32 golden rel_to_scale ~1.2e-3 (budget 1e-2). See
-//   pxa-llama-fork/A1-MOE-VERIFY-RESULTS-2026-07-07.md.
+//   half2 vs FP32 golden rel_to_scale ~1.2e-3 (budget 1e-2). (Internal
+//   A1 MoE-verify results, 2026-07-07.)
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

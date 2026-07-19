@@ -1,6 +1,6 @@
 # SWE-bench Lite — 19.6% (11/56), graded by the OFFICIAL docker harness
 
-The claim, precisely: on the first 56 instances of **SWE-bench Lite**, the PXQ6 flagship
+The claim, precisely: on the first 56 instances of **SWE-bench Lite**, the PXQ4 flagship (formerly PXQ6)
 driving the minimal ReAct harness in `run_swe.py` produced patches that the **official**
 `swebench.harness.run_evaluation` (prebuilt per-instance docker images, FAIL_TO_PASS +
 PASS_TO_PASS) graded as **11 resolved = 19.6%**. Of the 38 instances where a non-empty patch
@@ -19,7 +19,7 @@ the scaffold.
 ## Reproduce
 
 ```bash
-# 1) serve the flagship (PXQ6 or PXQ6-MTP; see ../speed-bench.sh for flags)
+# 1) serve the flagship (the PXQ6/PXQ6-MTP files = the PXQ4 tier; see ../speed-bench.sh for flags)
 # 2) generate predictions (resumable; appends to results.jsonl):
 python3 run_swe.py --limit 56          # our published run; --limit 300 for the full Lite set
 # 3) grade with the OFFICIAL harness (this is the number that counts):

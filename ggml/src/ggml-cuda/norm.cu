@@ -364,6 +364,67 @@ static __global__ void fused_rms_norm_f32(const src_t * x, const float * y, floa
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// G2-F3 NORMFUSE (2026-07-19): fused rms-norm that ALSO emits the q8_1 quantization of its own
+// output as a sidecar, so the consuming mul_mat_vec_q chain needs no separate quantize_q8_1
+// launch (and no extra global read pass). The f32 dst is written EXACTLY like fused_rms_norm_f32
+// (same block size selection -> same reduction order -> bit-identical), and the q8_1 epilogue
+// replicates quantize_q8_1's arithmetic verbatim (one warp per 32-wide block: warp amax/sum
+// reduce, d = amax/127, q = roundf(xi/d)) on identically-computed values => the sidecar is
+// bit-identical to what quantize_q8_1 would have produced from the standalone norm output.
+// ---------------------------------------------------------------------------------------------
+template <int block_size>
+static __global__ void fused_rms_norm_q8_f32(const float * x, const float * y, float * dst,
+        void * vq8, const int ncols, const int ncols_padded, const float eps) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[row*ncols + col];
+        tmp += xi * xi;
+    }
+    tmp = warp_reduce_sum(tmp);
+    if (block_size > WARP_SIZE) {
+        __shared__ float s_sum[32];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = tmp;
+        }
+        __syncthreads();
+        tmp = lane_id < block_size/WARP_SIZE ? s_sum[lane_id] : 0.0f;
+        tmp = warp_reduce_sum(tmp);
+    }
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[row*ncols + col] = scale * y[col] * x[row*ncols + col];
+    }
+
+    // q8_1 epilogue — quantize_q8_1 replicated, one warp per 32-wide block
+    block_q8_1 * q8 = (block_q8_1 *)vq8 + (int64_t)row*(ncols_padded/QK8_1);
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    for (int ib = warp_id; ib < ncols_padded/QK8_1; ib += block_size/WARP_SIZE) {
+        const int col = ib*QK8_1 + lane_id;
+        const float xi = col < ncols ? scale * y[col] * x[row*ncols + col] : 0.0f;
+        float amax = fabsf(xi);
+        float sum  = xi;
+        amax = warp_reduce_max(amax);
+        sum  = warp_reduce_sum(sum);
+        const float d = amax / 127;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+        q8[ib].qs[lane_id] = q;
+        if (lane_id == 0) {
+            reinterpret_cast<half&>(q8[ib].ds.x) = d;
+            reinterpret_cast<half&>(q8[ib].ds.y) = sum;
+        }
+    }
+}
+
 template <int block_size, typename src_t>
 static __global__ void fused_rms_norm_f32_nc(
         const src_t * x, const float * y, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
@@ -1052,4 +1113,31 @@ void ggml_cuda_op_fused_rms_rms_add(ggml_backend_cuda_context & ctx, ggml_tensor
     else {
         GGML_ABORT("Not implemented");
     }
+}
+
+// G2-F3 NORMFUSE launcher/entry (see kernel comment above). Returns false when the shape is
+// outside the bit-exact-parity envelope (ncols < 256 would pick a different block size than the
+// standalone launcher) — the caller then falls back to the plain norm + quantize path.
+static bool fused_rms_norm_q8_f32_cuda(const float * x, const float * y, float * dst, void * q8,
+        const int ncols, const int ncols_padded, const int nrows, const float eps, cudaStream_t stream) {
+    if (ncols < 256 || ncols % WARP_SIZE != 0 || ncols_padded % QK8_1 != 0) return false;
+    if (ncols < 1024) {
+        fused_rms_norm_q8_f32<256><<<nrows, 256, 0, stream>>>(x, y, dst, q8, ncols, ncols_padded, eps);
+    } else {
+        fused_rms_norm_q8_f32<1024><<<nrows, 1024, 0, stream>>>(x, y, dst, q8, ncols, ncols_padded, eps);
+    }
+    return true;
+}
+
+bool ggml_cuda_op_fused_rms_norm_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, int64_t ncols_padded) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (!src1) return false;
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) return false;
+    if (ggml_nrows(src1) != 1 || src0->ne[0] != src1->ne[0]) return false;
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    return fused_rms_norm_q8_f32_cuda((const float *)src0->data, (const float *)src1->data, (float *)dst->data,
+            q8, src0->ne[0], (int)ncols_padded, ggml_nrows(src0), eps, ctx.stream());
 }

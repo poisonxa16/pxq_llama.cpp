@@ -779,6 +779,11 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    // PXA_CUDA_GRAPH_V2 P3: pool generation for graph-replay safety. Bumped whenever a pool buffer
+    // is actually cudaFree'd (legacy pool overflow path) -- a captured graph baked pointers into
+    // pool memory; a generation change forces recapture instead of replaying dangling pointers.
+    // The VMM pool grows in place (bump allocator, base address never moves) so it never bumps.
+    virtual uint64_t generation() const { return 0; }
 };
 
 template<typename T>
@@ -862,6 +867,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cur_graph = nullptr;
 
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    // PXA_CUDA_GRAPH_V2: monotonic eval counter for LRU bookkeeping of the keyed graph cache.
+    uint64_t cuda_graph_eval_no = 0;
 
 #endif
 

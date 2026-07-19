@@ -1,6 +1,6 @@
 // pxq4.cuh — PXQ4: the PXA-native quant format (MXFP4 numerics, GEMM-tile-ordered layout).
 //
-// Design: pxa-llama-fork/PXA-QUANT-DESIGN-2026-07-15.md (PXACLAW repo). PoC: pxa-bench/pxq4_bench.cu
+// Design: PXA quant design notes, 2026-07-15 (internal lab). PoC: pxa-bench/pxq4_bench.cu
 // (measured 2.53x vs the prod dequant+cublas16F path on P100 at live gpt-oss expert shapes).
 //
 // On-disk layout (v1, frozen):

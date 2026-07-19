@@ -805,7 +805,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         // compute acceptance fraction if we have a recorded draft length
         if (n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)n_draft_last;
-            // PXA_NGRAM_RESET_STREAK (2026-07-09, run): the hardcoded streak-3 full-map wipe
+            // PXA_NGRAM_RESET_STREAK (2026-07-09): the hardcoded streak-3 full-map wipe
             // thrashes the 4M map on varied-writer models (accept~0.64 -> frequent f_acc<0.5 rounds ->
             // the map never warms). Env-tunable: default 3 = upstream; 0 = never reset on acceptance.
             static const int pxa_reset_streak = getenv("PXA_NGRAM_RESET_STREAK") ? atoi(getenv("PXA_NGRAM_RESET_STREAK")) : 3;

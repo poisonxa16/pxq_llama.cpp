@@ -195,11 +195,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q1_0_G128     = 41, // except 1d tensors, 38 to be compatible with mainline
         LLAMA_FTYPE_MOSTLY_PXQ4          = 250, // PXA-native: MXFP4 numerics in the fused-GEMM slab layout (expert tensors)
         LLAMA_FTYPE_MOSTLY_PXQ5          = 251, // PXA proprietary numerics (learned book + SE8 scale) in the slab layout
-        LLAMA_FTYPE_MOSTLY_PXQ6          = 252, // PXQ5 numerics + E16-row scales (per-row fp16 anchor + 4-bit EW subs)
-        LLAMA_FTYPE_MOSTLY_PXQ6HQ        = 253, // PXQ6 with bs8 sub-scales (HQ tier)
+        LLAMA_FTYPE_MOSTLY_PXQ6          = 252, // display name PXQ4 (re-laddered 2026-07-19): PXQ5 numerics + E16-row scales (per-row fp16 anchor + 4-bit EW subs)
+        LLAMA_FTYPE_MOSTLY_PXQ6HQ        = 253, // display name PXQ4-HQ: PXQ4 with bs8 sub-scales (HQ tier)
         LLAMA_FTYPE_MOSTLY_PXQ2          = 254, // 2-bit LM4 codes x E16-row scales (experts)
         LLAMA_FTYPE_MOSTLY_PXQ3          = 255, // 3-bit LM8 codes (bit-plane) x E16-row scales
-        LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL = 256, // mixed PXQ2/PXQ3/PXQ6 per-tensor tier map (--pxq-universal)
+        LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL = 256, // mixed PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ1_BN        = 136, // except 1d tensors

@@ -19,7 +19,7 @@
 //
 // SOURCES (sha256-locked): books.json ("b3_e16")
 //   e3ef27d550d4538654bf46c9ca8dac39ff181af31871da336a48b9e54755089f
-//   (/root/pxq-universal-lab/e-row-2bit-experts-mixed/books.json)
+//   (internal calibration lab artifact; the sha256 pins the exact book used)
 // Sub-scale LUT: PXQ6_SUB16_INIT from ggml-pxq6-tables.h REUSED VERBATIM (codebook-agnostic,
 // measured bit-identical after fp16 snap when refit on the LM8 pool). No PXQ3 sub table.
 // Book is the alternating-co-fit LM8 (kept round 2), fp16-snapped, exact fp32 hex.

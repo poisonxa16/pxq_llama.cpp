@@ -1,6 +1,7 @@
 #!/bin/bash
 # Perplexity ladder for the PXA Fusion2-35B PXQ tiers — the exact protocol behind the published table.
-#   PXQ6 7.3563 ±0.0818 | PXQ3 7.4407 ±0.0830 (+1.1%) | PXQ2 8.3906 ±0.0961 (+14.1%)
+#   PXQ4 7.3563 ±0.0818 | PXQ3 7.4407 ±0.0830 (+1.1%) | PXQ2 8.3906 ±0.0961 (+14.1%)
+# (PXQ4 = the 4-bit flagship, formerly PXQ6; the published file keeps the PXQ6 filename)
 # Protocol: wikitext-2-raw TEST split, n_ctx=512, 200 chunks, fa on, f16 KV, b/ub 512.
 # Usage: MODELS_DIR=/path/to/ggufs [BUILD=./build] [NGL=99] ./ppl-ladder.sh
 set -eu
@@ -29,6 +30,6 @@ for TIER in PXQ6 PXQ3 PXQ2; do
     2>&1 | grep -E "Final estimate|perplexity:"
 done
 # Notes:
-# - A single 16 GB card runs PXQ6 only partially (-ngl < 99); the published PXQ6 number used
+# - A single 16 GB card runs the 4-bit flagship only partially (-ngl < 99); its published number used
 #   2 cards with -sm layer -ts 1,1. PXQ3/PXQ2 fit one 16 GB / 11 GB card at -ngl 99.
 # - Expect Final estimates to match the table above to within the printed +/- error.

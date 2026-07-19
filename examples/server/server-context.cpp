@@ -11,6 +11,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "pxa-expert-log.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -294,6 +295,13 @@ server_context::~server_context() {
 
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
+
+    // PXA_EXPERT_LOG_v1: env-gated per-request MoE expert-routing histograms
+    if (pxa_expert_log_enabled()) {
+        params_base.cb_eval           = pxa_expert_log_cb;
+        params_base.cb_eval_user_data = nullptr;
+        fprintf(stderr, "PXA_EXPERT_LOG: enabled, dir=%s (np1 only!)\n", getenv("PXA_EXPERT_LOG"));
+    }
 
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 
@@ -910,7 +918,7 @@ const common_chat_msg& server_slot::update_chat_msg(bool is_partial, std::vector
         }
     }
     auto msg_prv_copy = chat_msg;
-    // PXA 2026-07-11 (run): a length-truncated / forced-close answer can be unparseable by the PEG chat
+    // PXA 2026-07-11: a length-truncated / forced-close answer can be unparseable by the PEG chat
     // parser -> NEVER let that become a 500. Fall back to delivering the raw generated text as content so
     // the client still gets the answer (finish_reason is set upstream from the stop type).
     common_chat_msg new_msg;
@@ -1325,6 +1333,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
     slot.params.oaicompat = task.params.oaicompat;
     slot.params.oaicompat_cmpl_id =task.params.oaicompat_cmpl_id;
+    pxa_expert_log_begin(task.id, slot.params.oaicompat_cmpl_id);
 
     slot.oai_resp_thinking_block_started = false;
     slot.oai_resp_text_block_started = false;
@@ -2739,6 +2748,20 @@ void server_context::send_final_response(server_slot& slot) {
     if (slot.oaicompat) {
         res->data["oaicompat_token_ctr"] = slot.n_decoded;
         res->data["model"] = slot.oaicompat_model;
+    }
+
+    // PXA_EXPERT_LOG_v1: dump this request's expert-routing histogram
+    {
+        std::string prompt_preview;
+        try {
+            prompt_preview = slot.prompt.is_string() ? slot.prompt.get<std::string>() : slot.prompt.dump();
+        } catch (...) {}
+        if (prompt_preview.size() > 200) prompt_preview.resize(200);
+        const std::string elog_path = pxa_expert_log_flush(slot.id_task, slot.params.oaicompat_cmpl_id,
+                slot.n_prompt_tokens, slot.n_decoded, prompt_preview);
+        if (!elog_path.empty()) {
+            res->data["pxa_expert_log"] = elog_path;
+        }
     }
 
     queue_results.send(std::move(res));

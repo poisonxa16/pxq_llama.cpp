@@ -38,6 +38,22 @@ struct ggml_cuda_graph {
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.
     int graph_cpynode_index = -1;
+
+    // PXA_CUDA_GRAPH_V2 (G1, 2026-07-19): replace the PERMANENT too-many-updates disable with a
+    // cooldown -- early churn (prompt boundaries, first-token topology variants) can no longer kill
+    // steady-state replay for the rest of the session. While cooldown_remaining > 0 the key runs
+    // eager; at 0 it re-arms (consecutive-update counter reset).
+    int cooldown_remaining = 0;
+    // Pool generation at last property store; a bump (real cudaFree of pool memory) forces recapture
+    // so a replay can never dereference baked pool pointers that were returned to the driver.
+    uint64_t pool_generation = 0;
+    // LRU bookkeeping for the keyed cache (each captured exec holds device memory).
+    uint64_t last_use = 0;
+    // Honest per-key counters (PXA_CUDA_GRAPH_LOG instrumentation).
+    long n_captures = 0;
+    long n_replays  = 0;
+    long n_eager    = 0;
+    int  last_n_nodes = 0;
 #endif
 };
 

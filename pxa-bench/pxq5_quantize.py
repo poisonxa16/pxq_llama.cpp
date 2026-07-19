@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # pxq5_quantize.py — PXQ5 reference quantizer / dequantizer / book learner (spec v1, frozen 2026-07-16).
 #
-# PXQ5 = the PXA fully-proprietary 4-bit quant: LEARNED numerics in the PXQ4 slab LAYOUT. 4.25 bpw.
+# LEGACY (2026-07-19): PXQ5 is superseded by the 4-bit tier now displayed PXQ4 (formerly PXQ6),
+# which adds E16-row scales on the same numerics. Kept for reproducibility.
+#
+# PXQ5 = the PXA fully-proprietary 4-bit quant: LEARNED numerics in the legacy slab LAYOUT. 4.25 bpw.
 #   value(code c, scale byte s) = scale_tab[s] * book[c]
 #   - book: 16 fp16 levels (default PX16 = pooled Lloyd-Max on real MoE expert weights),
 #     sorted ascending, book[7] == 0, absmax == 1. Frozen u16 bit patterns below.

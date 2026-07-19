@@ -1,7 +1,7 @@
 // pxq23.cuh — PXQ2 (2-bit LM4) + PXQ3 (3-bit LM8, bit-plane) CUDA side: device tables, env
 // gates, format policies, and the convert.cu dequant wrappers.
 //
-// Spec: pxa-llama-fork/PXQ-UNIVERSAL-2026-07-17.md. One COMBINED file (not pxq2.cuh+pxq3.cuh):
+// Spec: PXQ-UNIVERSAL design notes, 2026-07-17 (internal lab). One COMBINED file (not pxq2.cuh+pxq3.cuh):
 // the two types differ ONLY in book size and pair-decode (~40 lines each); every kernel they
 // run on lives in pxq6.cuh's policy-templated family (k_pxq6_*), exactly how PXQ6HQ already
 // rides PXQ6's kernels — a per-type file would be 90% boilerplate. This mirrors how pxq6.cuh

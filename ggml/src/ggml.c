@@ -1351,13 +1351,16 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
-    // PXQ4: PXA-native quant. MXFP4 numerics (E2M1 codes x E8M0 scale, 32-elem blocks, 17 B)
-    // in a GEMM-tile-ordered 64-row slab layout consumed by the fused CUDA kernels (pxq4.cuh).
-    // 64-row panel interleave => there is NO per-row CPU codec: to_float/from_float/vec_dot are
-    // deliberately NULL. PXQ4 tensors are produced by the lossless MXFP4 repack tool and are
-    // only ever consumed by the CUDA backend (dequant fallback + fused paths).
+    // GGML_TYPE_PXQ4 (id 250, LEGACY -- display name "pxq4_legacy"): MXFP4 numerics (E2M1 codes
+    // x E8M0 scale, 32-elem blocks, 17 B) in a GEMM-tile-ordered 64-row slab layout consumed by
+    // the fused CUDA kernels (pxq4.cuh). 64-row panel interleave => there is NO per-row CPU
+    // codec: to_float/from_float/vec_dot are deliberately NULL. Tensors of this type are
+    // produced by the lossless MXFP4 repack tool and are only ever consumed by the CUDA backend.
+    // NOTE (2026-07-19 display-name re-ladder): the display name "pxq4" now belongs to the
+    // 4-bit quality tier (id 252, formerly "pxq6"); this legacy MXFP4-repack type keeps its
+    // numeric id and is displayed as "pxq4_legacy".
     [GGML_TYPE_PXQ4] = {
-        .type_name                = "pxq4",
+        .type_name                = "pxq4_legacy",
         .blck_size                = 32,
         .type_size                = 17,
         .is_quantized             = true,
@@ -1375,12 +1378,14 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
-    // PXQ6 / PXQ6HQ: PXQ5 numerics + E16-row two-level scales (per-row fp16 anchor lives in a
-    // 128 B per-64-row-panel header = row_meta_size 2 B/row; ggml_row_size/nbytes stay exact).
-    // Same 64-row panel interleave as PXQ4/PXQ5 => no per-row CPU codec (CUDA-only consumer);
-    // produced by llama-quantize PXQ6/PXQ6HQ (src/pxq6-quantize.inc.cpp).
+    // PXQ4 / PXQ4-HQ (ids 252/253, formerly displayed PXQ6/PXQ6HQ -- 2026-07-19 re-ladder by
+    // bpw class; numeric ids unchanged, internal GGML_TYPE_PXQ6* identifiers kept): PXQ5
+    // numerics + E16-row two-level scales (per-row fp16 anchor lives in a 128 B per-64-row-panel
+    // header = row_meta_size 2 B/row; ggml_row_size/nbytes stay exact). Same 64-row panel
+    // interleave as the legacy slab types => no per-row CPU codec (CUDA-only consumer);
+    // produced by llama-quantize PXQ4/PXQ4-HQ (src/pxq6-quantize.inc.cpp; old names accepted).
     [GGML_TYPE_PXQ6] = {
-        .type_name                = "pxq6",
+        .type_name                = "pxq4",
         .blck_size                = 32,
         .type_size                = 17,
         .is_quantized             = true,
@@ -1388,7 +1393,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .row_meta_size            = 2,
     },
     [GGML_TYPE_PXQ6HQ] = {
-        .type_name                = "pxq6hq",
+        .type_name                = "pxq4hq",
         .blck_size                = 32,
         .type_size                = 18,
         .is_quantized             = true,
