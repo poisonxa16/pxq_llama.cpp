@@ -161,7 +161,6 @@ flake.lock
 a.out
 a.out.*
 .dev
-.github
 
 # PXA dev scratch (timestamped manual backups) — never commit
 *.bak-*
