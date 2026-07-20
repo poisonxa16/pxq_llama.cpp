@@ -1,5 +1,40 @@
 # Known issues
 
+## `--pxq-universal` quantize: harmless CUDA-driver noise + argument order
+
+**Two things trip people up when building a PXQU (`--pxq-universal`) quant. Neither is a real bug.**
+
+**1. Harmless container noise.** Running `llama-quantize` inside an `nvidia/cuda` container prints,
+before any real output:
+
+```
+ERROR: driverInitFileInfo 578 result=11
+ERROR: init 664 result=11
+ERROR: init 250 result=11
+```
+
+This is emitted by the **NVIDIA container runtime's own driver probe**, not by `llama-quantize` —
+the string does not exist anywhere in our source or binary. Quantization proceeds and completes
+normally. Ignore it. (It also appears on a plain `--help`, and on any other quant type; it is not
+specific to `--pxq-universal`.)
+
+**2. `--pxq-universal` is a flag — put it before the positional filenames.** `llama-quantize`
+parses option flags only until the first positional argument. If `--pxq-universal 16g` comes
+*after* the input/output paths, `--pxq-universal` lands in the positional `type` slot and you get:
+
+```
+main: invalid ftype '--pxq-universal'
+```
+
+Correct order (flag first, then `in out PXQ_UNIVERSAL`):
+
+```bash
+llama-quantize --imatrix model.imatrix --pxq-universal 16g \
+  model-bf16.gguf model-PXQU16.gguf PXQ_UNIVERSAL
+```
+
+Presets: `12g`, `16g`, `16g-hq`, or a path to a `.tiers` map. See `docs/COOKBOOK.md`.
+
 ## llama-imatrix crashes on CPU / partial-offload configs (pre-existing; fix pending)
 
 **Symptom:** an imatrix capture run (`llama-imatrix`, or any `cb_eval`-based activation capture)

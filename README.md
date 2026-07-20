@@ -122,10 +122,14 @@ PXA_FUSE_DELTANET=3 PXA_G2_ADDFUSE=1 \
 
 # PXQU — PXQ-Universal ("pick your card"): a knapsack mix of PXQ2/3/4 per expert tensor,
 # sized so the model runs FULL ub2048 prefill on one card. Presets are BAKED IN — this
-# works from a bare clone, no side files:
-./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQU-16.gguf     --pxq-universal 16g PXQ_UNIVERSAL    # 14.0 GB -> fills a 16 GB card (P100/V100)
-./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQU-12.gguf     --pxq-universal 12g PXQ_UNIVERSAL    # 11.6 GB -> fills a 12 GB card
+# works from a bare clone, no side files.
+# NOTE: --pxq-universal is a flag; it must come BEFORE the positional in/out/type args
+# (put it after them and you get "invalid ftype '--pxq-universal'"). See docs/KNOWN-ISSUES.md.
+./build/bin/llama-quantize --imatrix your.imatrix --pxq-universal 16g model-bf16.gguf out-PXQU-16.gguf PXQ_UNIVERSAL    # 14.0 GB -> fills a 16 GB card (P100/V100)
+./build/bin/llama-quantize --imatrix your.imatrix --pxq-universal 12g model-bf16.gguf out-PXQU-12.gguf PXQ_UNIVERSAL    # 11.6 GB -> fills a 12 GB card
 ```
+> Running under an `nvidia/cuda` container? A few `ERROR: ... init ... result=11` lines print first —
+> that's the NVIDIA runtime's own driver probe, not `llama-quantize`. Harmless; quantization continues.
 
 **⚠ PXQ models must be FULLY GPU-resident** — the CPU MoE op has no PXQ support, so partial
 offload (`-ngl < 99` with PXQ expert layers left on CPU, or `--n-cpu-moe`) aborts. Pick the tier
