@@ -16,8 +16,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
 
       - name: Install CUDA toolkit
         run: |
@@ -58,6 +56,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: pxq_llama ${{ inputs.tag }}
           body: |
             Prebuilt linux x86_64 CUDA 12 binaries (`llama-server`, `llama-quantize`, `llama-perplexity` + shared libs), arches sm 60/61/70/86/89. Unpack, `LD_LIBRARY_PATH=$PWD`, run — see RUN.txt inside.
