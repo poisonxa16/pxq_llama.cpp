@@ -21,6 +21,28 @@ export LD_LIBRARY_PATH=build/bin:build/src:build/ggml/src:build/examples/mtmd
 (`PXA_G2_ADDFUSE=1` is the 2026-07-19 late addition: +1.9% V100 / +1.2% P100 decode on top of
 the published rows, bit-exact. What each var does: `docs/LEVERS.md`.)
 
+## Two FA regimes — pick by workload (read this before quoting a prefill number)
+
+On these pre-Turing cards (P100/V100/1080 Ti), flash-attention is a **decode win but a
+cold-prefill loss** — for this engine *and* for upstream ik_llama. You run **one** setting per
+server, so choose by what you're doing. Measured (35B, cold 5.8k-token prompt, `-b 2048`, median
+of 3; full sweep in `bench/fair-battle.md`):
+
+| card | `-fa on` (interactive: chat/agent) | `-fa off` (batch: ingest/summarize/embed) |
+|---|---|---|
+| P100 | prefill **817** · decode **56.7** | prefill **1,213** · decode 41.1 |
+| V100 | prefill **1,589** · decode **94.1** | prefill **1,700** · decode 76.6 |
+| 1080 Ti | prefill **667** · decode **65.4** | prefill **1,001** · decode 34.2 |
+
+- **Interactive serving → `-fa on`** (what the recipes below use). You get the full decode speed
+  *and* a solid prefill in the same server — e.g. P100 gets +59% prefill / +30% decode vs upstream
+  simultaneously, no mode switch.
+- **Prefill-heavy batch → `-fa off`.** Prefill jumps 26–56% (this is where the "+88% P100
+  prefill" headline comes from) but decode drops 16–48%. Use it for one-shot ingest/summarize
+  passes where you barely decode.
+- The recipes below are the interactive (`-fa on`) defaults. For a batch job, add `-fa off` and
+  read the prefill from the right column above.
+
 ## 1× Tesla P100 16 GB — PXQU-16 (q8_0 head)
 
 ```bash
