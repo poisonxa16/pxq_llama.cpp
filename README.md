@@ -3,10 +3,19 @@
 
 # pxq_llama — run PXQ-quantized models (revive your landfill GPUs)
 
-A fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) that adds **PXQ**, a family of
-PXA-native low-bit quants for MoE models, so a real **35B runs on a single 12–16 GB card** —
-including salvaged datacenter Teslas (**P100 / V100**, sm_60/70), a **1080 Ti** (sm_61), or any modern
-consumer card. Built to give old hardware a second life instead of the e-waste bin.
+A fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — a **general MoE accelerator for
+Pascal/Volta silicon** (and modern cards), plus **PXQ**, a family of PXA-native low-bit quants. The
+engine work — an sm_60 fp16-GEMM gate fix, a flash-attention regime fix, MoE-path fixes, and correct
+`np>1` hybrid concurrency — speeds up **any** MoE on these cards, at any size, and it **scales from one
+salvaged card to a multi-card `-sm layer` spread to CPU/RAM offload**. So it runs a **35B on a single
+12–16 GB card**, and it runs **120B / 122B-class MoEs** across a stack of old Teslas — faster than
+mainline ik in every config measured so far. Built to give old hardware a second life instead of the
+e-waste bin.
+
+> **The single-card 35B below is the reproducible proof-of-concept** — one $150 card, one downloadable
+> GGUF, a chart you can rebuild. It's the on-ramp, not the ceiling: the same engine + PXQ tiers carry
+> straight up to big multi-card MoEs (a published multi-card bench is coming; today those wins are
+> measured, not yet charted here).
 
 Models: **https://github.com/poisonxa16/pxq_llama** ← you are here · Weights: [huggingface.co/poisonxa](https://huggingface.co/poisonxa)
 
@@ -76,6 +85,22 @@ decode, gate/up fusion) tuned for Pascal/Volta.
 
 The backbone (attention / router / embeddings) stays MXFP4 (standard mixed-precision). Numerics are
 imatrix-calibrated and gated byte-exact against a reference (Q-G1 byte-parity + Q-G2 wrel).
+
+## Scales up — one card to a rack
+
+The 35B single-card story is the reproducible demo, not the scope. Two independent layers:
+
+- **The engine** (format-agnostic, helps any quant): the sm_60 fp16-GEMM gate fix, the FA-regime
+  handling, the MoE-path fixes, and correct `np>1` hybrid concurrency speed up **any MoE at any size**
+  on Pascal/Volta — measured faster than mainline ik on **gpt-oss-120B and 122B-class** models, in
+  single-card, multi-card `-sm layer` spread, **and** CPU/RAM offload configs.
+- **The PXQ quant** (GPU-resident MoE): the 2/3/4-bit + universal tiers apply at every model size and
+  beat ik's IQ_K where the model is resident. (PXQ has no CPU codec — for a partial-offload run use a
+  standard quant on the fast engine; the PXQ speed comparison is GPU-resident.)
+
+So: pile up 2 / 4 / 6 salvaged Teslas and run a big MoE the same way you'd run the 35B on one. A
+published multi-card head-to-head is coming; today the 35B fair-battle (above) is the fully
+reproducible chart, and the big-model wins are measured but not yet charted here.
 
 ## Build (CUDA)
 
