@@ -11,7 +11,12 @@ __attribute__((used))
 __attribute__((used, visibility("default"))) const char pxa_provenance[] =
     "pxq_llama :: authored by PXA Network (pxanetwork.com) :: "
     "creator=PXANetwork :: origin-canary=PXA-7Q6LM32E16-ORIGIN :: forensic-watermark";
-static const char * const pxa_provenance_ref = pxa_provenance;
+namespace {
+// Keep the authorship canary in the linked binary (forensic provenance) --
+// referenced at load so --gc-sections cannot drop it.
+struct pxa_prov_keeper_t { pxa_prov_keeper_t() { volatile const char * volatile s = pxa_provenance; (void)s; } };
+__attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
+} // namespace
 // SPDX-License-Identifier: MIT
 //
 #include "ggml-cuda.h"
