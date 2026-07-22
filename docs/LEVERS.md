@@ -278,6 +278,77 @@ instrumentation), `PXA_GRAPH_DUMP` (graph node dump), `PXA_MOE_DEBUG`, `PXA_SPEC
 tracing), `PXA_OP_SYNC_CHECK` / `PXA_SYNC_BISECT` (per-op sync bisection for debugging async
 faults), `PXA_CHATPARSE_EVERY` (chat-parse cadence).
 
+## 10. Architecture support: GLM-4.7-Flash (`glm4_moe_lite`)
+
+`Glm4MoeLiteForCausalLM` (HF `model_type: glm4_moe_lite`, e.g. `zai-org/GLM-4.7-Flash`) is a
+**different architecture from GLM-4.5/GLM-4.6** (`Glm4MoeForCausalLM`, `model_type: glm4_moe`,
+loaded here by `build_glm4_moe()`). Flash is DeepSeek-V2/V3-lineage — MLA attention, sigmoid
+(`noaux_tc`) MoE gating with a score-correction bias, and a NextN/MTP tail — not the GQA
+attention `build_glm4_moe()` implements. Mapping it onto that graph produces shape mismatches
+or silent rope garbage; it must NOT be treated as a `glm4_moe` variant.
+
+- **Converts as `deepseek2` (MLA), not a new arch.** `convert_hf_to_gguf.py`:
+  `Glm4MoeLiteModel(DeepseekV2Model)` (`model_arch = gguf.MODEL_ARCH.DEEPSEEK2`), registered
+  `@Model.register("Glm4MoeLiteForCausalLM")`. Two gaps closed on top of the existing
+  `DeepseekV2Model`: (1) the HF config omits `scoring_func` (uses `topk_method: noaux_tc`
+  instead) where `DeepseekV2Model.set_gguf_parameters` hard-indexes it — the subclass
+  `setdefault`s it to `"sigmoid"` (correct: the `e_score_correction_bias` tensor is present,
+  and the loader's own GLM-4.7-Flash 47-layer heuristic already defaults to sigmoid gating
+  when the KV is missing); (2) the tokenizer pre-hash `cdf5f353...` (GLM-4.7-Flash's own
+  vocab, distinct from GLM-4.5's `9ca2dd61...`) is mapped to `res = "glm4"` — the fork's
+  `tokenizer.ggml.pre == "glm4"` vocab path already existed and needed no changes. Everything
+  else (expert 3D-stacking into `ffn_{gate,up,down}_exps`, `kv_b_proj` → `attn_kv_b` +
+  transposed-split `attn_k_b`/`attn_v_b`, `e_score_correction_bias` → `exp_probs_b.bias`,
+  `q_lora_rank`/`kv_lora_rank`/`key_length`/`value_length`/`rope.dimension_count` KV writes) was
+  already correct in `DeepseekV2Model` — this is a converter-registration gap, not a loader gap.
+- **Loads on the existing `LLM_ARCH_DEEPSEEK2` graph — no loader changes needed.** The loader
+  already special-cases the 47-layer shape (`n_layer==47` → sigmoid gating default, `is_lite`
+  heuristic correctly excludes it so `q_lora_rank` is read) and already builds `wk_b`/`wv_b` +
+  shared-expert tensors generically. Verified end-to-end: a mainline-converted (unsloth)
+  GLM-4.7-Flash GGUF loads clean and produces coherent temp-0 output under this fork; the
+  fork's own converter output was verified separately against a synthetic fixture (below).
+- **Run flags: `-fa on -mla >= 1` is REQUIRED for `-sm` multi-GPU on this (and any MLA) arch** —
+  the multi-GPU graph path aborts otherwise. Bake `-fa on -mla 3` (or `-mla 1`) into any launch
+  config; a temp-0 `-mla 1` vs `-mla 3` A/B on the same GGUF must be token-identical (divergence
+  there is a graph bug, not an expected quant/precision difference).
+- **NextN/MTP layer is skipped at conversion, by design.** `model.layers.<num_hidden_layers>.*`
+  (the NextN/MTP block: `eh_proj`/`embed_tokens`/`enorm`/`hnorm`/`shared_head.{head,norm}` plus
+  a full attn+MoE block) is dropped by the existing `DeepseekV2Model.modify_tensors` layer-index
+  guard — this fork's native MTP tail (`build_glm4_moe_mtp()`) is hard-gated to `LLM_ARCH_GLM_DSA`
+  only, so GLM-4.7-Flash gets no speculative-decode head from this pass; wiring the fork's tail
+  to the NextN block is future work, not part of this conversion path.
+- **PXQ4/PXQ6 quantize the routed experts natively, no code changes.** `pxq4_tensor_eligible`
+  (name ends `_exps.weight`, `ne[1] % 64 == 0`, `ne[0] % 32 == 0`) is purely name/shape driven —
+  GLM-4.7-Flash's `ffn_{gate,up}_exps` (`ne=[2048,1536,64]`) and `ffn_down_exps`
+  (`ne=[1536,2048,64]`) qualify with zero arch-specific handling.
+- **MLA small-tensor quant lever — `attn_v_b` is the one gap.** `llama-quantize`'s legacy
+  loose substring match `name.find("attn_k") != npos` (written for classic single `attn_k`
+  GQA tensors) incidentally also matches `attn_k_b`, `attn_kv_a_mqa`, and `attn_kv_b` (all
+  contain `"attn_k"` as a substring) — combined with `n_expert >= 4` this already forces those
+  three MLA tensors to `q8_0` for free, no code change needed. `attn_v_b` does **not** match
+  (no `"attn_k"` substring, and the exact-suffix `"attn_v.weight"` check doesn't fire either),
+  so it rides plain MXFP4 (bs32; legal, `ne[0]=192` on the real model is not 256-superblock
+  divisible but MXFP4/q8_0 don't care). If a quality gate ever flags the MLA path, force
+  `attn_v_b` to `q8_0` explicitly (`--attn-v-type q8_0` or a `--custom-quants` regex override);
+  `attn_k_b`/`attn_kv_a_mqa`/`attn_kv_b` need no such override.
+- **CI conversion smoke test:** `tests/test-glm47flash-convert.sh` +
+  `tests/fixtures/glm4-moe-lite-tiny/` — a synthetic 2-layer (`num_hidden_layers=2`,
+  `first_k_dense_replace=1`) fixture carrying every real tensor-name pattern including the
+  NextN tail, the REAL tokenizer (so the `cdf5f353...` pre-hash actually fires), and a
+  config.json that deliberately OMITS `scoring_func` (the exact key gap this conversion path
+  must survive). Asserts an exact tensor-name-set match (36 tensors; nothing missing, nothing
+  extra, no NextN leak), `general.architecture==deepseek2`, and the sigmoid/MLA/tokenizer KVs.
+  CPU-only, no GPU, no model download — safe on every commit.
+- **Verified on real weights (2026-07-22).** `llama-quantize --allow-requantize` q8_0 → PXQ4 on
+  the real 30.159 B model: 138/138 `_exps` take PXQ4 native (embedded tensor type 252, E16-row
+  scales, tier core/bs16), head → q8_0, `attn_k_b`/`attn_kv_a_mqa`/`attn_kv_b` keep q8_0,
+  `attn_v_b` → MXFP4, routers + `exp_probs_b` stay F32 — exactly the fixture prediction. Output
+  15.307 GiB / 4.360 bpw (tensor mix: 281 f32, 142 q8_0, 330 mxfp4, 138 pxq4). Loads split across
+  2× P100-16GB (`-ngl 99 -sm layer -fa on -mla 3 -c 8192`, 8279+7234 MiB weights, 423 MiB KV) with
+  temp-0 coherent output on capital-continuation / factual-QA / code-reasoning prompts. mla A/B on
+  a 1.5k-token cold prompt (P100 pair): prefill 686 t/s (`-mla 3`) vs 139 t/s (`-mla 1`) — ~4.9× —
+  decode parity (~10.5 t/s at 1.5k fill; 24–28 t/s near-empty). `-mla 3` is the setting to ship.
+
 ---
 
 *Numbers cite their config; anything without a number has no published A/B on the shipped

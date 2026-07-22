@@ -4,3 +4,5 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!fixtures
+!fixtures/glm4-moe-lite-tiny
