@@ -784,7 +784,19 @@ std::vector<llama_token> llama_sampling_sample_and_accept_n(struct common_sample
 static bool pxa_spec_relaxed_enabled() {
     static const bool en = [] {
         const char * e = std::getenv("PXA_SPEC_RELAXED");
-        return e && atoi(e) != 0;
+        if (e) {
+            return atoi(e) != 0;   // explicit env always wins over the level default
+        }
+        // Level default — keep in sync with pxa_config_level()/pxa_spec_relaxed_resolve() in
+        // ggml/src/ggml-cuda/pxa-enhance.cuh (this is a non-CUDA TU, so the logic is mirrored):
+        // PXA_REFERENCE=1 -> off (wins if both set); PXA_ENHANCE=1 -> on (G3, spec lanes only);
+        // neither -> off (shipped default, unchanged behavior).
+        const char * r = std::getenv("PXA_REFERENCE");
+        if (r && atoi(r) != 0) {
+            return false;
+        }
+        const char * l = std::getenv("PXA_ENHANCE");
+        return l && atoi(l) != 0;
     }();
     return en;
 }

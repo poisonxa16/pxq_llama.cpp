@@ -8,7 +8,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
 #include "pxq4.cuh"
-#include "pxq5.cuh"
 #include "pxq6.cuh"
 #include <type_traits>
 #include <cstdlib>
@@ -2019,17 +2018,15 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_PXQ4:
-            return dequantize_row_pxq4_cuda;
-        case GGML_TYPE_PXQ5:
-            return dequantize_row_pxq5_cuda;
-        case GGML_TYPE_PXQ6:
             return dequantize_row_pxq6_cuda;
-        case GGML_TYPE_PXQ6HQ:
+        case GGML_TYPE_PXQ4HQ:
             return dequantize_row_pxq6hq_cuda;
         case GGML_TYPE_PXQ2:
             return dequantize_row_pxq2_cuda;
         case GGML_TYPE_PXQ3:
             return dequantize_row_pxq3_cuda;
+        case GGML_TYPE_PXQ6:
+            return dequantize_row_pxq6r_cuda;
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ4_KS:
@@ -2134,17 +2131,15 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_PXQ4:
-            return dequantize_row_pxq4_cuda;
-        case GGML_TYPE_PXQ5:
-            return dequantize_row_pxq5_cuda;
-        case GGML_TYPE_PXQ6:
             return dequantize_row_pxq6_cuda;
-        case GGML_TYPE_PXQ6HQ:
+        case GGML_TYPE_PXQ4HQ:
             return dequantize_row_pxq6hq_cuda;
         case GGML_TYPE_PXQ2:
             return dequantize_row_pxq2_cuda;
         case GGML_TYPE_PXQ3:
             return dequantize_row_pxq3_cuda;
+        case GGML_TYPE_PXQ6:
+            return dequantize_row_pxq6r_cuda;
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ4_KS:

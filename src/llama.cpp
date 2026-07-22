@@ -3923,6 +3923,7 @@ static bool llm_load_tensors(
     // slices with NO ->extra, so llm_build_moe_ffn keeps the fused op that the CUDA
     // ggml_cuda_moe_up_gate_unary shard branch consumes. Flag unset => no override,
     // bit-identical behavior.
+#ifdef GGML_USE_CUDA   // pxa_expert_shard_buffer_type lives in ggml-cuda.cu (CUDA-only feature)
     if (const char * pes = getenv("PXA_EXPERT_SHARD")) {
         std::vector<int> group;
         { std::string t; for (const char * p = pes; ; ++p) {
@@ -3949,6 +3950,7 @@ static bool llm_load_tensors(
             LLAMA_LOG_INFO("]\n");
         }
     }
+#endif // GGML_USE_CUDA
 
     if (!overrides.empty()) {
         auto & last = overrides.emplace_back();

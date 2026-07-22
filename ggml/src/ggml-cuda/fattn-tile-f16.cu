@@ -8,10 +8,11 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-tile-f16.cuh"
+#include "pxa-enhance.cuh"
 
 #define FATTN_KQ_STRIDE_TILE_F16 64
 
-template<int D, int ncols, int nwarps, int parallel_blocks, bool use_softcap> // D == head size
+template<int D, int ncols, int nwarps, int parallel_blocks, bool use_softcap, bool pxa_mask_skip> // D == head size
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 __launch_bounds__(nwarps*WARP_SIZE, 1)
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
@@ -109,8 +110,43 @@ static __global__ void flash_attn_tile_ext_f16(
 
     __syncthreads();
 
+    // PXA_FA_MASK_SKIP_TILE (2026-07-22): scratch for the fully-masked-tile skip below
+    // (port of the shipped PXA_FA_MASK_SKIP_v1 from fattn-wmma-f16.cuh to the Pascal tile kernel).
+    __shared__ float pxa_skip_smax[nwarps];
+
     const int k_start = parallel_blocks == 1 ? 0 : ip*FATTN_KQ_STRIDE_TILE_F16;
     for (int k_VKQ_0 = k_start; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE_TILE_F16) {
+        // PXA_FA_MASK_SKIP_TILE: skip KV tiles whose mask is entirely -inf. Such tiles contribute
+        // exactly nothing (sum == -inf -> hmax leaves kqmax unchanged -> exp(-inf - max) == 0,
+        // VKQ rescale == 1), so skipping them is bit-identical to computing them. They dominate
+        // causal prefill (every query block scans the full padded KV extent; all strictly-future
+        // tiles are -inf) and np>1 co-resident-slot scans. The scan reads ncols*64 mask halves,
+        // ~6% of the K/V bytes the tile would otherwise move.
+        if (pxa_mask_skip && mask) {
+            const half2 * pxa_m2  = (const half2 *) maskh; // maskh is already offset to query row ic0
+            const int pxa_stride2 = stride_mask/2;         // mask query-row stride in half2
+            float pxa_max = -INFINITY;
+            for (int idx = threadIdx.y*WARP_SIZE + threadIdx.x; idx < ncols*(FATTN_KQ_STRIDE_TILE_F16/2); idx += nwarps*WARP_SIZE) {
+                const int j = idx / (FATTN_KQ_STRIDE_TILE_F16/2);
+                const int k = idx % (FATTN_KQ_STRIDE_TILE_F16/2);
+                const half2 v = pxa_m2[j*pxa_stride2 + k_VKQ_0/2 + k];
+                pxa_max = fmaxf(pxa_max, fmaxf(__low2float(v), __high2float(v)));
+            }
+            pxa_max = warp_reduce_max(pxa_max);
+            if (threadIdx.x == 0) {
+                pxa_skip_smax[threadIdx.y] = pxa_max;
+            }
+            __syncthreads();
+            float pxa_tile_max = pxa_skip_smax[0];
+#pragma unroll
+            for (int w = 1; w < nwarps; ++w) {
+                pxa_tile_max = fmaxf(pxa_tile_max, pxa_skip_smax[w]);
+            }
+            __syncthreads(); // protect pxa_skip_smax before the next iteration overwrites it
+            if (pxa_tile_max == -INFINITY) {
+                continue;
+            }
+        }
         // Calculate KQ tile and keep track of new maximum KQ values:
 
         half kqmax_new[ncols/nwarps];
@@ -309,25 +345,34 @@ static __global__ void flash_attn_tile_ext_f16(
 #endif // FP16_AVAILABLE
 }
 
-template <int cols_per_block, int parallel_blocks, bool use_softcap>
+template <int cols_per_block, int parallel_blocks, bool use_softcap, bool pxa_mask_skip>
 void launch_fattn_tile_f16_64_128(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     switch (Q->ne[0]) {
         case  64: {
             constexpr int      D = 64;
             constexpr int nwarps = 8;
-            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap>;
+            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip>;
             launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
         } break;
         case 128: {
             constexpr int      D = 128;
             constexpr int nwarps = 8;
-            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap>;
+            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip>;
             launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
         } break;
         default: {
             GGML_ABORT("FlashAttention without tensor cores only supports head sizes 64 and 128.");
         } break;
+    }
+}
+
+template <int cols_per_block, int parallel_blocks, bool use_softcap>
+static void launch_fattn_tile_f16_skip_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (pxa_fa_mask_skip_tile()) {
+        launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, use_softcap, true>(ctx, dst);
+    } else {
+        launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, use_softcap, false>(ctx, dst);
     }
 }
 
@@ -349,9 +394,9 @@ void ggml_cuda_flash_attn_ext_tile_f16(ggml_backend_cuda_context & ctx, ggml_ten
         constexpr int cols_per_block = 16;
         constexpr int parallel_blocks = 4;
         if (softcap == 0.0f) {
-            launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, false>(ctx, dst);
+            launch_fattn_tile_f16_skip_dispatch<cols_per_block, parallel_blocks, false>(ctx, dst);
         } else {
-            launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, true>(ctx, dst);
+            launch_fattn_tile_f16_skip_dispatch<cols_per_block, parallel_blocks, true>(ctx, dst);
         }
         return;
     }
@@ -360,9 +405,9 @@ void ggml_cuda_flash_attn_ext_tile_f16(ggml_backend_cuda_context & ctx, ggml_ten
         constexpr int cols_per_block = 32;
         constexpr int parallel_blocks = 4;
         if (softcap == 0.0f) {
-            launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, false>(ctx, dst);
+            launch_fattn_tile_f16_skip_dispatch<cols_per_block, parallel_blocks, false>(ctx, dst);
         } else {
-            launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, true>(ctx, dst);
+            launch_fattn_tile_f16_skip_dispatch<cols_per_block, parallel_blocks, true>(ctx, dst);
         }
         return;
     }
@@ -370,9 +415,9 @@ void ggml_cuda_flash_attn_ext_tile_f16(ggml_backend_cuda_context & ctx, ggml_ten
     constexpr int cols_per_block = 32;
     constexpr int parallel_blocks = 1;
     if (softcap == 0.0f) {
-        launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, false>(ctx, dst);
+        launch_fattn_tile_f16_skip_dispatch<cols_per_block, parallel_blocks, false>(ctx, dst);
     } else {
-        launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, false>(ctx, dst);
+        launch_fattn_tile_f16_skip_dispatch<cols_per_block, parallel_blocks, false>(ctx, dst);
     }
 }
 

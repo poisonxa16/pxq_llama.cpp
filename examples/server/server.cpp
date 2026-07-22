@@ -468,6 +468,96 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PXA POSTURE LAYER (2026-07-22): PXA_MODE=balance|max + ADAPTIVE-UB.
+// The two owner-facing postures (the PRODUCT; the kernel levers are the means):
+//   BALANCE (default, the daily): -fa on, ub 2048-class. Best decode AND best-possible
+//     prefill IN the fa-on regime — carried by PXA_FA_PREFILL_SPLIT + PXA_FA_MASK_SKIP_TILE
+//     (see ggml/src/ggml-cuda/pxa-enhance.cuh); fa-on decode is byte-untouched by construction.
+//   MAX (bulk ingest): -fa off, largest-fitting ub. Absolute max prefill, decode secondary.
+// This layer only FILLS FLAGS THE CLI LEFT UNSET — explicit -fa/-ub (or their
+// LLAMA_ARG_* env forms) always win. PXA_REFERENCE=1 stands the posture layer down
+// entirely (pure reference path, stock defaults). Kernel-lever selection lives in the
+// pxa_mode() resolver in pxa-enhance.cuh — keep the PXA_MODE parsing here in lockstep.
+//
+// ADAPTIVE-UB: probe free/total VRAM per assigned CUDA device and pick the largest ub in
+// {2048,1024,768,512} that plausibly fits next to the model's per-device share (heuristic
+// ~0.5 MiB compute buffer per ub token — deliberately optimistic so full-VRAM cards keep
+// their measured optimum; the card-type default is the primary selector). Safe fallback =
+// card-type default: >=15 GiB card -> 2048, >=10 GiB (11 GB 1080Ti class) -> 768, else 512.
+#if defined(GGML_USE_CUDA)
+#   include "ggml-cuda.h"
+#endif
+#include <cstring>
+#include <initializer_list>
+
+// 0 = balance, 1 = max, -1 = reference (posture layer stands down)
+static int pxa_posture_mode() {
+    const char * r = getenv("PXA_REFERENCE");
+    if (r && atoi(r) != 0) return -1;
+    const char * m = getenv("PXA_MODE");
+    return (m && (m[0] == 'm' || m[0] == 'M')) ? 1 : 0;
+}
+
+static bool pxa_argv_has(int argc, char ** argv, std::initializer_list<const char *> names) {
+    for (int i = 1; i < argc; ++i) {
+        for (const char * n : names) {
+            if (strcmp(argv[i], n) == 0) return true;
+        }
+    }
+    return false;
+}
+
+// returns the chosen ubatch (>0) or 0 = leave params.n_ubatch untouched; fills *why
+static int pxa_adaptive_ubatch(const gpt_params & params, std::string & why) {
+#if defined(GGML_USE_CUDA)
+    const int ndev = ggml_backend_cuda_get_device_count();
+    if (ndev <= 0) { why = "no CUDA devices - ub untouched"; return 0; }
+    size_t min_free = SIZE_MAX, min_total = SIZE_MAX;
+    for (int i = 0; i < ndev; ++i) {
+        size_t free = 0, total = 0;
+        ggml_backend_cuda_get_device_memory(i, &free, &total);
+        if (free  < min_free)  min_free  = free;
+        if (total < min_total) min_total = total;
+    }
+    const size_t GiB = 1024ull*1024ull*1024ull;
+    // card-type default (the safe fallback + the cap): 16 GB class -> 2048, 11 GB class -> 768
+    const int card_default = min_total >= 15*GiB ? 2048 : min_total >= 10*GiB ? 768 : 512;
+    // model per-device share (uniform-split estimate; tensor-split refinement not modeled)
+    size_t model_bytes = 0;
+    {
+        std::ifstream f(params.model, std::ios::binary | std::ios::ate);
+        if (f.good()) model_bytes = (size_t) f.tellg();
+    }
+    char buf[256];
+    if (model_bytes == 0) {
+        snprintf(buf, sizeof(buf), "card-type default (model size unknown; min total %zu MiB)", min_total>>20);
+        why = buf;
+        return card_default;
+    }
+    const size_t share = model_bytes / (size_t) ndev;
+    const size_t headroom = min_free > share ? min_free - share : 0;
+    static const int ladder[] = { 2048, 1024, 768, 512 };
+    for (int ub : ladder) {
+        if (ub > card_default) continue;
+        const size_t need = (size_t) ub * 512ull * 1024ull; // ~0.5 MiB per ub token (optimistic)
+        if (need <= headroom) {
+            snprintf(buf, sizeof(buf), "adaptive: min free %zu MiB, min total %zu MiB, model share %zu MiB -> headroom %zu MiB",
+                     min_free>>20, min_total>>20, share>>20, headroom>>20);
+            why = buf;
+            return ub;
+        }
+    }
+    snprintf(buf, sizeof(buf), "adaptive floor (headroom %zu MiB too tight)", headroom>>20);
+    why = buf;
+    return 512;
+#else
+    (void) params;
+    why = "no CUDA build - ub untouched";
+    return 0;
+#endif
+}
+
 int main(int argc, char ** argv) {
 #if SERVER_VERBOSE != 1
     log_disable();
@@ -501,6 +591,39 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // PXA POSTURE (2026-07-22): PXA_MODE=balance|max fills -fa/-ub the CLI left unset;
+    // explicit flags always win; PXA_REFERENCE=1 stands this down. See the block above main.
+    {
+        const int  pmode       = pxa_posture_mode();
+        const bool fa_explicit = pxa_argv_has(argc, argv, {"-fa", "--flash-attn", "-no-fa", "--no-flash-attn"})
+                                 || getenv("LLAMA_ARG_FLASH_ATTN") != nullptr;
+        const bool ub_explicit = pxa_argv_has(argc, argv, {"-ub", "--ubatch-size"})
+                                 || getenv("LLAMA_ARG_UBATCH") != nullptr;
+        if (pmode < 0) {
+            fprintf(stderr, "PXA posture: reference (PXA_REFERENCE=1) - fa/ub untouched (fa=%s ub=%d)\n",
+                    params.flash_attn ? "on" : "off", params.n_ubatch);
+        } else {
+            if (!fa_explicit) {
+                params.flash_attn = (pmode == 0);   // BALANCE -> fa on (serving); MAX -> fa off (ingest)
+            }
+            std::string ub_why = "explicit CLI/env - ub untouched";
+            if (!ub_explicit) {
+                const int ub = pxa_adaptive_ubatch(params, ub_why);
+                if (ub > 0) {
+                    params.n_ubatch = ub;
+                    if (params.n_batch < ub && !pxa_argv_has(argc, argv, {"-b", "--batch-size"})) {
+                        params.n_batch = ub;   // keep -b >= -ub so the ub choice is not clamped away
+                    }
+                }
+            }
+            fprintf(stderr, "PXA posture: mode=%s [%s] fa=%s%s ub=%d (%s)\n",
+                    pmode == 1 ? "max" : "balance",
+                    pmode == 1 ? "fa-off ingest, absolute max prefill" : "fa-on serving, decode-first",
+                    params.flash_attn ? "on" : "off", fa_explicit ? " (explicit)" : "",
+                    params.n_ubatch, ub_why.c_str());
+        }
+    }
 
     LOG_INFO("build info", {
         {"build",  LLAMA_BUILD_NUMBER},

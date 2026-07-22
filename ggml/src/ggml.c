@@ -21,6 +21,7 @@
 #include "ggml-aarch64.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
+#include "pxq-cpu.h"     // CPU panel-dequant fallback for the PXQ slab types (A5)
 #if GGML_USE_IQK_MULMAT
 #include "iqk/iqk_mul_mat.h"
 #include "iqk/iqk_config.h"
@@ -1351,40 +1352,26 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
-    // GGML_TYPE_PXQ4 (id 250, LEGACY -- display name "pxq4_legacy"): MXFP4 numerics (E2M1 codes
-    // x E8M0 scale, 32-elem blocks, 17 B) in a GEMM-tile-ordered 64-row slab layout consumed by
-    // the fused CUDA kernels (pxq4.cuh). 64-row panel interleave => there is NO per-row CPU
-    // codec: to_float/from_float/vec_dot are deliberately NULL. Tensors of this type are
-    // produced by the lossless MXFP4 repack tool and are only ever consumed by the CUDA backend.
-    // NOTE (2026-07-19 display-name re-ladder): the display name "pxq4" now belongs to the
-    // 4-bit quality tier (id 252, formerly "pxq6"); this legacy MXFP4-repack type keeps its
-    // numeric id and is displayed as "pxq4_legacy".
-    [GGML_TYPE_PXQ4] = {
-        .type_name                = "pxq4_legacy",
-        .blck_size                = 32,
-        .type_size                = 17,
-        .is_quantized             = true,
-        .nrows                    = 1,
-        .row_meta_size            = 0,
-    },
-    // PXQ5: PXA proprietary numerics (learned book + SE8 log-scale), PXQ4 slab layout.
-    // Same 64-row panel interleave => no per-row CPU codec (CUDA-only consumer format);
-    // produced by llama-quantize PXQ5 / pxa-bench/pxq5_quantize.py.
-    [GGML_TYPE_PXQ5] = {
-        .type_name                = "pxq5",
-        .blck_size                = 32,
-        .type_size                = 17,
-        .is_quantized             = true,
-        .nrows                    = 1,
-        .row_meta_size            = 0,
-    },
+    // ids 250 + 251 RESERVED — retired GGML_TYPE_PXQ4_LEGACY ("pxq4_legacy", the lossless
+    // MXFP4-repack slab type) and GGML_TYPE_PXQ5 ("pxq5", the learned-book + SE8 legacy type),
+    // both removed 2026-07-21; never reuse these ids. Old id-250/251 files get a clean
+    // "retired type" error at gguf load (see gguf_init_from_file) — requantize from the
+    // source model with llama-quantize PXQ4 or PXQ6.
+    //
+    // PXQ slab types (252-256): 64-row panel interleave => there is NO per-row CPU codec:
+    // to_float/from_float/vec_dot are deliberately NULL (and must STAY NULL — a to_float
+    // gets a single-row pointer, but a PXQ row's bytes are scattered across its panel's slabs).
+    // CPU-side consumers (partial offload: --cpu-moe / -ngl < 99) instead go through the
+    // panel-aware whole-matrix fallback in pxq-cpu.c (pxa_pxq_dequant_2d & friends), wired
+    // into the mul_mat/mul_mat_id/fused-up-gate compute paths below.
+    //
     // PXQ4 / PXQ4-HQ (ids 252/253, formerly displayed PXQ6/PXQ6HQ -- 2026-07-19 re-ladder by
-    // bpw class; numeric ids unchanged, internal GGML_TYPE_PXQ6* identifiers kept): PXQ5
+    // bpw class): PX16-book
     // numerics + E16-row two-level scales (per-row fp16 anchor lives in a 128 B per-64-row-panel
     // header = row_meta_size 2 B/row; ggml_row_size/nbytes stay exact). Same 64-row panel
     // interleave as the legacy slab types => no per-row CPU codec (CUDA-only consumer);
     // produced by llama-quantize PXQ4/PXQ4-HQ (src/pxq6-quantize.inc.cpp; old names accepted).
-    [GGML_TYPE_PXQ6] = {
+    [GGML_TYPE_PXQ4] = {
         .type_name                = "pxq4",
         .blck_size                = 32,
         .type_size                = 17,
@@ -1392,7 +1379,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
-    [GGML_TYPE_PXQ6HQ] = {
+    [GGML_TYPE_PXQ4HQ] = {
         .type_name                = "pxq4hq",
         .blck_size                = 32,
         .type_size                = 18,
@@ -1400,7 +1387,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
-    // PXQ2/PXQ3: PXQ-UNIVERSAL low-bit tiers -- LM4/LM8 codes x the PXQ6 E16-row scales
+    // PXQ2/PXQ3: PXQ-UNIVERSAL low-bit tiers -- LM4/LM8 codes x the PXQ4-tier E16-row scales
     // (same 128 B/64-row anchor header via row_meta_size=2; same 64 B scale SoA per slab).
     // No CPU codec (CUDA-only consumer); produced by llama-quantize PXQ2/PXQ3/PXQ_UNIVERSAL
     // (src/pxq2-quantize.inc.cpp / pxq3-quantize.inc.cpp).
@@ -1416,6 +1403,20 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .type_name                = "pxq3",
         .blck_size                = 32,
         .type_size                = 13,
+        .is_quantized             = true,
+        .nrows                    = 1,
+        .row_meta_size            = 2,
+    },
+    // PXQ6 (id 256, the 5-bit quality tier): LM32 5-bit codes x the same E16-row scales
+    // (128 B/64-row anchor header via row_meta_size=2). Slab = 64 B scale SoA + 64 x 20 B code
+    // rows = 1344 B => 21 B / 32 elems (1 scale byte + 20 code bytes). CUDA-only consumer
+    // (no CPU codec, like the other slab types); produced by llama-quantize PXQ6
+    // (src/pxq6r-quantize.inc.cpp — verified against its emitted layout + ggml-pxq6-tables.h
+    // PXQ6R_TYPE_SIZE/PXQ6R_SLAB_BYTES/PXQ6R_ROW_META).
+    [GGML_TYPE_PXQ6] = {
+        .type_name                = "pxq6",
+        .blck_size                = 32,
+        .type_size                = 21,
         .is_quantized             = true,
         .nrows                    = 1,
         .row_meta_size            = 2,
@@ -7979,10 +7980,10 @@ struct ggml_tensor * ggml_mul_mat_id(
 bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate) {
     if (type_up == type_gate) return true;
     // PXQ-UNIVERSAL mixed tiers (CUDA-only slab types): the fused CUDA MoE kernels
-    // handle mixed up/gate pairs over {PXQ2, PXQ3, PXQ6} with independent per-operand
+    // handle mixed up/gate pairs over {PXQ2, PXQ3, PXQ4} with independent per-operand
     // policies (ggml-cuda/pxq6.cuh PXQ6_PICK_FMT_GU mixed-pair table).
-    const bool up_ok   = type_up   == GGML_TYPE_PXQ2 || type_up   == GGML_TYPE_PXQ3 || type_up   == GGML_TYPE_PXQ6;
-    const bool gate_ok = type_gate == GGML_TYPE_PXQ2 || type_gate == GGML_TYPE_PXQ3 || type_gate == GGML_TYPE_PXQ6;
+    const bool up_ok   = type_up   == GGML_TYPE_PXQ2 || type_up   == GGML_TYPE_PXQ3 || type_up   == GGML_TYPE_PXQ4;
+    const bool gate_ok = type_gate == GGML_TYPE_PXQ2 || type_gate == GGML_TYPE_PXQ3 || type_gate == GGML_TYPE_PXQ4;
     return up_ok && gate_ok;
 }
 
@@ -17156,6 +17157,27 @@ static int ggml_compute_forward_mul_mat(
     }
 #endif
 
+    if (pxa_pxq_is_cpu_supported(type)) {
+        // PXQ slab weights in a plain mul_mat: no CPU vec_dot exists (the chunked path
+        // below would call a NULL fn) — panel-dequant fallback (pxq-cpu.c), one 2D slice
+        // at a time with the standard src0 broadcast.
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        const int64_t pxq_r2 = ne12/ne02;
+        const int64_t pxq_r3 = ne13/ne03;
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                pxa_pxq_mul_mat_cpu(type,
+                        (const char *)src0->data + (i12/pxq_r2)*nb02 + (i13/pxq_r3)*nb03,
+                        ne01, ne00,
+                        (const char *)src1->data + i12*nb12 + i13*nb13, nb11, 0,
+                        (char *)dst->data + i12*nb2 + i13*nb3, nb1, 0,
+                        NULL, ne11, ne11,
+                        ith, nth);
+            }
+        }
+        return node_n;
+    }
+
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -17457,7 +17479,20 @@ static void ggml_compute_forward_mul_mat_id(
 
         const int64_t nr0 = ne01; // src0 rows
         const int64_t nr1 = cne1; // src1 rows
-                                  //
+
+        if (pxa_pxq_is_cpu_supported(type)) {
+            // PXQ slab weights (e.g. ffn_down_exps with --cpu-moe): the type has no CPU
+            // vec_dot/gemv and no iqk kernels — panel-dequant fallback (pxq-cpu.c).
+            // For PXQ, vec_dot_type == F32, so src1 was never quantized into wdata; use
+            // the original f32 src1 with its true strides.
+            GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne13 == 1);
+            pxa_pxq_mul_mat_cpu(type, src0_cur, nr0, ne00,
+                    (const char *)src1->data, nb11, nb12,
+                    (char *)dst->data, nb1, nb2,
+                    (const struct pxa_pxq_rowmap *)(matrix_rows + cur_a*ne12), ne11, nr1,
+                    ith, nth);
+            continue;
+        }
 #if GGML_USE_IQK_MULMAT
         if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
            if (!iqk_mul_mat_moe(nr0, nr1, ne00, ne11,
@@ -17603,7 +17638,11 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    GGML_ASSERT(!dst->src[1] || dst->src[0]->type == dst->src[1]->type);
+    // mixed up/gate pairs are allowed for the PXQ-UNIVERSAL slab tiers (see
+    // ggml_moe_up_gate_can_fuse); the CPU PXQ fallback below dequants each operand with
+    // its own type, so the same-type requirement only applies to non-PXQ weights.
+    GGML_ASSERT(!dst->src[1] || dst->src[0]->type == dst->src[1]->type ||
+                (pxa_pxq_is_cpu_supported(dst->src[0]->type) && pxa_pxq_is_cpu_supported(dst->src[1]->type)));
     GGML_ASSERT(!dst->src[1] || ggml_are_same_shape(dst->src[0], dst->src[1]));
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
@@ -17746,6 +17785,32 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         const int64_t nr0 = src0_2 ? ne01 : ne01/2; // src0 rows
         const int64_t nr1 = cne1; // src1 rows
 
+        if (pxa_pxq_is_cpu_supported(type)) {
+            // PXQ slab weights: no iqk CPU kernels exist (panel-interleaved CUDA-consumer
+            // format) — run the correct-but-slow panel-dequant fallback (pxq-cpu.c) instead
+            // of aborting. Activations are consumed as the ORIGINAL f32 src1 (for PXQ,
+            // vec_dot_type == F32, so no wdata quantization ever happened for them).
+            GGML_ASSERT(src1->type == GGML_TYPE_F32);
+            const enum ggml_type type_gate = src0_2 ? src0_2->type : type;
+            const char * up_c, * gate_c;
+            if (src0_2) {
+                up_c   = (const char *)src0_1->data + cur_a*nb02;
+                gate_c = (const char *)src0_2->data + cur_a*src0_2->nb[2];   // own stride (mixed pair)
+            } else {
+                // interleaved single tensor: first half of rows = gate, second half = up
+                gate_c = (const char *)src0_1->data + cur_a*nb02;
+                up_c   = gate_c + nb02/2;
+                GGML_ASSERT((ne01/2) % 64 == 0);   // the up half must start on a panel boundary
+            }
+            pxa_pxq_moe_up_gate_cpu(type, up_c, type_gate, gate_c, nr0, ne00,
+                    (const float *)up_b_cur, (const float *)gate_b_cur,
+                    (const char *)src1->data, nb11, nb12,
+                    (char *)dst->data, nb1, nb2,
+                    (const struct pxa_pxq_rowmap *)(matrix_rows + cur_a*ne12), ne11, nr1,
+                    dst->op_params[0], limit, ith, nth);
+            continue;
+        }
+
         if (!iqk_moe_fused_up_gate(nr0, nr1, ne00, ne11, dst->op_params[0],
                             type, src0_1_cur, src0_2_cur, nb01,
                             vec_dot_type, (const char *)wdata, row_size,
@@ -17792,6 +17857,22 @@ static void ggml_compute_forward_mul_mat_up_gate(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
     GGML_ASSERT(ne13 == 1);
+
+    if (pxa_pxq_is_cpu_supported(type)) {
+        // PXQ slab weights (dense fused up/gate): panel-dequant fallback (pxq-cpu.c).
+        // For PXQ, vec_dot_type == F32 (from_float below would be NULL) — consume the
+        // original f32 src1 directly and skip the wdata quantization entirely.
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne12 == 1);
+        const float pxq_limit = *(const float *)(dst->op_params + 1);
+        pxa_pxq_moe_up_gate_cpu(type, src0_1->data, src0_2->type, src0_2->data, ne01, ne00,
+                NULL, NULL,
+                (const char *)src1->data, nb11, nb12,
+                (char *)dst->data, nb1, nb2,
+                NULL, ne11, ne11,
+                dst->op_params[0], pxq_limit, ith, nth);
+        return;
+    }
 
     ggml_from_float_t const from_float = type_traits[vec_dot_type].from_float;
 
@@ -29285,6 +29366,28 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
                 (int64_t) info->ne[1] *
                 (int64_t) info->ne[2] *
                 (int64_t) info->ne[3];
+
+            if (info->type == 250 || info->type == 251) {
+                // retired GGML_TYPE_PXQ4_LEGACY / GGML_TYPE_PXQ5 (traits removed 2026-07-21) —
+                // clean error, not a crash
+                fprintf(stderr, "%s: tensor '%s' has type id %d (%s) — this type was retired 2026-07-21; "
+                        "requantize from your source model with llama-quantize PXQ4 or PXQ6\n",
+                        __func__, info->name.data, (int) info->type,
+                        info->type == 250 ? "pxq4_legacy" : "pxq5");
+                fclose(file);
+                gguf_free(ctx);
+                return NULL;
+            }
+
+            if (ggml_blck_size(info->type) == 0) {
+                // in-range type id with no registered traits (a reserved/retired gap id) — the
+                // modulo below would be a division by zero
+                fprintf(stderr, "%s: tensor '%s' has unregistered type id %d — unsupported file\n",
+                        __func__, info->name.data, (int) info->type);
+                fclose(file);
+                gguf_free(ctx);
+                return NULL;
+            }
 
             if (ne % ggml_blck_size(info->type) != 0) {
                 fprintf(stderr, "%s: tensor '%s' of type %d (%s) number of elements (%" PRId64 ") is not a multiple of block size (%" PRId64 ")\n",

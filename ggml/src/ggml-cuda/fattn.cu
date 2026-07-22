@@ -16,11 +16,32 @@
 #include "convert.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 #define FATTN_KQ_STRIDE 256
 
 static inline bool mma_better_than_turing(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > CC_TURING;
+}
+
+// PXQ port of upstream ik_llama.cpp PR #2144 (merged 2026-07-17):
+// on sm_60 (P100/CC_PASCAL) the fp16 FA vec kernel accumulates the online-softmax
+// denominator and the P.V product in fp16, flipping ~3-4% of decode top-1 tokens vs an
+// all-fp32 reference. P100 decode is memory-bandwidth-bound, so routing decode
+// (batch <= 8) to the fp32 vec kernel is measured-free upstream (tg128 96.79 vs 96.61
+// t/s; neutral-or-better at long context). Prefill and the D=256 vec path stay on
+// vec_f16. sm_61 (1080Ti) is unaffected (no fast fp16 -> already vec_f32).
+// Env kill-switch: PXQ_SM60_FA_VEC_F32=0 restores the old fp16-accumulating route.
+static bool pxq_sm60_fa_vec_f32_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("PXQ_SM60_FA_VEC_F32");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+
+static inline bool pxq_use_sm60_vec_f32(const int cc, const ggml_tensor * Q) {
+    return cc == CC_PASCAL && Q->ne[1] <= 8 && pxq_sm60_fa_vec_f32_enabled();
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -78,7 +99,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (!fp16_mma_available(cc)) {
         if (precision == GGML_PREC_DEFAULT) {
             if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
-                ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
+                if (pxq_use_sm60_vec_f32(cc, Q)) { // PR #2144: sm_60 decode -> fp32 accumulation
+                    ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
+                }
             } else {
                 ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
             }
@@ -184,6 +209,9 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     if (!fp16_mma_available(cc)) {
         if (precision == GGML_PREC_DEFAULT) {
             if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+                if (pxq_use_sm60_vec_f32(cc, Q)) { // PR #2144: keep supported-check in lockstep
+                    return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+                }
                 return ggml_cuda_fattn_vec_f16_is_supported(ctx, dst);
             } else {
                 return ggml_cuda_fattn_tile_f16_is_supported(ctx, dst);

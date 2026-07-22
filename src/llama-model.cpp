@@ -1767,13 +1767,12 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q6_0_R4:  return "Q6_0_R4 - 6.5 bpw";
         case LLAMA_FTYPE_MOSTLY_Q8_0_R8:  return "Q8_0_R8 - 8.5 bpw";
         case LLAMA_FTYPE_MOSTLY_MXFP4:    return "MXFP4 - 4.25 bpw";
-        case LLAMA_FTYPE_MOSTLY_PXQ4:     return "PXQ4-LEGACY - 4.25 bpw, MXFP4 numerics, PXA slab layout";
-        case LLAMA_FTYPE_MOSTLY_PXQ5:     return "PXQ5 - 4.25 bpw, PXA proprietary numerics, slab layout (legacy)";
-        case LLAMA_FTYPE_MOSTLY_PXQ6:     return "PXQ4 - 4.27 bpw, E16-row scales, slab layout (formerly PXQ6)";
-        case LLAMA_FTYPE_MOSTLY_PXQ6HQ:   return "PXQ4-HQ - 4.52 bpw, E16-row bs8 scales, slab layout (formerly PXQ6HQ)";
+        case LLAMA_FTYPE_MOSTLY_PXQ4:     return "PXQ4 - 4.27 bpw, E16-row scales, slab layout (formerly PXQ6)";
+        case LLAMA_FTYPE_MOSTLY_PXQ4HQ:   return "PXQ4-HQ - 4.52 bpw, E16-row bs8 scales, slab layout (formerly PXQ6HQ)";
         case LLAMA_FTYPE_MOSTLY_PXQ2:     return "PXQ2 - 2.27 bpw, LM4 x E16-row scales, slab layout";
         case LLAMA_FTYPE_MOSTLY_PXQ3:     return "PXQ3 - 3.27 bpw, LM8 bit-plane x E16-row scales, slab layout";
         case LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL: return "PXQ-UNIVERSAL - mixed PXQ2/PXQ3/PXQ4 per-tensor tier map";
+        case LLAMA_FTYPE_MOSTLY_PXQ6:     return "PXQ6 - 5.27 bpw, LM32 x E16-row scales, slab layout";
         case LLAMA_FTYPE_MOSTLY_Q1_0_G128:return "Q1_0_G128 - 1.125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_KS:   return "IQ4_KS - 4.25 bpw";

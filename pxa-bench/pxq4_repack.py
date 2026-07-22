@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # pxq4_repack.py — lossless MXFP4 -> PXQ4-LEGACY GGUF repack (PXA-native slab type, id 250).
 #
+# ⚠ RETIRED 2026-07-21: type id 250 was REMOVED from the fork (enum/traits/kernels/quantize
+# path all gone) — the engine now refuses id-250 files with a clean error. Do NOT use this
+# tool to PRODUCE id-250 files anymore. It is kept ONLY for --reverse (id-250 -> MXFP4), the
+# migration path for old files: reverse-repack, then llama-quantize PXQ4 from a real source.
+#
 # NOTE (2026-07-19 re-ladder): this LEGACY type was previously displayed "PXQ4"; that name now
-# belongs to the 4-bit quality tier (id 252, formerly PXQ6). This tool and type id are unchanged;
-# llama-quantize now calls the output type PXQ4-LEGACY (ggml display name "pxq4_legacy").
+# belongs to the 4-bit quality tier (id 252, formerly PXQ6). As of 2026-07-21 llama-quantize no
+# longer has any id-250 target at all (the type is retired; see the RETIRED note above).
 #
 # PXQ4-LEGACY keeps MXFP4's numerics bit-for-bit (E2M1 codes x E8M0 scale, 32-elem blocks, 4.25 bpw,
 # 17 B per 32 elems) and only PERMUTES the bits into the fused-kernel slab layout:

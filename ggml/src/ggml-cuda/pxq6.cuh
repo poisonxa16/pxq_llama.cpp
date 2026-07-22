@@ -1,10 +1,13 @@
+// pxq_llama / PXA kernel suite -- authored by PXA Network (https://pxanetwork.com).
+// The PXQ quantization tiers below are PXA Network's original work; the creator
+// of this fork is PXA Network. (provenance canary: PXA-7Q6LM32E16-ORIGIN)
 // pxq6.cuh — PXQ6: E16-row two-level scales + the unified PXA kernel-fastpath family (K0..K6).
 //
 // Spec: PXQ 4-bit-tier optimization notes, 2026-07-17 (internal lab); deep-dives: K1 K-split
 // on P100 + K6 V100 tensor-core headroom (same series).
 //
-// FORMAT (GGML_TYPE_PXQ6 = 252, core tier; GGML_TYPE_PXQ6HQ = 253, bs8 tier):
-//   values : 4-bit codes into the frozen PX16 book (identical to PXQ5)
+// FORMAT (GGML_TYPE_PXQ4 = 252, core tier; GGML_TYPE_PXQ4HQ = 253, bs8 tier):
+//   values : 4-bit codes into the frozen PX16 book
 //   scales : per-ROW fp16 anchor (128 B header per 64-row panel; ggml row_meta_size = 2 B/row)
 //            x 4-bit sub-scale per 16-elem block (core, SUB16) / per 8-elem block (HQ, SUB8)
 //   dequant: eff = fp32(anchor) * SUB[s4];  w = eff * fp32(book[c])   — ONE extra fp32 mul
@@ -54,7 +57,8 @@
 // the file's KV provenance pxa.pxq6.*) — same discipline as PXA_PXQ5_BOOK.
 #pragma once
 
-#include "pxq5.cuh"              // pxq4/pxq5 tables, macros, tile structs, glu, gather (reused)
+#include "pxq4.cuh"              // shared slab macros, tile structs, glu, gather (reused)
+#include "pxa-enhance.cuh"       // PXA_REFERENCE / PXA_ENHANCE master config tiers
 #include "../../include/ggml-pxq6-tables.h"
 #include <mma.h>
 #include <type_traits>
@@ -64,6 +68,7 @@
 static __device__ float pxq6_book_g[16]  = PXQ6_BOOK_INIT;
 static __device__ float pxq6_sub16_g[16] = PXQ6_SUB16_INIT;
 static __device__ float pxq6_sub8_g[16]  = PXQ6_SUB8_INIT;
+static __device__ float pxq6_lm32_g[32]  = PXQ6_LM32_INIT;   // PXQ6 (id 256) 5-bit LM32 book
 
 // ---------------------------------------------------------------------------------------------
 // env gates (each cached once; every one logs its state on first query)
@@ -105,26 +110,63 @@ static inline bool pxa_pxq6_enabled() {
     return on;
 }
 
-#define PXA_PXQ6_GATE(fn, env, desc) \
+// Level-aware default (pxa-enhance.cuh): PXA_REFERENCE=1 -> every gate defaults OFF (pure
+// reference path); DEFAULT/ENHANCE -> the shipped default. An explicit env var ALWAYS wins.
+#define PXA_PXQ6_GATE(fn, env, dflt, desc) \
     static inline bool fn() { \
         static const bool on = [](){ \
-            bool v = pxa_pxq6_env_flag(env, false); \
-            if (v) fprintf(stderr, "%s: ON (%s)\n", env, desc); \
+            const char * e = getenv(env); \
+            bool v = e ? atoi(e) != 0 : pxa_gate_default(dflt); \
+            if (v != (dflt)) fprintf(stderr, "%s: %s (%s)\n", env, v ? "ON" : "OFF", desc); \
             return v; \
         }(); \
         return on; \
     }
 
-PXA_PXQ6_GATE(pxa_pxq6_ksplit,   "PXA_PXQ6_KSPLIT",   "K1 decode gateup K-split, bit-exact kseg form")
-PXA_PXQ6_GATE(pxa_pxq6_pairlut,  "PXA_PXQ6_PAIRLUT",  "K2 byte-pair float2 LUT, bit-exact")
-PXA_PXQ6_GATE(pxa_pxq6_vecx,     "PXA_PXQ6_VECX",     "K2 float4 activation loads, bit-exact")
-PXA_PXQ6_GATE(pxa_pxq6_gufuse,   "PXA_PXQ6_GUFUSE",   "K3 fused up+gate GEMM + GLU epilogue, bit-exact")
-PXA_PXQ6_GATE(pxa_pxq6_scatfuse, "PXA_PXQ6_SCATFUSE", "K3 down-GEMM scatter fusion, bit-exact")
-PXA_PXQ6_GATE(pxa_pxq6_ragtail,  "PXA_PXQ6_RAGTAIL",  "K4 ragged-tile FMA skip, bit-exact")
-PXA_PXQ6_GATE(pxa_pxq6_pipe,     "PXA_PXQ6_PIPE",     "K5 register-prefetch GEMM pipelining, bit-exact")
-PXA_PXQ6_GATE(pxa_pxq6_force_prefill, "PXA_PXQ6_FORCE_PREFILL", "TEST ONLY: bypass prefill arch gate")
-PXA_PXQ6_GATE(pxa_g2_redfuse,    "PXA_G2_REDFUSE",    "G2-F1 absorb gateup ksplit-reduce + GLU into the down-mmv x-staging prologue, bit-exact")
-PXA_PXQ6_GATE(pxa_g2_addfuse,    "PXA_G2_ADDFUSE",    "G2-F4 residual-add fusion: ADD+FUSED_RMS_NORM pair + MUL_MULTI_ADD residual epilogue, bit-exact")
+// Defaults: the measured bit-exact winners from docs/LEVERS.md §2 are ON out of the box
+// (published per-card numbers assume them; `<env>=0` reverts any one of them to the proven
+// reference path). Config-specific / no-gain levers (§3) stay opt-in.
+PXA_PXQ6_GATE(pxa_pxq6_ksplit,   "PXA_PXQ6_KSPLIT",   true,  "K1 decode gateup K-split, bit-exact kseg form")
+PXA_PXQ6_GATE(pxa_pxq6_pairlut,  "PXA_PXQ6_PAIRLUT",  false, "K2 byte-pair float2 LUT, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_vecx,     "PXA_PXQ6_VECX",     true,  "K2 float4 activation loads, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_gufuse,   "PXA_PXQ6_GUFUSE",   true,  "K3 fused up+gate GEMM + GLU epilogue, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_scatfuse, "PXA_PXQ6_SCATFUSE", true,  "K3 down-GEMM scatter fusion, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_ragtail,  "PXA_PXQ6_RAGTAIL",  true,  "K4 ragged-tile FMA skip, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_pipe,     "PXA_PXQ6_PIPE",     false, "K5 register-prefetch GEMM pipelining, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_force_prefill, "PXA_PXQ6_FORCE_PREFILL", false, "TEST ONLY: bypass prefill arch gate")
+PXA_PXQ6_GATE(pxa_g2_redfuse,    "PXA_G2_REDFUSE",    false, "G2-F1 absorb gateup ksplit-reduce + GLU into the down-mmv x-staging prologue, bit-exact")
+PXA_PXQ6_GATE(pxa_g2_addfuse,    "PXA_G2_ADDFUSE",    true,  "G2-F4 residual-add fusion: ADD+FUSED_RMS_NORM pair + MUL_MULTI_ADD residual epilogue, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_prmt,     "PXA_PXQ6_PRMT",     false, "K2c prmt register-LUT book decode (4-bit tiers, decode mmv), bit-exact")
+PXA_PXQ6_GATE(pxa_pxq6_ldcs,     "PXA_PXQ6_LDCS",     false, "K7 streaming (evict-last-priority) weight code loads in decode mmv, bit-exact")
+
+// PXQ6R (GGML_TYPE_PXQ6 = 256, display "pxq6") master gate + host self-check. Default ON;
+// PXA_PXQ6R=0 disables (dequant->cublas fallback). Invariants of the frozen LM32 book:
+// exactly 32 entries, strictly ascending, fp16-snap idempotent, book[16] == +0.0f (PXQ6R_ZIDX),
+// book[0] == -1.0f, book[31] > 0. Failure -> one-time warning + fmt NONE.
+static inline bool pxa_pxq6r_enabled() {
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ6R");
+        bool v = !(e && atoi(e) == 0);
+        if (v) {
+            static const float book[32] = PXQ6_LM32_INIT;
+            bool ok = book[16] == 0.0f && book[0] == -1.0f && book[31] > 0.0f;
+            for (int i = 0; i < 31 && ok; ++i) ok = book[i] < book[i+1];
+            for (int i = 0; i < 32 && ok; ++i) {   // fp16-snap idempotence (frozen contract)
+                ok = __half2float(__float2half_rn(book[i])) == book[i];
+            }
+            if (!ok) {
+                fprintf(stderr, "PXA_PXQ6R: LM32 table self-check FAILED — fused kernels DISABLED (fallback in use)\n");
+                v = false;
+            } else {
+                fprintf(stderr, "PXA_PXQ6R fused kernels: ON (LM32 self-check PASS; PXA_PXQ6R=0 disables)\n");
+            }
+        } else {
+            fprintf(stderr, "PXA_PXQ6R fused kernels: OFF (dequant->cublas fallback)\n");
+        }
+        return v;
+    }();
+    return on;
+}
 
 // K6 WMMA: 0 = off (default), 1 = fp32-accum fragments, 2 = fp16-accum twin. cc==700 only.
 static inline int pxa_pxq6_wmma() {
@@ -150,34 +192,38 @@ static inline int pxa_pxq6_ksplit_gen() {
     return s;
 }
 
-// env table overrides (PXA_PXQ6_BOOK / _SUB / _SUB_HQ), fp16-snapped, per-device upload
+// env table overrides (PXA_PXQ6_BOOK / _SUB / _SUB_HQ + the PXQ6R 32-entry PXA_PXQ6R_BOOK),
+// fp16-snapped, per-device upload
 static inline void pxq6_maybe_upload_tables(int device) {
     static bool parsed = false;
-    static bool have_book = false, have_sub = false, have_sub8 = false;
-    static float ebook[16], esub[16], esub8[16];
+    static bool have_book = false, have_sub = false, have_sub8 = false, have_lm32 = false;
+    static float ebook[16], esub[16], esub8[16], elm32[32];
     static bool uploaded[64] = {false};
     if (!parsed) {
         parsed = true;
-        auto parse16 = [](const char * e, float * out) -> bool {
-            int n = 0; float v[16];
+        auto parse_nw = [](const char * e, float * out, int want) -> bool {
+            int n = 0; float v[32];
             char * dup = strdup(e);
-            for (char * t = strtok(dup, ","); t && n < 16; t = strtok(nullptr, ",")) v[n++] = strtof(t, nullptr);
+            for (char * t = strtok(dup, ","); t && n < want; t = strtok(nullptr, ",")) v[n++] = strtof(t, nullptr);
             free(dup);
-            if (n != 16) return false;
-            for (int i = 0; i < 16; ++i) out[i] = __half2float(__float2half_rn(v[i]));
+            if (n != want) return false;
+            for (int i = 0; i < want; ++i) out[i] = __half2float(__float2half_rn(v[i]));
             return true;
         };
+        auto parse16 = [&](const char * e, float * out) -> bool { return parse_nw(e, out, 16); };
         if (const char * e = getenv("PXA_PXQ6_BOOK"))   { have_book = parse16(e, ebook);  fprintf(stderr, "PXA_PXQ6_BOOK: %s\n",   have_book ? "custom book active"  : "parse FAILED — ignored"); }
         if (const char * e = getenv("PXA_PXQ6_SUB"))    { have_sub  = parse16(e, esub);   fprintf(stderr, "PXA_PXQ6_SUB: %s\n",    have_sub  ? "custom SUB16 active" : "parse FAILED — ignored"); }
         if (const char * e = getenv("PXA_PXQ6_SUB_HQ")) { have_sub8 = parse16(e, esub8);  fprintf(stderr, "PXA_PXQ6_SUB_HQ: %s\n", have_sub8 ? "custom SUB8 active"  : "parse FAILED — ignored"); }
+        if (const char * e = getenv("PXA_PXQ6R_BOOK"))  { have_lm32 = parse_nw(e, elm32, 32); fprintf(stderr, "PXA_PXQ6R_BOOK: %s\n", have_lm32 ? "custom LM32 book active" : "parse FAILED — ignored"); }
     }
-    if ((have_book || have_sub || have_sub8) && device >= 0 && device < 64 && !uploaded[device]) {
+    if ((have_book || have_sub || have_sub8 || have_lm32) && device >= 0 && device < 64 && !uploaded[device]) {
         uploaded[device] = true;
         int cur = 0; cudaGetDevice(&cur);
         if (cur != device) cudaSetDevice(device);
         if (have_book) cudaMemcpyToSymbol(pxq6_book_g,  ebook, sizeof(ebook));
         if (have_sub)  cudaMemcpyToSymbol(pxq6_sub16_g, esub,  sizeof(esub));
         if (have_sub8) cudaMemcpyToSymbol(pxq6_sub8_g,  esub8, sizeof(esub8));
+        if (have_lm32) cudaMemcpyToSymbol(pxq6_lm32_g,  elm32, sizeof(elm32));
         if (cur != device) cudaSetDevice(cur);
     }
 }
@@ -187,49 +233,9 @@ static inline void pxq6_maybe_upload_tables(int device) {
 // effective scales are decoded. NEFF = distinct eff scales per 32-elem block (1 = single chain,
 // preserving the exact PXQ4/PXQ5 accumulation shape).
 // ---------------------------------------------------------------------------------------------
-struct pxq6_pol_p4 {
-    static constexpr int  SLAB = 1088, HDR = 0, CODE_OFF = 64, NEFF = 1;
-    __device__ static void stage_tabs(float * tab, float * sub, int tid) {
-        if (tid < 16) tab[tid] = (float)pxq4_kvalues[tid];
-        (void)sub;
-    }
-    __device__ static float bookv(int i) { return (float)pxq4_kvalues[i]; }
-    __device__ static float anchor(const uint8_t * panel, int row) { (void)panel; (void)row; return 0.f; }
-    __device__ static void row_effs(const uint8_t * slab, int row, float anch, const float * sub, float * eff) {
-        (void)anch; (void)sub;
-        eff[0] = pxq4_e8m0_to_f32(slab[row]);
-    }
-    static constexpr int CODE_WORDS = 4, CODE_BYTES = 16;
-    __device__ static float2 pair(const uint32_t * q, int b, const float * tab) {
-        const int byte = (q[b >> 2] >> (8*(b & 3))) & 0xff;   // LE byte b of the 16-B code row
-        return make_float2(tab[byte & 0xf], tab[byte >> 4]);
-    }
-    __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
-        return plut[(q[b >> 2] >> (8*(b & 3))) & 0xff];
-    }
-};
+// (pxq6_pol_p4, the policy for the retired legacy type id 250, was removed 2026-07-21.)
 
-struct pxq6_pol_p5 {
-    static constexpr int  SLAB = 1088, HDR = 0, CODE_OFF = 64, NEFF = 1;
-    __device__ static void stage_tabs(float * tab, float * sub, int tid) {
-        if      (tid < 16) tab[tid]      = pxq5_book_g[tid];
-        else if (tid < 24) sub[tid - 16] = pxq5_frt8_g[tid - 16];   // sub[0..7] = frt8
-    }
-    __device__ static float bookv(int i) { return pxq5_book_g[i]; }
-    __device__ static float anchor(const uint8_t * panel, int row) { (void)panel; (void)row; return 0.f; }
-    __device__ static void row_effs(const uint8_t * slab, int row, float anch, const float * sub, float * eff) {
-        (void)anch;
-        eff[0] = pxq5_scale_fast(slab[row], sub);   // exact bit-decode (K0-verified 255/255)
-    }
-    static constexpr int CODE_WORDS = 4, CODE_BYTES = 16;
-    __device__ static float2 pair(const uint32_t * q, int b, const float * tab) {
-        const int byte = (q[b >> 2] >> (8*(b & 3))) & 0xff;   // LE byte b of the 16-B code row
-        return make_float2(tab[byte & 0xf], tab[byte >> 4]);
-    }
-    __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
-        return plut[(q[b >> 2] >> (8*(b & 3))) & 0xff];
-    }
-};
+// (pxq6_pol_p5, the policy for the retired legacy type id 251, was removed 2026-07-21.)
 
 struct pxq6_pol_p6 {
     static constexpr int  SLAB = PXQ6_SLAB_BYTES, HDR = PXQ6_HDR_BYTES, CODE_OFF = 64, NEFF = 2;
@@ -283,13 +289,120 @@ struct pxq6_pol_p6hq {
     }
 };
 
+// PXQ6R "real PXQ6" (GGML_TYPE_PXQ6 = 256, display "pxq6"): LM32 5-bit codes on the UNCHANGED
+// E16-row scale machinery (fp16 row anchor + shared SUB16 4-bit sub per 16-elem block).
+// Code row = 20 B: bytes 0..15 nibble plane (byte-identical layout to the P6 core rows) +
+// bytes 16..19 one LE u32 hi-bit plane (bit j = bit 4 of code j, j = 0..31). Code rows start
+// at 64 + 20r — 4-byte aligned for every r, NOT 8/16-aligned for odd r => scalar u32 loads
+// ONLY (the CODE_WORDS == 5 arm of pxq6_ldcodes; uint2/uint4 vector loads are ILLEGAL here).
+// Modes: TAB/TAB_CS only — the 32-entry book rides neither PRMT (two 16-entry byte planes
+// keyed by a nibble) nor PAIRLUT (256-entry LUT keyed on one byte = two 4-bit codes); the
+// pickers demote exactly like P2/P3 (pairl() is a never-executed compile stub).
+struct pxq6_pol_p6r {
+    static constexpr int  SLAB = PXQ6R_SLAB_BYTES, HDR = PXQ6R_HDR_BYTES, CODE_OFF = PXQ6R_CODE_OFF, NEFF = 2;
+    static constexpr int CODE_WORDS = 5, CODE_BYTES = 20;
+    __device__ static void stage_tabs(float * tab, float * sub, int tid) {
+        if      (tid < 32) tab[tid]      = pxq6_lm32_g[tid];
+        else if (tid < 48) sub[tid - 32] = pxq6_sub16_g[tid - 32];
+    }
+    __device__ static float bookv(int i) { return pxq6_lm32_g[i & 31]; }
+    __device__ static float anchor(const uint8_t * panel, int row) {
+        return __half2float(((const half *)panel)[row]);
+    }
+    __device__ static void row_effs(const uint8_t * slab, int row, float anch, const float * sub, float * eff) {
+        const int sb = slab[row];
+        eff[0] = anch * sub[sb & 0xf];    // elems 0-15
+        eff[1] = anch * sub[sb >> 4];     // elems 16-31
+    }
+    // pair b (elems 2b, 2b+1): nibble plane byte extraction == proven P6 form; 5th bit from the
+    // register-resident plane word q[4] (bit j = element j -> elem 2b at bit 2b, 2b+1 at 2b+1)
+    __device__ static float2 pair(const uint32_t * q, int b, const float * tab) {
+        const int byte = (q[b >> 2] >> (8*(b & 3))) & 0xff;   // LE byte b of the 16-B nibble plane
+        const uint32_t hi = q[4];                             // hi-bit plane word
+        const int c0 = (byte & 0xf) | (int)(((hi >> (2*b    )) & 1) << 4);   // element 2b
+        const int c1 = (byte >> 4)  | (int)(((hi >> (2*b + 1)) & 1) << 4);   // element 2b+1
+        return make_float2(tab[c0], tab[c1]);
+    }
+    __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
+        (void)q; (void)b; (void)plut; return make_float2(0.f, 0.f);   // PAIRLUT demoted for P6R
+    }
+};
+
 // per-row code load: CODE_WORDS LE u32 words. 16 B formats keep the proven uint4 load;
 // 8 B uses uint2 (8-aligned: CODE_OFF 64 + row*8); 12 B uses 3 u32 (4-aligned: row*12).
-template <class POL>
+// CS variant (K7): identical addresses/values through ld.global.cs — the decode weight stream
+// is read exactly once per token, so mark it evict-first and keep L2 for the hot working set
+// (activations/tables/KV). Cache policy cannot change loaded values => bit-exact by construction.
+template <class POL, bool CS = false>
 static __device__ __forceinline__ void pxq6_ldcodes(const uint8_t * p, uint32_t * q) {
-    if constexpr (POL::CODE_WORDS == 4)      { *(uint4 *)q = *(const uint4 *)p; }
-    else if constexpr (POL::CODE_WORDS == 2) { *(uint2 *)q = *(const uint2 *)p; }
-    else { const uint32_t * s = (const uint32_t *)p; q[0] = s[0]; q[1] = s[1]; q[2] = s[2]; }
+    if constexpr (POL::CODE_WORDS == 4) {
+        if constexpr (CS) { *(uint4 *)q = __ldcs((const uint4 *)p); }
+        else              { *(uint4 *)q = *(const uint4 *)p; }
+    } else if constexpr (POL::CODE_WORDS == 2) {
+        if constexpr (CS) { *(uint2 *)q = __ldcs((const uint2 *)p); }
+        else              { *(uint2 *)q = *(const uint2 *)p; }
+    } else if constexpr (POL::CODE_WORDS == 5) {
+        // P6R 20 B row: only 4-aligned (odd rows) -> five scalar u32 loads, NEVER vector
+        const uint32_t * s = (const uint32_t *)p;
+        if constexpr (CS) { q[0] = __ldcs(s); q[1] = __ldcs(s + 1); q[2] = __ldcs(s + 2); q[3] = __ldcs(s + 3); q[4] = __ldcs(s + 4); }
+        else              { q[0] = s[0]; q[1] = s[1]; q[2] = s[2]; q[3] = s[3]; q[4] = s[4]; }
+    } else {
+        const uint32_t * s = (const uint32_t *)p;
+        if constexpr (CS) { q[0] = __ldcs(s); q[1] = __ldcs(s + 1); q[2] = __ldcs(s + 2); }
+        else              { q[0] = s[0]; q[1] = s[1]; q[2] = s[2]; }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// K2c PRMT register-LUT book decode (B1 steal from the QTIP/Marlin lineage). The 16-entry
+// fp16-snapped book is held as two byte planes (lo/hi) across 8 uniform registers; a nibble
+// code indexes them with prmt (byte_perm) — zero smem traffic, zero bank conflicts, and the
+// produced fp32 values are IDENTICAL to tab[] (the book is fp16-snapped, half->float is exact)
+// with the same FMA order => bit-exact vs MODE_TAB. 4-bit tiers only (nibble == book index).
+// ---------------------------------------------------------------------------------------------
+struct pxq6_prmt_book {
+    uint32_t L[4];   // lo bytes of book[0..15]
+    uint32_t H[4];   // hi bytes of book[0..15]
+};
+
+// build once per block from the staged fp32 tab (post-__syncthreads); uniform across threads.
+static __device__ __forceinline__ void pxq6_prmt_build(const float * __restrict__ tab, pxq6_prmt_book & B) {
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        uint32_t lo = 0, hi = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned short u = __half_as_ushort(__float2half_rn(tab[4*r + i]));
+            lo |= (uint32_t)(u & 0xff) << (8*i);
+            hi |= (uint32_t)(u >> 8)   << (8*i);
+        }
+        B.L[r] = lo; B.H[r] = hi;
+    }
+}
+
+// Gather two book bytes from one 16-entry plane (4 regs). idx_lo/idx_hi land in OUTPUT bytes 0/1.
+// KEY: __byte_perm selects each output byte via a 4-BIT NIBBLE of the selector (not a byte), so the
+// two indices' low-3-bits go in nibbles 0 and 1 (perm_sel). The high-half (idx>=8) select is a
+// per-BYTE 0xFF mask, so __vcmpgeu4 takes a byte-packed copy of the indices (mask_sel).
+static __device__ __forceinline__ uint32_t pxq6_prmt_plane(const uint32_t * __restrict__ P,
+                                                           uint32_t perm_sel, uint32_t mask_sel) {
+    const uint32_t a = __byte_perm(P[0], P[1], perm_sel);   // out[0,1] = entries (idx&7) of the low half
+    const uint32_t b = __byte_perm(P[2], P[3], perm_sel);   // out[0,1] = entries (idx&7)+8 of the high half
+    const uint32_t m = __vcmpgeu4(mask_sel, 0x08080808u);   // 0xFF in byte i where idx_i >= 8
+    return (a & ~m) | (b & m);
+}
+
+// one code byte (2 nibbles) -> float2(book[lo], book[hi]); same value/order contract as pair().
+static __device__ __forceinline__ float2 pxq6_prmt_pair(const uint32_t * __restrict__ q, int b,
+                                                        const pxq6_prmt_book & B) {
+    const uint32_t byte   = (q[b >> 2] >> (8*(b & 3))) & 0xffu;
+    const uint32_t idx_lo = byte & 0xfu, idx_hi = byte >> 4;
+    const uint32_t perm   = (idx_lo & 7u) | ((idx_hi & 7u) << 4);   // nibble0=idx_lo&7, nibble1=idx_hi&7
+    const uint32_t mask   = idx_lo | (idx_hi << 8);                 // byte0=idx_lo, byte1=idx_hi
+    const uint32_t lo     = pxq6_prmt_plane(B.L, perm, mask);       // out[0,1]=lo(V_lo),lo(V_hi)
+    const uint32_t hi     = pxq6_prmt_plane(B.H, perm, mask);       // out[0,1]=hi(V_lo),hi(V_hi)
+    const uint32_t w      = __byte_perm(lo, hi, 0x5140u);           // [lo(Vlo),hi(Vlo),lo(Vhi),hi(Vhi)]=half2
+    return __half22float2(*(const half2 *)&w);
 }
 
 // shared address helpers
@@ -312,18 +425,34 @@ static __device__ __forceinline__ void pxq6_stage_pairlut(float2 * plut, int tid
 // the scaled 32-elem dot product — the ONE routine every decode kernel shares.
 // NEFF=1 keeps the exact single-chain accumulation of the proven PXQ4/PXQ5 kernels
 // (su += d*t with one t chain); NEFF=2/4 is the PXQ6/PXQ6HQ reference form.
-// PAIR/VECX only change operand SOURCING, never order => bit-exact per variant.
+// MODE/VECX only change operand SOURCING (never order) => bit-exact per variant:
+//   MODE 0 = smem tab, 1 = smem PAIRLUT, 2 = PRMT register book,
+//        3 = smem tab + ld.cs codes, 4 = PRMT + ld.cs codes.
 // ---------------------------------------------------------------------------------------------
-template <class POL, bool PAIR, bool VECX>
+#define PXQ6_MODE_TAB     0
+#define PXQ6_MODE_PAIRL   1
+#define PXQ6_MODE_PRMT    2
+#define PXQ6_MODE_TAB_CS  3
+#define PXQ6_MODE_PRMT_CS 4
+
+template <int MODE> struct pxq6_mode {
+    static constexpr bool cs   = (MODE == PXQ6_MODE_TAB_CS) || (MODE == PXQ6_MODE_PRMT_CS);
+    static constexpr bool prmt = (MODE == PXQ6_MODE_PRMT)   || (MODE == PXQ6_MODE_PRMT_CS);
+    static constexpr bool pairl = (MODE == PXQ6_MODE_PAIRL);
+};
+
+template <class POL, int MODE, bool VECX>
 static __device__ __forceinline__ float pxq6_dot32(const uint8_t * __restrict__ slab, int row, float anch,
                                                    const float * __restrict__ xk,
                                                    const float * __restrict__ tab,
                                                    const float * __restrict__ sub,
-                                                   const float2 * __restrict__ plut) {
+                                                   const float2 * __restrict__ plut,
+                                                   const pxq6_prmt_book & pb) {
+    using M = pxq6_mode<MODE>;
     float eff[POL::NEFF];
     POL::row_effs(slab, row, anch, sub, eff);
     uint32_t q[POL::CODE_WORDS];
-    pxq6_ldcodes<POL>(slab + POL::CODE_OFF + row*POL::CODE_BYTES, q);
+    pxq6_ldcodes<POL, M::cs>(slab + POL::CODE_OFF + row*POL::CODE_BYTES, q);
     float t[POL::NEFF];
     #pragma unroll
     for (int i = 0; i < POL::NEFF; ++i) t[i] = 0.f;
@@ -331,15 +460,15 @@ static __device__ __forceinline__ float pxq6_dot32(const uint8_t * __restrict__ 
         #pragma unroll
         for (int b = 0; b < 16; b += 2) {
             const float4 xv = *(const float4 *)&xk[2*b];
-            const float2 p0 = PAIR ? POL::pairl(q, b,   plut) : POL::pair(q, b,   tab);
-            const float2 p1 = PAIR ? POL::pairl(q, b+1, plut) : POL::pair(q, b+1, tab);
+            const float2 p0 = M::prmt ? pxq6_prmt_pair(q, b,   pb) : M::pairl ? POL::pairl(q, b,   plut) : POL::pair(q, b,   tab);
+            const float2 p1 = M::prmt ? pxq6_prmt_pair(q, b+1, pb) : M::pairl ? POL::pairl(q, b+1, plut) : POL::pair(q, b+1, tab);
             t[(b*POL::NEFF) >> 4]     += p0.x*xv.x + p0.y*xv.y;
             t[((b+1)*POL::NEFF) >> 4] += p1.x*xv.z + p1.y*xv.w;
         }
     } else {
         #pragma unroll
         for (int b = 0; b < 16; ++b) {
-            const float2 p = PAIR ? POL::pairl(q, b, plut) : POL::pair(q, b, tab);
+            const float2 p = M::prmt ? pxq6_prmt_pair(q, b, pb) : M::pairl ? POL::pairl(q, b, plut) : POL::pair(q, b, tab);
             t[(b*POL::NEFF) >> 4] += p.x*xk[2*b] + p.y*xk[2*b+1];
         }
     }
@@ -355,7 +484,7 @@ static __device__ __forceinline__ float pxq6_dot32(const uint8_t * __restrict__ 
 template <class POL, typename dst_t>
 static __global__ void k_pxq6_dequant_matrix(const uint8_t * __restrict__ wq, dst_t * __restrict__ y,
                                              const int kslabs, const int64_t K) {
-    __shared__ float tab[16];
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
     POL::stage_tabs(tab, sub, threadIdx.x);
     __syncthreads();
@@ -410,11 +539,26 @@ static void dequantize_row_pxq6hq_cuda(const void * vx, dst_t * y, const int64_t
     k_pxq6_dequant_matrix<pxq6_pol_p6hq, dst_t><<<nslabs, 64, 0, stream>>>((const uint8_t *)vx, y, kslabs, n_per_row);
 }
 
+template <typename dst_t>
+static void dequantize_row_pxq6r_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row,
+                                      cudaStream_t stream) {
+    if (nrows % PXQ6_BM != 0 || n_per_row % PXQ6_QK != 0) {
+        fprintf(stderr, "FATAL: dequantize_row_pxq6r_cuda: nrows=%lld n_per_row=%lld not slab-aligned\n",
+                (long long)nrows, (long long)n_per_row);
+        abort();
+    }
+    int dev = -1; cudaGetDevice(&dev);
+    pxq6_maybe_upload_tables(dev);   // handles the shared SUB16 + the PXQ6R LM32 override
+    const int kslabs = (int)(n_per_row / PXQ6_QK);
+    const int64_t nslabs = (nrows / PXQ6_BM) * (int64_t)kslabs;
+    k_pxq6_dequant_matrix<pxq6_pol_p6r, dst_t><<<nslabs, 64, 0, stream>>>((const uint8_t *)vx, y, kslabs, n_per_row);
+}
+
 // ---------------------------------------------------------------------------------------------
 // decode: fused up+gate+GLU mmv + down mmv — the generic family (grid/threads/smem identical
 // to the proven k_pxq5_* pair; POL/PAIR/VECX select format + K2 variants).
 // ---------------------------------------------------------------------------------------------
-template <class POLU, class POLG, bool PAIR, bool VECX>
+template <class POLU, class POLG, int MODE, bool VECX>
 static __global__ void __launch_bounds__(256)
 k_pxq6_gateup_mmv(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg,
                   const char * __restrict__ x_base, const size_t x_tok_stride,
@@ -437,12 +581,14 @@ k_pxq6_gateup_mmv(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ 
     const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride);
     for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
 
-    __shared__ float tabU[16], subU[16], tabG[16], subG[16];
-    __shared__ float2 plut[PAIR ? 256 : 1];
+    __shared__ float tabU[32], subU[16], tabG[32], subG[16];   // 32-entry tabs: P6R LM32
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
     POLU::stage_tabs(tabU, subU, threadIdx.x);
     POLG::stage_tabs(tabG, subG, threadIdx.x);
-    if (PAIR) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 256);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 256);
     __syncthreads();
+    pxq6_prmt_book pbU{}, pbG{};
+    if constexpr (pxq6_mode<MODE>::prmt) { pxq6_prmt_build(tabU, pbU); pxq6_prmt_build(tabG, pbG); }
 
     const int row  = threadIdx.x & 63;
     const int kseg = threadIdx.x >> 6;
@@ -455,8 +601,8 @@ k_pxq6_gateup_mmv(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ 
     float su = 0.f, sg = 0.f;
     for (int kb = kseg; kb < kslabs; kb += PXQ4_MMV_KSEG) {
         const float * xk = xs + kb*PXQ6_QK;
-        su += pxq6_dot32<POLU, PAIR, VECX>(panU + POLU::HDR + (size_t)kb*POLU::SLAB, row, anchU, xk, tabU, subU, plut);
-        sg += pxq6_dot32<POLG, PAIR, VECX>(panG + POLG::HDR + (size_t)kb*POLG::SLAB, row, anchG, xk, tabG, subG, plut);
+        su += pxq6_dot32<POLU, MODE, VECX>(panU + POLU::HDR + (size_t)kb*POLU::SLAB, row, anchU, xk, tabU, subU, plut, pbU);
+        sg += pxq6_dot32<POLG, MODE, VECX>(panG + POLG::HDR + (size_t)kb*POLG::SLAB, row, anchG, xk, tabG, subG, plut, pbG);
     }
     red[(kseg*64 + row)]                      = su;
     red[(PXQ4_MMV_KSEG*64) + (kseg*64 + row)] = sg;
@@ -477,7 +623,7 @@ k_pxq6_gateup_mmv(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ 
     }
 }
 
-template <class POL, bool PAIR, bool VECX>
+template <class POL, int MODE, bool VECX>
 static __global__ void __launch_bounds__(256)
 k_pxq6_mmv(const uint8_t * __restrict__ W,
            const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
@@ -497,12 +643,14 @@ k_pxq6_mmv(const uint8_t * __restrict__ W,
     const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride);
     for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
 
-    __shared__ float tab[16];
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
-    __shared__ float2 plut[PAIR ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
     POL::stage_tabs(tab, sub, threadIdx.x);
-    if (PAIR) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
     __syncthreads();
+    pxq6_prmt_book pb{};
+    if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
 
     const int row  = threadIdx.x & 63;
     const int kseg = threadIdx.x >> 6;
@@ -512,8 +660,8 @@ k_pxq6_mmv(const uint8_t * __restrict__ W,
 
     float su = 0.f;
     for (int kb = kseg; kb < kslabs; kb += PXQ4_MMV_KSEG) {
-        su += pxq6_dot32<POL, PAIR, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
-                                          xs + kb*PXQ6_QK, tab, sub, plut);
+        su += pxq6_dot32<POL, MODE, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                          xs + kb*PXQ6_QK, tab, sub, plut, pb);
     }
     red[kseg*64 + row] = su;
     __syncthreads();
@@ -537,7 +685,7 @@ k_pxq6_mmv(const uint8_t * __restrict__ W,
 // Driver-guarded: only when the gateup dst is SOLE-consumed by this down MUL_MAT_ID, only for
 // the bit-exact KSPLIT=1 form (declined under KSPLIT_GEN).
 // ---------------------------------------------------------------------------------------------
-template <class POL, bool PAIR, bool VECX>
+template <class POL, int MODE, bool VECX>
 static __global__ void __launch_bounds__(256)
 k_pxq6_mmv_redfuse(const uint8_t * __restrict__ W,
                    const float * __restrict__ ws,      // KSPLIT partials; gateup R == our K
@@ -571,12 +719,14 @@ k_pxq6_mmv_redfuse(const uint8_t * __restrict__ W,
         xs[idx] = pxq4_glu_apply(g, u, unary, alpha, limit);
     }
 
-    __shared__ float tab[16];
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
-    __shared__ float2 plut[PAIR ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
     POL::stage_tabs(tab, sub, threadIdx.x);
-    if (PAIR) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
     __syncthreads();
+    pxq6_prmt_book pb{};
+    if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
 
     const int row  = threadIdx.x & 63;
     const int kseg = threadIdx.x >> 6;
@@ -586,8 +736,8 @@ k_pxq6_mmv_redfuse(const uint8_t * __restrict__ W,
 
     float su = 0.f;
     for (int kb = kseg; kb < kslabs; kb += PXQ4_MMV_KSEG) {
-        su += pxq6_dot32<POL, PAIR, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
-                                          xs + kb*PXQ6_QK, tab, sub, plut);
+        su += pxq6_dot32<POL, MODE, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                          xs + kb*PXQ6_QK, tab, sub, plut, pb);
     }
     red[kseg*64 + row] = su;
     __syncthreads();
@@ -608,7 +758,7 @@ k_pxq6_mmv_redfuse(const uint8_t * __restrict__ W,
 // ascending) + bias + GLU exactly => bit-identical dst.
 // workspace layout: ws[((iy*n_ids + j)*2 + {0=u,1=g})*KSEG*R + kseg*R + grow]
 // ---------------------------------------------------------------------------------------------
-template <class POLU, class POLG, bool PAIR, bool VECX>
+template <class POLU, class POLG, int MODE, bool VECX>
 static __global__ void __launch_bounds__(64)
 k_pxq6_gateup_mmv_ksplit(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg,
                          const char * __restrict__ x_base, const size_t x_tok_stride,
@@ -629,12 +779,14 @@ k_pxq6_gateup_mmv_ksplit(const uint8_t * __restrict__ Wu, const uint8_t * __rest
     const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride);
     for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
 
-    __shared__ float tabU[16], subU[16], tabG[16], subG[16];
-    __shared__ float2 plut[PAIR ? 256 : 1];
+    __shared__ float tabU[32], subU[16], tabG[32], subG[16];   // 32-entry tabs: P6R LM32
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
     POLU::stage_tabs(tabU, subU, threadIdx.x);
     POLG::stage_tabs(tabG, subG, threadIdx.x);
-    if (PAIR) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 64);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 64);
     __syncthreads();
+    pxq6_prmt_book pbU{}, pbG{};
+    if constexpr (pxq6_mode<MODE>::prmt) { pxq6_prmt_build(tabU, pbU); pxq6_prmt_build(tabG, pbG); }
 
     const int row = threadIdx.x;
     const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
@@ -646,8 +798,8 @@ k_pxq6_gateup_mmv_ksplit(const uint8_t * __restrict__ Wu, const uint8_t * __rest
     float su = 0.f, sg = 0.f;
     for (int kb = kseg; kb < kslabs; kb += PXQ4_MMV_KSEG) {
         const float * xk = xs + kb*PXQ6_QK;
-        su += pxq6_dot32<POLU, PAIR, VECX>(panU + POLU::HDR + (size_t)kb*POLU::SLAB, row, anchU, xk, tabU, subU, plut);
-        sg += pxq6_dot32<POLG, PAIR, VECX>(panG + POLG::HDR + (size_t)kb*POLG::SLAB, row, anchG, xk, tabG, subG, plut);
+        su += pxq6_dot32<POLU, MODE, VECX>(panU + POLU::HDR + (size_t)kb*POLU::SLAB, row, anchU, xk, tabU, subU, plut, pbU);
+        sg += pxq6_dot32<POLG, MODE, VECX>(panG + POLG::HDR + (size_t)kb*POLG::SLAB, row, anchG, xk, tabG, subG, plut, pbG);
     }
     const int grow = p*PXQ6_BM + row;
     float * wsj = ws + ((size_t)iy*n_ids + j)*2*PXQ4_MMV_KSEG*R;
@@ -689,7 +841,7 @@ static __global__ void k_pxq6_gateup_reduce(const float * __restrict__ ws,
 // only its K-chunk slice of x (the smem rider from the deep-dive: dyn smem K/S + red).
 // Reduction: same workspace; the reducer sums S chunk-partials in ascending chunk order
 // (deterministic run-to-run; differs from the proven chain order => G3 before live use).
-template <class POLU, class POLG, bool PAIR, bool VECX>
+template <class POLU, class POLG, int MODE, bool VECX>
 static __global__ void __launch_bounds__(256)
 k_pxq6_gateup_mmv_ksplit_gen(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg,
                              const char * __restrict__ x_base, const size_t x_tok_stride,
@@ -715,12 +867,14 @@ k_pxq6_gateup_mmv_ksplit_gen(const uint8_t * __restrict__ Wu, const uint8_t * __
     const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride) + kb0*PXQ6_QK;
     for (int idx = threadIdx.x; idx < Kc; idx += blockDim.x) xs[idx] = x[idx];
 
-    __shared__ float tabU[16], subU[16], tabG[16], subG[16];
-    __shared__ float2 plut[PAIR ? 256 : 1];
+    __shared__ float tabU[32], subU[16], tabG[32], subG[16];   // 32-entry tabs: P6R LM32
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
     POLU::stage_tabs(tabU, subU, threadIdx.x);
     POLG::stage_tabs(tabG, subG, threadIdx.x);
-    if (PAIR) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 256);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 256);
     __syncthreads();
+    pxq6_prmt_book pbU{}, pbG{};
+    if constexpr (pxq6_mode<MODE>::prmt) { pxq6_prmt_build(tabU, pbU); pxq6_prmt_build(tabG, pbG); }
 
     const int row  = threadIdx.x & 63;
     const int kseg = threadIdx.x >> 6;
@@ -733,8 +887,8 @@ k_pxq6_gateup_mmv_ksplit_gen(const uint8_t * __restrict__ Wu, const uint8_t * __
     float su = 0.f, sg = 0.f;
     for (int kb = kb0 + kseg; kb < kb1; kb += PXQ4_MMV_KSEG) {
         const float * xk = xs + (kb - kb0)*PXQ6_QK;
-        su += pxq6_dot32<POLU, PAIR, VECX>(panU + POLU::HDR + (size_t)kb*POLU::SLAB, row, anchU, xk, tabU, subU, plut);
-        sg += pxq6_dot32<POLG, PAIR, VECX>(panG + POLG::HDR + (size_t)kb*POLG::SLAB, row, anchG, xk, tabG, subG, plut);
+        su += pxq6_dot32<POLU, MODE, VECX>(panU + POLU::HDR + (size_t)kb*POLU::SLAB, row, anchU, xk, tabU, subU, plut, pbU);
+        sg += pxq6_dot32<POLG, MODE, VECX>(panG + POLG::HDR + (size_t)kb*POLG::SLAB, row, anchG, xk, tabG, subG, plut, pbG);
     }
     red[(kseg*64 + row)]                      = su;
     red[(PXQ4_MMV_KSEG*64) + (kseg*64 + row)] = sg;
@@ -831,7 +985,7 @@ k_pxq6_gemm_grouped(const uint8_t * __restrict__ W, const half * __restrict__ A,
     const half    * At  = A + (size_t)tile.row0*K;
     float         * Ct  = C + (size_t)tile.row0*R + (size_t)p*PXQ6_BM;
 
-    __shared__ float tab[16];
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
     __shared__ half sW[PXQ6_QK][PXQ4_BM];
     __shared__ half sA[PXQ6_QK][PXQ4_BN];
@@ -949,7 +1103,7 @@ k_pxq6_gemm_gufuse(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__
     const half    * At  = A + (size_t)tile.row0*K;
     dst_t         * Ht  = H + (size_t)tile.row0*R + (size_t)p*PXQ6_BM;
 
-    __shared__ float tab[16];
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
     __shared__ half sWu[PXQ6_QK][PXQ4_BM];
     __shared__ half sWg[PXQ6_QK][PXQ4_BM];
@@ -1080,7 +1234,7 @@ k_pxq6_gemm_down_scat(const uint8_t * __restrict__ W, const half * __restrict__ 
     const uint8_t * pan = pxq6_panel<POL>(W, tile.e, panels, p, kslabs);
     const half    * At  = A + (size_t)tile.row0*K;
 
-    __shared__ float tab[16];
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
     __shared__ half sW[PXQ6_QK][PXQ4_BM];
     __shared__ half sA[PXQ6_QK][PXQ4_BN];
@@ -1228,7 +1382,7 @@ k_pxq6_gemm_grouped_wmma(const uint8_t * __restrict__ W, const half * __restrict
     const half    * At  = A + (size_t)tile.row0*K;
     float         * Ct  = C + (size_t)tile.row0*R + (size_t)p*PXQ6_BM;
 
-    __shared__ float tab[16];
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
     __shared__ half sWA[2][64*PXQ6_WMMA_LD];      // [0] = W rows, [1] = A tokens (row-major, skewed)
     const int tid  = threadIdx.x;
@@ -1318,25 +1472,26 @@ k_pxq6_gemm_grouped_wmma(const uint8_t * __restrict__ W, const half * __restrict
 
 // ---------------------------------------------------------------------------------------------
 // host-side dispatch: format codes + kernel pickers (runtime env -> template instantiation).
-// fmt: 1 = PXQ4, 2 = PXQ5, 3 = PXQ6 core, 4 = PXQ6HQ, 5 = PXQ2, 6 = PXQ3; 0 = not a PXA slab
-// type / gated off.
+// fmt: 3 = PXQ4 core, 4 = PXQ4-HQ, 5 = PXQ2, 6 = PXQ3, 7 = PXQ6 (display pxq6, 5-bit LM32);
+// 0 = not a PXA slab type / gated off. (1 and 2 = the retired legacy id-250/id-251 formats,
+// removed 2026-07-21 — values reserved, never reuse.)
 // ---------------------------------------------------------------------------------------------
 #define PXA_PXQ_FMT_NONE 0
-#define PXA_PXQ_FMT_P4   1
-#define PXA_PXQ_FMT_P5   2
+// 1 reserved — retired PXA_PXQ_FMT_P4 (legacy type id 250), removed 2026-07-21
+// 2 reserved — retired PXA_PXQ_FMT_P5 (legacy type id 251), removed 2026-07-21
 #define PXA_PXQ_FMT_P6   3
 #define PXA_PXQ_FMT_P6HQ 4
 #define PXA_PXQ_FMT_P2   5      // ADD
 #define PXA_PXQ_FMT_P3   6      // ADD
+#define PXA_PXQ_FMT_P6R  7      // ADD: real-PXQ6 tier (TAB/TAB_CS modes only, like P2/P3)
 
 static inline int pxa_pxq_fmt(ggml_type t) {
     switch (t) {
-        case GGML_TYPE_PXQ4:   return pxa_pxq4_enabled() ? PXA_PXQ_FMT_P4   : PXA_PXQ_FMT_NONE;
-        case GGML_TYPE_PXQ5:   return pxa_pxq5_enabled() ? PXA_PXQ_FMT_P5   : PXA_PXQ_FMT_NONE;
-        case GGML_TYPE_PXQ6:   return pxa_pxq6_enabled() ? PXA_PXQ_FMT_P6   : PXA_PXQ_FMT_NONE;
-        case GGML_TYPE_PXQ6HQ: return pxa_pxq6_enabled() ? PXA_PXQ_FMT_P6HQ : PXA_PXQ_FMT_NONE;
+        case GGML_TYPE_PXQ4:   return pxa_pxq6_enabled() ? PXA_PXQ_FMT_P6   : PXA_PXQ_FMT_NONE;
+        case GGML_TYPE_PXQ4HQ: return pxa_pxq6_enabled() ? PXA_PXQ_FMT_P6HQ : PXA_PXQ_FMT_NONE;
         case GGML_TYPE_PXQ2:   return pxa_pxq2_enabled() ? PXA_PXQ_FMT_P2   : PXA_PXQ_FMT_NONE;
         case GGML_TYPE_PXQ3:   return pxa_pxq3_enabled() ? PXA_PXQ_FMT_P3   : PXA_PXQ_FMT_NONE;
+        case GGML_TYPE_PXQ6:  return pxa_pxq6r_enabled() ? PXA_PXQ_FMT_P6R : PXA_PXQ_FMT_NONE;
         default:               return PXA_PXQ_FMT_NONE;
     }
 }
@@ -1368,43 +1523,80 @@ typedef void (*pxq6_scat_fn)(const uint8_t *, const half *, char *, size_t, size
 #define PXQ6_PICK_FMT(RET, NAME, K) \
     static inline RET NAME(int fmt, bool b1, bool b2) { \
         switch (fmt) { \
-            case PXA_PXQ_FMT_P4: return PXQ6_PICK2(K, pxq6_pol_p4,   b1, b2); \
-            case PXA_PXQ_FMT_P5: return PXQ6_PICK2(K, pxq6_pol_p5,   b1, b2); \
             case PXA_PXQ_FMT_P6: return PXQ6_PICK2(K, pxq6_pol_p6,   b1, b2); \
             case PXA_PXQ_FMT_P2: return PXQ6_PICK2(K, pxq6_pol_p2, false, b2); \
             case PXA_PXQ_FMT_P3: return PXQ6_PICK2(K, pxq6_pol_p3, false, b2); \
+            case PXA_PXQ_FMT_P6R: return PXQ6_PICK2(K, pxq6_pol_p6r, false, b2); \
             default:             return PXQ6_PICK2(K, pxq6_pol_p6hq, b1, b2); \
         } \
     }
 
-#define PXQ6_PICK2U(K, PU, PG, b1, b2) \
-    ((b1) ? ((b2) ? (K<PU, PG, true, true>) : (K<PU, PG, true, false>)) \
-          : ((b2) ? (K<PU, PG, false, true>) : (K<PU, PG, false, false>)))
-#define PXQ6_PICK_FMT_GU(RET, NAME, K) \
-    static inline RET NAME(int fu, int fg, bool b1, bool b2) { \
-        if (fu == fg) switch (fu) { \
-            case PXA_PXQ_FMT_P4: return PXQ6_PICK2U(K, pxq6_pol_p4, pxq6_pol_p4, b1, b2); \
-            case PXA_PXQ_FMT_P5: return PXQ6_PICK2U(K, pxq6_pol_p5, pxq6_pol_p5, b1, b2); \
-            case PXA_PXQ_FMT_P6: return PXQ6_PICK2U(K, pxq6_pol_p6, pxq6_pol_p6, b1, b2); \
-            case PXA_PXQ_FMT_P2: return PXQ6_PICK2U(K, pxq6_pol_p2, pxq6_pol_p2, false, b2); \
-            case PXA_PXQ_FMT_P3: return PXQ6_PICK2U(K, pxq6_pol_p3, pxq6_pol_p3, false, b2); \
-            default:             return PXQ6_PICK2U(K, pxq6_pol_p6hq, pxq6_pol_p6hq, b1, b2); \
+// decode-family pickers: runtime sourcing MODE (0 tab / 1 pairlut / 2 prmt / 3 tab+cs / 4 prmt+cs).
+// P2/P3 (sub-nibble code packing) support only the tab paths — prmt/pairlut demote at compile time.
+static inline int pxa_pxq6_decode_mode() {
+    static const int m = [](){
+        const bool cs = pxa_pxq6_ldcs();
+        if (pxa_pxq6_prmt())    return cs ? PXQ6_MODE_PRMT_CS : PXQ6_MODE_PRMT;
+        if (pxa_pxq6_pairlut()) return PXQ6_MODE_PAIRL;   // pairlut+cs not offered (lever is OFF-verdict)
+        return cs ? PXQ6_MODE_TAB_CS : PXQ6_MODE_TAB;
+    }();
+    return m;
+}
+#define PXQ6_PICKM(K, POL, m, vx) \
+    ((m) == PXQ6_MODE_PAIRL   ? ((vx) ? (K<POL, PXQ6_MODE_PAIRL,   true>) : (K<POL, PXQ6_MODE_PAIRL,   false>)) : \
+     (m) == PXQ6_MODE_PRMT    ? ((vx) ? (K<POL, PXQ6_MODE_PRMT,    true>) : (K<POL, PXQ6_MODE_PRMT,    false>)) : \
+     (m) == PXQ6_MODE_TAB_CS  ? ((vx) ? (K<POL, PXQ6_MODE_TAB_CS,  true>) : (K<POL, PXQ6_MODE_TAB_CS,  false>)) : \
+     (m) == PXQ6_MODE_PRMT_CS ? ((vx) ? (K<POL, PXQ6_MODE_PRMT_CS, true>) : (K<POL, PXQ6_MODE_PRMT_CS, false>)) : \
+                                ((vx) ? (K<POL, PXQ6_MODE_TAB,     true>) : (K<POL, PXQ6_MODE_TAB,     false>)))
+#define PXQ6_PICKM23(K, POL, m, vx) /* P2/P3: tab paths only */ \
+    (((m) == PXQ6_MODE_TAB_CS || (m) == PXQ6_MODE_PRMT_CS) \
+        ? ((vx) ? (K<POL, PXQ6_MODE_TAB_CS, true>) : (K<POL, PXQ6_MODE_TAB_CS, false>)) \
+        : ((vx) ? (K<POL, PXQ6_MODE_TAB,    true>) : (K<POL, PXQ6_MODE_TAB,    false>)))
+#define PXQ6_PICKM_FMT(RET, NAME, K) \
+    static inline RET NAME(int fmt, int m, bool vx) { \
+        switch (fmt) { \
+            case PXA_PXQ_FMT_P6: return PXQ6_PICKM(K, pxq6_pol_p6,   m, vx); \
+            case PXA_PXQ_FMT_P2: return PXQ6_PICKM23(K, pxq6_pol_p2, m, vx); \
+            case PXA_PXQ_FMT_P3: return PXQ6_PICKM23(K, pxq6_pol_p3, m, vx); \
+            case PXA_PXQ_FMT_P6R: return PXQ6_PICKM23(K, pxq6_pol_p6r, m, vx); \
+            default:             return PXQ6_PICKM(K, pxq6_pol_p6hq, m, vx); \
         } \
-        switch (fu*8 + fg) {   /* mixed pairs: universal files only (P2/P3/P6), PAIR off */ \
-            case PXA_PXQ_FMT_P2*8+PXA_PXQ_FMT_P3: return PXQ6_PICK2U(K, pxq6_pol_p2, pxq6_pol_p3, false, b2); \
-            case PXA_PXQ_FMT_P2*8+PXA_PXQ_FMT_P6: return PXQ6_PICK2U(K, pxq6_pol_p2, pxq6_pol_p6, false, b2); \
-            case PXA_PXQ_FMT_P3*8+PXA_PXQ_FMT_P2: return PXQ6_PICK2U(K, pxq6_pol_p3, pxq6_pol_p2, false, b2); \
-            case PXA_PXQ_FMT_P3*8+PXA_PXQ_FMT_P6: return PXQ6_PICK2U(K, pxq6_pol_p3, pxq6_pol_p6, false, b2); \
-            case PXA_PXQ_FMT_P6*8+PXA_PXQ_FMT_P2: return PXQ6_PICK2U(K, pxq6_pol_p6, pxq6_pol_p2, false, b2); \
-            case PXA_PXQ_FMT_P6*8+PXA_PXQ_FMT_P3: return PXQ6_PICK2U(K, pxq6_pol_p6, pxq6_pol_p3, false, b2); \
+    }
+
+#define PXQ6_PICKMU(K, PU, PG, m, vx) \
+    ((m) == PXQ6_MODE_PAIRL   ? ((vx) ? (K<PU, PG, PXQ6_MODE_PAIRL,   true>) : (K<PU, PG, PXQ6_MODE_PAIRL,   false>)) : \
+     (m) == PXQ6_MODE_PRMT    ? ((vx) ? (K<PU, PG, PXQ6_MODE_PRMT,    true>) : (K<PU, PG, PXQ6_MODE_PRMT,    false>)) : \
+     (m) == PXQ6_MODE_TAB_CS  ? ((vx) ? (K<PU, PG, PXQ6_MODE_TAB_CS,  true>) : (K<PU, PG, PXQ6_MODE_TAB_CS,  false>)) : \
+     (m) == PXQ6_MODE_PRMT_CS ? ((vx) ? (K<PU, PG, PXQ6_MODE_PRMT_CS, true>) : (K<PU, PG, PXQ6_MODE_PRMT_CS, false>)) : \
+                                ((vx) ? (K<PU, PG, PXQ6_MODE_TAB,     true>) : (K<PU, PG, PXQ6_MODE_TAB,     false>)))
+#define PXQ6_PICKMU23(K, PU, PG, m, vx) /* any P2/P3 operand: tab paths only */ \
+    (((m) == PXQ6_MODE_TAB_CS || (m) == PXQ6_MODE_PRMT_CS) \
+        ? ((vx) ? (K<PU, PG, PXQ6_MODE_TAB_CS, true>) : (K<PU, PG, PXQ6_MODE_TAB_CS, false>)) \
+        : ((vx) ? (K<PU, PG, PXQ6_MODE_TAB,    true>) : (K<PU, PG, PXQ6_MODE_TAB,    false>)))
+#define PXQ6_PICKM_FMT_GU(RET, NAME, K) \
+    static inline RET NAME(int fu, int fg, int m, bool vx) { \
+        if (fu == fg) switch (fu) { \
+            case PXA_PXQ_FMT_P6: return PXQ6_PICKMU(K, pxq6_pol_p6, pxq6_pol_p6, m, vx); \
+            case PXA_PXQ_FMT_P2: return PXQ6_PICKMU23(K, pxq6_pol_p2, pxq6_pol_p2, m, vx); \
+            case PXA_PXQ_FMT_P3: return PXQ6_PICKMU23(K, pxq6_pol_p3, pxq6_pol_p3, m, vx); \
+            case PXA_PXQ_FMT_P6R: return PXQ6_PICKMU23(K, pxq6_pol_p6r, pxq6_pol_p6r, m, vx); \
+            default:             return PXQ6_PICKMU(K, pxq6_pol_p6hq, pxq6_pol_p6hq, m, vx); \
+        } \
+        switch (fu*8 + fg) {   /* mixed pairs: universal files only (P2/P3/P6), tab modes only */ \
+            case PXA_PXQ_FMT_P2*8+PXA_PXQ_FMT_P3: return PXQ6_PICKMU23(K, pxq6_pol_p2, pxq6_pol_p3, m, vx); \
+            case PXA_PXQ_FMT_P2*8+PXA_PXQ_FMT_P6: return PXQ6_PICKMU23(K, pxq6_pol_p2, pxq6_pol_p6, m, vx); \
+            case PXA_PXQ_FMT_P3*8+PXA_PXQ_FMT_P2: return PXQ6_PICKMU23(K, pxq6_pol_p3, pxq6_pol_p2, m, vx); \
+            case PXA_PXQ_FMT_P3*8+PXA_PXQ_FMT_P6: return PXQ6_PICKMU23(K, pxq6_pol_p3, pxq6_pol_p6, m, vx); \
+            case PXA_PXQ_FMT_P6*8+PXA_PXQ_FMT_P2: return PXQ6_PICKMU23(K, pxq6_pol_p6, pxq6_pol_p2, m, vx); \
+            case PXA_PXQ_FMT_P6*8+PXA_PXQ_FMT_P3: return PXQ6_PICKMU23(K, pxq6_pol_p6, pxq6_pol_p3, m, vx); \
             default: return nullptr;   /* unsupported mix -> driver declines (fallback) */ \
         } \
     }
-PXQ6_PICK_FMT_GU(pxq6_gateup_fn,     pxq6_pick_gateup,            k_pxq6_gateup_mmv)
-PXQ6_PICK_FMT(pxq6_mmv_fn,        pxq6_pick_mmv,               k_pxq6_mmv)
-PXQ6_PICK_FMT(pxq6_mmv_redfuse_fn, pxq6_pick_mmv_redfuse,      k_pxq6_mmv_redfuse)
-PXQ6_PICK_FMT_GU(pxq6_gateup_ks_fn,  pxq6_pick_gateup_ksplit,     k_pxq6_gateup_mmv_ksplit)
-PXQ6_PICK_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen, k_pxq6_gateup_mmv_ksplit_gen)
+PXQ6_PICKM_FMT_GU(pxq6_gateup_fn,     pxq6_pick_gateup,            k_pxq6_gateup_mmv)
+PXQ6_PICKM_FMT(pxq6_mmv_fn,        pxq6_pick_mmv,               k_pxq6_mmv)
+PXQ6_PICKM_FMT(pxq6_mmv_redfuse_fn, pxq6_pick_mmv_redfuse,      k_pxq6_mmv_redfuse)
+PXQ6_PICKM_FMT_GU(pxq6_gateup_ks_fn,  pxq6_pick_gateup_ksplit,     k_pxq6_gateup_mmv_ksplit)
+PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen, k_pxq6_gateup_mmv_ksplit_gen)
 PXQ6_PICK_FMT(pxq6_gemm_fn,       pxq6_pick_gemm,              k_pxq6_gemm_grouped)
 PXQ6_PICK_FMT(pxq6_scat_fn,       pxq6_pick_down_scat,         k_pxq6_gemm_down_scat)
 
@@ -1413,28 +1605,24 @@ PXQ6_PICK_FMT(pxq6_scat_fn,       pxq6_pick_down_scat,         k_pxq6_gemm_down_
           : ((b2) ? (K<POL, T, false, true>) : (K<POL, T, false, false>)))
 static inline pxq6_gufuse_h_fn pxq6_pick_gufuse_h(int fmt, bool rag, bool pipe) {
     switch (fmt) {
-        case PXA_PXQ_FMT_P4: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p4,   half, rag, pipe);
-        case PXA_PXQ_FMT_P5: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p5,   half, rag, pipe);
         case PXA_PXQ_FMT_P6: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6,   half, rag, pipe);
         case PXA_PXQ_FMT_P2: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p2,   half, rag, pipe);
         case PXA_PXQ_FMT_P3: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p3,   half, rag, pipe);
+        case PXA_PXQ_FMT_P6R: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6r, half, rag, pipe);
         default:             return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6hq, half, rag, pipe);
     }
 }
 static inline pxq6_gufuse_f_fn pxq6_pick_gufuse_f(int fmt, bool rag, bool pipe) {
     switch (fmt) {
-        case PXA_PXQ_FMT_P4: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p4,   float, rag, pipe);
-        case PXA_PXQ_FMT_P5: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p5,   float, rag, pipe);
         case PXA_PXQ_FMT_P6: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6,   float, rag, pipe);
         case PXA_PXQ_FMT_P2: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p2,   float, rag, pipe);
         case PXA_PXQ_FMT_P3: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p3,   float, rag, pipe);
+        case PXA_PXQ_FMT_P6R: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6r, float, rag, pipe);
         default:             return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6hq, float, rag, pipe);
     }
 }
 static inline pxq6_gemm_fn pxq6_pick_gemm_wmma(int fmt, bool f32acc) {
     switch (fmt) {
-        case PXA_PXQ_FMT_P4: return f32acc ? (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p4,   true> : (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p4,   false>;
-        case PXA_PXQ_FMT_P5: return f32acc ? (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p5,   true> : (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p5,   false>;
         case PXA_PXQ_FMT_P6: return f32acc ? (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6,   true> : (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6,   false>;
         default:             return f32acc ? (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6hq, true> : (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6hq, false>;
     }

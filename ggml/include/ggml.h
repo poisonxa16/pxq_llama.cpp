@@ -455,33 +455,42 @@ extern "C" {
         GGML_TYPE_IQ2_KL  = 157,
         GGML_TYPE_IQ1_KT  = 158,
 
-        // PXA-native quant: MXFP4 numerics in a GEMM-tile-ordered slab layout (fused
-        // dequant-in-GEMM). Lossless bit-permutation transcode from/to MXFP4.
-        // 250 = free gap (ik scalar quants end at 158; CPU repacks live at 202-233 / 335-399).
-        GGML_TYPE_PXQ4      = 250,
+        // 250 RESERVED — retired GGML_TYPE_PXQ4_LEGACY (MXFP4-repack legacy type, pre-2026-07-19
+        // name "PXQ4"), removed 2026-07-21; never reuse this id.
+        // 251 RESERVED — retired GGML_TYPE_PXQ5 (learned-book x SE8 log-scale legacy type),
+        // removed 2026-07-21; never reuse this id.
+        // Old id-250/251 files: requantize from the source model with llama-quantize PXQ4 or PXQ6.
 
-        // PXQ5: PXA fully-proprietary numerics (learned 16-level book x SE8 log-scale) in the
-        // same slab layout. 4.25 bpw. Native quantize from F32/BF16/Q8_0 (NOT MXFP4-transcodable).
-        GGML_TYPE_PXQ5      = 251,
-
-        // PXQ6 (display name "PXQ4" since the 2026-07-19 re-ladder by bpw class; the internal
-        // identifier + numeric id are unchanged): PXQ5 numerics (frozen PX16 book) + E16-row two-level scales: per-ROW fp16
+        // PXQ4 (formerly displayed "PXQ6" pre-2026-07-19; re-laddered by bpw class, internal
+        // identifier renamed 2026-07-21): frozen-PX16-book numerics + E16-row two-level scales: per-ROW fp16
         // anchor (2 B/row via row_meta_size = 128 B header per 64-row panel) x 4-bit EW
-        // sub-scale per 16-elem block. 4.25 + 16/K bpw; measured -12.6% wrel vs PXQ5.
+        // sub-scale per 16-elem block. 4.25 + 16/K bpw; measured -12.6% wrel vs the retired PXQ5.
         // CUDA-consumer format, native quantize only (llama-quantize PXQ4; old name PXQ6 accepted).
-        GGML_TYPE_PXQ6      = 252,
-        // PXQ6HQ (display name "PXQ4-HQ"): PXQ6 with 4-bit subs per 8-elem block (scale SoA x2, 18 B / 32 elems).
-        // 4.5 + 16/K bpw; measured -24.7% wrel vs PXQ5.
-        GGML_TYPE_PXQ6HQ    = 253,
+        GGML_TYPE_PXQ4      = 252,
+        // PXQ4-HQ (formerly displayed "PXQ6HQ"): PXQ4 with 4-bit subs per 8-elem block (scale SoA x2, 18 B / 32 elems).
+        // 4.5 + 16/K bpw; measured -24.7% wrel vs the retired PXQ5.
+        GGML_TYPE_PXQ4HQ    = 253,
 
         // PXQ2/PXQ3 (PXQ-UNIVERSAL low-bit tiers): 2-bit LM4 / 3-bit LM8 codes on the
-        // UNCHANGED PXQ6 E16-row scale machinery (fp16 row anchor via row_meta_size=2 +
+        // UNCHANGED PXQ4 (4-bit tier) E16-row scale machinery (fp16 row anchor via row_meta_size=2 +
         // frozen SUB16 4-bit sub per 16-elem block). PXQ3 codes are bit-plane packed.
         // 2.25+16/K / 3.25+16/K bpw. CUDA-consumer formats, native quantize only
         // (llama-quantize PXQ2/PXQ3/PXQ_UNIVERSAL). Measured wrel (rng-42 lab protocol):
-        // PXQ2 0.3020, PXQ3 0.1435 (PXQ6 core = 0.0696).
+        // PXQ2 0.3020, PXQ3 0.1435 (PXQ4 core = 0.0696).
         GGML_TYPE_PXQ2      = 254,
         GGML_TYPE_PXQ3      = 255,
+
+        // PXQ6 (display name "pxq6", CLI arg PXQ6 — the 5-bit quality tier of the bpw-class-honest
+        // ladder): LM32 5-bit codes (16-byte nibble plane + one LE u32 hi-bit plane per 32-elem
+        // code row) on the UNCHANGED E16-row scale machinery of the 4-bit tier (fp16 row anchor
+        // via row_meta_size=2 + frozen SUB16 4-bit sub per 16-elem block). 5.25+16/K bpw
+        // (~5.27 at K=4096). Measured wrel 0.034301 (rng-42 lab protocol, gate Q-G2b) vs the
+        // 4-bit-tier core's 0.0696 (−56%). CUDA-consumer format, native quantize only
+        // (llama-quantize PXQ6, ftype 257; quantizer src/pxq6r-quantize.inc.cpp — the internal
+        // pxq6r_* identifiers are the historical "PXQ6R" working name, not user-visible).
+        // id 256 sits in the free 256-334 gap below; NOTE: ftype id 256 (= PXQ_UNIVERSAL in
+        // llama.h) is a DIFFERENT namespace — no conflict with this ggml type id.
+        GGML_TYPE_PXQ6     = 256,
 
         GGML_TYPE_Q4_0_R8   = 202,
         GGML_TYPE_Q5_0_R4   = 206,

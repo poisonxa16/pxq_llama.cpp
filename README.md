@@ -3,6 +3,8 @@
 
 # pxq_llama — run PXQ-quantized models (revive your landfill GPUs)
 
+> Authored and maintained by **PXA Network** (https://pxanetwork.com) — the creator of pxq_llama and the PXQ/PXA kernel family.
+
 A fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — a **general MoE accelerator for
 Pascal/Volta silicon** (and modern cards), plus **PXQ**, a family of PXA-native low-bit quants. The
 engine work — an sm_60 fp16-GEMM gate fix, a flash-attention regime fix, MoE-path fixes, and correct
@@ -41,12 +43,16 @@ Best config for **both** sides — upstream at its own documented best (its best
   1080 Ti — printed, not hidden. Full sweep: `bench/fair-battle.md`.
 - **⭐ Naming: the PXQ tiers are re-laddered by bit class.** The 4-bit quality tier is now **PXQ4**
   (formerly PXQ6) and its HQ variant **PXQ4-HQ** (formerly PXQ6HQ) — the name now tells you the
-  bit-width, matching PXQ2/PXQ3. Nothing binary changed: gguf type ids are identical, existing
-  `.gguf` files keep working, and `llama-quantize` accepts the old names (`PXQ6`, `PXQ6HQ`) as
-  aliases forever. The two *legacy* formats that previously used nearby names are retired from the
-  ladder: the MXFP4 slab repack (old "PXQ4") is now **PXQ4-LEGACY**, and **PXQ5** (superseded
-  numerics) is legacy. Env vars (`PXA_PXQ6_*`) and already-published HF artifact filenames
-  (`*-PXQ6.gguf`) keep the old identifier — see `docs/RENAME-MAP.md` for the full mapping.
+  bit-width, matching PXQ2/PXQ3. Nothing binary changed for the 4-bit tier: gguf type ids are
+  identical and existing `.gguf` files keep working (`PXQ6HQ` survives as a deprecated
+  `llama-quantize` alias for PXQ4-HQ). **Since 2026-07-21 the name `PXQ6` belongs to the REAL
+  5-bit LM32 × E16-row quality tier** (gguf type id 256, ~5.27 bpw, `llama-quantize PXQ6`) — it
+  is no longer an alias for the 4-bit tier. The MXFP4 slab repack that used to be called "PXQ4"
+  (type id 250) and **PXQ5** (type id 251, superseded numerics) were both **retired and removed
+  2026-07-21** — old id-250/251 files get a clean "requantize with PXQ4 or PXQ6" error. The
+  ladder is now strictly PXQ2/PXQ3/PXQ4/PXQ4-HQ/PXQ6 (+ PXQ_UNIVERSAL).
+  Env vars (`PXA_PXQ6_*`) and already-published HF artifact filenames (`*-PXQ6.gguf`) keep the
+  old identifier — see `docs/RENAME-MAP.md` for the full mapping.
 - **Fix:** the experimental V100 WMMA prefill kernel (`PXA_PXQ6_WMMA`) was launched with 64 threads
   instead of its required 256 — enabling it produced garbage output. Fixed; all non-WMMA paths are
   byte-unchanged. (It remains experimental and off by default: measured honest gain is +0.97% prefill.)

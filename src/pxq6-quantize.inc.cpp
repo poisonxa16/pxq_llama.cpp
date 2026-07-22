@@ -42,6 +42,17 @@ static const float pxq6_book_q_[16]  = PXQ6_BOOK_INIT;
 static const float pxq6_sub16_q_[16] = PXQ6_SUB16_INIT;
 static const float pxq6_sub8_q_[16]  = PXQ6_SUB8_INIT;
 
+#ifndef PXQ_TIE_BREAK_DEFINED
+#define PXQ_TIE_BREAK_DEFINED
+// deterministic tie-break for reproducible quantization (shared by all PXQ-family quantizers;
+// applies ONLY when two candidates carry bit-identical weighted error — quality-neutral)
+static inline bool pxq_tie_take_hi(int64_t row, int64_t blk) {
+    uint64_t v = ((uint64_t)row ^ (uint64_t)blk) ^ 0x5Aull;
+    v ^= v >> 32; v ^= v >> 16; v ^= v >> 8; v ^= v >> 4; v ^= v >> 2; v ^= v >> 1;
+    return (v & 1) != 0;
+}
+#endif
+
 static inline bool pxq6_parse16(const char * e, float * out) {
     int n = 0; float v[16];
     char * dup = strdup(e);
@@ -118,7 +129,7 @@ static inline double pxq6_block_err(const float * x, const float * w, float d,
 template <int BS>
 static inline double pxq6_quant_subblock(const float * x, const float * w, float anchor,
                                          const float * book, const double * mids, const float * sub,
-                                         uint8_t * s4_out, uint8_t * codes_out) {
+                                         uint8_t * s4_out, uint8_t * codes_out, int64_t row, int64_t blk) {
     float amax = 0.f;
     for (int i = 0; i < BS; ++i) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     if (!(amax > 0.f) || !(anchor > 0.f)) {
@@ -131,7 +142,7 @@ static inline double pxq6_quant_subblock(const float * x, const float * w, float
     for (int j = 0; j < 16; ++j) {
         const float d = (float)((double)anchor * (double)sub[j]);   // == fp32 anchor*sub (exact-product, single round)
         const double err = pxq6_block_err<BS>(x, w, d, book, mids, codes);
-        if (err < best) {
+        if (err < best || (err == best && pxq_tie_take_hi(row, blk))) {   // deterministic tie-break for reproducible quantization
             best = err;
             *s4_out = (uint8_t)j;
             memcpy(codes_out, codes, BS);
@@ -147,11 +158,11 @@ static inline double pxq6_quant_subblock(const float * x, const float * w, float
 template <int BS>
 static double pxq6_quant_row(const float * x, const float * w, int64_t K, float anchor,
                              const float * book, const double * mids, const float * sub,
-                             uint8_t * s4_flat /*K/BS*/, uint8_t * codes_flat /*K*/) {
+                             uint8_t * s4_flat /*K/BS*/, uint8_t * codes_flat /*K*/, int64_t row) {
     double err = 0.0;
     for (int64_t b = 0; b < K/BS; ++b) {
         err += pxq6_quant_subblock<BS>(x + b*BS, w ? w + b*BS : nullptr, anchor,
-                                       book, mids, sub, &s4_flat[b], &codes_flat[b*BS]);
+                                       book, mids, sub, &s4_flat[b], &codes_flat[b*BS], row, b);
     }
     return err;
 }
@@ -166,7 +177,7 @@ static inline bool pxq6_anchor_fit_enabled() {
 template <int BS>
 static float pxq6_pick_anchor(const float * x, const float * w, int64_t K,
                               const float * book, const double * mids, const float * sub,
-                              uint8_t * s4_tmp, uint8_t * codes_tmp) {
+                              uint8_t * s4_tmp, uint8_t * codes_tmp, int64_t row) {
     float amax = 0.f;
     for (int64_t i = 0; i < K; ++i) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     if (amax > 65504.f) amax = 65504.f;                    // fp16 ceiling (hardening; sane weights never hit)
@@ -181,7 +192,7 @@ static float pxq6_pick_anchor(const float * x, const float * w, int64_t K,
         for (int i = 0; i < np; ++i) if (prev[i] == cand) { dup = true; break; }
         if (dup) continue;
         prev[np++] = cand;
-        const double e = pxq6_quant_row<BS>(x, w, K, cand, book, mids, sub, s4_tmp, codes_tmp);
+        const double e = pxq6_quant_row<BS>(x, w, K, cand, book, mids, sub, s4_tmp, codes_tmp, row);
         if (best_e < 0.0 || e < best_e) { best_e = e; best_a = cand; }
     }
     return best_a;
@@ -206,12 +217,13 @@ static void pxq6_quantize_expert(const float * src, uint8_t * dst, int64_t R, in
         ggml_fp16_t * anchors = (ggml_fp16_t *)panel;      // 64 x fp16 header
         for (int64_t r = 0; r < 64; ++r) {
             const float * x = src + (p*64 + r)*K;
+            const int64_t row = p*64 + r;
             const float anchor = tier
-                ? pxq6_pick_anchor<8> (x, imx, K, book, mids, sub, s4.data(), codes.data())
-                : pxq6_pick_anchor<16>(x, imx, K, book, mids, sub, s4.data(), codes.data());
+                ? pxq6_pick_anchor<8> (x, imx, K, book, mids, sub, s4.data(), codes.data(), row)
+                : pxq6_pick_anchor<16>(x, imx, K, book, mids, sub, s4.data(), codes.data(), row);
             anchors[r] = ggml_fp32_to_fp16(anchor);
-            if (tier) pxq6_quant_row<8> (x, imx, K, anchor, book, mids, sub, s4.data(), codes.data());
-            else      pxq6_quant_row<16>(x, imx, K, anchor, book, mids, sub, s4.data(), codes.data());
+            if (tier) pxq6_quant_row<8> (x, imx, K, anchor, book, mids, sub, s4.data(), codes.data(), row);
+            else      pxq6_quant_row<16>(x, imx, K, anchor, book, mids, sub, s4.data(), codes.data(), row);
             // scatter into slabs
             for (int64_t kb = 0; kb < KB; ++kb) {
                 uint8_t * slab = panel + PXQ6_HDR_BYTES + kb*slab_bytes;

@@ -1518,6 +1518,8 @@ add_library(ggml
             ggml-backend.cpp
             ggml-quants.c
             ggml-quants.h
+            pxq-cpu.c
+            pxq-cpu.h
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}

@@ -1596,17 +1596,18 @@ class GGMLQuantizationType(IntEnum):
     Q4_0_8_8  =  33
     I2_S      =  36
     MXFP4     =  39
-    # PXQ display names re-laddered by bpw class (2026-07-19): the 4-bit quality tier is now
-    # PXQ4 (id 252, formerly PXQ6) and PXQ4HQ (id 253, formerly PXQ6HQ). Numeric ids UNCHANGED.
-    # The old member names remain as value aliases (PXQ6/PXQ6HQ resolve to the same members).
-    PXQ4_LEGACY = 250 # legacy MXFP4 numerics, GEMM-tile slab layout (lossless repack); was named PXQ4
-    PXQ5      = 251   # legacy PXA proprietary numerics (learned book + SE8 scale), slab layout
+    # PXQ names re-laddered by bpw class (2026-07-19 display; 2026-07-21 honest ladder): the
+    # 4-bit quality tier is PXQ4 (id 252, formerly PXQ6) and PXQ4HQ (id 253, formerly PXQ6HQ);
+    # PXQ6 is the REAL 5-bit LM32 tier at id 256. PXQ6HQ remains a deprecated value alias.
+    # ids 250 (PXQ4_LEGACY, the MXFP4-repack legacy) and 251 (PXQ5, learned book + SE8) were
+    # RETIRED/removed 2026-07-21 — never reuse those ids; old id-250/251 files must be
+    # requantized (llama-quantize PXQ4 or PXQ6).
     PXQ4      = 252   # PX16 book + E16-row scales (per-row fp16 anchor + 4-bit EW subs); formerly PXQ6
-    PXQ6      = 252   # alias (old display name)
     PXQ4HQ    = 253   # PXQ4 bs8 tier; formerly PXQ6HQ
     PXQ6HQ    = 253   # alias (old display name)
     PXQ2      = 254   # 2-bit LM4 x E16-row scales (PXQ-UNIVERSAL)
     PXQ3      = 255   # 3-bit LM8, bit-plane packed, x E16-row scales
+    PXQ6      = 256   # 5-bit LM32 x E16-row scales — the quality tier (~5.27 bpw)
     Q8_0_X4   =  97
     Q8_1_X4   =  98
     Q8_2_X4   =  99
@@ -1835,12 +1836,11 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.IQ1_M       : ( 256,   56),
     GGMLQuantizationType.BF16        : (   1,    2),
     GGMLQuantizationType.MXFP4       : (  32,   17),
-    GGMLQuantizationType.PXQ4_LEGACY : (  32,   17),
-    GGMLQuantizationType.PXQ5        : (  32,   17),
     GGMLQuantizationType.PXQ4        : (  32,   17),  # + 2 B/row anchor meta (128 B / 64-row panel) — NOT representable here
     GGMLQuantizationType.PXQ4HQ      : (  32,   18),  # + 2 B/row anchor meta
     GGMLQuantizationType.PXQ2        : (  32,    9),  # + 2 B/row anchor meta (128 B / 64-row panel) — NOT representable here
     GGMLQuantizationType.PXQ3        : (  32,   13),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXQ6        : (  32,   21),  # + 2 B/row anchor meta (matches ggml.c traits: blck 32, type_size 21, row_meta 2)
     GGMLQuantizationType.Q4_0_4_4    : (  32,   18),
     GGMLQuantizationType.Q4_0_4_8    : (  32,   18),
     GGMLQuantizationType.Q4_0_8_8    : (  32,   18),

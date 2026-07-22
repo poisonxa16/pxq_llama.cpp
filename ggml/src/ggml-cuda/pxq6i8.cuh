@@ -31,16 +31,32 @@
 //
 // ENV: PXA_PXQ_INT8_PREFILL=0 (default, OFF) | 1 (sm_61 only — the ship gate) | 2 (all archs,
 // TEST: sm_70+ has real dp4a; sm_60 falls to the emulated ggml_cuda_dp4a — never ship that).
+//
+// ---- PARKED (measured losses, 2026-07-22 sm_61 A/B — do NOT re-run blind) -------------------
+// Two maturation candidates for this tile were implemented, gated (PXA_PXQ_I8_DBUF /
+// PXA_PXQ_I8_BN=128), proven output-equivalent, and A/B'd on the 1080 Ti (PXQ2, fair-battle
+// rev2: fa-off ub768 cold 5432-tok prompt, median of 3; same-binary parent 958-976 t/s pf):
+//   I8-DBUF  (smem ping-pong, 1 barrier/slab, prefetch-into-regs): -0.4%  -> KILL.
+//     ptxas: the shipped kernel already runs 223-228 regs, 0 spills, 4 blocks/SM — it is
+//     ILP-saturated, not latency-bound; the ping-pong bought nothing.
+//   I8-BN128 (64x128 tiles, 128 thr, halves W stream + W-decode per token): -23%   -> KILL
+//     at ub768: this MoE routes ~96 tokens/expert per ubatch, so 128-token tiles run mostly
+//     partial-fill (idle FMA lanes) and grid.y halves. Only plausible at >=2x per-expert
+//     batches (ub2048-class), which the 11 GB card cannot hold next to a ~10 GB model.
+//   Stack (both): -21% -> KILL.
+// Even the <64,false> template restructure of this kernel (lambda-split stage/FMA) measured
+// -2.5% on its own — keep the body below textually as-is. Full diff of the parked variants:
+// the 2026-07-22 sm_61 window report (pxa-1080ti-i8-maturation-2026-07-22.patch).
 #pragma once
 
 // requires: pxq6.cuh (policies incl. pxq6_pol_p2/p3 via pxq23.cuh, pxq6_panel, pxq6_ldcodes,
 // pxq4_tile_info, pxq4_rowmap, pxq4_glu_apply, PXA_PXQ_FMT_*), common.cuh (ggml_cuda_dp4a).
 
+#include "pxa-enhance.cuh"   // level default: ENHANCE -> mode 1 (sm_61 ship gate); env wins
+
 static inline int pxa_pxq_int8_prefill() {
     static const int mode = [](){
-        const char * e = getenv("PXA_PXQ_INT8_PREFILL");
-        int m = e ? atoi(e) : 0;
-        if (m < 0 || m > 2) m = 0;
+        const int m = pxa_int8_prefill_mode_resolve();
         if (m) fprintf(stderr, "PXA_PXQ_INT8_PREFILL: mode %d (N13 dp4a int8 MMQ-tile prefill, %s; "
                        "s8 book snap — NOT bit-exact vs fused fp16, G3-gated)\n",
                        m, m == 1 ? "sm_61 only" : "ALL archs (TEST)");
@@ -250,11 +266,10 @@ k_pxqi8_gemm_grouped(const uint8_t * __restrict__ W,
     }
 }
 
-// per-format picker. P4 (E2M1 book, not snap-validated) and unknown formats decline -> the
-// caller falls back to the proven fp16/cublas paths for the WHOLE op.
+// per-format picker. Unknown formats decline -> the caller falls back to the proven
+// fp16/cublas paths for the WHOLE op. (The retired legacy P4/P5 formats were removed 2026-07-21.)
 static pxqi8_gemm_fn pxqi8_pick_gemm(int fmt) {
     switch (fmt) {
-        case PXA_PXQ_FMT_P5:   return k_pxqi8_gemm_grouped<pxq6_pol_p5>;
         case PXA_PXQ_FMT_P6:   return k_pxqi8_gemm_grouped<pxq6_pol_p6>;
         case PXA_PXQ_FMT_P6HQ: return k_pxqi8_gemm_grouped<pxq6_pol_p6hq>;
         case PXA_PXQ_FMT_P2:   return k_pxqi8_gemm_grouped<pxq6_pol_p2>;

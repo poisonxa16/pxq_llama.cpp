@@ -10,11 +10,12 @@
 //       eliminating the CONCAT's 4.15MB read + 4.15MB write per layer per token entirely.
 //   FUSED_RMS_NORM(ssm_norm) + FUSED_MUL_UNARY(silu z)  2 kernels -> 1  (pxa_dn_rms_silu_gate_f32)
 //
-// Env gate: PXA_FUSE_DELTANET (bitmask, default 0 = OFF, eager path untouched)
+// Env gate: PXA_FUSE_DELTANET (bitmask, default 3 = both fusions ON; =0 restores the eager path)
 //   bit0 (1): the qk-norm/state-writeback cluster (anchored at the SILU node; consumes the
 //             23-node SILU..CONCAT window incl. the already-fused ADD+SOFTPLUS+MUL beta-gate)
 //   bit1 (2): the out-gate rms+silu fusion (anchored at FUSED_RMS_NORM)
-//   PXA_FUSE_DELTANET=3 enables both.
+//   Default ON: measured +3.7% P100 decode on the published U16 config (docs/LEVERS.md §2),
+//   bit-exact vs the eager kernels; pattern mismatch still falls through to eager per-node.
 //
 // Correctness notes:
 //  - Pure eval-time pattern fusion: the ggml graph is UNCHANGED; only the launched kernel
@@ -31,8 +32,10 @@
 
 #pragma once
 
+#include "pxa-enhance.cuh"   // level default: REFERENCE -> 0 (eager path); env always wins
+
 static inline int pxa_fuse_deltanet_mask() {
-    static const int mask = getenv("PXA_FUSE_DELTANET") ? atoi(getenv("PXA_FUSE_DELTANET")) : 0;
+    static const int mask = getenv("PXA_FUSE_DELTANET") ? atoi(getenv("PXA_FUSE_DELTANET")) : pxa_fuse_deltanet_default();
     return mask;
 }
 

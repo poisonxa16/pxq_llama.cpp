@@ -3,6 +3,15 @@
 // Copyright (C) 2023-2024 The ggml authors
 // Copyright (C) 2024 Iwan Kawrakow
 // MIT license
+
+// PXA provenance canary -- kept in the binary for authorship forensics.
+#ifdef __GNUC__
+__attribute__((used))
+#endif
+__attribute__((used, visibility("default"))) const char pxa_provenance[] =
+    "pxq_llama :: authored by PXA Network (pxanetwork.com) :: "
+    "creator=PXANetwork :: origin-canary=PXA-7Q6LM32E16-ORIGIN :: forensic-watermark";
+static const char * const pxa_provenance_ref = pxa_provenance;
 // SPDX-License-Identifier: MIT
 //
 #include "ggml-cuda.h"
@@ -10,6 +19,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/pxa-enhance.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argsort.cuh"
@@ -250,6 +260,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
     GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_CUBLAS: no\n", __func__);
 #endif // GGML_CUDA_FORCE_CUBLAS
     GGML_CUDA_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices:\n", __func__, info.device_count);
+    int  pxa_ccs[GGML_CUDA_MAX_DEVICES] = {0};
+    char pxa_names[GGML_CUDA_MAX_DEVICES][256] = {{0}};
     for (int id = 0; id < info.device_count; ++id) {
         int device_vmm = 0;
 
@@ -285,7 +297,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
         info.devices[id].cc = 100*prop.major + 10*prop.minor;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+        pxa_ccs[id] = info.devices[id].cc;
+        snprintf(pxa_names[id], sizeof(pxa_names[id]), "%s", prop.name);
     }
+
+    // PXA master config tiers (PXA_REFERENCE / default / PXA_ENHANCE): one-time per-device report
+    pxa_enhance_log_startup(info.device_count, pxa_ccs, pxa_names);
 
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;
@@ -2032,9 +2049,10 @@ static void ggml_cuda_op_mul_mat_cublas(
     // 30%% + maxwell_sgemm/sgemm_*_vec 49%%). fast_fp16_available() (cc>=600 && cc!=610) already knows
     // the truth — use it here: fp16 dequant (half the write traffic) + GemmEx 16F (2x FLOP rate).
     // sm_61 (1080Ti) stays excluded. Env PXA_P100_FP16_GEMM=0 rolls back to the old fp32 path.
-    static const bool pxa_p100_fp16_gemm = [](){ const char * e = getenv("PXA_P100_FP16_GEMM"); return !(e && atoi(e) == 0); }();
+    // PXA 0a hygiene (2026-07-22): level-aware resolver (pxa-enhance.cuh) — REFERENCE -> false so
+    // PXA_REFERENCE=1 baselines on sm_60 really run the pure fp32 SGEMM reference path. Env wins.
     const bool pxa_fp16_gemm_ok = compute_capability >= CC_VOLTA ||
-        (pxa_p100_fp16_gemm && compute_capability < CC_VOLTA && fast_fp16_available(compute_capability));
+        (pxa_p100_fp16_gemm() && compute_capability < CC_VOLTA && fast_fp16_available(compute_capability));
     if (pxa_fp16_gemm_ok && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
@@ -3335,7 +3353,6 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 #include "ggml-cuda/grouped_moe_verify.cuh"
 #include "ggml-cuda/pxq4.cuh"
-#include "ggml-cuda/pxq5.cuh"
 #include "ggml-cuda/pxq6.cuh"
 #include "ggml-cuda/pxq6i8.cuh"
 
@@ -3356,9 +3373,8 @@ static bool pxa_pxq4_bufs_on_device(ggml_backend_cuda_context & ctx, std::initia
 }
 
 // decode / fast-TG: ny <= 8 tokens, one fused mmv per (token, routed expert slot).
-// PXQ6 build: all four PXA slab formats (PXQ4/PXQ5/PXQ6/PXQ6HQ) dispatch here. With NO
-// PXA_PXQ6_* fastpath env set, PXQ4/PXQ5 take their original proven kernels (byte-identical
-// to the pre-PXQ6 build) and PXQ6/PXQ6HQ take the policy-family baseline. Fastpath gates:
+// All PXA slab formats (PXQ4/PXQ4-HQ/PXQ2/PXQ3/PXQ6) dispatch here on the policy kernel
+// family. (The legacy id-250/id-251 old-family kernels were removed 2026-07-21.) Fastpath gates:
 // K1 PXA_PXQ6_KSPLIT (bit-exact) / PXA_PXQ6_KSPLIT_GEN=S (G3-gated), K2 PXA_PXQ6_PAIRLUT /
 // PXA_PXQ6_VECX (bit-exact) — all format-independent via the pxq6 policy family.
 static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
@@ -3372,7 +3388,6 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int fmt   = pxa_pxq_fmt(src0_1->type);                       // up
     const int fmt_g = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;  // gate
     if (!src0_2 || fmt == PXA_PXQ_FMT_NONE || fmt_g == PXA_PXQ_FMT_NONE) return -1;
-    if (fmt == PXA_PXQ_FMT_P5 || fmt_g == PXA_PXQ_FMT_P5) pxq5_maybe_upload_book(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P2 || fmt_g >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
     const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
@@ -3393,7 +3408,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     const ggml_tensor * bu = dst->src[4], * bg = dst->src[5];
 
-    const bool pair = pxa_pxq6_pairlut();
+    const int  pair = pxa_pxq6_decode_mode();   // sourcing MODE (tab/pairlut/prmt x cs) — name kept for call-site diff-min
     const bool vecx = pxa_pxq6_vecx();
     const int  sgen = pxa_pxq6_ksplit_gen();
     const bool newfam = fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6 || pair || vecx || sgen || pxa_pxq6_ksplit();
@@ -3500,29 +3515,18 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
         }
     }
     if (!gu_done) {
-        if (newfam) {
-            auto * kern_gu = pxq6_pick_gateup(fmt, fmt_g, pair, vecx);
-            if (!kern_gu) return -1;
-            kern_gu<<<grid, 256, smem_gu, stream>>>(
-                (const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
-                (const char *)src1->data, src1->nb[2],
-                (char *)dst->data, dst->nb[2], dst->nb[1],
-                (const char *)ids->data, ids->nb[0], ids->nb[1],
-                bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
-                bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
-                (int)R, (int)K, (int)n_as, unary, 1.702f, limit);
-        } else {
-            if (fmt != fmt_g) return -1;
-            auto * kern_gu = fmt == PXA_PXQ_FMT_P5 ? (pxa_pxq5_fast() ? k_pxq5_gateup_mmv_fast : k_pxq5_gateup_mmv) : k_pxq4_gateup_mmv;
-            kern_gu<<<grid, 256, smem_gu, stream>>>(
-                (const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
-                (const char *)src1->data, src1->nb[2],
-                (char *)dst->data, dst->nb[2], dst->nb[1],
-                (const char *)ids->data, ids->nb[0], ids->nb[1],
-                bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
-                bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
-                (int)R, (int)K, (int)n_as, unary, 1.702f, limit);
-        }
+        // every remaining PXA slab format is new-family (the id-250/251 legacy kernels were
+        // removed 2026-07-21); newfam is true by construction here.
+        auto * kern_gu = pxq6_pick_gateup(fmt, fmt_g, pair, vecx);
+        if (!kern_gu) return -1;
+        kern_gu<<<grid, 256, smem_gu, stream>>>(
+            (const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
+            (const char *)src1->data, src1->nb[2],
+            (char *)dst->data, dst->nb[2], dst->nb[1],
+            (const char *)ids->data, ids->nb[0], ids->nb[1],
+            bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
+            bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
+            (int)R, (int)K, (int)n_as, unary, 1.702f, limit);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -3539,8 +3543,8 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const size_t smem_d = (size_t)Kd*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
         if (smem_d <= 46*1024) {
             dim3 gridd((unsigned)(Rd/PXQ4_BM), (unsigned)n_ids, (unsigned)Ny);
-            auto * kern_d = (newfam || fmt_d >= PXA_PXQ_FMT_P6) ? pxq6_pick_mmv(fmt_d, pair, vecx)
-                : (fmt_d == PXA_PXQ_FMT_P5 ? (pxa_pxq5_fast() ? k_pxq5_mmv_fast : k_pxq5_mmv) : k_pxq4_mmv);
+            auto * kern_d = pxq6_pick_mmv(fmt_d, pair, vecx);
+            if (!kern_d) return i;   // no kernel for this format combination — skip the fusion
             kern_d<<<gridd, 256, smem_d, stream>>>(
                 (const uint8_t *)next->src[0]->data,
                 (const char *)dst->data, dst->nb[2], dst->nb[1],
@@ -3566,7 +3570,6 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int fmt   = pxa_pxq_fmt(src0_1->type);                       // up
     const int fmt_g = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;  // gate
     if (!src0_2 || fmt == PXA_PXQ_FMT_NONE || fmt_g == PXA_PXQ_FMT_NONE) return -1;
-    if (fmt == PXA_PXQ_FMT_P5 || fmt_g == PXA_PXQ_FMT_P5) pxq5_maybe_upload_book(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P2 || fmt_g >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
     const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
@@ -3622,7 +3625,7 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     // up + gate grouped GEMMs (biases folded into the epilogue).
     // Kernel-family selection (PXQ6 spec K3/K4/K5/K6): with NO PXA_PXQ6_* prefill gate set,
-    // PXQ4/PXQ5 keep their original proven/fast kernels (byte-identical to the pre-PXQ6 build).
+    // (The legacy id-250/251 old-family prefill kernels were removed 2026-07-21.)
     const ggml_tensor * bu = dst->src[4], * bg = dst->src[5];
     dim3 grid((unsigned)(R/PXQ4_BM), (unsigned)tiles.size());
 
@@ -3631,7 +3634,7 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const bool pipe   = pxa_pxq6_pipe();
     const bool newfam = fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6 || wmma_mode || rag || pipe ||
                         pxa_pxq6_gufuse() || pxa_pxq6_scatfuse() || pxa_pxq6_force_prefill();
-    if (!newfam && fmt != fmt_g) return -1;   // legacy P4/P5 path is single-format (belt)
+    if (!newfam) return -1;   // belt: every remaining PXA slab format is new-family
     const bool gufuse = newfam && pxa_pxq6_gufuse() && !wmma_mode && fmt == fmt_g;   // K6 keeps split GEMMs; fused up+gate kernel is 1-policy
     const bool scat   = newfam && pxa_pxq6_scatfuse();
     // K6 launch fix (2026-07-19): k_pxq6_gemm_grouped_wmma is a 256-thread (8-warp) block
@@ -3640,16 +3643,14 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // unstaged + 6/8 warps missing = garbage output (no CUDA error: launch_bounds is a max).
     const unsigned nthr_gu = wmma_mode ? 256u : 64u;
 
-    pxq6_gemm_fn kern_up   = newfam ? (wmma_mode ? pxq6_pick_gemm_wmma(fmt,   wmma_mode == 1) : pxq6_pick_gemm(fmt,   rag, pipe)) : nullptr;
-    pxq6_gemm_fn kern_gate = newfam ? (wmma_mode ? pxq6_pick_gemm_wmma(fmt_g, wmma_mode == 1) : pxq6_pick_gemm(fmt_g, rag, pipe)) : nullptr;
-    if (newfam && (!kern_up || !kern_gate)) return -1;
-    auto * kern_old = fmt == PXA_PXQ_FMT_P5 ? (pxa_pxq5_fast() ? k_pxq5_gemm_grouped_fast : k_pxq5_gemm_grouped) : k_pxq4_gemm_grouped;
+    pxq6_gemm_fn kern_up   = wmma_mode ? pxq6_pick_gemm_wmma(fmt,   wmma_mode == 1) : pxq6_pick_gemm(fmt,   rag, pipe);
+    pxq6_gemm_fn kern_gate = wmma_mode ? pxq6_pick_gemm_wmma(fmt_g, wmma_mode == 1) : pxq6_pick_gemm(fmt_g, rag, pipe);
+    if (!kern_up || !kern_gate) return -1;
 
     if (fuse_down) {
         const int64_t Rd = next->src[0]->ne[1], Kd = next->src[0]->ne[0];   // Kd == R
         const int fmt_d = pxa_pxq_fmt(next->src[0]->type);
-        if (!newfam && fmt_d != fmt) return -1;   // legacy path needs a single shared format (belt)
-        ggml_cuda_pool_alloc<half> H_f16(ctx.pool(), total*R);
+            ggml_cuda_pool_alloc<half> H_f16(ctx.pool(), total*R);
         if (gufuse) {
             // K3 GUFUSE: one kernel = up GEMM + gate GEMM + GLU -> f16 (bit-exact vs the
             // 3-kernel pipeline; identical accumulation chains + identical GLU/convert)
@@ -3663,17 +3664,10 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
         } else {
             ggml_cuda_pool_alloc<float> C_up(ctx.pool(), total*R);
             ggml_cuda_pool_alloc<float> C_gate(ctx.pool(), total*R);
-            if (newfam) {
-                kern_up<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_1->data, A_f16.get(), C_up.get(),
-                        bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-                kern_gate<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_2->data, A_f16.get(), C_gate.get(),
-                        bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-            } else {
-                kern_old<<<grid, 64, 0, stream>>>((const uint8_t *)src0_1->data, A_f16.get(), C_up.get(),
-                        bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-                kern_old<<<grid, 64, 0, stream>>>((const uint8_t *)src0_2->data, A_f16.get(), C_gate.get(),
-                        bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-            }
+            kern_up<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_1->data, A_f16.get(), C_up.get(),
+                    bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
+            kern_gate<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_2->data, A_f16.get(), C_gate.get(),
+                    bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
             CUDA_CHECK(cudaGetLastError());
             const int64_t k = total*R;
             k_pxq4_glu<half><<<(unsigned)((k + 255)/256), 256, 0, stream>>>(
@@ -3689,15 +3683,10 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
             CUDA_CHECK(cudaGetLastError());
         } else {
             ggml_cuda_pool_alloc<float> C_down(ctx.pool(), total*Rd);
-            if (newfam) {
-                const bool down_wmma = wmma_mode && fmt_d == fmt;
-                pxq6_gemm_fn kern_down = down_wmma ? pxq6_pick_gemm_wmma(fmt_d, wmma_mode == 1) : pxq6_pick_gemm(fmt_d, rag, pipe);
-                kern_down<<<gridd, down_wmma ? 256u : 64u, 0, stream>>>((const uint8_t *)next->src[0]->data, H_f16.get(),
-                        C_down.get(), nullptr, 0, dev_tiles.get(), (int)Rd, (int)Kd);
-            } else {
-                kern_old<<<gridd, 64, 0, stream>>>((const uint8_t *)next->src[0]->data, H_f16.get(),
-                        C_down.get(), nullptr, 0, dev_tiles.get(), (int)Rd, (int)Kd);
-            }
+            const bool down_wmma = wmma_mode && fmt_d == fmt;
+            pxq6_gemm_fn kern_down = down_wmma ? pxq6_pick_gemm_wmma(fmt_d, wmma_mode == 1) : pxq6_pick_gemm(fmt_d, rag, pipe);
+            kern_down<<<gridd, down_wmma ? 256u : 64u, 0, stream>>>((const uint8_t *)next->src[0]->data, H_f16.get(),
+                    C_down.get(), nullptr, 0, dev_tiles.get(), (int)Rd, (int)Kd);
             CUDA_CHECK(cudaGetLastError());
             dim3 bd(std::min((unsigned)Rd, 768u));
             k_copy_dst_from_contiguous<<<(unsigned)total, bd, 0, stream>>>((char *)next->data,
@@ -3720,17 +3709,10 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     } else {
         ggml_cuda_pool_alloc<float> C_up(ctx.pool(), total*R);
         ggml_cuda_pool_alloc<float> C_gate(ctx.pool(), total*R);
-        if (newfam) {
-            kern_up<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_1->data, A_f16.get(), C_up.get(),
-                    bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-            kern_gate<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_2->data, A_f16.get(), C_gate.get(),
-                    bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-        } else {
-            kern_old<<<grid, 64, 0, stream>>>((const uint8_t *)src0_1->data, A_f16.get(), C_up.get(),
-                    bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-            kern_old<<<grid, 64, 0, stream>>>((const uint8_t *)src0_2->data, A_f16.get(), C_gate.get(),
-                    bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
-        }
+        kern_up<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_1->data, A_f16.get(), C_up.get(),
+                bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
+        kern_gate<<<grid, nthr_gu, 0, stream>>>((const uint8_t *)src0_2->data, A_f16.get(), C_gate.get(),
+                bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0, dev_tiles.get(), (int)R, (int)K);
         CUDA_CHECK(cudaGetLastError());
         const int64_t k = total*R;
         k_pxq4_glu<float><<<(unsigned)((k + 255)/256), 256, 0, stream>>>(
@@ -3764,7 +3746,6 @@ static int pxa_pxq_moe_prefill_i8(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int fmt   = src0_1 ? pxa_pxq_fmt(src0_1->type) : PXA_PXQ_FMT_NONE;
     const int fmt_g = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;
     if (!src0_2 || !pxqi8_pick_gemm(fmt) || !pxqi8_pick_gemm(fmt_g)) return -1;
-    if (fmt == PXA_PXQ_FMT_P5 || fmt_g == PXA_PXQ_FMT_P5) pxq5_maybe_upload_book(ctx.device);
     pxq6_maybe_upload_tables(ctx.device);
     pxq23_maybe_upload_books(ctx.device);
     const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
@@ -3922,9 +3903,10 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     if (pxa_moe_dbg && src1->ne[2] > 1 && src1->ne[2] <= 8) { static int pxa_cnt = 0; if (pxa_cnt < 48) { ++pxa_cnt;
         fprintf(stderr, "PXA_MOE ny=%d fast=%d dev=%d\n", (int)src1->ne[2], src1->ne[2] <= pxa_fast_tg_max_ny ? 1 : 0, ctx.device); } }
     if (src1->ne[1] == 1 && src1->ne[2] <= pxa_fast_tg_max_ny && src1->ne[3] == 1 &&
-        ggml_is_quantized(src0_1->type) && src0_1->type != GGML_TYPE_PXQ4 && src0_1->type != GGML_TYPE_PXQ5 &&
-        src0_1->type != GGML_TYPE_PXQ6 && src0_1->type != GGML_TYPE_PXQ6HQ &&
+        ggml_is_quantized(src0_1->type) &&
+        src0_1->type != GGML_TYPE_PXQ4 && src0_1->type != GGML_TYPE_PXQ4HQ &&
         src0_1->type != GGML_TYPE_PXQ2 && src0_1->type != GGML_TYPE_PXQ3 &&      // ADD
+        src0_1->type != GGML_TYPE_PXQ6 &&                                       // ADD (no vec_dot)
         (!src0_2 || ggml_is_quantized(src0_2->type)) &&
         ggml_backend_buffer_is_cuda(src0_1->buffer) &&
         (!src0_2 || ggml_backend_buffer_is_cuda(src0_2->buffer)) &&
@@ -4485,8 +4467,9 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
 }
 
 static inline bool pxa_is_pxq_type(ggml_type t) {
-    return t == GGML_TYPE_PXQ4 || t == GGML_TYPE_PXQ5 || t == GGML_TYPE_PXQ6 ||
-           t == GGML_TYPE_PXQ6HQ || t == GGML_TYPE_PXQ2 || t == GGML_TYPE_PXQ3;
+    return t == GGML_TYPE_PXQ4 ||
+           t == GGML_TYPE_PXQ4HQ || t == GGML_TYPE_PXQ2 || t == GGML_TYPE_PXQ3 ||
+           t == GGML_TYPE_PXQ6;
 }
 
 static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -5438,6 +5421,12 @@ static int pxa_cuda_graph_log_level() {
 //      MoE ny>8) no longer clobbers the stored decode properties at a shared/collided key;
 //   4. the per-context graph cache is LRU-capped (PXA_CUDA_GRAPH_LRU slots, default 8).
 static bool pxa_cuda_graph_v2_enabled() {
+    // NOTE (2026-07-21): whole-token graph replay is measured NEGATIVE on BOTH box arches with
+    // captures verified firing (PXA_CUDA_GRAPH_LOG): V100 −2..−4%, P100 −3.9% (65.0→62.5 t/s,
+    // public PXQ2, replays=396/400 tokens, byte-identical). An earlier "+3.5% P100" reading was
+    // NOISE from a config where the cc<CC_AMPERE arch gate silently kept captures at 0 — always
+    // verify captures>0 before believing a graph number. Decode is GPU-busy; replay bookkeeping
+    // is pure tax on these cards. Stays env-only opt-in for instrumentation/diagnostics.
     static const bool on = [] { const char * e = getenv("PXA_CUDA_GRAPH_V2"); return e && atoi(e) != 0; }();
     return on;
 }
@@ -5632,9 +5621,9 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
             // PXQ4: only the fused decode path is device-only/capturable. If the type is PXQ4
             // but that path would decline (env off, wrong unary, unaligned dims, smem), decode
             // falls to the host-syncing per-expert loop -> must NOT capture.
-            if (moe_capturable && (src0_1->type == GGML_TYPE_PXQ4 || src0_1->type == GGML_TYPE_PXQ5 ||
-                                   src0_1->type == GGML_TYPE_PXQ6 || src0_1->type == GGML_TYPE_PXQ6HQ ||
-                                   src0_1->type == GGML_TYPE_PXQ2 || src0_1->type == GGML_TYPE_PXQ3)) {
+            if (moe_capturable && (src0_1->type == GGML_TYPE_PXQ4 || src0_1->type == GGML_TYPE_PXQ4HQ ||
+                                   src0_1->type == GGML_TYPE_PXQ2 || src0_1->type == GGML_TYPE_PXQ3 ||
+                                   src0_1->type == GGML_TYPE_PXQ6)) {
                 const ggml_unary_op puop = (ggml_unary_op)node->op_params[0];
                 const int cfu = pxa_pxq_fmt(src0_1->type);
                 const int cfg = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;
@@ -5743,8 +5732,13 @@ static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_gra
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (node->src[i] &&
             node->src[i]->data != graph_node_properties->src_address[i] &&
-            node->op != GGML_OP_CPY &&
-            node->op != GGML_OP_VIEW
+            node->op != GGML_OP_VIEW &&
+            // PXQ port of upstream ik_llama.cpp PR #2136 (merged 2026-07-17): only a CPY node's
+            // DESTINATION (src[1], the KV-cache view whose address legitimately moves between
+            // captures) is exempt from the address check. The READ source (src[0]) must force a
+            // re-capture when it moves, or the captured graph keeps reading the old address
+            // (stale-read bug, e.g. SWA mask/KV re-pointing).
+            !(node->op == GGML_OP_CPY && i == 1)
         ) {
             return false;
         }
@@ -5784,7 +5778,8 @@ static void pxa_cgraph_log_first_mismatch(const void * key, int i, ggml_tensor *
         if (detail[0] == 0) {
             for (int s = 0; s < GGML_MAX_SRC; s++) {
                 if (node->src[s] && node->src[s]->data != p->src_address[s] &&
-                    node->op != GGML_OP_CPY && node->op != GGML_OP_VIEW) {
+                    node->op != GGML_OP_VIEW &&
+                    !(node->op == GGML_OP_CPY && s == 1)) { // PR #2136: keep logger in lockstep with the matcher
                     field = "src";
                     snprintf(detail, sizeof(detail), "src%d(%s) %p->%p", s, node->src[s]->name,
                              p->src_address[s], node->src[s]->data);
@@ -6337,11 +6332,10 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_PXQ4:
-                    case GGML_TYPE_PXQ5:
-                    case GGML_TYPE_PXQ6:
-                    case GGML_TYPE_PXQ6HQ:
+                    case GGML_TYPE_PXQ4HQ:
                     case GGML_TYPE_PXQ2:      // ADD
                     case GGML_TYPE_PXQ3:      // ADD
+                    case GGML_TYPE_PXQ6:     // ADD
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_IQ2_KL:
                     case GGML_TYPE_IQ3_KS:

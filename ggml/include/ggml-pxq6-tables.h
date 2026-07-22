@@ -14,7 +14,7 @@
 //   sublevels.json  d8847db66fafc90644526597a71907889e1cf1d06bf9290bc7277d5fb6e22cab
 //   books.json      047ef6431435339def7000571726e9a8fe8cd3e654448e70803c2bfa1fad3041
 // All sublevels are fp16-snapped then emitted as exact fp32 hex literals. The book is the
-// PXQ5 PX16 book verbatim (see ggml-pxq5-tables.h; PXQ6_BOOK_INIT must stay bit-identical).
+// The frozen PX16 book (inherited verbatim from the retired PXQ5 type — values byte-frozen).
 #pragma once
 
 #define PXQ6_QK          32
@@ -49,9 +49,27 @@
     0x1.07c0000000000p-1f, 0x1.1c80000000000p-1f, 0x1.32c0000000000p-1f, 0x1.4bc0000000000p-1f, \
     0x1.68c0000000000p-1f, 0x1.8b40000000000p-1f, 0x1.b700000000000p-1f, 0x1.f380000000000p-1f }
 
-// HQ+ STAGED (gate Q-G2b): LM32 5-bit book (bs16 refit, refine-uniform5bitref BK_BS16),
-// fp16-snapped. NOT wired into a runtime type yet -- frozen here for provenance + the
-// Q-G2b composition eval. book zero index = 16.
+// PXQ6 5-bit tier (display name "pxq6", GGML_TYPE_PXQ6 = 256; internal working name PXQ6R): the HQ+ composition
+// (gate Q-G2b PASSED at wrel 0.034301 @ 5.2656 bpw, K=1024) — LM32 5-bit book x the frozen
+// E16-row scale machinery (fp16 row anchor + SUB16 4-bit sub per 16-elem block; no new sub
+// table — PXQ6_SUB16_INIT is shared verbatim, like PXQ2/PXQ3).
+//   code row = 20 B / 32 elems: bytes 0..15 nibble plane (byte b = lo4(c[2b]) | lo4(c[2b+1])<<4,
+//   byte-identical layout to the PXQ6 core rows) + bytes 16..19 one LE u32 hi-bit plane
+//   (bit j = bit 4 of c[j], j = 0..31). Slab = 64 B scale SoA + 64 x 20 B code rows = 1344 B.
+//   dequant contract (parity-locked, fp32):
+//     eff = fp32(anchor_fp16) * PXQ6_SUB16[s4]; w = eff * fp32(PXQ6_LM32[c])
+//   zero 16-block: s4 = 0, codes = PXQ6R_ZIDX (book[16] == +0.0f); zero row: anchor fp16 +0,
+//   scale nibbles 0, codes PXQ6R_ZIDX -> exact 0.0 on every path.
+#define PXQ6R_TYPE_SIZE   21      // bytes / 32 elems (1 scale byte + 20 code bytes)
+#define PXQ6R_SLAB_BYTES  1344    // 64 B scale SoA + 64 rows x 20 B codes
+#define PXQ6R_HDR_BYTES   128     // 64 x fp16 row anchors per 64-row panel (== PXQ6_HDR_BYTES)
+#define PXQ6R_ROW_META    2       // ggml row_meta_size
+#define PXQ6R_CODE_OFF    64
+#define PXQ6R_ZIDX        16      // LM32 book zero index (book[16] == +0.0f)
+
+// LM32 5-bit book (bs16 refit, refine-uniform5bitref BK_BS16), fp16-snapped. Wired as
+// GGML_TYPE_PXQ6 (display pxq6) as of 2026-07-21; values remain frozen (byte-frozen —
+// never edit). book zero index = 16.
 #define PXQ6_LM32_INIT { \
     -0x1.0000000000000p+0f, -0x1.e500000000000p-1f, -0x1.b280000000000p-1f, -0x1.8400000000000p-1f, \
     -0x1.5a80000000000p-1f, -0x1.3480000000000p-1f, -0x1.1180000000000p-1f, -0x1.e200000000000p-2f, \

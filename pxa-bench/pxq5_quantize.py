@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# RETIRED 2026-07-21: type id 251 (PXQ5) was REMOVED from the fork — the engine refuses
+# id-251 files. Do NOT produce new PXQ5 files; kept only as a historical reference.
 # pxq5_quantize.py — PXQ5 reference quantizer / dequantizer / book learner (spec v1, frozen 2026-07-16).
 #
 # LEGACY (2026-07-19): PXQ5 is superseded by the 4-bit tier now displayed PXQ4 (formerly PXQ6),

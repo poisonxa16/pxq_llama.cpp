@@ -3,11 +3,11 @@
 // CORRECTNESS (runs on the 1080Ti while the Teslas are busy — bit-exactness is arch-independent
 // for identical fp32 op sequences on IEEE hardware):
 //   decode : new-family baseline vs {PAIRLUT, VECX, PAIR+VECX, KSPLIT(bit-exact), KSPLIT_GEN}
-//            per format (PXQ4/PXQ5/PXQ6/PXQ6HQ) — memcmp; KSPLIT_GEN reports maxdiff (expected
-//            tiny nonzero — G3-gated form). Old proven PXQ4/PXQ5 kernels vs new-family baseline
+//            per format (PXQ4/PXQ4-HQ/PXQ6) — memcmp; KSPLIT_GEN reports maxdiff (expected
+//            tiny nonzero — G3-gated form). (The legacy old-proven-kernel comparisons went with
 //            — memcmp (proves the policy family preserved the exact chains).
 //   prefill: gemm baseline vs {RAGTAIL, PIPE, RAG+PIPE} memcmp; GUFUSE vs 3-kernel pipeline
-//            memcmp; SCATFUSE vs gemm+copy memcmp; old PXQ4/PXQ5 gemm vs new baseline memcmp.
+//            memcmp; SCATFUSE vs gemm+copy memcmp. (The id-250/251 legacy rows were removed 2026-07-21.)
 //   dequant: k_pxq6_dequant_matrix output vs the CPU reference contract (bitwise).
 //   WMMA   : compiled in; executes only on cc==700 (prints SKIP elsewhere) — correctness =
 //            maxdiff vs fp32 CPU reference (NOT bit-exact by design) + kernel-t/s A/B.
@@ -35,9 +35,10 @@ static inline float ggml_fp16_to_fp32(ggml_fp16_t h) { return _cvtsh_ss(h); }
 static inline ggml_fp16_t ggml_fp32_to_fp16(float f) { return _cvtss_sh(f, 0); }
 
 // minimal ggml type shim so pxq6.cuh's host helpers compile standalone
-enum ggml_type { GGML_TYPE_PXQ4 = 250, GGML_TYPE_PXQ5 = 251, GGML_TYPE_PXQ6 = 252, GGML_TYPE_PXQ6HQ = 253 };
+enum ggml_type { /* 250/251 = retired legacy types, removed 2026-07-21 */ GGML_TYPE_PXQ4 = 252, GGML_TYPE_PXQ4HQ = 253, GGML_TYPE_PXQ2 = 254, GGML_TYPE_PXQ3 = 255, GGML_TYPE_PXQ6 = 256 };
 
 #include "pxq6-quantize.inc.cpp"        // CPU quantizer + reference dequant (the contract)
+#include "pxq6r-quantize.inc.cpp"       // PXQ6R (real-PXQ6 tier) CPU quantizer + parity dequant
 #include "pxq6.cuh"                      // the kernel family under test
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
@@ -65,17 +66,14 @@ static std::vector<uint8_t> make_wq(int fmt, int64_t R, int64_t K, int64_t E, st
         pxq6_quantize_tensor(W.data(), q.data(), R, K, E, nullptr, 0, 8, tier);
         return q;
     }
-    // PXQ4/PXQ5: random VALID slab bytes (codes uniform; scales in a sane range)
-    const int64_t eb = R*(K/32)*17;
-    std::vector<uint8_t> q(eb*E);
-    std::uniform_int_distribution<int> byt(0, 255);
-    std::uniform_int_distribution<int> sc4(118, 132);    // e8m0 around 2^-9..2^5
-    std::uniform_int_distribution<int> sc5(120, 200);    // pxq5 log grid
-    for (int64_t s = 0; s < (int64_t)q.size(); s += 1088) {
-        for (int i = 0; i < 64; ++i)  q[s + i] = fmt == PXA_PXQ_FMT_P4 ? (uint8_t)sc4(grng) : (uint8_t)sc5(grng);
-        for (int i = 64; i < 1088; ++i) q[s + i] = (uint8_t)byt(grng);
+    if (fmt == PXA_PXQ_FMT_P6R) {
+        const int64_t eb = (R/64)*(PXQ6R_HDR_BYTES + (K/32)*(int64_t)PXQ6R_SLAB_BYTES);
+        std::vector<uint8_t> q(eb*E);
+        pxq6r_quantize_tensor(W.data(), q.data(), R, K, E, nullptr, 0, 8);
+        return q;
     }
-    return q;
+    fprintf(stderr, "make_wq: unsupported fmt %d (legacy formats removed 2026-07-21)\n", fmt);
+    abort();
 }
 
 struct DevBuf { void * p = nullptr; size_t n = 0;
@@ -84,7 +82,7 @@ struct DevBuf { void * p = nullptr; size_t n = 0;
 };
 
 static const char * fmtname(int f) {
-    return f == 1 ? "PXQ4" : f == 2 ? "PXQ5" : f == 3 ? "PXQ6" : "PXQ6HQ";
+    return f == 3 ? "PXQ4" : f == 7 ? "PXQ6" : "PXQ4-HQ";
 }
 
 // ---------------- decode test ----------------
@@ -134,33 +132,23 @@ static void test_decode(int fmt, bool bench) {
     std::vector<uint8_t> ref(outb), got(outb);
 
     printf("[decode %s]\n", fmtname(fmt));
-    run_gu(pxq6_pick_gateup(fmt, false, false), dout.p);
+    run_gu(pxq6_pick_gateup(fmt, fmt, 0, false), dout.p);
     CK(cudaMemcpy(ref.data(), dout.p, outb, cudaMemcpyDeviceToHost));
 
-    // old proven kernels vs new-family baseline
-    if (fmt == PXA_PXQ_FMT_P4 || fmt == PXA_PXQ_FMT_P5) {
-        auto * old_gu = fmt == PXA_PXQ_FMT_P5 ? k_pxq5_gateup_mmv_fast : k_pxq4_gateup_mmv;
-        run_gu(old_gu, dout2.p);
+    // K2 variants: sourcing MODE (0 tab / 1 pairlut / 2 prmt / 3 tab+cs / 4 prmt+cs) x VECX.
+    // P2/P3 pickers demote prmt/pairlut modes to tab at compile time — the memcmp still must PASS.
+    for (int md = 0; md <= 4; ++md) for (int vx = 0; vx <= 1; ++vx) {
+        if (md == 0 && vx == 0) continue;
+        run_gu(pxq6_pick_gateup(fmt, fmt, md, vx != 0), dout2.p);
         CK(cudaMemcpy(got.data(), dout2.p, outb, cudaMemcpyDeviceToHost));
-        check("old proven kernel == new-family baseline", got == ref);
-        if (fmt == PXA_PXQ_FMT_P5) {
-            run_gu(k_pxq5_gateup_mmv, dout2.p);   // proven (non-fast) twin
-            CK(cudaMemcpy(got.data(), dout2.p, outb, cudaMemcpyDeviceToHost));
-            check("old PROVEN (slow-table) == new baseline", got == ref);
-        }
-    }
-    // K2 variants
-    for (int m = 1; m < 4; ++m) {
-        run_gu(pxq6_pick_gateup(fmt, m & 1, m & 2), dout2.p);
-        CK(cudaMemcpy(got.data(), dout2.p, outb, cudaMemcpyDeviceToHost));
-        char buf[64]; snprintf(buf, 64, "PAIRLUT=%d VECX=%d == baseline", m & 1, (m >> 1) & 1);
+        char buf[64]; snprintf(buf, 64, "MODE=%d VECX=%d == baseline", md, vx);
         check(buf, got == ref);
     }
     // K1 bit-exact ksplit
     {
         CK(cudaMemset(dout2.p, 0xee, outb));
         dim3 grids((unsigned)(R/64*PXQ4_MMV_KSEG), (unsigned)n_ids, (unsigned)Ny);
-        pxq6_pick_gateup_ksplit(fmt, false, false)<<<grids, 64, K*4>>>(
+        pxq6_pick_gateup_ksplit(fmt, fmt, 0, false)<<<grids, 64, K*4>>>(
             (const uint8_t *)du.p, (const uint8_t *)dg.p, (const char *)dx.p, x_tok,
             (float *)dws.p, (const char *)dids.p, ids_nb0, ids_nb1, (int)R, (int)K, (int)E, (int)n_ids);
         CK(cudaGetLastError());
@@ -180,7 +168,7 @@ static void test_decode(int fmt, bool bench) {
         const int kslabs = (int)(K/32);
         const int kcmax = ((kslabs + S - 1)/S)*32;
         dim3 grids((unsigned)(R/64*S), (unsigned)n_ids, (unsigned)Ny);
-        pxq6_pick_gateup_ksplit_gen(fmt, false, false)<<<grids, 256, kcmax*4 + 2*PXQ4_MMV_KSEG*64*4>>>(
+        pxq6_pick_gateup_ksplit_gen(fmt, fmt, 0, false)<<<grids, 256, kcmax*4 + 2*PXQ4_MMV_KSEG*64*4>>>(
             (const uint8_t *)du.p, (const uint8_t *)dg.p, (const char *)dx.p, x_tok,
             (float *)dws.p, (const char *)dids.p, ids_nb0, ids_nb1, (int)R, (int)K, (int)E, (int)n_ids, S);
         CK(cudaGetLastError());
@@ -211,18 +199,13 @@ static void test_decode(int fmt, bool bench) {
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         };
         std::vector<uint8_t> dref(downb), dgot(downb);
-        run_d(pxq6_pick_mmv(fmt, false, false), ddown.p);
+        run_d(pxq6_pick_mmv(fmt, 0, false), ddown.p);
         CK(cudaMemcpy(dref.data(), ddown.p, downb, cudaMemcpyDeviceToHost));
-        if (fmt == PXA_PXQ_FMT_P4 || fmt == PXA_PXQ_FMT_P5) {
-            auto * old_d = fmt == PXA_PXQ_FMT_P5 ? k_pxq5_mmv_fast : k_pxq4_mmv;
-            run_d(old_d, ddown2.p);
+        for (int md = 0; md <= 4; ++md) for (int vx = 0; vx <= 1; ++vx) {
+            if (md == 0 && vx == 0) continue;
+            run_d(pxq6_pick_mmv(fmt, md, vx != 0), ddown2.p);
             CK(cudaMemcpy(dgot.data(), ddown2.p, downb, cudaMemcpyDeviceToHost));
-            check("down: old proven == new baseline", dgot == dref);
-        }
-        for (int m = 1; m < 4; ++m) {
-            run_d(pxq6_pick_mmv(fmt, m & 1, m & 2), ddown2.p);
-            CK(cudaMemcpy(dgot.data(), ddown2.p, downb, cudaMemcpyDeviceToHost));
-            char buf[64]; snprintf(buf, 64, "down: PAIRLUT=%d VECX=%d == baseline", m & 1, (m >> 1) & 1);
+            char buf[64]; snprintf(buf, 64, "down: MODE=%d VECX=%d == baseline", md, vx);
             check(buf, dgot == dref);
         }
     }
@@ -236,13 +219,17 @@ static void test_decode(int fmt, bool bench) {
             float ms; cudaEventElapsedTime(&ms, e0, e1);
             printf("  BENCH gateup %-28s %8.2f us/launch\n", lbl, ms*1000/200);
         };
-        t_gu(pxq6_pick_gateup(fmt, false, false), "baseline");
-        t_gu(pxq6_pick_gateup(fmt, true, true), "pairlut+vecx");
+        t_gu(pxq6_pick_gateup(fmt, fmt, 0, false), "baseline");
+        t_gu(pxq6_pick_gateup(fmt, fmt, 0, true),  "vecx");
+        t_gu(pxq6_pick_gateup(fmt, fmt, 1, true),  "pairlut+vecx");
+        t_gu(pxq6_pick_gateup(fmt, fmt, 2, true),  "prmt+vecx");
+        t_gu(pxq6_pick_gateup(fmt, fmt, 3, true),  "tab+cs+vecx");
+        t_gu(pxq6_pick_gateup(fmt, fmt, 4, true),  "prmt+cs+vecx");
         // ksplit bench
         dim3 grids((unsigned)(R/64*PXQ4_MMV_KSEG), (unsigned)n_ids, (unsigned)Ny);
         dim3 gridr((unsigned)((R + 255)/256), (unsigned)n_ids, (unsigned)Ny);
         auto run_ks = [&]() {
-            pxq6_pick_gateup_ksplit(fmt, false, false)<<<grids, 64, K*4>>>(
+            pxq6_pick_gateup_ksplit(fmt, fmt, 0, false)<<<grids, 64, K*4>>>(
                 (const uint8_t *)du.p, (const uint8_t *)dg.p, (const char *)dx.p, x_tok,
                 (float *)dws.p, (const char *)dids.p, ids_nb0, ids_nb1, (int)R, (int)K, (int)E, (int)n_ids);
             k_pxq6_gateup_reduce<<<gridr, 256>>>((const float *)dws.p, (char *)dout2.p, dst_tok, dst_slot,
@@ -297,12 +284,6 @@ static void test_prefill(int fmt, bool bench, int cc) {
     run_g(pxq6_pick_gemm(fmt, false, false), dwu.p, dC.p);
     CK(cudaMemcpy(ref.data(), dC.p, ref.size(), cudaMemcpyDeviceToHost));
 
-    if (fmt == PXA_PXQ_FMT_P4 || fmt == PXA_PXQ_FMT_P5) {
-        auto * old_g = fmt == PXA_PXQ_FMT_P5 ? k_pxq5_gemm_grouped_fast : k_pxq4_gemm_grouped;
-        run_g(old_g, dwu.p, dC2.p);
-        CK(cudaMemcpy(got.data(), dC2.p, got.size(), cudaMemcpyDeviceToHost));
-        check("gemm: old proven == new baseline", got == ref);
-    }
     for (int m = 1; m < 4; ++m) {
         run_g(pxq6_pick_gemm(fmt, m & 1, m & 2), dwu.p, dC2.p);
         CK(cudaMemcpy(got.data(), dC2.p, got.size(), cudaMemcpyDeviceToHost));
@@ -371,8 +352,8 @@ static void test_prefill(int fmt, bool bench, int cc) {
                 }
         check("K3 SCATFUSE == gemm+copy (valid rows)", ok);
     }
-    // dequant matrix vs CPU contract (PXQ6 formats only; PXQ4/5 already covered by prior gates)
-    if (fmt >= PXA_PXQ_FMT_P6) {
+    // dequant matrix vs CPU contract (PXQ6-family formats only; PXQ4/5 already covered by prior gates)
+    if (fmt == PXA_PXQ_FMT_P6 || fmt == PXA_PXQ_FMT_P6HQ) {
         const int tier = fmt == PXA_PXQ_FMT_P6HQ ? 1 : 0;
         std::vector<float> cpu(R*K), gpu(R*K);
         pxq6_dequant_expert(hu.data(), cpu.data(), R, K, tier);
@@ -384,9 +365,20 @@ static void test_prefill(int fmt, bool bench, int cc) {
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(gpu.data(), dy.p, R*K*4, cudaMemcpyDeviceToHost));
         check("dequant_matrix == CPU reference contract", memcmp(cpu.data(), gpu.data(), R*K*4) == 0);
+    } else if (fmt == PXA_PXQ_FMT_P6R) {
+        // P6R arm: golden contract = pxq6r_dequant_expert (spec §2 parity-locked inverse)
+        std::vector<float> cpu(R*K), gpu(R*K);
+        pxq6r_dequant_expert(hu.data(), cpu.data(), R, K);
+        DevBuf dq, dy; dq.up(hu.data(), (R/64)*(PXQ6R_HDR_BYTES + (K/32)*(int64_t)PXQ6R_SLAB_BYTES));
+        dy.alloc(R*K*4);
+        const int kslabs = (int)(K/32);
+        k_pxq6_dequant_matrix<pxq6_pol_p6r, float><<<(R/64)*kslabs, 64>>>((const uint8_t *)dq.p, (float *)dy.p, kslabs, K);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(gpu.data(), dy.p, R*K*4, cudaMemcpyDeviceToHost));
+        check("dequant_matrix == pxq6r CPU reference contract", memcmp(cpu.data(), gpu.data(), R*K*4) == 0);
     }
-    // WMMA (sm_70 only)
-    if (cc == 700) {
+    // WMMA (sm_70 only; v1 excludes the demoted formats P2/P3/P6R — same gate as the driver)
+    if (cc == 700 && fmt < PXA_PXQ_FMT_P2) {
         run_g(pxq6_pick_gemm_wmma(fmt, true), dwu.p, dC2.p);
         std::vector<float> h1(total*R), h2(total*R);
         CK(cudaMemcpy(h1.data(), dC.p, total*R*4, cudaMemcpyDeviceToHost));
@@ -403,7 +395,8 @@ static void test_prefill(int fmt, bool bench, int cc) {
         printf("  K6 WMMA fp32-acc vs half2 baseline: maxdiff %.4e relL2 %.4e (NOT bit-exact by design; G3+G4 gate)\n",
                md, sqrt(rel/fmax(den, 1e-30)));
     } else {
-        printf("  K6 WMMA: SKIP (cc=%d != 700 — staged for the V100 window)\n", cc);
+        printf("  K6 WMMA: SKIP (%s)\n", cc != 700 ? "cc != 700 — staged for the V100 window"
+                                                   : "fmt >= P2 — wmma excluded for demoted formats");
     }
     if (bench) {
         cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
@@ -421,7 +414,7 @@ static void test_prefill(int fmt, bool bench, int cc) {
         t_g(pxq6_pick_gemm(fmt, true, false), "ragtail");
         t_g(pxq6_pick_gemm(fmt, false, true), "pipe");
         t_g(pxq6_pick_gemm(fmt, true, true), "ragtail+pipe");
-        if (cc == 700) {
+        if (cc == 700 && fmt < PXA_PXQ_FMT_P2) {
             t_g(pxq6_pick_gemm_wmma(fmt, true),  "WMMA fp32-acc");
             t_g(pxq6_pick_gemm_wmma(fmt, false), "WMMA fp16-acc");
         }
@@ -434,8 +427,8 @@ int main(int argc, char ** argv) {
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, dev));
     const int cc = prop.major*100 + prop.minor*10;
     printf("pxq6_test on %s (cc %d)%s\n", prop.name, cc, bench ? " [BENCH]" : "");
-    for (int fmt = 1; fmt <= 4; ++fmt) test_decode(fmt, bench);
-    for (int fmt = 1; fmt <= 4; ++fmt) test_prefill(fmt, bench, cc);
+    for (int fmt : {3, 4, 7}) test_decode(fmt, bench);       // 7 = PXQ6; 5/6 (P2/P3) have their own harness path (1/2 = retired legacy, removed)
+    for (int fmt : {3, 4, 7}) test_prefill(fmt, bench, cc);
     printf(g_fail ? "RESULT: %d MISMATCHES\n" : "RESULT: ALL BIT-EXACT CHECKS PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

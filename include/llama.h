@@ -193,13 +193,18 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_0_8_8      = 35, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 38, // except 1d tensors, 38 to be compatible with mainline
         LLAMA_FTYPE_MOSTLY_Q1_0_G128     = 41, // except 1d tensors, 38 to be compatible with mainline
-        LLAMA_FTYPE_MOSTLY_PXQ4          = 250, // PXA-native: MXFP4 numerics in the fused-GEMM slab layout (expert tensors)
-        LLAMA_FTYPE_MOSTLY_PXQ5          = 251, // PXA proprietary numerics (learned book + SE8 scale) in the slab layout
-        LLAMA_FTYPE_MOSTLY_PXQ6          = 252, // display name PXQ4 (re-laddered 2026-07-19): PXQ5 numerics + E16-row scales (per-row fp16 anchor + 4-bit EW subs)
-        LLAMA_FTYPE_MOSTLY_PXQ6HQ        = 253, // display name PXQ4-HQ: PXQ4 with bs8 sub-scales (HQ tier)
+        // 250 RESERVED — retired LLAMA_FTYPE_MOSTLY_PXQ4_LEGACY (MXFP4-repack legacy, pre-2026-07-19 name "PXQ4"),
+        //     removed 2026-07-21; never reuse this id.
+        // 251 RESERVED — retired LLAMA_FTYPE_MOSTLY_PXQ5 (learned-book + SE8 legacy), removed 2026-07-21;
+        //     never reuse this id. Old id-250/251 files: requantize with llama-quantize PXQ4 or PXQ6.
+        // PXQ ftype tokens re-laddered by bpw class 2026-07-21 (matching the GGML_TYPE_* re-ladder):
+        // the 4-bit quality tier is PXQ4/PXQ4HQ (formerly PXQ6/PXQ6HQ); PXQ6 is the 5-bit LM32 tier.
+        LLAMA_FTYPE_MOSTLY_PXQ4          = 252, // 4-bit quality tier (formerly PXQ6): PX16 book + E16-row scales (per-row fp16 anchor + 4-bit EW subs)
+        LLAMA_FTYPE_MOSTLY_PXQ4HQ        = 253, // PXQ4-HQ (formerly PXQ6HQ): PXQ4 with bs8 sub-scales (HQ tier)
         LLAMA_FTYPE_MOSTLY_PXQ2          = 254, // 2-bit LM4 codes x E16-row scales (experts)
         LLAMA_FTYPE_MOSTLY_PXQ3          = 255, // 3-bit LM8 codes (bit-plane) x E16-row scales
         LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL = 256, // mixed PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)
+        LLAMA_FTYPE_MOSTLY_PXQ6          = 257, // 5-bit quality tier: LM32 5-bit codes x E16-row scales, ~5.27 bpw (gguf tensor type id 256)
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ1_BN        = 136, // except 1d tensors

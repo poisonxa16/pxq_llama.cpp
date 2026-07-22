@@ -6,6 +6,7 @@
 //
 
 #include "mmq.cuh"
+#include "pxa-enhance.cuh"
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
@@ -249,12 +250,16 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11) {
     if (cc < CC_OFFSET_AMD) {
         // On Volta, large-batch quantized matmuls otherwise fall back through
         // fp16 cuBLAS temporaries. Keep using MMQ for pre-Turing NVIDIA.
-        // PXA_VOLTA_CUBLAS_NE11 (prefill experiment): when set (>0), Volta (sm_70)
-        // routes batches with ne11 >= threshold to the dequant+cuBLAS fp16 path
-        // (tensor cores) instead of DP4A MMQ. Unset/0 = MMQ always (current behavior).
+        // PXA_VOLTA_CUBLAS_NE11: Volta (sm_70) routes batches with ne11 >= threshold to the
+        // dequant+cuBLAS fp16 path (HMMA tensor cores) instead of DP4A MMQ.
+        // DEFAULT 64 since 2026-07-21 — measured on the PUBLIC PXA-Fusion2-35B-PXQ2, single
+        // V100, ~6k-token prompt, 3 interleaved rounds: prefill median +9.4% (1949→2133 t/s),
+        // won every round; decode byte-untouched (ne11 < 64 stays MMQ). Earlier internal 35B
+        // config measured +6.5% — consistent. env =0 restores MMQ-always, other values retune.
+        // G3-class numerics (fp16 cuBLAS vs int8 MMQ on prefill logits).
+        // Resolver lives in pxa-enhance.cuh (level-aware: PXA_REFERENCE -> 0; env wins).
         if (cc >= CC_VOLTA && cc < CC_TURING) {
-            static const char * pxa_vc_env  = getenv("PXA_VOLTA_CUBLAS_NE11");
-            static const int    pxa_vc_ne11 = pxa_vc_env ? atoi(pxa_vc_env) : 0;
+            const int pxa_vc_ne11 = pxa_volta_cublas_ne11();
             if (pxa_vc_ne11 > 0 && ne11 >= pxa_vc_ne11) {
                 return false;
             }

@@ -1535,6 +1535,29 @@ llm_expert_gating_func_type   gating_op,
     return cur;
 }
 
+// PXA_FA_PREFILL_SPLIT (2026-07-22): per-ubatch FA regime dispatch. On pre-Turing cards the
+// non-FA batched-cuBLAS attention chain is the FAST prefill regime (P100 fa-off 1213 vs fa-on
+// 817 t/s), while FA is the fast/lean decode regime. With a threshold N > 0, a graph whose
+// attention batch (n_tokens) >= N builds the non-FA chain even under -fa on; smaller batches
+// (decode, MTP verify, spec) keep the untouched FA branch — decode is byte-identical by
+// construction. Mirror of pxa_fa_prefill_split_ne11() in ggml/src/ggml-cuda/pxa-enhance.cuh
+// (this is a non-CUDA TU) — KEEP THE TWO IN LOCKSTEP, including the level/mode defaults:
+// env wins (0 = off; 1..8 clamped to 9 for decode/MTP-verify safety); PXA_REFERENCE -> 0;
+// PXA_MODE=max -> 0 (fa is off in MAX, the split is inert); BALANCE (default) -> 64 (the
+// 2026-07-22 posture directive — SPLIT is the BALANCE prefill carrier).
+static int pxa_fa_prefill_split_ne11_mirror() {
+    static const int v = [](){
+        const char * e = getenv("PXA_FA_PREFILL_SPLIT");
+        if (e) { int t = atoi(e); return t <= 0 ? 0 : (t < 9 ? 9 : t); }
+        const char * r = getenv("PXA_REFERENCE");
+        if (r && atoi(r) != 0) return 0;                    // reference: lever off
+        const char * m = getenv("PXA_MODE");
+        if (m && (m[0] == 'm' || m[0] == 'M')) return 0;    // MAX posture: fa-off, split inert
+        return 64;                                          // BALANCE (default): carrier ON
+    }();
+    return v;
+}
+
 static ggml_tensor * llm_build_kqv(
         struct ggml_context * ctx,
        struct llama_context & lctx,
@@ -1610,7 +1633,14 @@ static ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * cur;
 
-    if (cparams.flash_attn) {
+    // PXA_FA_PREFILL_SPLIT: big-batch graphs ride the non-FA chain (fast pre-Turing prefill);
+    // the FA branch below stays byte-untouched for decode-sized batches. The kv.v_trans==false
+    // FA V-cache layout is already handled by the non-FA branch (ggml_cont(ggml_transpose(v))),
+    // and ggml_soft_max_ext accepts the FA-mode F16 mask.
+    const int  pxa_split_ne11 = pxa_fa_prefill_split_ne11_mirror();
+    const bool pxa_split_now  = cparams.flash_attn && pxa_split_ne11 > 0 && n_tokens >= pxa_split_ne11;
+
+    if (cparams.flash_attn && !pxa_split_now) {
         GGML_UNUSED(model);
         GGML_UNUSED(n_ctx);
 
