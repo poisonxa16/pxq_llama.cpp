@@ -86,8 +86,8 @@
       <h3>New in this release</h3>
       <ul class="feat">
         <li><span class="n">↑45%</span><span><b>BALANCE mode</b> — P100 gets fa-off-class prefill in a fa-on serving config (834 → 1,206 t/s, decode held). One flag auto-tunes each card.</span></li>
-        <li><span class="n">↑12%</span><span><b>MTP speculative decode</b> — P100 56.8 → 63.4 t/s, ~0.8 accept.</span></li>
-        <li><span class="n">↑26%</span><span><b>V100 tensor-core prefill</b> — 1,700 → 2,149 t/s.</span></li>
+        <li><span class="n">↑18%</span><span><b>MTP speculative decode</b> — P100 63.4, V100 <b>108.3</b> t/s steady-state (~0.8 accept).</span></li>
+        <li><span class="n">↑39%</span><span><b>V100 tensor-core prefill</b> — 1,700 → 2,358 t/s (CUBLAS64 + WMMA-v2 expert GEMMs).</span></li>
         <li><span class="n">NEW</span><span><b>GLM-4.7-Flash support</b> + the honest 5-bit <b>PXQ6</b> quant tier.</span></li>
       </ul>
     </div>
@@ -99,20 +99,20 @@
   </div>
 
   <p class="foot">
-    <b style="color:var(--muted)">Shared absolute scale within each metric</b> — every bar in a section is measured against the same axis, so a P100 reads shorter than a V100 (they are). The % gains are each card vs its <em>own</em> upstream baseline: the code doesn't turn a P100 into a V100, it gets far more out of the P100 you have. Newest V100 prefill is the shipped CUBLAS64 figure; a tensor-core expert-GEMM rebuild is in measurement and may raise it. <code>docs/LEVERS.md</code> · <code>bench/fair-battle.md</code>
+    <b style="color:var(--muted)">Shared absolute scale within each metric</b> — every bar in a section is measured against the same axis, so a P100 reads shorter than a V100 (they are). The % gains are each card vs its <em>own</em> upstream baseline: the code doesn't turn a P100 into a V100, it gets far more out of the P100 you have. Bars marked (MTP) use speculative decode (n_max=1, ~0.8 accept, steady-state medians); V100 prefill is the merged WMMA-v2 figure (confirm-set median 2,384). <code>docs/LEVERS.md</code> · <code>bench/fair-battle.md</code>
   </p>
 </div>
 
 <script>
   const D = {
-    prefill:{ axis:2200, tick:500, unit:"t/s", cards:[
+    prefill:{ axis:2400, tick:600, unit:"t/s", cards:[
       {n:"Tesla P100", a:"sm_60", ik:645, prev:1213, new:1213, badge:{t:"carried",flat:1}},
-      {n:"Tesla V100", a:"sm_70", ik:1509, prev:1700, new:2149, badge:{t:"+26%"}},
+      {n:"Tesla V100", a:"sm_70", ik:1509, prev:1700, new:2358, badge:{t:"+39%"}},
       {n:"GTX 1080 Ti", a:"sm_61", ik:1154, prev:1001, new:1001, badge:{t:"−13% vs ik",flat:1}},
     ]},
-    decode:{ axis:100, tick:25, unit:"t/s", cards:[
+    decode:{ axis:120, tick:30, unit:"t/s", cards:[
       {n:"Tesla P100", a:"sm_60", ik:44.7, prev:58.1, new:63.4, badge:{t:"+9% (MTP)"}},
-      {n:"Tesla V100", a:"sm_70", ik:84.5, prev:95.5, new:95.5, badge:{t:"carried",flat:1}},
+      {n:"Tesla V100", a:"sm_70", ik:84.5, prev:95.5, new:108.3, badge:{t:"+13% (MTP)"}},
       {n:"GTX 1080 Ti", a:"sm_61", ik:52.2, prev:65.4, new:65.4, badge:{t:"+25% vs ik"}},
     ]}
   };
