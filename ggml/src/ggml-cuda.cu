@@ -3634,13 +3634,19 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * bu = dst->src[4], * bg = dst->src[5];
     dim3 grid((unsigned)(R/PXQ4_BM), (unsigned)tiles.size());
 
-    const int  wmma_mode = (cc == 700 && fmt < PXA_PXQ_FMT_P2 && fmt == fmt_g) ? pxa_pxq6_wmma() : 0;   // K6: exactly Volta (sm_70); v1 excludes 2/3-bit + mixed pairs
+    const int  wmma_env  = cc == 700 ? pxa_pxq6_wmma() : 0;   // K6: exactly Volta (sm_70)
+    // v1 (modes 1/2) excludes 2/3-bit + mixed pairs; v2 (mode 3) covers P2/P3/P6/P6HQ + mixed
+    // pairs but excludes P6R and requires GUFUSE (its fused kernel IS the up+gate path).
+    const int  wmma_mode = wmma_env == 3
+        ? ((fmt != PXA_PXQ_FMT_P6R && fmt_g != PXA_PXQ_FMT_P6R && pxa_pxq6_gufuse()) ? 3 : 0)
+        : ((fmt < PXA_PXQ_FMT_P2 && fmt == fmt_g) ? wmma_env : 0);
+    const bool wmma2     = wmma_mode == 3;   // K6 v2: double-buffered, GUFUSE-fused, WMMA scat down
     const bool rag    = pxa_pxq6_ragtail();
     const bool pipe   = pxa_pxq6_pipe();
     const bool newfam = fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6 || wmma_mode || rag || pipe ||
                         pxa_pxq6_gufuse() || pxa_pxq6_scatfuse() || pxa_pxq6_force_prefill();
     if (!newfam) return -1;   // belt: every remaining PXA slab format is new-family
-    const bool gufuse = newfam && pxa_pxq6_gufuse() && !wmma_mode && fmt == fmt_g;   // K6 keeps split GEMMs; fused up+gate kernel is 1-policy
+    const bool gufuse = newfam && pxa_pxq6_gufuse() && (!wmma_mode || wmma2) && (fmt == fmt_g || wmma2);   // K6 v1 keeps split GEMMs; v2 has its own fused (mixed-pair-capable) kernel
     const bool scat   = newfam && pxa_pxq6_scatfuse();
     // K6 launch fix (2026-07-19): k_pxq6_gemm_grouped_wmma is a 256-thread (8-warp) block
     // (__launch_bounds__(256); srow = tid>>2 stages 64 rows x 4 thr; wm/wn = 4x2 warp grid).
@@ -3648,8 +3654,8 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // unstaged + 6/8 warps missing = garbage output (no CUDA error: launch_bounds is a max).
     const unsigned nthr_gu = wmma_mode ? 256u : 64u;
 
-    pxq6_gemm_fn kern_up   = wmma_mode ? pxq6_pick_gemm_wmma(fmt,   wmma_mode == 1) : pxq6_pick_gemm(fmt,   rag, pipe);
-    pxq6_gemm_fn kern_gate = wmma_mode ? pxq6_pick_gemm_wmma(fmt_g, wmma_mode == 1) : pxq6_pick_gemm(fmt_g, rag, pipe);
+    pxq6_gemm_fn kern_up   = (wmma_mode && !wmma2) ? pxq6_pick_gemm_wmma(fmt,   wmma_mode != 2) : pxq6_pick_gemm(fmt,   rag, pipe);
+    pxq6_gemm_fn kern_gate = (wmma_mode && !wmma2) ? pxq6_pick_gemm_wmma(fmt_g, wmma_mode != 2) : pxq6_pick_gemm(fmt_g, rag, pipe);
     if (!kern_up || !kern_gate) return -1;
 
     if (fuse_down) {
@@ -3659,8 +3665,8 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
         if (gufuse) {
             // K3 GUFUSE: one kernel = up GEMM + gate GEMM + GLU -> f16 (bit-exact vs the
             // 3-kernel pipeline; identical accumulation chains + identical GLU/convert)
-            auto * kg = pxq6_pick_gufuse_h(fmt, rag, pipe);
-            kg<<<grid, 64, 0, stream>>>((const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
+            auto * kg = wmma2 ? pxq6_pick_gufuse_wmma_h(fmt, fmt_g) : pxq6_pick_gufuse_h(fmt, rag, pipe);
+            kg<<<grid, wmma2 ? 256u : 64u, 0, stream>>>((const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
                     A_f16.get(), H_f16.get(),
                     bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
                     bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
@@ -3681,15 +3687,17 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
         dim3 gridd((unsigned)(Rd/PXQ4_BM), (unsigned)tiles.size());
         if (scat) {
             // K3 SCATFUSE: down GEMM scatters straight to the MoE output rows
-            auto * kd = pxq6_pick_down_scat(fmt_d, rag, pipe);
-            kd<<<gridd, 64, 0, stream>>>((const uint8_t *)next->src[0]->data, H_f16.get(),
+            pxq6_scat_fn kd = wmma2 && fmt_d != PXA_PXQ_FMT_P6R ? pxq6_pick_down_scat_wmma(fmt_d) : nullptr;
+            const unsigned nthr_d = kd ? 256u : 64u;
+            if (!kd) kd = pxq6_pick_down_scat(fmt_d, rag, pipe);
+            kd<<<gridd, nthr_d, 0, stream>>>((const uint8_t *)next->src[0]->data, H_f16.get(),
                     (char *)next->data, next->nb[1], next->nb[2],
                     (const pxq4_rowmap *)dev_row_mapping.get(), dev_tiles.get(), (int)Rd, (int)Kd);
             CUDA_CHECK(cudaGetLastError());
         } else {
             ggml_cuda_pool_alloc<float> C_down(ctx.pool(), total*Rd);
-            const bool down_wmma = wmma_mode && fmt_d == fmt;
-            pxq6_gemm_fn kern_down = down_wmma ? pxq6_pick_gemm_wmma(fmt_d, wmma_mode == 1) : pxq6_pick_gemm(fmt_d, rag, pipe);
+            const bool down_wmma = wmma_mode && !wmma2 && fmt_d == fmt;
+            pxq6_gemm_fn kern_down = down_wmma ? pxq6_pick_gemm_wmma(fmt_d, wmma_mode != 2) : pxq6_pick_gemm(fmt_d, rag, pipe);
             kern_down<<<gridd, down_wmma ? 256u : 64u, 0, stream>>>((const uint8_t *)next->src[0]->data, H_f16.get(),
                     C_down.get(), nullptr, 0, dev_tiles.get(), (int)Rd, (int)Kd);
             CUDA_CHECK(cudaGetLastError());
@@ -3704,8 +3712,8 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // no down fusion: GLU to f32, scatter to dst
     ggml_cuda_pool_alloc<float> Out(ctx.pool(), total*R);
     if (gufuse) {
-        auto * kg = pxq6_pick_gufuse_f(fmt, rag, pipe);
-        kg<<<grid, 64, 0, stream>>>((const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
+        auto * kg = wmma2 ? pxq6_pick_gufuse_wmma_f(fmt, fmt_g) : pxq6_pick_gufuse_f(fmt, rag, pipe);
+        kg<<<grid, wmma2 ? 256u : 64u, 0, stream>>>((const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
                 A_f16.get(), Out.get(),
                 bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
                 bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,

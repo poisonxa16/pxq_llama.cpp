@@ -43,9 +43,11 @@
 //                           tile.nrows skip the FMA loop (stores were already masked) => exact.
 //   K5 PXA_PXQ6_PIPE=1      prefill: 2-stage register prefetch of the next slab's codes + A
 //                           tile (sm_60 latency tool; identical arithmetic DAG) => bit-exact.
-//   K6 PXA_PXQ6_WMMA=1|2    V100 (cc==700) ONLY: fused dequant→skewed-smem-fp16→m16n16k16
+//   K6 PXA_PXQ6_WMMA=1|2|3  V100 (cc==700) ONLY: fused dequant→skewed-smem-fp16→m16n16k16
 //                           HMMA grouped GEMM. 1 = fp32 accumulator fragments, 2 = fp16-accum
-//                           twin (closest-precision A/B). NOT bit-exact (fp16-mul/fp32-add-tree
+//                           twin (closest-precision A/B), 3 = v2 REBUILD (2-stage register
+//                           double-buffer + fused up+gate/GLU + WMMA scat down; fp32 accum).
+//                           NOT bit-exact (fp16-mul/fp32-add-tree
 //                           vs strict-k half2 chain) — G3 logprob parity + G4 ppl regate are
 //                           MANDATORY before any live use; temp-0 sha is NOT a valid gate here.
 //   PXA_PXQ6=0              master off for PXQ6/PXQ6HQ fused kernels (dequant→cublas fallback).
@@ -168,13 +170,15 @@ static inline bool pxa_pxq6r_enabled() {
     return on;
 }
 
-// K6 WMMA: 0 = off (default), 1 = fp32-accum fragments, 2 = fp16-accum twin. cc==700 only.
+// K6 WMMA: 0 = off (default), 1 = fp32-accum fragments, 2 = fp16-accum twin,
+// 3 = v2 (double-buffered + GUFUSE-fused + WMMA scat down; fp32 accum). cc==700 only.
 static inline int pxa_pxq6_wmma() {
     static const int mode = [](){
         const char * e = getenv("PXA_PXQ6_WMMA");
         int m = e ? atoi(e) : 0;
-        if (m < 0 || m > 2) m = 0;
-        if (m) fprintf(stderr, "PXA_PXQ6_WMMA: mode %d (K6 V100 HMMA prefill — NOT bit-exact, G3+G4 gated)\n", m);
+        if (m < 0 || m > 3) m = 0;
+        if (m) fprintf(stderr, "PXA_PXQ6_WMMA: mode %d (K6 V100 HMMA prefill%s — NOT bit-exact, G3+G4 gated)\n",
+                       m, m == 3 ? " v2: dbuf+gufuse+scat" : "");
         return m;
     }();
     return mode;
@@ -1468,6 +1472,306 @@ k_pxq6_gemm_grouped_wmma(const uint8_t * __restrict__ W, const half * __restrict
 #endif
 }
 
+// ---------------------------------------------------------------------------------------------
+// K6 WMMA-v2 (2026-07-22) — the V100 tensor-core prefill REBUILD (PXA_PXQ6_WMMA=3).
+// v1 measured +0.97% because it is single-buffered (sync-stage-sync-MMA, zero overlap), the
+// driver drops GUFUSE under WMMA (2 GEMM launches + 2x total*R f32 C round-trips + a separate
+// GLU kernel), drops the down GEMM back to the 64-thread half2 scat kernel — and its gate
+// excludes the P2/P3 tiers + mixed up/gate pairs, which on PXQU mixed-tier models (e.g. the
+// 35B: 21 pxq4 / 41 pxq2 / 58 pxq3 expert tensors) leaves MOST expert GEMMs on half2. v2:
+//   (1) 2-stage register->smem DOUBLE-BUFFER over k-slabs: the next slab's full code row +
+//       scale bytes + A uint4 are issued as global loads while the current slab's smem stores
+//       + HMMA work retire (the K5 PIPE pattern applied to the WMMA loop).
+//   (2) FUSED up+gate WMMA kernel with the GLU epilogue writing dst_t directly — GUFUSE
+//       parity: one launch, A staged ONCE for both tensors, each B fragment loaded once and
+//       reused for the U and G MMAs, no f32 C intermediates, no separate GLU kernel.
+//   (3) a WMMA down GEMM with the SCATFUSE scatter epilogue, so the whole expert triple rides
+//       the tensor cores under the default SCATFUSE config.
+//   (4) POLICY-GENERIC dequant staging (P2/P3/P6/P6HQ via the proven POL::pair decode) and a
+//       TWO-POLICY template so mixed-tier up/gate pairs ride WMMA too.
+// fp32 accumulators only (fp16-mul/fp32-add HMMA is full-rate on V100; the quality-safe form).
+// Same determinism contract as v1: NOT bit-exact vs the half2 chain (fp16-mul/fp32-add tree) —
+// G3 logprob/coherence parity + a ppl regate are MANDATORY; temp-0 sha is NOT a valid gate.
+// cc==700 runtime dispatch only; P6R excluded (no model need, keeps the test surface small).
+// ---------------------------------------------------------------------------------------------
+
+// prefetched-scale helpers: the raw sub-scale byte(s) of one row, loaded a slab ahead so the
+// k-loop body touches no cold global memory. Layout per policy: NEFF==2 -> 1 byte at slab[row]
+// (P2/P3/P6 share it); NEFF==4 -> 2 bytes at slab[2*row] (2-aligned, u16 load).
+template <class POL>
+static __device__ __forceinline__ uint16_t pxq6_wmma_ldscale(const uint8_t * __restrict__ slab, int srow) {
+    if constexpr (POL::NEFF == 4) return *(const uint16_t *)(slab + 2*srow);
+    else                          return (uint16_t)slab[srow];
+}
+// eff scale for the 8-elem segment sseg (elems sseg*8..sseg*8+7) — replicates
+// POL::row_effs + v1's eff[(sseg*NEFF)>>2] selection exactly, from the prefetched byte(s).
+template <class POL>
+static __device__ __forceinline__ float pxq6_wmma_eff(uint16_t sc, int sseg, float anch,
+                                                      const float * __restrict__ sub) {
+    if constexpr (POL::NEFF == 4) {
+        const int byte = (sseg < 2) ? (sc & 0xff) : (sc >> 8);
+        return anch * sub[(sseg & 1) ? (byte >> 4) : (byte & 0xf)];
+    } else {
+        const int byte = sc & 0xff;
+        return anch * sub[(sseg < 2) ? (byte & 0xf) : (byte >> 4)];
+    }
+}
+
+// dequant this thread's 8 elems (pairs sseg*4..sseg*4+3) from a prefetched FULL code row via
+// the policy's proven pair() decode — policy-generic (P2/P3/P6/P6HQ). The full-row load is
+// 4x redundant across the 4 threads of a row; the rows are tiny (8-16 B) and L1-resident.
+template <class POL>
+static __device__ __forceinline__ void pxq6_wmma_deq8(const uint32_t * __restrict__ q, int sseg,
+                                                      float e, const float * __restrict__ tab,
+                                                      half * __restrict__ o) {
+    #pragma unroll
+    for (int b2 = 0; b2 < 4; ++b2) {
+        const float2 v = POL::pair(q, sseg*4 + b2, tab);
+        o[2*b2]   = __float2half_rn(e * v.x);
+        o[2*b2+1] = __float2half_rn(e * v.y);
+    }
+}
+
+// v2 fused up+gate grouped WMMA GEMM + GLU epilogue (dst_t = half for the fuse_down H, float
+// for the no-fusion path). Two policies (mixed-tier up/gate pairs are common in PXQU models).
+// Block 256 thr / 8 warps; 64x64 C tile; warp (wm,wn) owns 16x32.
+template <class POLU, class POLG, typename dst_t>
+static __global__ void __launch_bounds__(256)
+k_pxq6_gemm_gufuse_wmma(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg,
+                        const half * __restrict__ A, dst_t * __restrict__ H,
+                        const float * __restrict__ bias_u, const size_t bias_u_nb1,
+                        const float * __restrict__ bias_g, const size_t bias_g_nb1,
+                        const pxq4_tile_info * __restrict__ tiles, const int R, const int K,
+                        const int unary, const float alpha, const float limit) {
+#if __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
+    using namespace nvcuda;
+    const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
+    const int p = blockIdx.x;
+    const pxq4_tile_info tile = tiles[blockIdx.y];
+    const uint8_t * panU = pxq6_panel<POLU>(Wu, tile.e, panels, p, kslabs);
+    const uint8_t * panG = pxq6_panel<POLG>(Wg, tile.e, panels, p, kslabs);
+    const half    * At  = A + (size_t)tile.row0*K;
+    dst_t         * Ht  = H + (size_t)tile.row0*R + (size_t)p*PXQ6_BM;
+
+    __shared__ float tabU[32], subU[16], tabG[32], subG[16];
+    __shared__ half sS[3][64*PXQ6_WMMA_LD];       // [0]=U rows, [1]=G rows, [2]=A tokens
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    POLU::stage_tabs(tabU, subU, tid);
+    POLG::stage_tabs(tabG, subG, tid);
+
+    const int srow = tid >> 2, sseg = tid & 3;    // 4 threads/row, 8 halves each
+    const float anchU = POLU::HDR ? POLU::anchor(panU, srow) : 0.f;
+    const float anchG = POLG::HDR ? POLG::anchor(panG, srow) : 0.f;
+
+    const int wm = warp & 3, wn = warp >> 2;      // 4 x 2 warp grid over the 64x64 C tile
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accU[2], accG[2];
+    wmma::fill_fragment(accU[0], 0.f); wmma::fill_fragment(accU[1], 0.f);
+    wmma::fill_fragment(accG[0], 0.f); wmma::fill_fragment(accG[1], 0.f);
+
+    const bool a_valid = srow < tile.nrows;       // srow doubles as the token index for A
+
+    // 2-stage register prefetch (kb = 0 prologue): full code rows + scale bytes + A vector
+    uint32_t qun[POLU::CODE_WORDS], qgn[POLG::CODE_WORDS];
+    uint16_t scun, scgn;
+    uint4 an = {0,0,0,0};
+    {
+        const uint8_t * slabU = panU + POLU::HDR;
+        const uint8_t * slabG = panG + POLG::HDR;
+        pxq6_ldcodes<POLU>(slabU + POLU::CODE_OFF + srow*POLU::CODE_BYTES, qun);
+        pxq6_ldcodes<POLG>(slabG + POLG::CODE_OFF + srow*POLG::CODE_BYTES, qgn);
+        scun = pxq6_wmma_ldscale<POLU>(slabU, srow);
+        scgn = pxq6_wmma_ldscale<POLG>(slabG, srow);
+        if (a_valid) an = *(const uint4 *)(At + (size_t)srow*K + sseg*8);
+    }
+
+    for (int kb = 0; kb < kslabs; ++kb) {
+        uint32_t qu[POLU::CODE_WORDS], qg[POLG::CODE_WORDS];
+        #pragma unroll
+        for (int i = 0; i < POLU::CODE_WORDS; ++i) qu[i] = qun[i];
+        #pragma unroll
+        for (int i = 0; i < POLG::CODE_WORDS; ++i) qg[i] = qgn[i];
+        const uint16_t scu = scun, scg = scgn;
+        const uint4 av = an;
+        if (kb + 1 < kslabs) {   // issue next-slab loads; latency hides under stores+sync+MMA
+            const uint8_t * slabU = panU + POLU::HDR + (size_t)(kb+1)*POLU::SLAB;
+            const uint8_t * slabG = panG + POLG::HDR + (size_t)(kb+1)*POLG::SLAB;
+            pxq6_ldcodes<POLU>(slabU + POLU::CODE_OFF + srow*POLU::CODE_BYTES, qun);
+            pxq6_ldcodes<POLG>(slabG + POLG::CODE_OFF + srow*POLG::CODE_BYTES, qgn);
+            scun = pxq6_wmma_ldscale<POLU>(slabU, srow);
+            scgn = pxq6_wmma_ldscale<POLG>(slabG, srow);
+            if (a_valid) an = *(const uint4 *)(At + (size_t)srow*K + (kb+1)*PXQ6_QK + sseg*8);
+        }
+        __syncthreads();   // prior MMA done reading smem (also publishes tabs on kb==0)
+        pxq6_wmma_deq8<POLU>(qu, sseg, pxq6_wmma_eff<POLU>(scu, sseg, anchU, subU), tabU,
+                             &sS[0][srow*PXQ6_WMMA_LD + sseg*8]);
+        pxq6_wmma_deq8<POLG>(qg, sseg, pxq6_wmma_eff<POLG>(scg, sseg, anchG, subG), tabG,
+                             &sS[1][srow*PXQ6_WMMA_LD + sseg*8]);
+        {
+            half * o = &sS[2][srow*PXQ6_WMMA_LD + sseg*8];
+            if (a_valid) {
+                *(uint4 *)o = av;
+            } else {
+                const half hz = __float2half_rn(0.f);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) o[i] = hz;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kf = 0; kf < 2; ++kf) {          // two k=16 fragments per 32-K slab
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> afU, afG;
+            wmma::load_matrix_sync(afU, &sS[0][(wm*16)*PXQ6_WMMA_LD + kf*16], PXQ6_WMMA_LD);
+            wmma::load_matrix_sync(afG, &sS[1][(wm*16)*PXQ6_WMMA_LD + kf*16], PXQ6_WMMA_LD);
+            #pragma unroll
+            for (int nf = 0; nf < 2; ++nf) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+                wmma::load_matrix_sync(bf, &sS[2][(wn*32 + nf*16)*PXQ6_WMMA_LD + kf*16], PXQ6_WMMA_LD);
+                wmma::mma_sync(accU[nf], afU, bf, accU[nf]);
+                wmma::mma_sync(accG[nf], afG, bf, accG[nf]);
+            }
+        }
+    }
+
+    // epilogue: per-warp 16x17 f32 scratch (reuses the k-loop smem; 8 warps x 1088 B < 15.3 KB).
+    // Stage U, pull the lane's 8 elems to registers, stage G over the same tile, then
+    // bias + pxq4_glu_apply + ONE dst_t store per element (the exact gufuse epilogue math).
+    __syncthreads();
+    float * mytile = (float *)sS + warp*16*17;
+    #pragma unroll
+    for (int nf = 0; nf < 2; ++nf) {
+        const int col0 = wn*32 + nf*16, row0 = wm*16;
+        wmma::store_matrix_sync(mytile, accU[nf], 17, wmma::mem_col_major);
+        __syncwarp();
+        float ureg[8];
+        #pragma unroll
+        for (int ii = 0; ii < 8; ++ii) {
+            const int i = ii*32 + lane;
+            ureg[ii] = mytile[(i >> 4)*17 + (i & 15)];
+        }
+        __syncwarp();
+        wmma::store_matrix_sync(mytile, accG[nf], 17, wmma::mem_col_major);
+        __syncwarp();
+        #pragma unroll
+        for (int ii = 0; ii < 8; ++ii) {
+            const int i = ii*32 + lane, rr = i & 15, t = i >> 4;
+            if (col0 + t < tile.nrows) {
+                const int row = row0 + rr;
+                const float bu = bias_u ? *(const float *)((const char *)bias_u + (size_t)tile.e*bias_u_nb1 + (size_t)(p*PXQ6_BM + row)*sizeof(float)) : 0.f;
+                const float bg = bias_g ? *(const float *)((const char *)bias_g + (size_t)tile.e*bias_g_nb1 + (size_t)(p*PXQ6_BM + row)*sizeof(float)) : 0.f;
+                Ht[(size_t)(col0 + t)*R + row] = (dst_t)pxq4_glu_apply(mytile[t*17 + rr] + bg, ureg[ii] + bu, unary, alpha, limit);
+            }
+        }
+        __syncwarp();
+    }
+#else
+    (void)Wu; (void)Wg; (void)A; (void)H; (void)bias_u; (void)bias_u_nb1; (void)bias_g; (void)bias_g_nb1;
+    (void)tiles; (void)R; (void)K; (void)unary; (void)alpha; (void)limit;
+#endif
+}
+
+// v2 down GEMM: double-buffered WMMA + the SCATFUSE scatter epilogue (same values/rows as
+// k_pxq6_gemm_down_scat — the scatter is a pure addressing epilogue). Policy-generic.
+template <class POL>
+static __global__ void __launch_bounds__(256)
+k_pxq6_gemm_down_scat_wmma(const uint8_t * __restrict__ W, const half * __restrict__ A,
+                           char * __restrict__ dst, const size_t nb1, const size_t nb2,
+                           const pxq4_rowmap * __restrict__ map,
+                           const pxq4_tile_info * __restrict__ tiles, const int R, const int K) {
+#if __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
+    using namespace nvcuda;
+    const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
+    const int p = blockIdx.x;
+    const pxq4_tile_info tile = tiles[blockIdx.y];
+    const uint8_t * pan = pxq6_panel<POL>(W, tile.e, panels, p, kslabs);
+    const half    * At  = A + (size_t)tile.row0*K;
+
+    __shared__ float tab[32];
+    __shared__ float sub[16];
+    __shared__ half sS[2][64*PXQ6_WMMA_LD];       // [0]=W rows, [1]=A tokens
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    POL::stage_tabs(tab, sub, tid);
+
+    const int srow = tid >> 2, sseg = tid & 3;
+    const float anch = POL::HDR ? POL::anchor(pan, srow) : 0.f;
+
+    const int wm = warp & 3, wn = warp >> 2;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
+    wmma::fill_fragment(acc[0], 0.f); wmma::fill_fragment(acc[1], 0.f);
+
+    const bool a_valid = srow < tile.nrows;
+
+    uint32_t qn[POL::CODE_WORDS]; uint16_t scn;
+    uint4 an = {0,0,0,0};
+    {
+        const uint8_t * slab = pan + POL::HDR;
+        pxq6_ldcodes<POL>(slab + POL::CODE_OFF + srow*POL::CODE_BYTES, qn);
+        scn = pxq6_wmma_ldscale<POL>(slab, srow);
+        if (a_valid) an = *(const uint4 *)(At + (size_t)srow*K + sseg*8);
+    }
+
+    for (int kb = 0; kb < kslabs; ++kb) {
+        uint32_t q[POL::CODE_WORDS];
+        #pragma unroll
+        for (int i = 0; i < POL::CODE_WORDS; ++i) q[i] = qn[i];
+        const uint16_t sc = scn; const uint4 av = an;
+        if (kb + 1 < kslabs) {
+            const uint8_t * slab = pan + POL::HDR + (size_t)(kb+1)*POL::SLAB;
+            pxq6_ldcodes<POL>(slab + POL::CODE_OFF + srow*POL::CODE_BYTES, qn);
+            scn = pxq6_wmma_ldscale<POL>(slab, srow);
+            if (a_valid) an = *(const uint4 *)(At + (size_t)srow*K + (kb+1)*PXQ6_QK + sseg*8);
+        }
+        __syncthreads();
+        pxq6_wmma_deq8<POL>(q, sseg, pxq6_wmma_eff<POL>(sc, sseg, anch, sub), tab,
+                            &sS[0][srow*PXQ6_WMMA_LD + sseg*8]);
+        {
+            half * o = &sS[1][srow*PXQ6_WMMA_LD + sseg*8];
+            if (a_valid) {
+                *(uint4 *)o = av;
+            } else {
+                const half hz = __float2half_rn(0.f);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) o[i] = hz;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kf = 0; kf < 2; ++kf) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af;
+            wmma::load_matrix_sync(af, &sS[0][(wm*16)*PXQ6_WMMA_LD + kf*16], PXQ6_WMMA_LD);
+            #pragma unroll
+            for (int nf = 0; nf < 2; ++nf) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+                wmma::load_matrix_sync(bf, &sS[1][(wn*32 + nf*16)*PXQ6_WMMA_LD + kf*16], PXQ6_WMMA_LD);
+                wmma::mma_sync(acc[nf], af, bf, acc[nf]);
+            }
+        }
+    }
+
+    __syncthreads();
+    float * mytile = (float *)sS + warp*16*17;    // 8 warps x 1088 B < 10.2 KB
+    #pragma unroll
+    for (int nf = 0; nf < 2; ++nf) {
+        const int col0 = wn*32 + nf*16, row0 = wm*16;
+        wmma::store_matrix_sync(mytile, acc[nf], 17, wmma::mem_col_major);
+        __syncwarp();
+        #pragma unroll
+        for (int ii = 0; ii < 8; ++ii) {
+            const int i = ii*32 + lane, rr = i & 15, t = i >> 4;
+            if (col0 + t < tile.nrows) {
+                const pxq4_rowmap m = map[tile.row0 + col0 + t];
+                float * o = (float *)(dst + (size_t)m.i1*nb1 + (size_t)m.i2*nb2);
+                o[p*PXQ6_BM + row0 + rr] = mytile[t*17 + rr];
+            }
+        }
+        __syncwarp();
+    }
+#else
+    (void)W; (void)A; (void)dst; (void)nb1; (void)nb2; (void)map; (void)tiles; (void)R; (void)K;
+#endif
+}
+
 #include "pxq23.cuh"   // PXQ2/PXQ3: tables, gates, pol_p2/pol_p3, dequant wrappers
 
 // ---------------------------------------------------------------------------------------------
@@ -1625,5 +1929,38 @@ static inline pxq6_gemm_fn pxq6_pick_gemm_wmma(int fmt, bool f32acc) {
     switch (fmt) {
         case PXA_PXQ_FMT_P6: return f32acc ? (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6,   true> : (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6,   false>;
         default:             return f32acc ? (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6hq, true> : (pxq6_gemm_fn)k_pxq6_gemm_grouped_wmma<pxq6_pol_p6hq, false>;
+    }
+}
+// K6 v2 pickers: 4 policies (P2/P3/P6/P6HQ) + mixed up/gate pairs; P6R -> nullptr (excluded)
+#define PXQ6_WMMA_GU_PICK(T, PU, fg) \
+    ((fg) == PXA_PXQ_FMT_P6   ? (k_pxq6_gemm_gufuse_wmma<PU, pxq6_pol_p6,   T>) : \
+     (fg) == PXA_PXQ_FMT_P6HQ ? (k_pxq6_gemm_gufuse_wmma<PU, pxq6_pol_p6hq, T>) : \
+     (fg) == PXA_PXQ_FMT_P2   ? (k_pxq6_gemm_gufuse_wmma<PU, pxq6_pol_p2,   T>) : \
+     (fg) == PXA_PXQ_FMT_P3   ? (k_pxq6_gemm_gufuse_wmma<PU, pxq6_pol_p3,   T>) : nullptr)
+static inline pxq6_gufuse_h_fn pxq6_pick_gufuse_wmma_h(int fu, int fg) {
+    switch (fu) {
+        case PXA_PXQ_FMT_P6:   return PXQ6_WMMA_GU_PICK(half, pxq6_pol_p6,   fg);
+        case PXA_PXQ_FMT_P6HQ: return PXQ6_WMMA_GU_PICK(half, pxq6_pol_p6hq, fg);
+        case PXA_PXQ_FMT_P2:   return PXQ6_WMMA_GU_PICK(half, pxq6_pol_p2,   fg);
+        case PXA_PXQ_FMT_P3:   return PXQ6_WMMA_GU_PICK(half, pxq6_pol_p3,   fg);
+        default:               return nullptr;
+    }
+}
+static inline pxq6_gufuse_f_fn pxq6_pick_gufuse_wmma_f(int fu, int fg) {
+    switch (fu) {
+        case PXA_PXQ_FMT_P6:   return PXQ6_WMMA_GU_PICK(float, pxq6_pol_p6,   fg);
+        case PXA_PXQ_FMT_P6HQ: return PXQ6_WMMA_GU_PICK(float, pxq6_pol_p6hq, fg);
+        case PXA_PXQ_FMT_P2:   return PXQ6_WMMA_GU_PICK(float, pxq6_pol_p2,   fg);
+        case PXA_PXQ_FMT_P3:   return PXQ6_WMMA_GU_PICK(float, pxq6_pol_p3,   fg);
+        default:               return nullptr;
+    }
+}
+static inline pxq6_scat_fn pxq6_pick_down_scat_wmma(int fmt) {
+    switch (fmt) {
+        case PXA_PXQ_FMT_P6:   return k_pxq6_gemm_down_scat_wmma<pxq6_pol_p6>;
+        case PXA_PXQ_FMT_P6HQ: return k_pxq6_gemm_down_scat_wmma<pxq6_pol_p6hq>;
+        case PXA_PXQ_FMT_P2:   return k_pxq6_gemm_down_scat_wmma<pxq6_pol_p2>;
+        case PXA_PXQ_FMT_P3:   return k_pxq6_gemm_down_scat_wmma<pxq6_pol_p3>;
+        default:               return nullptr;
     }
 }
