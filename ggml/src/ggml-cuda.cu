@@ -36,6 +36,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/dmmv.cuh"
+#include "ggml-cuda/pxa-smalln.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -3080,6 +3081,20 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // DP4A. With PXA_PASCAL_DMMV=1, a cc<CC_VOLTA device with a dmmv-supported type falls through
     // to the dequantize_mul_mat_vec branch below for ne11==1 GEMVs (loses the mmvq bias/TG fusion
     // for those nodes; A/B decides).
+    // PXA_SPEC_SMALLN (B4 SPEC_VERIFY_ENGINE, 2026-07-22): on pre-Volta cards route the dense
+    // quantized backbone at spec-verify batch sizes (ne11 2..8) to the multi-column dequant-FMA
+    // GEMV instead of emulated-dp4a MMVQ. See pxa-smalln.cuh. Default OFF (PXA_SPEC_SMALLN=1).
+    static const bool pxa_spec_smalln = getenv("PXA_SPEC_SMALLN") && atoi(getenv("PXA_SPEC_SMALLN")) != 0;
+    if (pxa_spec_smalln && cc < CC_VOLTA && ggml_cuda_pxa_smalln_supported(src0->type)
+        && src1->ne[1] >= 2 && src1->ne[1] <= 8
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src1->ne[2]*src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1
+        && src0->ne[0] % 32 == 0 && !bad_padding_clear
+        && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_pxa_smalln, nullptr);
+        return node_n;
+    }
+
     static const bool pxa_pascal_dmmv = getenv("PXA_PASCAL_DMMV") && atoi(getenv("PXA_PASCAL_DMMV")) != 0;
     const bool pxa_dmmv_take = pxa_pascal_dmmv && cc < CC_VOLTA && use_dequantize_mul_mat_vec;
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1 && !pxa_dmmv_take) {
