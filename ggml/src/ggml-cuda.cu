@@ -2960,8 +2960,89 @@ static void mul_mat_1row(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     }
 }
 
+// PXA_ROUTER_FUSE B3 phase-1 (2026-07-22): the MoE router-logits GEMV (`ffn_gate_inp`, kept F32
+// for precision — n_expert x n_embd against a single decode token) misses EVERY fast dispatch
+// path above: dmmv/mmvq/mmq all require a quantized src0, and the F32 batched-cublas branch
+// requires src1->ne[2]*ne[3] > 1 (a real batch dim). A plain F32 x F32, ne11==1 GEMV therefore
+// falls all the way through to the generic `ggml_cuda_op_mul_mat_cublas`, whose fp16-GEMM branch
+// also requires src0 to be F16/BF16/quantized — so an F32 src0 lands on a bare `cublasSgemm`
+// call. Measured (PXA_PROFILE, this session): ~450-480us/call on P100/V100 for what is a
+// ~1M-FLOP GEMV (256 rows x 2048 K) that should cost low single-digit us — the wall is cuBLAS's
+// per-call launch/workspace overhead for a GEMM shape it is not built for (N=1), paid on EVERY
+// decode token, per MoE layer. Fix: a dedicated warp-per-output-row GEMV kernel — sequential
+// per-thread partial sums + one warp-shuffle reduction, same "row dot x" summation shape a naive
+// reference implementation would use, so top-1/top-k expert *selection* is unaffected (logits
+// differ from cuBLAS's blocked/tiled reduction only at float ULP — gated on expert-id-stream
+// equality, not bit-for-bit logits, matching the spec's BX-for-fp32-math-variant call).
+// Restricted to the router's shape family (F32/F32/F32, ne11==1, no batch, small-ish output row
+// count) so it can never intercept a real dense/attention GEMM. Default OFF pending fair-battle.
+static __global__ void k_pxa_router_gemv_f32(
+        const float * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int ne00, const size_t nb01) {
+    const int row = blockIdx.x;
+    const float * wrow = (const float *)((const char *) w + (size_t) row * nb01);
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < ne00; k += WARP_SIZE) {
+        sum += wrow[k] * x[k];
+    }
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, off);
+    }
+    if (threadIdx.x == 0) {
+        y[row] = sum;
+    }
+}
+
+// Returns true if it fully handled the mul_mat (caller should return immediately).
+static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Per-ARCH gate (resolver in pxa-enhance.cuh, INT8_PREFILL-pattern): ENHANCE auto-enables
+    // on cc==700 ONLY (+5.1..7.0% decode measured sm_70; +1.6% KILL sm_60, Pascal stays off).
+    // Env always wins: PXA_ROUTER_FUSE=0 forces OFF at any level, =1 the sm_70 ship gate,
+    // =2 TEST all-arch. REFERENCE/DEFAULT: off unless env-forced.
+    if (!pxa_router_fuse_on(ggml_cuda_info().devices[ctx.device].cc)) {
+        return false;
+    }
+    // belt: never intercept a row-split weight (-sm row) — the raw data-pointer GEMV below
+    // reads src0 as one dense local matrix. Production layouts are -sm layer (non-split).
+    if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1)) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) {
+        return false;
+    }
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    // router shape family: many small output rows (experts), guard against ever matching a real
+    // dense/output-head projection (those have ne01 in the tens-of-thousands / vocab-sized range,
+    // or ne01==1 which mul_mat_1row above already owns).
+    if (src0->ne[1] < 2 || src0->ne[1] > 4096) {
+        return false;
+    }
+    const int ne00 = (int) src0->ne[0];
+    const int ne01 = (int) src0->ne[1];
+    k_pxa_router_gemv_f32<<<ne01, WARP_SIZE, 0, ctx.stream()>>>(
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+        ne00, src0->nb[1]);
+    return true;
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
+
+    if (ggml_cuda_router_gemv_f32(ctx, src0, src1, dst)) {
+        return node_n;
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.

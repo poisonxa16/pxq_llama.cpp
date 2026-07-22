@@ -17,17 +17,20 @@
 //                       winner set + VOLTA_CUBLAS_NE11=64) — behavior unchanged vs ship.
 //   PXA_ENHANCE=1    -> level 2 ENHANCE   : DEFAULT + the per-arch measured G3-class levers
 //                       whose ship gates passed: PXA_PXQ_INT8_PREFILL=1 (sm_61 ONLY — the ship
-//                       gate; +182% prefill measured on the 1080 Ti) and PXA_SPEC_RELAXED=1
-//                       (spec lanes only).
+//                       gate; +182% prefill measured on the 1080 Ti), PXA_ROUTER_FUSE=1 (sm_70
+//                       ONLY — the ship gate; +5.1..7.0% decode measured on the V100, a +1.6%
+//                       KILL on sm_60 so Pascal stays off) and PXA_SPEC_RELAXED=1 (spec lanes
+//                       only).
 //   REFERENCE wins if both are set.
 //
 // Explicit per-lever env vars ALWAYS override the level default — the level only moves the
 // DEFAULT each resolver falls back to when its own env var is unset.
 //
 // Consumers: pxq6.cuh (PXA_PXQ6_GATE family), pxa-deltanet-fuse.cuh (PXA_FUSE_DELTANET),
-// mmq.cu (PXA_VOLTA_CUBLAS_NE11), pxq6i8.cuh (PXA_PXQ_INT8_PREFILL), ggml-cuda.cu (the
-// one-time startup report). common/sampling.cpp (PXA_SPEC_RELAXED, a non-CUDA TU) keeps a
-// tiny in-sync copy of the level logic — keep the two in lockstep.
+// mmq.cu (PXA_VOLTA_CUBLAS_NE11), pxq6i8.cuh (PXA_PXQ_INT8_PREFILL), ggml-cuda.cu
+// (PXA_ROUTER_FUSE router-GEMV dispatch + the one-time startup report). common/sampling.cpp
+// (PXA_SPEC_RELAXED, a non-CUDA TU) keeps a tiny in-sync copy of the level logic — keep the
+// two in lockstep.
 #pragma once
 
 #include <cstdio>
@@ -84,6 +87,33 @@ static inline int pxa_int8_prefill_mode_resolve() {
     int m = e ? atoi(e) : (pxa_config_level() == 2 ? 1 : 0);
     if (m < 0 || m > 2) m = 0;
     return m;
+}
+
+// PXA_ROUTER_FUSE canonical resolver (ggml-cuda.cu router-GEMV dispatch + the startup report).
+// B3: the MoE router-logits F32 GEMV (ffn_gate_inp x one decode token) misses every fast
+// dispatch path and lands on a bare cublasSgemm; a dedicated warp-per-row GEMV kernel takes it
+// instead. ENHANCE defaults mode 1 — the cc==700-only ship gate (same shape as INT8_PREFILL's
+// sm_61 gate: the arch check lives at the dispatch site): +5.1..+7.0% decode measured on the
+// V100 (2026-07-22 fair-battle, reproduced), a +1.6% KILL on sm_60, so Pascal stays off.
+// REFERENCE/DEFAULT -> 0 (OFF, byte-identical dispatch). Explicit env wins at any level
+// (0 forces OFF, 1 = the sm_70 ship gate, 2 = TEST all-arch). G3-class (the fuse reorders FP
+// math vs cuBLAS: ULP logit deltas can flap expert ties — expert-id-stream gated, not sha).
+static inline int pxa_router_fuse_mode_resolve() {
+    static const int mode = [](){
+        const char * e = getenv("PXA_ROUTER_FUSE");
+        int m = e ? atoi(e) : (pxa_config_level() == 2 ? 1 : 0);
+        if (m < 0 || m > 2) m = 0;
+        return m;
+    }();
+    return mode;
+}
+
+// Dispatch-site arch gate for PXA_ROUTER_FUSE: mode 1 = exactly Volta (cc==700, the sm_70
+// ship gate); mode 2 = TEST all-arch. Hot path (runs per mul_mat dispatch) — the mode is
+// static-cached above.
+static inline bool pxa_router_fuse_on(int cc) {
+    const int m = pxa_router_fuse_mode_resolve();
+    return m == 2 || (m == 1 && cc == 700);
 }
 
 // PXA_SPEC_RELAXED level default (the actual consumer is common/sampling.cpp, which mirrors
@@ -187,13 +217,21 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
         const int i8 = pxa_int8_prefill_mode_resolve();
         if (level == 0) {
             fprintf(stderr, " reference [all PXA levers OFF]");
-        } else if (cc >= 700 && cc < 750 && pxa_volta_cublas_ne11() > 0) {
-            fprintf(stderr, " CUBLAS%d ON [+9.4%% pf]", pxa_volta_cublas_ne11());
+        } else if (cc >= 700 && cc < 750) {
+            if (pxa_volta_cublas_ne11() > 0) {
+                fprintf(stderr, " CUBLAS%d ON [+9.4%% pf]", pxa_volta_cublas_ne11());
+            }
+            fprintf(stderr, " ROUTER_FUSE %s", pxa_router_fuse_on(cc) ? "ON [+5-7% dec, sm_70]" : "off");
+            if (i8 == 2) {
+                fprintf(stderr, " INT8_PREFILL ON [TEST all-arch]");
+            }
         } else if (cc == 610 && (i8 == 1 || i8 == 2)) {
             fprintf(stderr, " INT8_PREFILL ON [+182%% pf, G3]%s", pxa_fa_mask_skip_tile() ? " MASK_SKIP_TILE ON" : "");
+            if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [TEST all-arch]");
         } else if (cc == 600) {
             fprintf(stderr, " FP16_GEMM %s [2:1 hgemm] MASK_SKIP_TILE %s [bit-exact]",
                     pxa_p100_fp16_gemm() ? "ON" : "off", pxa_fa_mask_skip_tile() ? "ON" : "off");
+            if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [TEST all-arch]");
         } else if (i8 == 2) {
             fprintf(stderr, " INT8_PREFILL ON [TEST all-arch]");
         } else {
