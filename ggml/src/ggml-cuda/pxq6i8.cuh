@@ -47,6 +47,23 @@
 // Even the <64,false> template restructure of this kernel (lambda-split stage/FMA) measured
 // -2.5% on its own — keep the body below textually as-is. Full diff of the parked variants:
 // the 2026-07-22 sm_61 window report (pxa-1080ti-i8-maturation-2026-07-22.patch).
+//
+// ---- B17/B18 GRUNT WINDOW, 2026-07-22 (track '1080ti', PXQ2 ub768) ---------------------------
+// Stream-K (splitting the K-reduction across extra blocks) was audited before building: at
+// ub768 this MoE's tile count (grid.y = sum over active experts of ceil(tokens_e/64), grid.x =
+// R/64 panels) already spans many multiples of the 1080Ti's 28 SMs x 4 blocks/SM = 112
+// concurrent-block ceiling — the grid is wave-bound, not SM-starved, so adding more blocks via a
+// K-split would only add partial-sum reduction overhead with no occupancy upside. Stream-K
+// DECLINED without a build (kill line: "the -13% gap is layout maturity beyond economic reach").
+// Instead: the fp16 sibling kernel (k_pxq6_gemm_grouped) already ships K4 RAGTAIL (bit-exact
+// ragged-tile FMA skip, PXA_PXQ6_RAGTAIL, default ON) — this int8 tile NEVER got the same
+// treatment (every block always ran the full 8x8 accumulate regardless of tile.nrows). Since
+// MoE routing at ub768 leaves most experts under one 64-token tile (partial fill is the norm,
+// not the exception — matches the I8-BN128 finding above), this is very likely the single
+// biggest untapped win in this file. Ported verbatim (same fma_on pattern, same coarse per-8-
+// token-group granularity, same "skipped FMAs only touch already-zeroed A data" bit-exact
+// argument as the fp16 kernel) as RAG, gated PXA_PXQ_I8_RAGTAIL (default OFF until proven; A/B
+// below). This is additive to N13 and does not touch the parked/killed variants above.
 #pragma once
 
 // requires: pxq6.cuh (policies incl. pxq6_pol_p2/p3 via pxq23.cuh, pxq6_panel, pxq6_ldcodes,
@@ -63,6 +80,21 @@ static inline int pxa_pxq_int8_prefill() {
         return m;
     }();
     return mode;
+}
+
+// K4-for-int8: ragged-tile FMA skip, ported from k_pxq6_gemm_grouped's RAG (bit-exact — the
+// skipped FMAs only ever touch A data that was already forced to zero by the a_valid staging
+// branch, so the accumulated sum is identical either way). Default OFF during the grunt A/B;
+// PXA_PXQ_I8_RAGTAIL=1 to enable, independent of PXA_PXQ6_RAGTAIL (separate kernel family).
+static inline bool pxa_pxq_i8_ragtail() {
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ_I8_RAGTAIL");
+        const bool v = e ? atoi(e) != 0 : false;
+        fprintf(stderr, "PXA_PXQ_I8_RAGTAIL: %s (K4-for-int8 ragged-tile FMA skip, bit-exact)\n",
+                v ? "ON" : "OFF");
+        return v;
+    }();
+    return on;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -140,7 +172,7 @@ static __global__ void k_pxqi8_glu_quant(const float * __restrict__ xg, const fl
 typedef void (*pxqi8_gemm_fn)(const uint8_t *, const uint8_t *, const float *, float *,
                               const float *, const size_t, const pxq4_tile_info *, const int, const int);
 
-template <class POL>
+template <class POL, bool RAG>
 static __global__ void __launch_bounds__(64)
 k_pxqi8_gemm_grouped(const uint8_t * __restrict__ W,
                      const uint8_t * __restrict__ Aq, const float * __restrict__ Ad,
@@ -184,6 +216,7 @@ k_pxqi8_gemm_grouped(const uint8_t * __restrict__ W,
         for (int j = 0; j < 8; ++j) acc[r8][j] = 0.f;
 
     const bool a_valid = tid < tile.nrows;
+    const bool fma_on  = !RAG || (8*ty) < tile.nrows;   // K4-for-int8: skip FMAs whose stores are masked
 
     for (int kb = 0; kb < kslabs; ++kb) {
         const uint8_t * slab = pan + POL::HDR + (size_t)kb*POL::SLAB;
@@ -217,6 +250,7 @@ k_pxqi8_gemm_grouped(const uint8_t * __restrict__ W,
             sDa[tid] = 0.f;
         }
         __syncthreads();
+        if (fma_on) {
         #pragma unroll
         for (int jb = 0; jb < 2; ++jb) {     // two 4-token register panels
             uint32_t aw[4][8]; float da[4];
@@ -251,6 +285,7 @@ k_pxqi8_gemm_grouped(const uint8_t * __restrict__ W,
                 }
             }
         }
+        }
         __syncthreads();
     }
     #pragma unroll
@@ -268,12 +303,14 @@ k_pxqi8_gemm_grouped(const uint8_t * __restrict__ W,
 
 // per-format picker. Unknown formats decline -> the caller falls back to the proven
 // fp16/cublas paths for the WHOLE op. (The retired legacy P4/P5 formats were removed 2026-07-21.)
+// RAG selection reads the PXA_PXQ_I8_RAGTAIL gate once (memoized inside pxa_pxq_i8_ragtail()).
 static pxqi8_gemm_fn pxqi8_pick_gemm(int fmt) {
+    const bool rag = pxa_pxq_i8_ragtail();
     switch (fmt) {
-        case PXA_PXQ_FMT_P6:   return k_pxqi8_gemm_grouped<pxq6_pol_p6>;
-        case PXA_PXQ_FMT_P6HQ: return k_pxqi8_gemm_grouped<pxq6_pol_p6hq>;
-        case PXA_PXQ_FMT_P2:   return k_pxqi8_gemm_grouped<pxq6_pol_p2>;
-        case PXA_PXQ_FMT_P3:   return k_pxqi8_gemm_grouped<pxq6_pol_p3>;
+        case PXA_PXQ_FMT_P6:   return rag ? k_pxqi8_gemm_grouped<pxq6_pol_p6,   true> : k_pxqi8_gemm_grouped<pxq6_pol_p6,   false>;
+        case PXA_PXQ_FMT_P6HQ: return rag ? k_pxqi8_gemm_grouped<pxq6_pol_p6hq, true> : k_pxqi8_gemm_grouped<pxq6_pol_p6hq, false>;
+        case PXA_PXQ_FMT_P2:   return rag ? k_pxqi8_gemm_grouped<pxq6_pol_p2,   true> : k_pxqi8_gemm_grouped<pxq6_pol_p2,   false>;
+        case PXA_PXQ_FMT_P3:   return rag ? k_pxqi8_gemm_grouped<pxq6_pol_p3,   true> : k_pxqi8_gemm_grouped<pxq6_pol_p3,   false>;
         default:               return nullptr;
     }
 }

@@ -3793,6 +3793,17 @@ static int pxa_pxq_moe_prefill_i8(ggml_backend_cuda_context & ctx, ggml_tensor *
         }
     }
     if (tiles.empty() || tiles.size() > 65535) return -1;   // grid.y limit; fallback handles it
+    if (getenv("PXA_PXQI8_DEBUG")) {
+        static long long ncalls = 0;
+        if (ncalls++ < 8) {
+            int full = 0, ragged_rows = 0;
+            for (auto & t : tiles) { if (t.nrows == PXQ4_BN) full++; else ragged_rows += (PXQ4_BN - t.nrows); }
+            fprintf(stderr, "PXA_PXQI8_DEBUG: n_as=%lld total_tok=%lld tiles=%zu panels(R/64)=%lld "
+                    "full_tiles=%d ragged_tiles=%zu wasted_rows=%d (112-block ceiling on 28-SM 1080Ti)\n",
+                    (long long)n_as, (long long)total, tiles.size(), (long long)(R/PXQ4_BM),
+                    full, tiles.size()-full, ragged_rows);
+        }
+    }
     ggml_cuda_pool_alloc<pxq4_tile_info> dev_tiles(ctx.pool(), tiles.size());
     CUDA_CHECK(cudaMemcpyAsync(dev_tiles.get(), tiles.data(), tiles.size()*sizeof(pxq4_tile_info),
                                cudaMemcpyHostToDevice, stream));
