@@ -115,6 +115,7 @@ enum e_model {
     MODEL_100B_A6B,
     MODEL_106B_A12B,
     MODEL_119B_A6B,
+    MODEL_118B_A8B, // Laguna-S 2.1
     MODEL_122B_A10B,
     MODEL_230B_A10B, // Minimax M2
     MODEL_235B_A22B,
