@@ -855,6 +855,7 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES] = {nullptr}; // PXA_CUBLAS_EAGER_WS (freed in dtor)
 
     int   fusion = GGML_CUDA_FUSION;
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;
@@ -897,6 +898,24 @@ struct ggml_backend_cuda_context {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11000
+            // PXA_CUBLAS_EAGER_WS: hand cuBLAS a preallocated workspace at handle creation so it
+            // never lazy-allocates one mid-inference — that lazy alloc is the intermittent
+            // CUBLAS_STATUS_INVALID_VALUE-with-valid-args failure on a near-full card (sm_86
+            // report; spec-verify fallback shapes are the trigger). Sizes = cuBLAS's own
+            // defaults (4 MiB pre-Hopper, 32 MiB Hopper+); a too-small workspace only degrades
+            // algorithm choice, never correctness. Alloc failure falls back to stock lazy mode.
+            const size_t ws_size = ggml_cuda_info().devices[device].cc >= 900
+                ? 32u*1024*1024 : 4u*1024*1024;
+            if (cublas_workspaces[device] == nullptr &&
+                cudaMalloc(&cublas_workspaces[device], ws_size) != cudaSuccess) {
+                cublas_workspaces[device] = nullptr;
+                (void) cudaGetLastError(); // clear the failed alloc so it can't leak into CUDA_CHECK
+            }
+            if (cublas_workspaces[device] != nullptr) {
+                CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device], cublas_workspaces[device], ws_size));
+            }
+#endif
         }
         return cublas_handles[device];
     }

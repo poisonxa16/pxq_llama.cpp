@@ -582,6 +582,15 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     } else{
         info->all_ctx[device] = this;
     }
+    // PXA_CUBLAS_EAGER_INIT (default ON, =0 rollback): create this device's cuBLAS handle (and
+    // its PXA_CUBLAS_EAGER_WS workspace) at backend init, BEFORE weights fill VRAM. Some decode
+    // configs first touch cuBLAS mid-inference via a rare fallback shape; lazy handle+workspace
+    // creation at that point is exactly the near-full-card alloc that fails intermittently.
+    static const bool pxa_cublas_eager_init =
+        !(getenv("PXA_CUBLAS_EAGER_INIT") && atoi(getenv("PXA_CUBLAS_EAGER_INIT")) == 0);
+    if (pxa_cublas_eager_init) {
+        cublas_handle(device);
+    }
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -609,6 +618,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+        }
+        if (cublas_workspaces[i] != nullptr) {
+            CUDA_CHECK(cudaFree(cublas_workspaces[i]));
         }
     }
     auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());
@@ -2922,12 +2934,21 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
 
 }
 
+// PXA_SPEC_1ROW (2026-07-23): one block per src1 token column (Ny<=8). The ne01==1 F32
+// shared-expert gate at MTP spec-verify batch sizes (Ny=2..4) misses EVERY fast dispatch path —
+// dmmv/mmvq/mmq need a quantized src0, batched-cublas needs src1->ne[2]*ne[3] > 1, and the
+// ne11==1-only branches below don't fire — so it fell through to a bare `cublasSgemm`
+// (per-call overhead every decode token, and cuBLAS's lazy workspace alloc can fail
+// mid-inference on a near-full card as CUBLAS_STATUS_INVALID_VALUE; reported on sm_86).
+// Ny==1 launches grid=1 with the identical arithmetic DAG as before (bit-identical).
 template <typename src_t, int block_size = 256>
-static __global__ void mul_mat_row(int n, const src_t * x, const float * y, float * z) {
+static __global__ void mul_mat_row(int n, const src_t * x, const float * y, float * z,
+        const size_t nb11, const size_t nb1) {
+    const float * ycol = (const float *)((const char *) y + (size_t) blockIdx.x * nb11);
     float sum = 0;
     for (int i = threadIdx.x; i < n; i += block_size) {
         float xi = ggml_cuda_cast<float, src_t>(x[i]);
-        sum += xi * y[i];
+        sum += xi * ycol[i];
     }
     sum = warp_reduce_sum(sum);
     if constexpr (block_size > WARP_SIZE) {
@@ -2940,21 +2961,22 @@ static __global__ void mul_mat_row(int n, const src_t * x, const float * y, floa
         sum = warp_reduce_sum(sum);
     }
     if (threadIdx.x == 0) {
-        z[0] = sum;
+        *(float *)((char *) z + (size_t) blockIdx.x * nb1) = sum;
     }
 }
 
 static void mul_mat_1row(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, ggml_backend_cuda_context & ctx) {
     constexpr int kBlockSize = 256;
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    const int ncols = (int) src1->ne[1];
     if (src0->type == GGML_TYPE_F16) {
-        mul_mat_row<<<1, kBlockSize, 0, ctx.stream()>>>((int)src0->ne[0], (const half *)src0->data, (const float *)src1->data, (float *)dst->data);
+        mul_mat_row<<<ncols, kBlockSize, 0, ctx.stream()>>>((int)src0->ne[0], (const half *)src0->data, (const float *)src1->data, (float *)dst->data, src1->nb[1], dst->nb[1]);
     }
     else if (src0->type == GGML_TYPE_BF16) {
-        mul_mat_row<<<1, kBlockSize, 0, ctx.stream()>>>((int)src0->ne[0], (const nv_bfloat16 *)src0->data, (const float *)src1->data, (float *)dst->data);
+        mul_mat_row<<<ncols, kBlockSize, 0, ctx.stream()>>>((int)src0->ne[0], (const nv_bfloat16 *)src0->data, (const float *)src1->data, (float *)dst->data, src1->nb[1], dst->nb[1]);
     }
     else if (src0->type == GGML_TYPE_F32) {
-        mul_mat_row<<<1, kBlockSize, 0, ctx.stream()>>>((int)src0->ne[0], (const float *)src0->data, (const float *)src1->data, (float *)dst->data);
+        mul_mat_row<<<ncols, kBlockSize, 0, ctx.stream()>>>((int)src0->ne[0], (const float *)src0->data, (const float *)src1->data, (float *)dst->data, src1->nb[1], dst->nb[1]);
     }
     else {
         GGML_ABORT("Fatal error");
@@ -3101,7 +3123,18 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
     }
 
-    if (ggml_nrows(src0) == 1 && ggml_nrows(src1) == 1) { // && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+    // PXA_SPEC_1ROW (default ON, =0 rollback to the ne11==1-only dispatch): single-output-row
+    // GEMV, now also at spec-verify batch sizes (Ny<=8, the MMVQ_MAX_BATCH_SIZE convention).
+    // Layout/type belts mirror the router-fuse checks above; shapes that fail them fall through
+    // to the generic paths exactly as before. Note this also retires the old GGML_ABORT for a
+    // 1-row quantized src0 that missed mmvq/mmq — those now fall through to the cuBLAS dequant
+    // path instead of aborting.
+    static const bool pxa_spec_1row = !(getenv("PXA_SPEC_1ROW") && atoi(getenv("PXA_SPEC_1ROW")) == 0);
+    if (ggml_nrows(src0) == 1 && (src1->ne[1] == 1 || (pxa_spec_1row && src1->ne[1] <= 8)) && src1->ne[2]*src1->ne[3] == 1
+        && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float)
+        && !(src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer))) {
         mul_mat_1row(src0, src1, dst, ctx);
         return node_n;
     }

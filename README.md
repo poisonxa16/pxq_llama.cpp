@@ -33,6 +33,17 @@ Best config for **both** sides — upstream at its own documented best (its best
 
 <p align="center"><img src="bench/fair-battle.svg" alt="pxq_llama vs upstream ik_llama.cpp benchmark" width="100%"></p>
 
+## Updates — 2026-07-24
+
+- **New recommended env (both default ON): `PXA_SPEC_1ROW`** extends the single-output-row GEMV
+  to MTP spec-verify batch sizes (`Ny<=8`), which previously fell through to a bare `cublasSgemm`
+  every spec-verify decode step. Measured: **+6.6% decode on a single V100** (110.64 vs 103.82 t/s,
+  ub1024 fa-on, MTP n1); flat/harmless on P100 and on a 2xV100 split (no regression anywhere).
+  `=0` rolls back to the old dispatch. **`PXA_CUBLAS_EAGER_INIT`** creates each device's cuBLAS
+  handle + workspace at backend init instead of lazily mid-inference (perf-neutral, ~12 MiB/device,
+  prevents a lazy-alloc failure on a near-full card). Full fair-battle protocol and per-cell numbers:
+  `docs/LEVERS.md`.
+
 ## Updates — 2026-07-19
 
 - **⭐ Fair battle vs upstream published** (chart above): best config for both sides, per metric.

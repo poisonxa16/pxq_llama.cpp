@@ -264,6 +264,25 @@ baseline** (same sha 384ec84d3aa7c001) — the graft is output-transparent when 
   it auto-enables the sm_70 fuse for free. All cells coherence-gated (clean English temp-0
   continuations; shas flutter on every cell incl. base, per the CUBLAS64 sm_70 protocol note).
 
+### PXA_SPEC_1ROW + PXA_CUBLAS_EAGER_INIT — MEASURED, both default ON (2026-07-23 fair-battle)
+
+**Origin:** an r/unsloth MTP-prefetch report, checked out line-for-line against our dispatch — the
+ne01==1 F32 shared-expert-gate GEMV at MTP spec-verify batch sizes (Ny=2..8) missed every fast
+path (dmmv/mmvq/mmq need a quantized src0, batched-cublas needs `src1->ne[2]*ne[3] > 1`, the old
+`mul_mat_1row` needed `ggml_nrows(src1)==1`, ROUTER_FUSE needs a `ne01` in [2,4096]) and fell
+through to a bare `cublasSgemm` every spec-verify decode step — plus a separately-reported
+intermittent `CUBLAS_STATUS_INVALID_VALUE` from cuBLAS's lazy workspace allocation on a
+near-full card (external sm_86 report; not reproduced on this box's Tesla-only fleet).
+
+| var | default | what it does | measured | gate class |
+|---|---|---|---|---|
+| `PXA_SPEC_1ROW` | **on** | extends the single-output-row GEMV (`mul_mat_1row`) from `ne11==1` only to spec-verify batch sizes `Ny<=8` (one CUDA block per token column instead of one block total); `=0` restores the old ne11==1-only dispatch, the missed shapes fall back to cuBLAS as before | **V100 single-card, ub1024 fa-on, MTP n1: +6.6% decode (110.64 vs 103.82 t/s off)** — 6-round fair-battle, median of rounds 3-6. **Flat/harmless on P100 ub512 (+0.06%, noise) and on a 2xV100 `-sm layer` split (+0.7%, noise; also flat under `-ts` PXQ4-MTP, 102.34 vs 101.66)** — the single-GPU win doesn't transfer once the model is split across cards, but nothing regresses. `Ny==1` launches the identical arithmetic DAG as before (bit-identical). `Ny` 2..8 replaces cuBLAS's tiled reduction with a per-thread fp32 dot product | **G3-class, gated like `PXA_PXQ_INT8_PREFILL` (logit-identity + accept-parity, not a sha gate).** Gate 1 (MTP off, temp-0 sha, 1 V100): 5/5 bit-identical, patched vs baseline. Gate 2 (MTP on, 3 arms, 1 V100): baseline == patched+`SPEC_1ROW=0` exact on all 5 prompts (identical sha + identical draft/accept counts, 0.8036 both); patched-default diverges from both on 2/5 prompts — confirmed via logprobs to be a genuine float-ULP near-tie flip (top-2 candidates within ~0.01-0.02 nats at the first diverging token) between the fp32 dot product and cuBLAS's tiled reduction, not a bug. Both diverged responses stay coherent and land on the same correct final answer, phrasing only. MTP accept-rate held (0.8036 off/baseline vs 0.8482 default-on; the higher total draft count is a longer path, not degraded acceptance) |
+| `PXA_CUBLAS_EAGER_INIT` | **on** | creates each device's cuBLAS handle + a preallocated `cublasSetWorkspace` buffer (cuBLAS's own default size, 4 MiB pre-Hopper / 32 MiB Hopper+) at backend init, before weights fill VRAM, instead of lazily on first use; `=0` restores stock lazy creation. Alloc failure at init falls back to stock lazy behavior silently | **Perf-neutral by design, measured: P100 ub512 +0.05% (noise); V100 ub1024 −1.5% (110.64→112.36 off), within the fair-battle's own ~2.7% round-to-round noise band.** Measured VRAM cost ~12 MiB/device (a bit above the theoretical 4 MiB workspace, still trivial). All 13 server starts across both cards in the fair-battle came up healthy in 11-12s, no OOM introduced at any point (V100 ub1024 had 995 MiB headroom, P100 ub512 had 1577 MiB) — this box's Tesla cards never sat near-full enough to reproduce the lazy-alloc failure the fix targets, so the stability claim is unverified-but-free here, not disproven | bit-exact (handle/workspace plumbing only, no math path touched) |
+
+Full protocol + raw per-round numbers: `bench/spec1row-fairbattle` results are summarized above;
+the same-worktree drift-free A/B build (2 target files only) ran on `build-spec1row` vs
+`build-baseline`, model PXA-Fusion4-35B-PXQU16-MTP.
+
 ## 6. Speculative-decode / MTP / server levers (engine features, model-dependent)
 
 | var | default | what it does |
