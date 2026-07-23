@@ -1,3 +1,9 @@
+> ## STOP — users need exactly two envs
+> **PXA_ENHANCE=1** (the tune) and optionally **PXA_MODE=balance|max** (posture). Every other env below is an
+> internal experiment record — including measured LOSSES kept so nobody rebuilds them blind. Setting lab knobs
+> manually bypasses per-arch gates and typically degrades performance (e.g. RAGTAIL is a measured loss on sm_61).
+> This file is the lab notebook, not a settings menu.
+
 # PXA levers — every shipping `PXA_*` environment variable
 
 The definitive reference for what each knob does, its default, its **measured** effect (with the

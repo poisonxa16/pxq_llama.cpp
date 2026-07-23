@@ -125,6 +125,18 @@ cmake --build build --target llama-server llama-quantize llama-perplexity -j
 
 ## Run
 
+**The only knobs you need:**
+
+| Env | What it does |
+|---|---|
+| PXA_ENHANCE=1 | THE tune. Auto-selects the measured-good levers per card (mixed-card boxes get per-GPU decisions). |
+| PXA_MODE=balance or max | Serving posture: balance = fa-on serving (default), max = max-prefill (not for GLM/MLA models). |
+
+Everything else you may find in docs/LEVERS.md is an **internal lab knob** — most are experiment records, several are
+documented *losses* kept for the paper trail. Setting them manually overrides the per-arch gating and usually makes
+things slower. If a flag is not in the examples below, leave it unset.
+
+
 ```bash
 LD_LIBRARY_PATH=build/bin:build/src:build/ggml/src \
 PXA_PXQ6=1 PXA_PXQ2=1 PXA_PXQ3=1 \
