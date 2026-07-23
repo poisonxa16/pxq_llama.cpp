@@ -67,3 +67,31 @@ slab layout is CUDA-consumer-only), not a regression.
 Not a bug in this fork, but a standing trap: no gguf-py size table (mainline's or this fork's) can
 express the E16-row per-row anchor, so a gguf-py read-modify-write **silently truncates** PXQ
 tensors. Re-run `llama-quantize` from the bf16/f16 source instead. (See README.)
+
+## deepseek2 / MLA (GLM-4.7-Flash class): never run with -fa off
+
+MLA-attention models (gguf arch `deepseek2`) degrade **catastrophically** with context when
+flash-attention is off — community-measured on a P40: 37 t/s at low fill collapsing to
+3.3 t/s by 36k ctx; `-fa on` fixed it outright. The compressed-KV (MLA) path without fa
+re-materializes full attention matrices whose cost grows with fill.
+
+Since 2026-07-23 `llama-server`s posture layer auto-wires  for
+
+## deepseek2 / MLA (GLM-4.7-Flash class): never run with -fa off
+
+MLA-attention models (gguf arch `deepseek2`) degrade **catastrophically** with context when
+flash-attention is off — community-measured on a P40: 37 t/s at low fill collapsing to
+3.3 t/s by 36k ctx; `-fa on` fixed it outright. The compressed-KV (MLA) path without fa
+re-materializes full attention matrices whose cost grows with fill.
+
+Since 2026-07-23 `llama-server`'s posture layer auto-wires `-fa on -mla 3` for
+`deepseek2` ggufs when the CLI leaves them unset — including under `PXA_MODE=max` (which
+is otherwise fa-off ingest; the exception is logged as `PXA posture: mode=max but
+arch=deepseek2 — fa kept ON (MLA requires it)`). If you explicitly pass `-no-fa` on a
+deepseek2 model the server still starts but prints:
+
+```
+WARNING: deepseek2/MLA with -fa off degrades severely with context; use -fa on -mla 3
+```
+
+Heed it. There is no supported fa-off serving posture for MLA models.

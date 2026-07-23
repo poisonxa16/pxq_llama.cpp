@@ -491,6 +491,19 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
 #include <cstring>
 #include <initializer_list>
 
+// read general.architecture from the gguf header (metadata only, no tensor data) — the
+// posture layer runs BEFORE model load but needs the arch for MLA-class exceptions.
+static std::string pxa_gguf_arch(const std::string & fname) {
+    struct gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    struct gguf_context * g = gguf_init_from_file(fname.c_str(), ip);
+    if (!g) return "";
+    std::string arch;
+    const int i = gguf_find_key(g, "general.architecture");
+    if (i >= 0) arch = gguf_get_val_str(g, i);
+    gguf_free(g);
+    return arch;
+}
+
 // 0 = balance, 1 = max, -1 = reference (posture layer stands down)
 static int pxa_posture_mode() {
     const char * r = getenv("PXA_REFERENCE");
@@ -600,12 +613,31 @@ int main(int argc, char ** argv) {
                                  || getenv("LLAMA_ARG_FLASH_ATTN") != nullptr;
         const bool ub_explicit = pxa_argv_has(argc, argv, {"-ub", "--ubatch-size"})
                                  || getenv("LLAMA_ARG_UBATCH") != nullptr;
+        // deepseek2 (GLM-4.7-Flash / DeepSeek class, MLA attention): fa-off degrades
+        // CATASTROPHICALLY with context (community-measured on a P40: 37 -> 3.3 t/s by
+        // 36k ctx; -fa on fixed it). The posture layer must never leave an MLA model on
+        // fa-off implicitly — explicit user flags still win (and draw the warning below).
+        const bool mla_explicit = pxa_argv_has(argc, argv, {"-mla", "--mla-use"});
+        const std::string gguf_arch = pxa_gguf_arch(params.model);
+        const bool is_mla_arch = gguf_arch == "deepseek2";
         if (pmode < 0) {
             fprintf(stderr, "PXA posture: reference (PXA_REFERENCE=1) - fa/ub untouched (fa=%s ub=%d)\n",
                     params.flash_attn ? "on" : "off", params.n_ubatch);
         } else {
             if (!fa_explicit) {
                 params.flash_attn = (pmode == 0);   // BALANCE -> fa on (serving); MAX -> fa off (ingest)
+                if (pmode == 1 && is_mla_arch) {
+                    // ARCH EXCEPTION: max mode is fa-off ingest, but MLA requires fa.
+                    params.flash_attn = true;
+                    fprintf(stderr, "PXA posture: mode=max but arch=deepseek2 — fa kept ON (MLA requires it)\n");
+                }
+                if (is_mla_arch && params.flash_attn) {
+                    fprintf(stderr, "PXA posture: arch=deepseek2 (MLA) — fa auto-wired ON, mla=%d%s\n",
+                            params.mla_attn, mla_explicit ? " (explicit)" : "");
+                }
+            }
+            if (is_mla_arch && !mla_explicit && params.mla_attn != 3) {
+                params.mla_attn = 3;   // deepseek2 default: -mla 3 (user-set wins)
             }
             std::string ub_why = "explicit CLI/env - ub untouched";
             if (!ub_explicit) {
@@ -622,6 +654,9 @@ int main(int argc, char ** argv) {
                     pmode == 1 ? "fa-off ingest, absolute max prefill" : "fa-on serving, decode-first",
                     params.flash_attn ? "on" : "off", fa_explicit ? " (explicit)" : "",
                     params.n_ubatch, ub_why.c_str());
+        }
+        if (is_mla_arch && !params.flash_attn) {
+            fprintf(stderr, "WARNING: deepseek2/MLA with -fa off degrades severely with context; use -fa on -mla 3\n");
         }
     }
 

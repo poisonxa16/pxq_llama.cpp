@@ -99,6 +99,15 @@ zero-env users get the fused kernels on every PXQ / PXQ-UNIVERSAL file.
 > defaults on sm_86/89 — the build is correct on Ampere/Ada, just untuned (no arch-specific
 > fast paths measured there yet).
 
+> **deepseek2 / MLA posture auto-wire (2026-07-23):** on a `deepseek2`-arch gguf
+> (GLM-4.7-Flash / DeepSeek class, MLA attention) `llama-server`'s posture layer defaults
+> `-fa on` and `-mla 3` when the CLI left them unset — **including `PXA_MODE=max`**, which
+> normally runs fa-off (logged: `PXA posture: mode=max but arch=deepseek2 — fa kept ON (MLA
+> requires it)`). Reason: fa-off on MLA degrades catastrophically with context
+> (community-measured P40: 37 → 3.3 t/s by 36k ctx; `-fa on` fixed it). Explicit `-no-fa` /
+> `-mla` always win, but fa-off on deepseek2 prints a loud warning either way. See
+> docs/KNOWN-ISSUES.md.
+
 > **RETIRED 2026-07-21:** type ids **250** (`PXQ4-LEGACY`, the lossless MXFP4-repack slab type;
 > `PXA_PXQ4` gate) and **251** (`PXQ5`, the learned-book + SE8 legacy type; `PXA_PXQ5` /
 > `PXA_PXQ5_FAST` gates) were removed from the fork entirely. Loading an old id-250/251 gguf now
