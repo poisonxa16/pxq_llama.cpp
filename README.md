@@ -5,6 +5,8 @@
 
 > Authored and maintained by **PXA Network** (https://pxanetwork.com) — the creator of pxq_llama and the PXQ/PXA kernel family.
 
+**Community: [Discord — PXA Network](https://discord.gg/BHWmMHHStY)** — support, benchmark wall, dev talk. Release notes post there automatically.
+
 A fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — a **general MoE accelerator for
 Pascal/Volta silicon** (and modern cards), plus **PXQ**, a family of PXA-native low-bit quants. The
 engine work — an sm_60 fp16-GEMM gate fix, a flash-attention regime fix, MoE-path fixes, and correct
@@ -124,6 +126,18 @@ cmake --build build --target llama-server llama-quantize llama-perplexity -j
 
 ## Run
 
+**The only knobs you need:**
+
+| Env | What it does |
+|---|---|
+| PXA_ENHANCE=1 | THE tune. Auto-selects the measured-good levers per card (mixed-card boxes get per-GPU decisions). |
+| PXA_MODE=balance or max | Serving posture: balance = fa-on serving (default), max = max-prefill (not for GLM/MLA models). |
+
+Everything else you may find in docs/LEVERS.md is an **internal lab knob** — most are experiment records, several are
+documented *losses* kept for the paper trail. Setting them manually overrides the per-arch gating and usually makes
+things slower. If a flag is not in the examples below, leave it unset.
+
+
 ```bash
 LD_LIBRARY_PATH=build/bin:build/src:build/ggml/src \
 PXA_PXQ6=1 PXA_PXQ2=1 PXA_PXQ3=1 \
@@ -218,3 +232,9 @@ work of the PXA project, built on ikawrakow's ik_llama.cpp.
 
 > Note: the **model weights** published on HuggingFace are a *separate* work under **Apache-2.0** (Qwen3.6
 > lineage via Ornith-1.0-35B-AEON / SIQ-1-35B) — see the model card. This repo (code) is MIT; the weights are Apache-2.0.
+
+## Community bug-finders 🏅
+
+Real-hardware testing by the community makes this fork honest. Credits:
+
+- **Last-Guitar-5924** (r/LocalLLM) — found the deepseek2/MLA fa-off context-decay cliff on a Tesla P40 (GLM-4.7-Flash decode collapsing 37 → 3.3 t/s by 36k ctx with flash attention off). His decode curve drove the automatic fa+mla posture for MLA models and the load-time warning shipping in the next release.
