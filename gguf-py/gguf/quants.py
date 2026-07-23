@@ -11,18 +11,25 @@ from .lazy import LazyNumpyTensor
 import numpy as np
 
 
+# PXA PXQ E16-row family: +2 B/row anchor meta (128 B fp16 anchors per 64-row panel),
+# interleaved in the tensor blob. GGML_QUANT_SIZES only covers the per-block slab bytes, so
+# gguf-py must add row_meta to round-trip these tensors without truncating the anchors.
+_PXA_ROW_META = {248: 2, 252: 2, 253: 2, 254: 2, 255: 2, 256: 2}  # PXQ1/PXQ4/PXQ4HQ/PXQ2/PXQ3/PXQ6
+
+
 def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
     if shape[-1] % block_size != 0:
         raise ValueError(f"Quantized tensor row size ({shape[-1]}) is not a multiple of {quant_type.name} block size ({block_size})")
-    return (*shape[:-1], shape[-1] // block_size * type_size)
+    return (*shape[:-1], shape[-1] // block_size * type_size + _PXA_ROW_META.get(int(quant_type), 0))
 
 
 def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
-    if shape[-1] % type_size != 0:
+    bpr = shape[-1] - _PXA_ROW_META.get(int(quant_type), 0)  # strip PXQ per-row anchor meta first
+    if bpr % type_size != 0:
         raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) is not a multiple of {quant_type.name} type size ({type_size})")
-    return (*shape[:-1], shape[-1] // type_size * block_size)
+    return (*shape[:-1], bpr // type_size * block_size)
 
 
 # This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time

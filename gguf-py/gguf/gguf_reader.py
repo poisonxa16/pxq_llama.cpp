@@ -327,6 +327,11 @@ class GGUFReader:
             np_dims = tuple(reversed(dims.tolist()))
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
             n_bytes = n_elems * type_size // block_size
+            # PXA PXQ E16-row family: add the per-row anchor meta (2 B/row) that gguf's
+            # (block,type_size) table omits, else the tensor blob is read truncated.
+            _pxa_rm = {248: 2, 252: 2, 253: 2, 254: 2, 255: 2, 256: 2}.get(int(ggml_type), 0)
+            if _pxa_rm and int(dims[0]) != 0:
+                n_bytes += (n_elems // int(dims[0])) * _pxa_rm
             data_offs = int(start_offs + offset_tensor[0])
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:
