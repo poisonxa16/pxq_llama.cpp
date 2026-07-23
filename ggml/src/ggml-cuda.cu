@@ -7031,6 +7031,13 @@ GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, si
     CUDA_CHECK(cudaMemGetInfo(free, total));
 }
 
+GGML_CALL int ggml_backend_cuda_get_device_cc(int device) {
+    if (device < 0 || device >= ggml_cuda_info().device_count) {
+        return -1;
+    }
+    return ggml_cuda_info().devices[device].cc;
+}
+
 GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;

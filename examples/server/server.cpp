@@ -521,6 +521,24 @@ static bool pxa_argv_has(int argc, char ** argv, std::initializer_list<const cha
     return false;
 }
 
+// true only if EVERY visible CUDA device is cc 610 (sm_61: P40/GTX 10-series class). That
+// arch is fp16-starved (1:64 rate vs sm_60/P100's full-rate fp16, sm_70+'s tensor cores) and
+// the MLA flash-attention path leans on fp16 — community P40 measurement: fa-on decode is
+// 75-326% SLOWER there than fa-off, and the gap widens with context. A mixed fleet (any
+// sm_60/70+ device present) keeps the fa-on posture below; only an all-sm_61 fleet flips it.
+static bool pxa_all_devices_sm61() {
+#if defined(GGML_USE_CUDA)
+    const int ndev = ggml_backend_cuda_get_device_count();
+    if (ndev <= 0) return false;
+    for (int i = 0; i < ndev; ++i) {
+        if (ggml_backend_cuda_get_device_cc(i) != 610) return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 // returns the chosen ubatch (>0) or 0 = leave params.n_ubatch untouched; fills *why
 static int pxa_adaptive_ubatch(const gpt_params & params, std::string & why) {
 #if defined(GGML_USE_CUDA)
@@ -620,24 +638,36 @@ int main(int argc, char ** argv) {
         const bool mla_explicit = pxa_argv_has(argc, argv, {"-mla", "--mla-use"});
         const std::string gguf_arch = pxa_gguf_arch(params.model);
         const bool is_mla_arch = gguf_arch == "deepseek2";
+        // cc-aware fa default: an all-sm_61 fleet is fp16-starved for the MLA FA path (see
+        // pxa_all_devices_sm61 above) — it gets fa default OFF instead of the ON default that
+        // holds for every other fleet (sm_60/P100, sm_70+/tensor-core, or mixed).
+        const bool mla_fa_off_arch = is_mla_arch && pxa_all_devices_sm61();
         if (pmode < 0) {
             fprintf(stderr, "PXA posture: reference (PXA_REFERENCE=1) - fa/ub untouched (fa=%s ub=%d)\n",
                     params.flash_attn ? "on" : "off", params.n_ubatch);
         } else {
             if (!fa_explicit) {
                 params.flash_attn = (pmode == 0);   // BALANCE -> fa on (serving); MAX -> fa off (ingest)
-                if (pmode == 1 && is_mla_arch) {
-                    // ARCH EXCEPTION: max mode is fa-off ingest, but MLA requires fa.
+                if (pmode == 1 && is_mla_arch && !mla_fa_off_arch) {
+                    // ARCH EXCEPTION: max mode is fa-off ingest, but MLA requires fa — except on
+                    // an all-sm_61 fleet, where fa-off is the measured-correct posture (below).
                     params.flash_attn = true;
                     fprintf(stderr, "PXA posture: mode=max but arch=deepseek2 — fa kept ON (MLA requires it)\n");
                 }
-                if (is_mla_arch && params.flash_attn) {
-                    fprintf(stderr, "PXA posture: arch=deepseek2 (MLA) — fa auto-wired ON, mla=%d%s\n",
-                            params.mla_attn, mla_explicit ? " (explicit)" : "");
+                if (is_mla_arch) {
+                    if (mla_fa_off_arch) {
+                        params.flash_attn = false;
+                        fprintf(stderr, "PXA posture: arch=deepseek2 on sm_61 — fa default OFF (fp16-starved FA "
+                                        "path; measured 75-326%% slower decode with fa on), mla=%d%s\n",
+                                params.mla_attn, mla_explicit ? " (explicit)" : "");
+                    } else if (params.flash_attn) {
+                        fprintf(stderr, "PXA posture: arch=deepseek2 (MLA) — fa auto-wired ON, mla=%d%s\n",
+                                params.mla_attn, mla_explicit ? " (explicit)" : "");
+                    }
                 }
             }
             if (is_mla_arch && !mla_explicit && params.mla_attn != 3) {
-                params.mla_attn = 3;   // deepseek2 default: -mla 3 (user-set wins)
+                params.mla_attn = 3;   // deepseek2 default: -mla 3 (user-set wins), unchanged by device cc
             }
             std::string ub_why = "explicit CLI/env - ub untouched";
             if (!ub_explicit) {
@@ -655,7 +685,10 @@ int main(int argc, char ** argv) {
                     params.flash_attn ? "on" : "off", fa_explicit ? " (explicit)" : "",
                     params.n_ubatch, ub_why.c_str());
         }
-        if (is_mla_arch && !params.flash_attn) {
+        // the fa-off warning is suppressed on an all-sm_61 fleet — fa-off is the RECOMMENDED
+        // config there (see mla_fa_off_arch); it still fires for sm_60/70+ where fa-off is a
+        // real regression, whether the user set it explicitly or it's a mixed-fleet default.
+        if (is_mla_arch && !params.flash_attn && !mla_fa_off_arch) {
             fprintf(stderr, "WARNING: deepseek2/MLA with -fa off degrades severely with context; use -fa on -mla 3\n");
         }
     }

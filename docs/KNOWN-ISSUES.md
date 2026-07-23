@@ -68,30 +68,41 @@ Not a bug in this fork, but a standing trap: no gguf-py size table (mainline's o
 express the E16-row per-row anchor, so a gguf-py read-modify-write **silently truncates** PXQ
 tensors. Re-run `llama-quantize` from the bf16/f16 source instead. (See README.)
 
-## deepseek2 / MLA (GLM-4.7-Flash class): never run with -fa off
+## deepseek2 / MLA (GLM-4.7-Flash class): -fa posture is cc-aware, not one-size-fits-all
 
-MLA-attention models (gguf arch `deepseek2`) degrade **catastrophically** with context when
-flash-attention is off — community-measured on a P40: 37 t/s at low fill collapsing to
-3.3 t/s by 36k ctx; `-fa on` fixed it outright. The compressed-KV (MLA) path without fa
-re-materializes full attention matrices whose cost grows with fill.
+MLA-attention models (gguf arch `deepseek2`) degrade **catastrophically** with context on
+most silicon when flash-attention is off — community-measured on a P40: 37 t/s at low fill
+collapsing to 3.3 t/s by 36k ctx; `-fa on` fixed it outright. The compressed-KV (MLA) path
+without fa re-materializes full attention matrices whose cost grows with fill.
 
-Since 2026-07-23 `llama-server`s posture layer auto-wires  for
+**But that P40 is sm_61 (GTX 10-series class) — a second community P40 measurement found
+the MLA fa-on path itself is 75-326% SLOWER decode on sm_61 than fa-off, and the gap widens
+with context.** sm_61 is fp16-starved (1:64 rate) and the MLA flash-attention kernel leans
+on fp16, so the "fa on always" advice from the first measurement does not hold there. Root
+cause reconciled: fa-off is bad on deepseek2 in general (re-materialized attention), but on
+sm_61 specifically the fa-on kernel is even worse (fp16-starved), so fa-off ends up the net
+win on that arch alone.
 
-## deepseek2 / MLA (GLM-4.7-Flash class): never run with -fa off
+Since 2026-07-23 `llama-server`'s posture layer is **per-device-arch aware**:
 
-MLA-attention models (gguf arch `deepseek2`) degrade **catastrophically** with context when
-flash-attention is off — community-measured on a P40: 37 t/s at low fill collapsing to
-3.3 t/s by 36k ctx; `-fa on` fixed it outright. The compressed-KV (MLA) path without fa
-re-materializes full attention matrices whose cost grows with fill.
-
-Since 2026-07-23 `llama-server`'s posture layer auto-wires `-fa on -mla 3` for
-`deepseek2` ggufs when the CLI leaves them unset — including under `PXA_MODE=max` (which
-is otherwise fa-off ingest; the exception is logged as `PXA posture: mode=max but
-arch=deepseek2 — fa kept ON (MLA requires it)`). If you explicitly pass `-no-fa` on a
-deepseek2 model the server still starts but prints:
+- **`-mla 3` always defaults** on a `deepseek2` gguf, on every arch, when the CLI leaves it
+  unset (unaffected by device cc — this part of the story hasn't changed).
+- **`-fa` default depends on the visible CUDA fleet's compute capability:**
+  - **Every visible device is cc 610 (sm_61 / P40, GTX 10-series)** → `-fa` defaults **OFF**
+    (the measured-correct posture there), and the `PXA_MODE=max` fa-off-ingest exception does
+    **not** force it back on. Logged: `PXA posture: arch=deepseek2 on sm_61 — fa default OFF
+    (fp16-starved FA path; measured 75-326% slower decode with fa on), mla=3`.
+  - **Any sm_60 (P100, full-rate fp16) or sm_70+ (Volta+, tensor cores) device present** (incl.
+    a mixed fleet with an sm_61 card in it) → `-fa` defaults **ON** as before — including under
+    `PXA_MODE=max` (logged: `PXA posture: mode=max but arch=deepseek2 — fa kept ON (MLA
+    requires it)`).
+- **Explicit `-fa on` / `-no-fa` / `-mla` always win**, in both directions, on every arch.
+- **The fa-off warning is suppressed on an all-sm_61 fleet** (fa-off is the recommended config
+  there) but still fires everywhere else:
 
 ```
 WARNING: deepseek2/MLA with -fa off degrades severely with context; use -fa on -mla 3
 ```
 
-Heed it. There is no supported fa-off serving posture for MLA models.
+Heed it on sm_60/sm_70+. On an all-sm_61 fleet, fa-off is not a warning-worthy state — it's
+the default for a reason.

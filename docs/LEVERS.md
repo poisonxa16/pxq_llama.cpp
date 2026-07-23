@@ -99,14 +99,19 @@ zero-env users get the fused kernels on every PXQ / PXQ-UNIVERSAL file.
 > defaults on sm_86/89 — the build is correct on Ampere/Ada, just untuned (no arch-specific
 > fast paths measured there yet).
 
-> **deepseek2 / MLA posture auto-wire (2026-07-23):** on a `deepseek2`-arch gguf
-> (GLM-4.7-Flash / DeepSeek class, MLA attention) `llama-server`'s posture layer defaults
-> `-fa on` and `-mla 3` when the CLI left them unset — **including `PXA_MODE=max`**, which
-> normally runs fa-off (logged: `PXA posture: mode=max but arch=deepseek2 — fa kept ON (MLA
-> requires it)`). Reason: fa-off on MLA degrades catastrophically with context
-> (community-measured P40: 37 → 3.3 t/s by 36k ctx; `-fa on` fixed it). Explicit `-no-fa` /
-> `-mla` always win, but fa-off on deepseek2 prints a loud warning either way. See
-> docs/KNOWN-ISSUES.md.
+> **deepseek2 / MLA posture auto-wire, cc-aware (2026-07-23, refined):** on a
+> `deepseek2`-arch gguf (GLM-4.7-Flash / DeepSeek class, MLA attention) `llama-server`'s
+> posture layer defaults `-mla 3` on every arch, and defaults `-fa` **per visible CUDA
+> fleet compute capability**: **ON** everywhere EXCEPT when every visible device is cc 610
+> (sm_61 / P40, GTX 10-series), where it defaults **OFF**. Reason: fa-off on MLA degrades
+> catastrophically with context on most archs (community-measured P40: 37 → 3.3 t/s by
+> 36k ctx), BUT a second community P40 measurement found the MLA fa-on kernel itself is
+> 75-326% SLOWER decode on sm_61 (fp16-starved, 1:64 rate) than fa-off there — so sm_61
+> flips the default. `-fa on` still defaults ON under `PXA_MODE=max` for deepseek2 on
+> sm_60/70+ (logged: `PXA posture: mode=max but arch=deepseek2 — fa kept ON (MLA requires
+> it)`); on an all-sm_61 fleet that max-mode exception does NOT fire. Explicit `-fa`/`-mla`
+> always win on every arch; the fa-off warning is suppressed on an all-sm_61 fleet only.
+> See docs/KNOWN-ISSUES.md.
 
 > **RETIRED 2026-07-21:** type ids **250** (`PXQ4-LEGACY`, the lossless MXFP4-repack slab type;
 > `PXA_PXQ4` gate) and **251** (`PXQ5`, the learned-book + SE8 legacy type; `PXA_PXQ5` /
