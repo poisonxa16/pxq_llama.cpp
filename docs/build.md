@@ -360,6 +360,14 @@ Check [Optimizing and Running LLaMA2 on Intel® CPU](https://www.intel.com/conte
 
 This provides GPU acceleration using the CUDA cores of your Nvidia GPU. Make sure to have the CUDA toolkit installed. You can download it from your Linux distro's package manager (e.g. `apt install nvidia-cuda-toolkit`) or from here: [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads).
 
+The canonical build command for this fork (see the repo README) pins
+`-DCMAKE_CUDA_ARCHITECTURES="60;61;70;86;89"` — Pascal (P100 / 1080 Ti), Volta (V100),
+Ampere (3090-class, sm_86) and Ada (4090-class, sm_89). The sm_86/89 entries are
+binary-wide: every kernel and every quant compiles for them — full 30xx/40xx support, not a
+subset. The per-arch tuned lever gates (`PXA_ROUTER_FUSE` cc==7.0, `PXA_PXQ_INT8_PREFILL`
+cc==6.1, `PXA_PXQ6_WMMA` cc==7.0) simply fall through to the safe generic paths on sm_86/89
+— correct on Ampere/Ada, just not yet arch-tuned.
+
 For Jetson user, if you have Jetson Orin, you can try this: [Offical Support](https://www.jetson-ai-lab.com/tutorial_text-generation.html). If you are using an old model(nano/TX2), need some additional operations before compiling.
 
 - Using `make`:

@@ -91,6 +91,13 @@ exactness**, not single-run sha equality.
 All master gates are ON out of the box (they were mis-documented as "off" before 2026-07-21) —
 zero-env users get the fused kernels on every PXQ / PXQ-UNIVERSAL file.
 
+> **sm_86 / sm_89 (3090 / 4090 class, added 2026-07-23):** the canonical arch list is now
+> `60;61;70;86;89` — binary-wide (every kernel, every quant: full 30xx/40xx support, not a
+> PXQ-tier subset). The per-arch cc-gated levers (`PXA_ROUTER_FUSE` cc==7.0-only,
+> `PXA_PXQ_INT8_PREFILL` cc==6.1-only, `PXA_PXQ6_WMMA` cc==7.0-only) fall through to their safe
+> defaults on sm_86/89 — the build is correct on Ampere/Ada, just untuned (no arch-specific
+> fast paths measured there yet).
+
 > **RETIRED 2026-07-21:** type ids **250** (`PXQ4-LEGACY`, the lossless MXFP4-repack slab type;
 > `PXA_PXQ4` gate) and **251** (`PXQ5`, the learned-book + SE8 legacy type; `PXA_PXQ5` /
 > `PXA_PXQ5_FAST` gates) were removed from the fork entirely. Loading an old id-250/251 gguf now

@@ -110,8 +110,9 @@ reproducible chart, and the big-model wins are measured but not yet charted here
 
 ## Build (CUDA)
 
-Requires the NVIDIA container toolkit (or a local CUDA 12.x toolchain). Arches sm_60;61;70 cover
-P100 / 1080Ti / V100; add your own (e.g. 86, 89) for newer cards.
+Requires the NVIDIA container toolkit (or a local CUDA 12.x toolchain). The canonical arch list
+sm_60;61;70;86;89 covers P100 / 1080 Ti / V100 / 3090-class (sm_86) / 4090-class (sm_89); trim it
+to just your card for a faster build.
 
 ```bash
 git clone https://github.com/poisonxa16/pxq_llama && cd pxq_llama
