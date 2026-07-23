@@ -217,3 +217,9 @@ work of the PXA project, built on ikawrakow's ik_llama.cpp.
 
 > Note: the **model weights** published on HuggingFace are a *separate* work under **Apache-2.0** (Qwen3.6
 > lineage via Ornith-1.0-35B-AEON / SIQ-1-35B) — see the model card. This repo (code) is MIT; the weights are Apache-2.0.
+
+## Community bug-finders 🏅
+
+Real-hardware testing by the community makes this fork honest. Credits:
+
+- **Last-Guitar-5924** (r/LocalLLM) — found the deepseek2/MLA fa-off context-decay cliff on a Tesla P40 (GLM-4.7-Flash decode collapsing 37 → 3.3 t/s by 36k ctx with flash attention off). His decode curve drove the automatic fa+mla posture for MLA models and the load-time warning shipping in the next release.
