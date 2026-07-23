@@ -280,6 +280,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.moe_statics.e_score_correction",    # ernie4.5-moe
             "model.layers.{bid}.mlp.gate.expert_bias",                  # bailingmoe2
             "model.layers.{bid}.block_sparse_moe.e_score_correction",   # minimax-m2
+            "model.layers.{bid}.mlp.experts.e_score_correction",        # laguna
         ),
 
         # Feed-forward up
@@ -415,6 +416,10 @@ class TensorNameMap:
             "encoder.layer.{bid}.attention.self.layer_norm_k",                # jina-bert-v2
             "transformer.layers.{bid}.attn.k_norm",                           # openelm
             "model.layers.{bid}.attention.key_layernorm",                     # bailingmoe2
+        ),
+
+        MODEL_TENSOR.ATTN_GATE: (
+            "model.layers.{bid}.self_attn.g_proj",                            # laguna (per-head/per-element output gate)
         ),
 
         MODEL_TENSOR.ROPE_FREQS: (

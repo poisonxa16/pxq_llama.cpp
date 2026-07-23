@@ -1424,6 +1424,60 @@ void llm_load_hparams(
                     hparams.rope_freq_base_per_layer, hparams.n_layer, false);
                 GGML_ASSERT(hparams.has_rope_freq_base_per_layer || have_rfb_train_swa);
             } break;
+        case LLM_ARCH_LAGUNA:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // MoE (n_expert / n_expert_used are read by the common loader above)
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                hparams.n_expert_shared = 1;
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                if (hparams.n_ff_shexp == 0) {
+                    hparams.n_ff_shexp = hparams.n_ff_exp * hparams.n_expert_shared;
+                }
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,      hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,       hparams.expert_weights_norm,  false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,        hparams.expert_gating_func,   false);
+                if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                }
+
+                // Sliding-window attention is OPTIONAL. S-2.1/XS.2 are hybrid
+                // full/SWA period 4 (FULL at il%4==0, dense-first); M.1 has no
+                // sliding window (all full). window (n_swa) read from the GGUF.
+                hparams.n_swa = 0;
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                if (hparams.n_swa > 0) {
+                    hparams.n_swa_pattern = 4;
+                    // The unsloth GGUF stores no per-layer SWA pattern array; derive
+                    // the period-4 dense-first schedule directly (matches mainline
+                    // set_swa_pattern(4, dense_first=true)): FULL at il%4==0.
+                    for (int i = 0; i < (int) hparams.n_layer; ++i) {
+                        hparams.swa_layers[i] = (i % 4 != 0);
+                    }
+                    // Dual RoPE: full-attn layers = YaRN (theta from ROPE_FREQ_BASE);
+                    // SWA layers = plain RoPE (theta from ROPE_FREQ_BASE_SWA, no YaRN
+                    // scaling). The YaRN ext/attn/beta params are zeroed per-SWA-layer
+                    // inside build_std_attention.
+                    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = 1.0f;  // SWA never inherits the YaRN 1/factor
+                    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+                }
+                // Partial rotary dims (n_rot=64 full / n_rot_swa=128 SWA) are already
+                // read by the common loader from ROPE_DIMENSION_COUNT[_SWA]. Zero any
+                // per-layer rope-dim override so rope_n_rot(il) falls through to
+                // n_rot / n_rot_swa (STEP35's swa?n_rot:n_rot/2 wrongly assumes
+                // n_rot==head_dim, which is false for Laguna's partial rotary).
+                std::fill(hparams.rope_dim_per_layer.begin(), hparams.rope_dim_per_layer.end(), 0);
+                hparams.has_rope_freq_base_per_layer = false;
+
+                switch (hparams.n_layer) {
+                    case 48: model.type = e_model::MODEL_118B_A8B; break;   // Laguna-S 2.1
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_GLM_DSA:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);

@@ -1631,6 +1631,35 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_LAGUNA,
+        {
+            {   LLM_TENSOR_TOKEN_EMBD,        "token_embd" },
+            {   LLM_TENSOR_OUTPUT_NORM,       "output_norm" },
+            {   LLM_TENSOR_OUTPUT,            "output" },
+            {   LLM_TENSOR_ATTN_NORM,         "blk.%d.attn_norm" },
+            {   LLM_TENSOR_ATTN_Q,            "blk.%d.attn_q" },
+            {   LLM_TENSOR_ATTN_Q_NORM,       "blk.%d.attn_q_norm" },
+            {   LLM_TENSOR_ATTN_K,            "blk.%d.attn_k" },
+            {   LLM_TENSOR_ATTN_K_NORM,       "blk.%d.attn_k_norm" },
+            {   LLM_TENSOR_ATTN_V,            "blk.%d.attn_v" },
+            {   LLM_TENSOR_ATTN_GATE,         "blk.%d.attn_gate" },
+            {   LLM_TENSOR_ATTN_OUT,          "blk.%d.attn_output" },
+            {   LLM_TENSOR_FFN_NORM,          "blk.%d.ffn_norm" },
+            {   LLM_TENSOR_FFN_GATE,          "blk.%d.ffn_gate" },
+            {   LLM_TENSOR_FFN_DOWN,          "blk.%d.ffn_down" },
+            {   LLM_TENSOR_FFN_UP,            "blk.%d.ffn_up" },
+            {   LLM_TENSOR_FFN_GATE_INP,      "blk.%d.ffn_gate_inp" },
+            {   LLM_TENSOR_FFN_GATE_EXPS,     "blk.%d.ffn_gate_exps" },
+            {   LLM_TENSOR_FFN_DOWN_EXPS,     "blk.%d.ffn_down_exps" },
+            {   LLM_TENSOR_FFN_UP_EXPS,       "blk.%d.ffn_up_exps" },
+            {   LLM_TENSOR_FFN_GATE_UP_EXPS,  "blk.%d.ffn_gate_up_exps" },
+            {   LLM_TENSOR_FFN_GATE_SHEXP,    "blk.%d.ffn_gate_shexp" },
+            {   LLM_TENSOR_FFN_DOWN_SHEXP,    "blk.%d.ffn_down_shexp" },
+            {   LLM_TENSOR_FFN_UP_SHEXP,      "blk.%d.ffn_up_shexp" },
+            {   LLM_TENSOR_FFN_EXP_PROBS_B,   "blk.%d.exp_probs_b" },
+        },
+    },
+    {
         LLM_ARCH_GLM_DSA,
         {
             { LLM_TENSOR_TOKEN_EMBD,             "token_embd" },
@@ -1929,6 +1958,7 @@ const char * llama_model_type_name(e_model type) {
         case MODEL_100B_A6B:      return "100B.A6B";
         case MODEL_106B_A12B:     return "106B.A12B";
         case MODEL_119B_A6B:      return "119B.A6B";
+        case MODEL_118B_A8B:      return "118B.A8B";
         case MODEL_122B_A10B:     return "122B.A10B";
         case MODEL_230B_A10B:     return "230B.A10B";
         case MODEL_235B_A22B:     return "235B.A22B";
