@@ -297,6 +297,15 @@ static void coalesce_ranges(std::vector<llama_file_range> & ranges) {
     ranges = std::move(merged);
 }
 
+// process-global PXQ1-content flag: set once any gguf loaded by this process contains a
+// PXQ1 (type id 248) tensor. Consumed by common/sampling.cpp's PXQ1 repetition guard —
+// the 1-bit tier measurably loops on open-ended prompts, so ENHANCE arms defenses.
+static bool g_llama_pxa_pxq1_content = false;
+
+bool llama_pxa_pxq1_content(void) {
+    return g_llama_pxa_pxq1_content;
+}
+
 llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors,
         bool repack_tensors, bool use_thp, bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
         const llama_model_kv_override * param_overrides_p,
@@ -446,6 +455,11 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             enum ggml_type type = tensor->type;
 
             n_type[type]++;
+
+            if (type == GGML_TYPE_PXQ1 && !g_llama_pxa_pxq1_content) {
+                g_llama_pxa_pxq1_content = true;
+                LLAMA_LOG_INFO("%s: PXQ1 (1-bit tier) content detected — repetition guard eligible (arms at ENHANCE; PXA_PXQ1_REP_GUARD overrides)\n", __func__);
+            }
 
             if (n_type_max < n_type[type]) {
                 n_type_max = n_type[type];

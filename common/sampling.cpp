@@ -16,7 +16,50 @@ using json = nlohmann::ordered_json;
 struct llama_sampler_adaptive_p * llama_clone_adaptive_p(const struct llama_sampler_adaptive_p * adapt_p_ctx);
 void llama_free_adaptive_p(struct llama_sampler_adaptive_p * adapt_p_ctx);
 
-struct common_sampler * common_sampler_init(const struct llama_model * model, const struct common_params_sampling & params) {
+// PXQ1 repetition guard (2026-07-23): the 1-bit tier (type id 248) measurably loops on
+// open-ended prompts (coding answers stay clean — measured on a 122B PXQU24 mixed file).
+// When the loaded model contains PXQ1 tensors, fill repetition-defense DEFAULTS for any
+// knob the user left at its default — explicit user settings ALWAYS win (only untouched
+// values are moved). Level logic mirrors PXA_SPEC_RELAXED below / pxa_config_level() in
+// ggml/src/ggml-cuda/pxa-enhance.cuh (non-CUDA TU, so the logic is mirrored): the guard is
+// an ENHANCE-class lever; REFERENCE/DEFAULT leave sampling untouched.
+//   PXA_PXQ1_REP_GUARD=0  force off at any level
+//   PXA_PXQ1_REP_GUARD=1  force on at any level
+static void pxa_pxq1_apply_rep_guard(common_params_sampling & sp) {
+    static const int mode = [] {   // -1 = forced off, 0 = level default, 1 = forced on
+        const char * e = std::getenv("PXA_PXQ1_REP_GUARD");
+        return e ? (atoi(e) != 0 ? 1 : -1) : 0;
+    }();
+    if (mode == -1 || !llama_pxa_pxq1_content()) {
+        return;
+    }
+    if (mode == 0) {
+        const char * r = std::getenv("PXA_REFERENCE");
+        if (r && atoi(r) != 0) {
+            return;   // REFERENCE wins if both are set
+        }
+        const char * l = std::getenv("PXA_ENHANCE");
+        if (!(l && atoi(l) != 0)) {
+            return;   // arms at ENHANCE only
+        }
+    }
+    bool applied = false;
+    if (sp.penalty_repeat == 1.00f) { sp.penalty_repeat = 1.15f; applied = true; }
+    if (sp.penalty_last_n == 64)    { sp.penalty_last_n  = 256;  applied = true; }
+    if (sp.dry_multiplier == 0.0f)  { sp.dry_multiplier  = 0.8f; applied = true; }   // DRY: base/allowed-length keep their defaults
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "PXQ1 content detected: repetition guard ON [%s]%s (repeat_penalty=%.2f repeat_last_n=%d dry_multiplier=%.2f; PXA_PXQ1_REP_GUARD=0 disables)\n",
+                mode == 1 ? "FORCED" : "ENHANCE", applied ? "" : " — all knobs user-set, nothing filled",
+                sp.penalty_repeat, sp.penalty_last_n, sp.dry_multiplier);
+    }
+}
+
+struct common_sampler * common_sampler_init(const struct llama_model * model, const struct common_params_sampling & params_in) {
+    common_params_sampling params = params_in;   // mutable copy — the PXQ1 guard may fill defaults
+    pxa_pxq1_apply_rep_guard(params);
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     struct common_sampler * result = new common_sampler();
