@@ -76,7 +76,7 @@ struct quantize_state_internal {
     // used to figure out if a model shares tok_embd with the output weight
     bool has_output       = false;
 
-    // true for the PXQ ftypes (PXQ2/PXQ3/PXQ4/PXQ4HQ/PXQ6/PXQ_UNIVERSAL): the output head
+    // true for the PXQ ftypes (PXQ1/PXQ2/PXQ3/PXQ4/PXQ4HQ/PXQ6/PXQ_UNIVERSAL): the output head
     // (output.weight, NOT token_embd) defaults to q8_0 — see pxa_pxq_head_type()
     bool is_pxq           = false;
 
@@ -1036,6 +1036,7 @@ static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_t
 #include "pxq2-quantize.inc.cpp"   // PXQ2 native quantizer (LM4 x E16-row; Q-G1/Q-G2 2026-07-17)
 #include "pxq3-quantize.inc.cpp"   // PXQ3 native quantizer (LM8 bit-plane x E16-row)
 #include "pxq6r-quantize.inc.cpp"  // PXQ6 native quantizer (LM32 5-bit x E16-row; spec PXQ6-REAL v1.0-FINAL 2026-07-21)
+#include "pxq1-quantize.inc.cpp"   // PXQ1 native quantizer (1-bit sign x E16-row; the PXQ-UNIVERSAL sub-2-bit tier)
 
 // PXQ slab-tier eligibility (shared by every PXQ tier): expert tensors (_exps.weight),
 // rows % 64 == 0 (panel height), K % 32 == 0 (slab width).
@@ -1117,6 +1118,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_PXQ6:    default_type = GGML_TYPE_MXFP4;   break; // PXQ6 = native expert quantize (LM32 5-bit x E16-row)
         case LLAMA_FTYPE_MOSTLY_PXQ2:          default_type = GGML_TYPE_MXFP4;   break; // PXQ2 = native expert quantize, MXFP4 rules for the rest
         case LLAMA_FTYPE_MOSTLY_PXQ3:          default_type = GGML_TYPE_MXFP4;   break; // PXQ3 = native expert quantize
+        case LLAMA_FTYPE_MOSTLY_PXQ1:          default_type = GGML_TYPE_MXFP4;   break; // PXQ1 = native expert quantize (1-bit sign x E16-row)
         case LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL: default_type = GGML_TYPE_MXFP4;   break; // per-tensor tier map via custom_quants
         case LLAMA_FTYPE_MOSTLY_Q1_0_G128: default_type = GGML_TYPE_Q1_0_G128; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  default_type = GGML_TYPE_IQ4_XS;  break;
@@ -1174,6 +1176,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     if (pxq2_out || pxq3_out || pxqu_out) {
         ftype = LLAMA_FTYPE_MOSTLY_MXFP4;
     }
+    // PXQ1 (the sub-2-bit tier): same pattern -- native expert quantize, MXFP4 rules for
+    // the rest. Fixed {-1,+1} book + the shared SUB16 -> no provenance KVs needed.
+    const bool pxq1_out = ftype == LLAMA_FTYPE_MOSTLY_PXQ1;
+    if (pxq1_out) {
+        ftype = LLAMA_FTYPE_MOSTLY_MXFP4;
+    }
 
     int nthread = params->nthread;
 
@@ -1213,7 +1221,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
     struct quantize_state_internal qs(model, params);
     // PXQ ftypes (incl. UNIVERSAL): flag so the output head defaults to q8_0 (pxa_pxq_head_type)
-    qs.is_pxq = pxq6_out || pxq6hq_out || pxq6r_out || pxq2_out || pxq3_out || pxqu_out;
+    qs.is_pxq = pxq6_out || pxq6hq_out || pxq6r_out || pxq1_out || pxq2_out || pxq3_out || pxqu_out;
 
     if (params->only_copy) {
         ftype = model.ftype;
@@ -1804,9 +1812,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 float * f32_data;
 
                 if (tensor->type == GGML_TYPE_PXQ4 || tensor->type == GGML_TYPE_PXQ4HQ ||
-                    tensor->type == GGML_TYPE_PXQ6 ||
+                    tensor->type == GGML_TYPE_PXQ6 || tensor->type == GGML_TYPE_PXQ1 ||
                     tensor->type == GGML_TYPE_PXQ2 || tensor->type == GGML_TYPE_PXQ3) {
-                    throw std::runtime_error("cannot requantize from a PXQ slab type (PXQ4/PXQ4-HQ/PXQ2/PXQ3/PXQ6: CUDA-only slab layout, no CPU codec) — requantize from the original F32/BF16/Q8_0 source");
+                    throw std::runtime_error("cannot requantize from a PXQ slab type (PXQ1/PXQ2/PXQ3/PXQ4/PXQ4-HQ/PXQ6: CUDA-only slab layout, no CPU codec) — requantize from the original F32/BF16/Q8_0 source");
                 }
                 if (tensor->type == GGML_TYPE_F32) {
                     f32_data = (float *) tensor->data;
@@ -1867,7 +1875,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
                     name = extra.name;
                 } else if (!pxq4_tensor_eligible(name, tensor) &&
-                           (new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
+                           (new_type == GGML_TYPE_PXQ1 || new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
                             new_type == GGML_TYPE_PXQ4 || new_type == GGML_TYPE_PXQ4HQ ||
                             new_type == GGML_TYPE_PXQ6)) {
                     // safety: a PXQ target on a non-eligible tensor (bad custom rule) — the
@@ -1878,21 +1886,30 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
                             new_size, chunk_size_multiplier, params);
                 } else if (pxq4_tensor_eligible(name, tensor) &&
-                           (new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
+                           (new_type == GGML_TYPE_PXQ1 || new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
                             new_type == GGML_TYPE_PXQ4 || new_type == GGML_TYPE_PXQ4HQ ||
                             new_type == GGML_TYPE_PXQ6 ||
-                            ((pxq2_out || pxq3_out || pxq6_out || pxq6hq_out || pxq6r_out) &&
+                            ((pxq1_out || pxq2_out || pxq3_out || pxq6_out || pxq6hq_out || pxq6r_out) &&
                              new_type == GGML_TYPE_MXFP4))) {
                     // native PXQ quantize — per-tensor target wins (custom-q / --pxq-universal);
                     // an untouched MXFP4 default resolves to the whole-file ftype's tier.
                     ggml_type tgt = new_type;
                     if (tgt == GGML_TYPE_MXFP4) {
-                        tgt = pxq2_out ? GGML_TYPE_PXQ2 : pxq3_out ? GGML_TYPE_PXQ3 :
+                        tgt = pxq1_out ? GGML_TYPE_PXQ1 :
+                              pxq2_out ? GGML_TYPE_PXQ2 : pxq3_out ? GGML_TYPE_PXQ3 :
                               pxq6r_out ? GGML_TYPE_PXQ6 :
                               pxq6hq_out ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ4;
                     }
                     const int64_t K = tensor->ne[0], R = tensor->ne[1], E = tensor->ne[2]*tensor->ne[3];
                     switch (tgt) {
+                        case GGML_TYPE_PXQ1:
+                            new_size = (size_t)E*(R/64)*(PXQ1_HDR_BYTES + (K/32)*(int64_t)PXQ1_SLAB_BYTES);
+                            if (work.size() < new_size) work.resize(new_size);
+                            new_data = work.data();
+                            pxq1_quantize_tensor(f32_data, (uint8_t *)new_data, R, K, E,
+                                                 imatrix, imatrix ? K*E : 0, nthread);
+                            LLAMA_LOG_INFO("PXQ1 native quantize (1-bit sign x E16-row) -> pxq1 .. ");
+                            break;
                         case GGML_TYPE_PXQ2:
                             new_size = (size_t)E*(R/64)*(PXQ2_HDR_BYTES + (K/32)*(int64_t)PXQ2_SLAB_BYTES);
                             if (work.size() < new_size) work.resize(new_size);

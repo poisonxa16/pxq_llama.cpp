@@ -86,6 +86,7 @@ exactness**, not single-run sha equality.
 | `PXA_PXQ2` | **on** | the 2-bit (LM4) kernel family; `=0` disables | |
 | `PXA_PXQ3` | **on** | the 3-bit (LM8 bit-plane) kernel family; `=0` disables | |
 | `PXA_PXQ6R` | **on** | the 5-bit PXQ6 (LM32 x E16-row) kernel family; `=0` drops to dequant→cuBLAS | the quality tier (env name keeps the internal working name) |
+| — (PXQ1, type id 248) | always on | the sub-2-bit tier: 1-bit sign codes × the shared E16-row scales (per-row fp16 anchor + frozen SUB16 4-bit subs), 2-level book {−1,+1}, type_size 5 (1 scale byte + 4 code bytes / 32 elems), ~1.26 bpw. **Served dequant→cuBLAS GEMM in v1** — no fused kernel family, no env gate (nothing to disable). Built for `--pxq-universal` mixed maps: the 24/32 GB stretch tiers put low-importance experts at 1-bit (`pxq1` lines in the tier map, e.g. a knapsack mix like 126×pxq1/18×pxq2 for a ≤24 GB 122B-A5B) | quantize: `llama-quantize … PXQ1` (uniform) or `pxq1` rules in a `--pxq-universal` map; fixed compiled-in book, no provenance KVs |
 
 All master gates are ON out of the box (they were mis-documented as "off" before 2026-07-21) —
 zero-env users get the fused kernels on every PXQ / PXQ-UNIVERSAL file.

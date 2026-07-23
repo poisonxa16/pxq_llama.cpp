@@ -4026,6 +4026,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         ggml_is_quantized(src0_1->type) &&
         src0_1->type != GGML_TYPE_PXQ4 && src0_1->type != GGML_TYPE_PXQ4HQ &&
         src0_1->type != GGML_TYPE_PXQ2 && src0_1->type != GGML_TYPE_PXQ3 &&      // ADD
+        src0_1->type != GGML_TYPE_PXQ1 &&
         src0_1->type != GGML_TYPE_PXQ6 &&                                       // ADD (no vec_dot)
         (!src0_2 || ggml_is_quantized(src0_2->type)) &&
         ggml_backend_buffer_is_cuda(src0_1->buffer) &&
@@ -4589,6 +4590,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
 static inline bool pxa_is_pxq_type(ggml_type t) {
     return t == GGML_TYPE_PXQ4 ||
            t == GGML_TYPE_PXQ4HQ || t == GGML_TYPE_PXQ2 || t == GGML_TYPE_PXQ3 ||
+           t == GGML_TYPE_PXQ1 ||
            t == GGML_TYPE_PXQ6;
 }
 
@@ -5743,6 +5745,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
             // falls to the host-syncing per-expert loop -> must NOT capture.
             if (moe_capturable && (src0_1->type == GGML_TYPE_PXQ4 || src0_1->type == GGML_TYPE_PXQ4HQ ||
                                    src0_1->type == GGML_TYPE_PXQ2 || src0_1->type == GGML_TYPE_PXQ3 ||
+                                   src0_1->type == GGML_TYPE_PXQ1 ||
                                    src0_1->type == GGML_TYPE_PXQ6)) {
                 const ggml_unary_op puop = (ggml_unary_op)node->op_params[0];
                 const int cfu = pxa_pxq_fmt(src0_1->type);
@@ -6455,6 +6458,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_PXQ4HQ:
                     case GGML_TYPE_PXQ2:      // ADD
                     case GGML_TYPE_PXQ3:      // ADD
+                    case GGML_TYPE_PXQ1:
                     case GGML_TYPE_PXQ6:     // ADD
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_IQ2_KL:

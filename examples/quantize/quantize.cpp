@@ -40,7 +40,8 @@ static const std::vector<struct quant_option> QUANT_OPTIONS = {
     { "PXQ6",     LLAMA_FTYPE_MOSTLY_PXQ6,     " 5.27 bpw, LM32 5-bit x E16-row scales — the quality tier (wrel -56% vs PXQ4)",},
     { "PXQ2",     LLAMA_FTYPE_MOSTLY_PXQ2,     " 2.27 bpw, LM4 x E16-row scales (experts; wrel 4.3x PXQ4)",},
     { "PXQ3",     LLAMA_FTYPE_MOSTLY_PXQ3,     " 3.27 bpw, LM8 bit-plane x E16-row scales (experts; wrel 2.1x PXQ4)",},
-    { "PXQ_UNIVERSAL", LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL, " mixed PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)",},
+    { "PXQ_UNIVERSAL", LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL, " mixed PXQ1/PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)",},
+    { "PXQ1",     LLAMA_FTYPE_MOSTLY_PXQ1,     " 1.26 bpw, 1-bit sign x E16-row scales (experts; the sub-2-bit stretch tier)",},
     { "PXQ6HQ",   LLAMA_FTYPE_MOSTLY_PXQ4HQ,   " deprecated alias for PXQ4-HQ (pre-re-ladder name)",},
     { "PXQ4HQ",   LLAMA_FTYPE_MOSTLY_PXQ4HQ,   " alias for PXQ4-HQ",},
     { "IQ2_XXS",  LLAMA_FTYPE_MOSTLY_IQ2_XXS,  " 2.06 bpw quantization",            },
@@ -182,7 +183,7 @@ static void usage(const char * executable) {
     printf("  --custom-q regex1=type1,regex2=type2...: use this to specify custom quantization type rules.\n\n");
     printf("  --pxq-universal {12g|16g|16g-hq|/path/to/map.tiers}: PXQ-UNIVERSAL per-tensor tier map.\n");
     printf("        Presets resolve to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
-    printf("        The file is '#'-commented lines of regex=type (pxq2|pxq3|pxq4; pxq6 = the 5-bit tier since 2026-07-21), fed through --custom-q.\n\n");
+    printf("        The file is '#'-commented lines of regex=type (pxq1|pxq2|pxq3|pxq4; pxq6 = the 5-bit tier since 2026-07-21), fed through --custom-q.\n\n");
     printf("  --repack Repack all tensors to the corresponding _r4/8 variant if available.\n\n");
     printf("  --repack-pattern Comma separated list of regexs to use for matching tensor names to be repacked.\n\n");
     printf("  --symmetric-q40  Use [-7:7] range for Q4_0 quantization (turns off imatrix)\n\n");

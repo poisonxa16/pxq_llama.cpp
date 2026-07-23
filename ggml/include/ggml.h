@@ -480,6 +480,15 @@ extern "C" {
         GGML_TYPE_PXQ2      = 254,
         GGML_TYPE_PXQ3      = 255,
 
+        // PXQ1 (PXQ-UNIVERSAL sub-2-bit tier): 1-bit sign codes x the same E16-row scale
+        // machinery (fp16 row anchor via row_meta_size=2 + frozen SUB16 4-bit sub per
+        // 16-elem block). Magnitude rides entirely on the scales; the 2-level book is
+        // {-1,+1}. 1.25+16/K bpw (~1.26 at K=4096). CUDA-consumer format, native quantize
+        // only (llama-quantize PXQ1 / pxq1 lines in a --pxq-universal tier map); served
+        // dequant->GEMM in v1 (no fused kernel family). 248 = free id below the reserved
+        // 250/251 block.
+        GGML_TYPE_PXQ1      = 248,
+
         // PXQ6 (display name "pxq6", CLI arg PXQ6 — the 5-bit quality tier of the bpw-class-honest
         // ladder): LM32 5-bit codes (16-byte nibble plane + one LE u32 hi-bit plane per 32-elem
         // code row) on the UNCHANGED E16-row scale machinery of the 4-bit tier (fp16 row anchor

@@ -205,6 +205,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_PXQ3          = 255, // 3-bit LM8 codes (bit-plane) x E16-row scales
         LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL = 256, // mixed PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)
         LLAMA_FTYPE_MOSTLY_PXQ6          = 257, // 5-bit quality tier: LM32 5-bit codes x E16-row scales, ~5.27 bpw (gguf tensor type id 256)
+        LLAMA_FTYPE_MOSTLY_PXQ1          = 248, // sub-2-bit tier: 1-bit sign codes x E16-row scales, ~1.26 bpw (PXQ-UNIVERSAL Tier0)
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ1_BN        = 136, // except 1d tensors

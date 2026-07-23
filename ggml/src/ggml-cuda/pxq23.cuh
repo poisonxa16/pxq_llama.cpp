@@ -37,11 +37,13 @@
 
 #include "../../include/ggml-pxq2-tables.h"
 #include "../../include/ggml-pxq3-tables.h"
+#include "../../include/ggml-pxq1-tables.h"
 
 // per-TU device tables (ggml-cuda.cu and convert.cu each get a copy; env overrides are
 // uploaded per-TU + per-device by pxq23_maybe_upload_books()).
 static __device__ float pxq2_book_g[4] = PXQ2_BOOK_INIT;
 static __device__ float pxq3_book_g[8] = PXQ3_BOOK_INIT;
+static __device__ float pxq1_book_g[2] = PXQ1_BOOK_INIT;
 
 // ---------------------------------------------------------------------------------------------
 // master gates + host self-check (table integrity: fp16-snapped, strictly ascending,
@@ -133,6 +135,35 @@ static inline void pxq23_maybe_upload_books(int device) {
 // NEFF = 2: two eff scales per 32-elem block (elems 0-15 / 16-31), identical to pxq6_pol_p6.
 // eff-group split in the shared kernels is by ELEMENT-PAIR index b: eff[(b*NEFF)>>4].
 // ---------------------------------------------------------------------------------------------
+// PXQ1 (sub-2-bit tier): 1-bit sign codes, single LE u32 code word / 32-elem row-block.
+// Dequant-only in v1 -- instantiated ONLY by k_pxq6_dequant_matrix (the dequant->GEMM
+// serve path); no fused-kernel picker names this policy (pxa_pxq_fmt(PXQ1) == NONE).
+struct pxq6_pol_p1 {
+    static constexpr int SLAB = PXQ1_SLAB_BYTES, HDR = PXQ1_HDR_BYTES, CODE_OFF = 64, NEFF = 2;
+    static constexpr int CODE_WORDS = 1, CODE_BYTES = 4;
+    __device__ static void stage_tabs(float * tab, float * sub, int tid) {
+        if      (tid < 16) tab[tid]      = tid < 2 ? pxq1_book_g[tid] : 0.f;
+        else if (tid < 32) sub[tid - 16] = pxq6_sub16_g[tid - 16];
+    }
+    __device__ static float bookv(int i) { return pxq1_book_g[i & 1]; }
+    __device__ static float anchor(const uint8_t * panel, int row) {
+        return __half2float(((const half *)panel)[row]);
+    }
+    __device__ static void row_effs(const uint8_t * slab, int row, float anch, const float * sub, float * eff) {
+        const int sb = slab[row];
+        eff[0] = anch * sub[sb & 0xf];
+        eff[1] = anch * sub[sb >> 4];
+    }
+    // pair b (elems 2b, 2b+1): single LE u32 word, elem j sign at bit j (1 bit/elem)
+    __device__ static float2 pair(const uint32_t * q, int b, const float * tab) {
+        const uint32_t w = q[0];
+        return make_float2(tab[(w >> (2*b)) & 1], tab[(w >> (2*b + 1)) & 1]);
+    }
+    __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
+        (void)q; (void)b; (void)plut; return make_float2(0.f, 0.f);   // PAIR never offered for P1
+    }
+};
+
 struct pxq6_pol_p2 {
     static constexpr int SLAB = PXQ2_SLAB_BYTES, HDR = PXQ2_HDR_BYTES, CODE_OFF = 64, NEFF = 2;
     static constexpr int CODE_WORDS = 2, CODE_BYTES = 8;
@@ -226,4 +257,20 @@ static void dequantize_row_pxq3_cuda(const void * vx, dst_t * y, const int64_t n
     const int kslabs = (int)(n_per_row / PXQ3_QK);
     const int64_t nslabs = (nrows / PXQ3_BM) * (int64_t)kslabs;
     k_pxq6_dequant_matrix<pxq6_pol_p3, dst_t><<<nslabs, 64, 0, stream>>>((const uint8_t *)vx, y, kslabs, n_per_row);
+}
+
+template <typename dst_t>
+static void dequantize_row_pxq1_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row,
+                                     cudaStream_t stream) {
+    if (nrows % PXQ1_BM != 0 || n_per_row % PXQ1_QK != 0) {
+        fprintf(stderr, "FATAL: dequantize_row_pxq1_cuda: nrows=%lld n_per_row=%lld not slab-aligned\n",
+                (long long)nrows, (long long)n_per_row);
+        abort();
+    }
+    int dev = -1; cudaGetDevice(&dev);
+    pxq6_maybe_upload_tables(dev);    // shared SUB16 override
+    pxq23_maybe_upload_books(dev);
+    const int kslabs = (int)(n_per_row / PXQ1_QK);
+    const int64_t nslabs = (nrows / PXQ1_BM) * (int64_t)kslabs;
+    k_pxq6_dequant_matrix<pxq6_pol_p1, dst_t><<<nslabs, 64, 0, stream>>>((const uint8_t *)vx, y, kslabs, n_per_row);
 }

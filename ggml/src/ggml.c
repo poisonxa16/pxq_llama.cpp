@@ -1407,6 +1407,19 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
+    // PXQ1: the sub-2-bit PXQ-UNIVERSAL tier -- 1-bit sign codes x the same E16-row scales
+    // (row_meta_size=2 anchor header; frozen SUB16 subs shared with the 4-bit tier).
+    // type_size 5 = 1 scale byte + 4 code bytes / 32 elems (~1.26 bpw). No CPU codec
+    // (CUDA-only consumer, dequant->GEMM in v1); produced by llama-quantize
+    // PXQ1/PXQ_UNIVERSAL (src/pxq1-quantize.inc.cpp).
+    [GGML_TYPE_PXQ1] = {
+        .type_name                = "pxq1",
+        .blck_size                = 32,
+        .type_size                = 5,
+        .is_quantized             = true,
+        .nrows                    = 1,
+        .row_meta_size            = 2,
+    },
     // PXQ6 (id 256, the 5-bit quality tier): LM32 5-bit codes x the same E16-row scales
     // (128 B/64-row anchor header via row_meta_size=2). Slab = 64 B scale SoA + 64 x 20 B code
     // rows = 1344 B => 21 B / 32 elems (1 scale byte + 20 code bytes). CUDA-only consumer
