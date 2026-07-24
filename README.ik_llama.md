@@ -2,6 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
+> **pxq_llama upstream base.** pxq_llama is based on **ikawrakow/ik_llama.cpp @ `1520eda98056`**
+> (2026-06-04, _"prompt cache: Fix assertion ... (#1913)"_), developed independently since (PXQ tiers
+> + ENHANCE + MoE/kernel fixes on top). This repo's history is flattened, so there is **no git
+> merge-base** with upstream — to diff or cherry-pick against upstream, use that exact commit.
+
 ## TL;DR
 
 This repository is a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) with better CPU and hybrid GPU/CPU performance, new SOTA quantization types, first-class Bitnet support, better DeepSeek performance via MLA, FlashMLA, fused MoE operations and tensor overrides for hybrid GPU/CPU inference, row-interleaved quant packing, etc.

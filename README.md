@@ -8,7 +8,12 @@
 **Community: [Discord — PXA Network](https://discord.gg/BHWmMHHStY)** — support, benchmark wall, dev talk. Release notes post there automatically.
 
 A fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — a **general MoE accelerator for
-Pascal/Volta silicon** (and modern cards), plus **PXQ**, a family of PXA-native low-bit quants. The
+Pascal/Volta silicon** (and modern cards), plus **PXQ**, a family of PXA-native low-bit quants.
+
+> **Upstream base:** this fork is based on **ikawrakow/ik_llama.cpp @ `1520eda98056`** (2026-06-04,
+> _"prompt cache: Fix assertion ... (#1913)"_), developed independently since (PXQ tiers + ENHANCE +
+> MoE/kernel fixes on top). The repo history is flattened, so there is **no git merge-base** with
+> upstream — to diff or cherry-pick, compare against upstream at that exact commit. The
 engine work — an sm_60 fp16-GEMM gate fix, a flash-attention regime fix, MoE-path fixes, and correct
 `np>1` hybrid concurrency — speeds up **any** MoE on these cards, at any size, and it **scales from one
 salvaged card to a multi-card `-sm layer` spread to CPU/RAM offload**. So it runs a **35B on a single
@@ -252,3 +257,5 @@ work of the PXA project, built on ikawrakow's ik_llama.cpp.
 Real-hardware testing by the community makes this fork honest. Credits:
 
 - **Last-Guitar-5924** (r/LocalLLM) — found the deepseek2/MLA fa-off context-decay cliff on a Tesla P40 (GLM-4.7-Flash decode collapsing 37 → 3.3 t/s by 36k ctx with flash attention off). His decode curve drove the automatic fa+mla posture for MLA models and the load-time warning shipping in the next release.
+- **[bradrlaw](https://github.com/bradrlaw)** — via a rigorous independent benchmark, root-caused the dual-GPU decode collapse to `-sm layer` on a no-NVLink (PHB) topology and showed `-sm graph -ts 1,1` restores full decode; also caught the missing `libnccl.so.2` in the release packaging. Both drove fixes in this release.
+
