@@ -3535,6 +3535,22 @@ static bool llm_load_tensors(
         n_gpu_layers = 999;
     }
 
+#ifdef GGML_USE_CUDA
+    // PXA_ENHANCE topology footgun guard: on a multi-GPU box with no NVLink/P2P (PHB topology),
+    // '-sm layer' serializes a per-token host-bridge round-trip and cripples decode (~17 t/s),
+    // whereas '-sm graph' keeps full decode (~93 t/s on the same hardware). We WARN only — an
+    // explicit '-sm layer' is respected, never silently overridden. (split_mode == LAYER here
+    // already implies the user did not select '-sm graph'.)
+    if (model.devices.size() > 1 && split_mode == LLAMA_SPLIT_MODE_LAYER && !ggml_backend_cuda_all_pairs_can_peer()) {
+        LLAMA_LOG_WARN("\n============================================================================\n");
+        LLAMA_LOG_WARN("PXA_ENHANCE: multi-GPU with NO NVLink/P2P peer access (PHB topology) detected,\n");
+        LLAMA_LOG_WARN("and split mode is 'layer'. On this topology '-sm layer' serializes a per-token\n");
+        LLAMA_LOG_WARN("host-bridge round-trip and severely limits decode throughput.\n");
+        LLAMA_LOG_WARN("  => RECOMMENDED: '-sm graph -ts 1,1' for full multi-GPU decode speed.\n");
+        LLAMA_LOG_WARN("     (Keeping your explicit '-sm layer' choice as requested — this is a warning only.)\n");
+        LLAMA_LOG_WARN("============================================================================\n\n");
+    }
+#endif // GGML_USE_CUDA
     model.split_mode   = split_mode;
     model.main_gpu     = main_gpu;
     model.max_gpu      = max_gpu;

@@ -49,6 +49,10 @@ GGML_API GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t *
 // raw compute capability (100*major + 10*minor, e.g. 610 for sm_61); -1 if device is out of range.
 GGML_API GGML_CALL int  ggml_backend_cuda_get_device_cc(int device);
 
+// true if every ordered GPU pair can peer-access (P2P) each other, or if there is <=1 device.
+// read-only probe (cudaDeviceCanAccessPeer only, NO EnablePeerAccess) — safe to call at model-load time. cached.
+GGML_API GGML_CALL bool ggml_backend_cuda_all_pairs_can_peer(void);
+
 GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

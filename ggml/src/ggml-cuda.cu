@@ -7071,6 +7071,38 @@ GGML_CALL int ggml_backend_cuda_get_device_cc(int device) {
     return ggml_cuda_info().devices[device].cc;
 }
 
+// Read-only P2P topology probe: true iff every ordered device pair can peer-access.
+// Uses cudaDeviceCanAccessPeer ONLY (no cudaDeviceEnablePeerAccess) so it is side-effect free
+// and safe to call at model-load time. Result is cached in a tri-state static.
+GGML_CALL bool ggml_backend_cuda_all_pairs_can_peer(void) {
+    static int cached = -1; // -1 unknown, 0 false, 1 true
+    if (cached != -1) {
+        return cached != 0;
+    }
+    const int device_count = ggml_backend_cuda_get_device_count();
+    if (device_count <= 1) {
+        cached = 1;
+        return true;
+    }
+    bool all_peer = true;
+    for (int id = 0; id < device_count && all_peer; ++id) {
+        ggml_cuda_set_device(id);
+        for (int id_other = 0; id_other < device_count; ++id_other) {
+            if (id == id_other) {
+                continue;
+            }
+            int can_access_peer = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
+            if (!can_access_peer) {
+                all_peer = false;
+                break;
+            }
+        }
+    }
+    cached = all_peer ? 1 : 0;
+    return all_peer;
+}
+
 GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;
