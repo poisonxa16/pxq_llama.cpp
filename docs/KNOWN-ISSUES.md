@@ -106,3 +106,23 @@ WARNING: deepseek2/MLA with -fa off degrades severely with context; use -fa on -
 
 Heed it on sm_60/sm_70+. On an all-sm_61 fleet, fa-off is not a warning-worthy state — it's
 the default for a reason.
+
+## Gemma-4 (128-expert Gemma MoE) is unsupported — fails clean at load
+
+The PXA runtime is tuned for Qwen-family MoE. The **128-expert Gemma-4 MoE** path (`GEMMA4`
+with per-layer embeddings, and the `GEMMA4_MTP` assistant) is **not supported**: on the affected
+expert-config it corrupted the heap (`double free or corruption` on batches >= 1024 tokens) and
+fell back to ~8 t/s scalar decode.
+
+Rather than risk heap corruption, the runtime now **fails clean at model-load / context-creation**
+with a clear error instead of attempting the build:
+
+```
+PXA runtime does not support arch 'gemma4' (128-expert Gemma-4 MoE); use stock llama.cpp. See docs/KNOWN-ISSUES.md.
+```
+
+- **Scope:** the `GEMMA4` / `GEMMA4_MTP` graph-build paths only. Every other architecture the fork
+  supports (llama, qwen3moe, glm4_moe, openai_moe, deepseek2, minimax_m2, ...) is unaffected — this
+  is a targeted denylist, not a Qwen-only allowlist.
+- **Workaround:** run Gemma-4 on **stock llama.cpp**. The PXA runtime does not attempt Gemma-4
+  optimization; the guard exists only to fail safely rather than corrupt memory.

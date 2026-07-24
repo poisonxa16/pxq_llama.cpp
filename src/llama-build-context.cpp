@@ -1,4 +1,5 @@
 #include <atomic>
+#include <stdexcept>
 #include "llama-build-context.h"
 #include "llama-hparams.h"
 #include "llama-cparams.h"
@@ -2423,12 +2424,16 @@ ggml_cgraph * llm_build_context::llama_build_graph(
                 result = llm.build_gemma3();
             } break;
         case LLM_ARCH_GEMMA4:
-            {
-                result = llm.build_gemma4();
-            } break;
         case LLM_ARCH_GEMMA4_MTP:
             {
-                result = llm.build_gemma4_mtp();
+                // PXA fail-clean guard: the PXA runtime is tuned for Qwen-family MoE and does NOT
+                // support the 128-expert Gemma-4 MoE path (heap corruption on >=1024-token batches,
+                // scalar decode). Throw a clear error at graph-build time (llama_build_graph runs a
+                // worst-case build at context creation, wrapped in try/catch) instead of corrupting
+                // the heap. Denylist GEMMA4/GEMMA4_MTP only — every other arch is unaffected.
+                throw std::runtime_error(std::string("PXA runtime does not support arch '")
+                        + llama_model_arch_name(model.arch)
+                        + "' (128-expert Gemma-4 MoE); use stock llama.cpp. See docs/KNOWN-ISSUES.md.");
             } break;
         case LLM_ARCH_STARCODER2:
             {
