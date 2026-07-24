@@ -14,6 +14,7 @@ these lived in separate build trees; this is the single canonical build with eve
 
 ## New architecture support
 
+- **Laguna (S-2.1 / XS-2.1)** — full `LLM_ARCH_LAGUNA` end-to-end support: loader, hparams, tokenizer, and a dedicated build-context graph.
 - **Cohere2-MoE (North Mini Code)** — full arch support: loader, build-context graph,
   a graph-parallel expert path, chat parser + template, and correct thinking-block parsing
   under `--reasoning off`.
