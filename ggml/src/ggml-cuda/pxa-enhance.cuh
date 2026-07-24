@@ -198,7 +198,10 @@ static inline int pxa_fa_prefill_split_ne11() {
         const char * e = getenv("PXA_FA_PREFILL_SPLIT");
         if (e) { int t = atoi(e); return t <= 0 ? 0 : (t < 9 ? 9 : t); }
         if (pxa_config_level() == 0) return 0;    // REFERENCE
-        return pxa_mode() == 1 ? 0 : 64;          // MAX -> inert; BALANCE -> 64
+        (void) pxa_mode();
+        return 0;   // EXPERIMENTAL opt-in ONLY (2026-07-24): ENHANCE no longer auto-enables FA_PREFILL_SPLIT.
+                    // It 2.35x-ed the compute buffer (1956->4607 MiB) for +2%% prefill, OOMing 16GB cards.
+                    // Set PXA_FA_PREFILL_SPLIT=64 explicitly to opt in.
     }();
     return v;
 }
