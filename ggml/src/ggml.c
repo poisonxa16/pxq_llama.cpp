@@ -19211,6 +19211,10 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     ggml_from_float_t const from_float = type_traits[dst->type].from_float;
+    // Our F32-dst path below copies floats directly (type_traits[F32].from_float is NULL); guard
+    // the remaining non-F32 case so a future dst type with a NULL from_float aborts loudly here
+    // instead of calling a NULL function pointer per scattered row.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || from_float);
 
     if (src1->type == GGML_TYPE_I64) {
         for (int64_t i03 = 0; i03 < ne03; ++i03) {
