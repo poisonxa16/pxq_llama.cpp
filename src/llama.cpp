@@ -5521,9 +5521,24 @@ static int llama_decode_internal(
         // helpers for smoother batch API transition
         // after deprecating the llama_eval calls, these will be removed
         if (u_batch.pos == nullptr) {
-            pos.resize(n_tokens);
+            // MROPE/IMROPE models (e.g. Qwen3.5 / QWEN35MOE) read 4 position sections per token; the
+            // RoPE op indexes pos[i], pos[i+n], pos[i+2n], pos[i+3n]. Sizing this legacy null-pos
+            // fallback (llama_batch_get_one path: llama-perplexity/llama-cli/llama-eval-callback) to
+            // only n_tokens (as for standard rope) made llama_set_inputs copy n_tokens*4 out of an
+            // n_tokens-sized vector -> an OOB read that fed garbage into 3 of the 4 rope sections ->
+            // wrong, run-to-run non-deterministic RoPE. Build the 4 sections like the explicit-pos
+            // path (text: t,t,t,0). Standard rope (NEOX) unchanged.
+            const int rope_pt = (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
+                                 hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+            pos.resize((size_t) n_tokens * rope_pt);
             for (uint32_t i = 0; i < n_tokens; i++) {
-                pos[i] = u_batch.all_pos_0 + i*u_batch.all_pos_1;
+                const int32_t p = u_batch.all_pos_0 + i*u_batch.all_pos_1;
+                pos[i] = p;
+                if (rope_pt == 4) {
+                    pos[    n_tokens + i] = p;
+                    pos[2 * n_tokens + i] = p;
+                    pos[3 * n_tokens + i] = 0;
+                }
             }
 
             u_batch.pos = pos.data();
