@@ -171,3 +171,9 @@ a.out.*
 *.pre-pxq6
 *.pre-pxashard
 !.pre-commit-config.yaml
+
+# PXQ universal-quant tier-SELECTION recipe (private; the engine/codec/quantizer stay open).
+# pxa-bench/pxqu_ref.cpp (decode reference) is intentionally NOT ignored — it is needed to USE the quants.
+pxa-bench/pxq-universal/
+pxa-bench/pxqu_wrel.py
+pxa-bench/pxqu_golden.py
