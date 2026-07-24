@@ -223,7 +223,7 @@ static __global__ void quantize_mmq_q8_1_id(
         }
     }
 
-    const float d = amax/127.f;
+    float d = amax/127.f;
     const float d_inv = d > 0 ? 1/d : 0.f;
     char4 q;
     q.x = roundf(xi.x*d_inv);
@@ -256,6 +256,11 @@ static __global__ void quantize_mmq_q8_1_id(
     }
 
     if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+        // PXA: clamp to fp16 range so an outlier expert activation cannot store
+        // +/-inf into the ds4 half2 and NaN the MMQ result (mirror of upstream
+        // #1659, which fixed only the dense quantize_mmq_q8_1, not this _id path).
+        d   = max(-65504.0f, min(65504.f, d));
+        sum = max(-65504.0f, min(65504.f, sum));
         y[ib].ds4[iqs/32] = make_half2(d, sum);
     } else {
         y[ib].d4[iqs/32]  = d;
