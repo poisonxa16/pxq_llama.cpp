@@ -1577,7 +1577,7 @@ static int pxa_fa_prefill_split_ne11_mirror() {
         if (r && atoi(r) != 0) return 0;                    // reference: lever off
         const char * m = getenv("PXA_MODE");
         if (m && (m[0] == 'm' || m[0] == 'M')) return 0;    // MAX posture: fa-off, split inert
-        return 64;                                          // BALANCE (default): carrier ON
+        return 0;   // EXPERIMENTAL opt-in ONLY (2026-07-24): ENHANCE no longer auto-enables (compute-buffer bloat). PXA_FA_PREFILL_SPLIT=64 to opt in.
     }();
     return v;
 }
