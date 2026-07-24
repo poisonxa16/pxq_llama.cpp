@@ -22,6 +22,8 @@ too). Rev 2 gives each side its best regime per metric. Nothing was re-measured 
 | Tesla V100 16 GB | IQ3_KS (14.2 GB) vs PXQU-16+q8head (14.1 GB) | 1,509 → **1,700 (+13%)** | 84.5 → **95.5 (+13%)** |
 | GTX 1080 Ti 11 GB | IQ2_KS (10.1 GB) vs PXQ2 (10.7 GB) | **1,154** → 1,001 (−13%) | 52.2 → **65.4 (+25%)** |
 
+> **Note:** the decode deltas in this table reflect the smaller PXQ quant class (PXQU-16 + q8_0 head, or PXQ2) **plus MTP speculative decode**, not the engine. The engine same-quant decode is **+2.7–3.3%** (V100 bit-identical) — see the Single-config view below. The engine win is prefill.
+
 ## Single-config view (chat serving: `-fa on -b 2048`, one server, no regime switching)
 
 | card | upstream (prefill / decode) | pxq_llama (prefill / decode) |

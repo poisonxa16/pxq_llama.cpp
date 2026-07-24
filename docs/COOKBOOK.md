@@ -35,8 +35,10 @@ of 3; full sweep in `bench/fair-battle.md`):
 | 1080 Ti | prefill **667** · decode **65.4** | prefill **1,001** · decode 34.2 |
 
 - **Interactive serving → `-fa on`** (what the recipes below use). You get the full decode speed
-  *and* a solid prefill in the same server — e.g. P100 gets +59% prefill / +30% decode vs upstream
-  simultaneously, no mode switch.
+  *and* a solid prefill in the same server — e.g. P100 gets **+59% prefill** vs upstream (the engine
+  win). The accompanying **+30% decode** in that comparison comes from the smaller PXQ quant tier
+  (PXQU-16 + q8_0 head vs upstream IQ3_KS) **plus MTP speculative decode**, not the kernel — the
+  same-quant engine control is decode +2.7–3.3% (see `bench/fair-battle.md`).
 - **Prefill-heavy batch → `-fa off`.** Prefill jumps 26–56% (this is where the "+88% P100
   prefill" headline comes from) but decode drops 16–48%. Use it for one-shot ingest/summarize
   passes where you barely decode.

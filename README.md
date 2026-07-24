@@ -47,13 +47,16 @@ Best config for **both** sides — upstream at its own documented best (its best
 ## Updates — 2026-07-19
 
 - **⭐ Fair battle vs upstream published** (chart above): best config for both sides, per metric.
-  Two ways to read it, both honest — **one interactive server** (`-fa on`, chat/agent) gets
-  **P100 +59% prefill / +30% decode *simultaneously***, V100 +12% / +14%, 1080 Ti −10% / +25%;
-  a **batch prefill pass** (`-fa off`) pushes prefill to **+88% P100** (the chart's headline
-  prefill bars) at the cost of decode. You pick one FA setting per server — see the regime table
-  in `docs/COOKBOOK.md`. Same-quant control (upstream's own IQ_K ggufs on our build): decode
-  +2.7–3.3% everywhere, V100 output bit-identical. Upstream keeps a cold-prefill edge on the
-  1080 Ti — printed, not hidden. Full sweep: `bench/fair-battle.md`.
+  **The engine win is PREFILL — roughly 1.7×** (P100 **+59%** in one interactive `-fa on` server,
+  **+88%** in a `-fa off` batch prefill pass; V100 +12–13%). That is a real kernel/scheduler win at
+  fixed weights.
+  **The decode deltas in the chart (P100 +30%, 1080 Ti +25%) are NOT an engine win** — they come
+  from running a **smaller, faster PXQ quant class** (PXQU-16 + a q8_0 head, 14.1 GB) against
+  upstream's larger **IQ3_KS** (14.2 GB) **plus MTP speculative decode**, not from the kernel.
+  The honest fixed-weight, **same-quant** control (upstream's own IQ_K ggufs run on our build) is
+  **decode +2.7–3.3% everywhere, V100 output bit-identical** — i.e. a decode no-op. You pick one FA
+  setting per server — see the regime table in `docs/COOKBOOK.md`. Upstream keeps a cold-prefill
+  edge on the 1080 Ti — printed, not hidden. Full sweep: `bench/fair-battle.md`.
 - **⭐ Naming: the PXQ tiers are re-laddered by bit class.** The 4-bit quality tier is now **PXQ4**
   (formerly PXQ6) and its HQ variant **PXQ4-HQ** (formerly PXQ6HQ) — the name now tells you the
   bit-width, matching PXQ2/PXQ3. Nothing binary changed for the 4-bit tier: gguf type ids are
