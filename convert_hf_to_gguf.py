@@ -672,6 +672,9 @@ class Model:
         if chkhsh == "972da7b59cec44d1f0a490a86c96df53859e486e481563e5dddac155013d87ac":
             # ref: https://huggingface.co/poolside/Laguna-XS.2
             res = "laguna"
+        if chkhsh == "bba3b3366b646dbdded5dbc42d59598b849371afc42f7beafa914afaa5b70aa6":
+            # ref: https://huggingface.co/tencent/Hunyuan-4B-Instruct  (shared by tencent/Hy3)
+            res = "hunyuan-dense"
         if res is None:
             logger.warning("\n")
             logger.warning("**************************************************************************************")
