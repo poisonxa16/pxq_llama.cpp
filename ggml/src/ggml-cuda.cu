@@ -3060,10 +3060,21 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
     return true;
 }
 
+
+// forward decl: definition lives with the other PXQ drivers (needs pxa_pxq4_bufs_on_device etc.)
+static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                          const ggml_tensor * src1, ggml_tensor * dst);
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
 
     if (ggml_cuda_router_gemv_f32(ctx, src0, src1, dst)) {
+        return node_n;
+    }
+
+    // PXQ 2D decode mmv: plain MUL_MAT on a PXQ slab weight (shared experts, attention,
+    // ssm_out, token_embd). Declines (-1) fall through to the stock dequant->cuBLAS path.
+    if (pxa_pxq_mmv_2d(ctx, src0, src1, dst) == 0) {
         return node_n;
     }
 
@@ -3504,6 +3515,91 @@ static bool pxa_pxq4_bufs_on_device(ggml_backend_cuda_context & ctx, std::initia
         if (((ggml_backend_cuda_buffer_context *) t->buffer->context)->device != ctx.device) return false;
     }
     return true;
+}
+
+// ============================ PXQ 2D decode mmv (non-MoE MUL_MAT) ============================
+// The fused PXQ drivers above are all wired into the MoE dispatch (MUL_MAT_ID over routed expert
+// stacks). A plain 2D MUL_MAT on a PXQ weight -- shared experts (ffn_*_shexp), attention
+// projections, ssm_out, token_embd, nextn.eh_proj -- found no fast path and fell through to
+// dequant(convert.cu)->cuBLAS, which re-expands the whole tensor to f16 in GLOBAL memory. Prefill
+// amortizes that over the batch; decode pays it per token. Measured cost of that fallback when the
+// shared experts were converted to PXQ4: decode 105.4 -> 63.5 t/s at 66-token fill (-39.7%) with
+// prefill unchanged (-0.7%) -- the exact signature of a per-call dequant.
+//
+// This driver closes that hole WITHOUT new kernel math: a 2D weight is just the E==1 case of the
+// expert-stacked mmv. We reuse k_pxq6_mmv verbatim (same template instantiations, same dot code)
+// and feed it a one-entry ids buffer holding 0 with BOTH id strides zeroed, so every block reads
+// e == 0 and pxq6_panel() degenerates to W + p*stride. The slot (j) axis collapses to a single
+// plane via zero x/dst slot strides. Numerics are therefore identical to the proven MoE path by
+// construction, not by re-derivation.
+//
+// Gate: PXA_PXQ4_2D=1 on, =0 off. PXA_PXQ4_2D_MAX_NY caps the token count we claim (default 8):
+// beyond that the dequant->cuBLAS GEMM amortizes and is the better path, so we decline.
+static bool pxa_pxq4_2d_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_PXQ4_2D");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+static int pxa_pxq4_2d_max_ny() {
+    static const int v = [] {
+        const char * e = getenv("PXA_PXQ4_2D_MAX_NY");
+        return e ? atoi(e) : 8;
+    }();
+    return v;
+}
+
+// returns 0 if it handled the node, -1 to decline (caller falls through to the stock paths)
+static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                          const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!pxa_pxq4_2d_enabled()) return -1;
+
+    const int fmt = pxa_pxq_fmt(src0->type);
+    if (fmt == PXA_PXQ_FMT_NONE) return -1;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return -1;
+
+    // true 2D weight, single batch on both sides
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return -1;
+    if (src1->ne[2] != 1 || src1->ne[3] != 1) return -1;
+    if (dst->ne[2]  != 1 || dst->ne[3]  != 1) return -1;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return -1;
+
+    const int64_t K = src0->ne[0], R = src0->ne[1];
+    if (K % PXQ6_QK || R % PXQ6_BM) return -1;      // slab width / 64-row panel height
+    if (dst->ne[0] != R) return -1;
+
+    const int64_t ny = src1->ne[1];                 // tokens this call
+    if (ny < 1 || ny > pxa_pxq4_2d_max_ny()) return -1;
+    if (src1->ne[0] != K) return -1;
+    if (dst->ne[1] != ny) return -1;
+
+    if (!pxa_pxq4_bufs_on_device(ctx, {src0, src1, dst})) return -1;
+
+    const size_t smem = (size_t)K*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
+    if (smem > 46*1024) return -1;                  // x is staged in shared memory
+
+    const int  pair = pxa_pxq6_decode_mode();
+    const bool vecx = pxa_pxq6_vecx();
+    auto * kern = pxq6_pick_mmv(fmt, pair, vecx);
+    if (!kern) return -1;                           // no instantiation for this format
+
+    cudaStream_t stream = ctx.stream();
+
+    // one-entry ids buffer == {0}; both strides zero so every (token, slot) block reads it
+    ggml_cuda_pool_alloc<int32_t> ids_zero(ctx.pool(), 1);
+    CUDA_CHECK(cudaMemsetAsync(ids_zero.get(), 0, sizeof(int32_t), stream));
+
+    dim3 grid((unsigned)(R/PXQ4_BM), 1u, (unsigned)ny);
+    kern<<<grid, 256, smem, stream>>>(
+        (const uint8_t *)src0->data,
+        (const char *)src1->data, src1->nb[1], /* x_slot_stride  */ 0,
+        (char *)dst->data,        dst->nb[1],  /* dst_slot_stride*/ 0,
+        (const char *)ids_zero.get(), /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+        (int)R, (int)K, /* n_as */ 1);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
 }
 
 // decode / fast-TG: ny <= 8 tokens, one fused mmv per (token, routed expert slot).
