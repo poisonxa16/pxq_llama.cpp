@@ -3064,6 +3064,8 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
 // forward decl: definition lives with the other PXQ drivers (needs pxa_pxq4_bufs_on_device etc.)
 static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                           const ggml_tensor * src1, ggml_tensor * dst);
+static int pxa_pxq_gemm_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                           const ggml_tensor * src1, ggml_tensor * dst);
 
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
@@ -3075,6 +3077,12 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // PXQ 2D decode mmv: plain MUL_MAT on a PXQ slab weight (shared experts, attention,
     // ssm_out, token_embd). Declines (-1) fall through to the stock dequant->cuBLAS path.
     if (pxa_pxq_mmv_2d(ctx, src0, src1, dst) == 0) {
+        return node_n;
+    }
+
+    // PXQ 2D prefill GEMM: the same E==1 idiom for the ny > PXA_PXQ4_2D_MAX_NY window, so on a
+    // gated arch a PXQ 2D weight never reaches the dequant->cuBLAS fallback. Default OFF.
+    if (pxa_pxq_gemm_2d(ctx, src0, src1, dst) == 0) {
         return node_n;
     }
 
@@ -3620,6 +3628,14 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const size_t smem = (size_t)K*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
     if (smem > 46*1024) return -1;                  // x is staged in shared memory
 
+    // Belt (2026-07-25): the fused MoE drivers upload the env-override book/SUB16 tables and the
+    // P2/P3 books on their first call, and every shipped file so far has a PXQ MoE node ahead of
+    // its PXQ 2D nodes -- so this driver got them for free. An attention-only (or embd-only)
+    // PXQ-native file has no such node: upload here too. No-op unless PXA_PXQ6_BOOK/_SUB/_SUB_HQ/
+    // PXA_PXQ6R_BOOK is set, and idempotent per device.
+    if (fmt >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
+    if (fmt >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
+
     const int  pair = pxa_pxq6_decode_mode();
     const bool vecx = pxa_pxq6_vecx();
     auto * kern = pxq6_pick_mmv(fmt, pair, vecx);
@@ -3670,6 +3686,125 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         (char *)dst->data,        dst->nb[1],  /* dst_slot_stride*/ 0,
         (const char *)ids_zero.get(), /* ids_nb0 */ 0, /* ids_nb1 */ 0,
         (int)R, (int)K, /* n_as */ 1);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// ============================ PXQ 2D prefill GEMM (non-MoE MUL_MAT) ============================
+// Companion to pxa_pxq_mmv_2d for the ny > PXA_PXQ4_2D_MAX_NY window. A plain 2D PXQ weight is
+// the ONE-EXPERT case of the expert-stacked grouped GEMM: reuse k_pxq6_gemm_grouped verbatim with
+// a tile map whose every entry carries e == 0, so pxq6_panel() degenerates to W + p*panel_stride
+// -- the same degeneration the mmv driver gets from its one-entry zero ids buffer. C needs no
+// scatter (Ct = C + row0*R + p*64 with Ct[t*R + row] IS the contiguous f32 dst laid out [ny][R])
+// and a plain 2D MUL_MAT never carries the MoE fused-bias sources, so bias is always nullptr.
+//
+// ARCH GATE, host-side compute capability (dispatch is a host decision; __CUDA_ARCH__ is
+// unavailable and meaningless here on a mixed-card rig where ONE binary drives sm_60 and sm_70):
+//   PXA_PXQ_GEMM_2D=0  OFF everywhere (default -- see the measurement below)
+//   PXA_PXQ_GEMM_2D=1  sm_60 only (GP100: full-rate fp16, no tensor cores)
+//   PXA_PXQ_GEMM_2D=2  sm_60 + sm_70 (any fast-fp16 pre-Turing arch)
+//
+// MEASURED 2026-07-25, Fusion4-35B-PXQ4N-attn, fill 5739 / n_predict 256 / temp 0, n=8 per arm,
+// interleaved in 4 blocks with a fresh server per arm per block, `-c 8192 -b 2048 -ub 2048`:
+//   2xV100 -ts 1.05,0.95, mode 2 : prefill 1718.3 -> 1757.9 t/s = +2.30%, decode flat (+0.4%)
+//   4xP100 -ts 1,1,1,1,  mode 1 : prefill  799.6 ->  806.7 t/s = +0.89%, decode flat (-0.03%)
+// Complete rank separation within both the cold-rep and warm-rep strata on both arches, so the
+// direction is not noise -- but both are BELOW the +3% pre-registered keep line, hence default 0.
+//
+// The pre-implementation spec predicted a MULTI-X REGRESSION on sm_70 and had this gated to sm_60
+// only. That prediction is wrong, and the reason is worth keeping: it compared this half2 tile
+// (~15-20 TF) against cuBLAS HMMA (~90 TF) alone, but the incumbent is not cuBLAS alone -- it is
+// k_pxq6_dequant_matrix (scalar 2-byte stores at a row stride of K, ~1/16 store efficiency)
+// PLUS cuBLAS. Folding the dequant into the GEMM pays for the slower matmul with ~2% left over.
+// The corollary for whoever tackles the prefill deficit next: this claims BOTH halves of the
+// incumbent and nets only +2.3%, so a fix that coalesces the dequant and KEEPS cuBLAS's HMMA
+// GEMM should dominate this on sm_70. Decode is untouched either way (ny <= PXA_PXQ4_2D_MAX_NY
+// is declined here and owned by pxa_pxq_mmv_2d).
+static int pxa_pxq_gemm_2d_mode() {
+    static const int v = [] {
+        const char * e = getenv("PXA_PXQ_GEMM_2D");
+        const int m = e ? atoi(e) : 0;
+        return (m < 0 || m > 2) ? 0 : m;
+    }();
+    return v;
+}
+
+// The claim is silent when it declines, and a decline is indistinguishable from a firing that did
+// nothing. Log the first firing and the first decline per device, like the KSPLIT lever does.
+static void pxa_pxq_gemm_2d_log(int device, bool fired, int R, int K, int ny, int cc) {
+    static std::atomic<uint32_t> seen{0};
+    if (device < 0 || device >= 16) return;
+    const uint32_t bit = 1u << (2*device + (fired ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    fprintf(stderr, "PXA_PXQ_GEMM_2D dev%d: %s (mode=%d cc=%d R=%d K=%d ny=%d)\n", device,
+            fired ? "FIRING" : "DECLINED -> dequant+cuBLAS", pxa_pxq_gemm_2d_mode(), cc, R, K, ny);
+}
+
+// returns 0 if it handled the node, -1 to decline (caller falls through to the stock paths)
+static int pxa_pxq_gemm_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                           const ggml_tensor * src1, ggml_tensor * dst) {
+    const int mode = pxa_pxq_gemm_2d_mode();
+    if (mode == 0) return -1;
+
+    const int fmt = pxa_pxq_fmt(src0->type);
+    if (fmt == PXA_PXQ_FMT_NONE) return -1;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return -1;
+    // a 2D MUL_MAT CAN carry GGML_PREC_F32 (the cuBLAS fallback honours it by taking the fp32
+    // SGEMM branch). This tile accumulates in half2 -- never silently downgrade such a node.
+    // (MUL_MAT_ID nodes never set it, which is why the MoE driver has no equivalent check.)
+    if (dst->op_params[0] != GGML_PREC_DEFAULT) return -1;
+
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return -1;      // true 2D weight
+    if (src1->ne[2] != 1 || src1->ne[3] != 1) return -1;
+    if (dst->ne[2]  != 1 || dst->ne[3]  != 1) return -1;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return -1;
+
+    const int64_t K = src0->ne[0], R = src0->ne[1];
+    if (K % PXQ6_QK || R % PXQ6_BM) return -1;                // slab width / 64-row panel height
+    if (dst->ne[0] != R || src1->ne[0] != K) return -1;
+    const int64_t ny = src1->ne[1];
+    if (dst->ne[1] != ny) return -1;
+    if (ny <= pxa_pxq4_2d_max_ny()) return -1;                // the decode mmv driver owns small ny
+
+    if (!pxa_pxq4_bufs_on_device(ctx, {src0, src1, dst})) return -1;
+    if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) return -1;
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool arch_ok = mode == 1 ? (cc < CC_VOLTA  && fast_fp16_available(cc))
+                                   : (cc < CC_TURING && fast_fp16_available(cc));
+    if (!arch_ok) { pxa_pxq_gemm_2d_log(ctx.device, false, (int)R, (int)K, (int)ny, cc); return -1; }
+
+    const int64_t ntiles = (ny + PXQ4_BN - 1)/PXQ4_BN;
+    if (ntiles > 65535) return -1;                            // grid.y limit
+
+    // env-override books: same belt as the mmv driver (see there).
+    if (fmt >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
+    if (fmt >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
+
+    pxq6_gemm_fn kern = pxq6_pick_gemm(fmt, pxa_pxq6_ragtail(), pxa_pxq6_pipe());
+    if (!kern) return -1;
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<pxq4_tile_info> dev_tiles(ctx.pool(), (size_t)ntiles);
+    k_pxq_tiles_2d<<<(unsigned)((ntiles + 255)/256), 256, 0, stream>>>(
+        dev_tiles.get(), (int)ny, (int)ntiles);
+    CUDA_CHECK(cudaGetLastError());
+
+    // src1 contiguous f32 [ny][K] -> the row-major half [ny][K] the kernel indexes as At + srow*K.
+    // Same converter, same argument order, as the cuBLAS fallback's src1 stage, so the kernel sees
+    // byte-identical activations to the path it replaces.
+    ggml_cuda_pool_alloc<half> A_f16(ctx.pool(), (size_t)ny*K);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(to_fp16 != nullptr);
+    to_fp16(src1->data, A_f16.get(), ny, K, stream);
+
+    pxa_pxq_gemm_2d_log(ctx.device, true, (int)R, (int)K, (int)ny, cc);
+
+    dim3 grid((unsigned)(R/PXQ4_BM), (unsigned)ntiles);
+    kern<<<grid, 64, 0, stream>>>((const uint8_t *)src0->data, A_f16.get(), (float *)dst->data,
+                                  /* bias */ nullptr, /* bias_nb1 */ 0,
+                                  dev_tiles.get(), (int)R, (int)K);
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }

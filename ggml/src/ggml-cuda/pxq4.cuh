@@ -43,6 +43,22 @@ struct pxq4_tile_info {
 // layout-compatible with ggml-cuda.cu's mmid_row_mapping {int32 i1, i2}
 struct pxq4_rowmap { int32_t i1, i2; };
 
+// E==1 tile map for the 2D (non-MoE) grouped GEMM: one 64-token tile per entry, expert 0, the
+// ragged tail carried in the last entry's nrows. Built ON DEVICE on purpose: the MoE prefill
+// driver builds its map host-side and cudaMemcpyAsync's it, which is a pageable H2D and is NOT
+// legal under stream capture (it survives only because prefill graphs are not captured today).
+// A kernel launch is capture-legal and cheaper than the copy.
+static __global__ void k_pxq_tiles_2d(pxq4_tile_info * __restrict__ tiles,
+                                      const int ny, const int ntiles) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ntiles) return;
+    const int r0   = i*PXQ4_BN;
+    const int left = ny - r0;
+    pxq4_tile_info t;
+    t.e = 0; t.row0 = r0; t.nrows = left < PXQ4_BN ? left : PXQ4_BN; t._pad = 0;
+    tiles[i] = t;
+}
+
 // (The legacy full-matrix dequant kernel k_pxq4_dequant_matrix / dequantize_row_pxq4_cuda,
 //  which served only type id 250, was removed 2026-07-21.)
 
