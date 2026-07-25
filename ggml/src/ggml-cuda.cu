@@ -3551,6 +3551,46 @@ static int pxa_pxq4_2d_max_ny() {
     return v;
 }
 
+// K1-2D KSPLIT: re-grid the four in-block k-segment chains of k_pxq6_mmv into four 64-thread
+// blocks + a fixed-order workspace reducer, so a launch that cannot put a block on every SM
+// spreads over 4x more of them. BIT-IDENTICAL to the single-launch form (same per-thread fp32
+// chains, same ascending 4-term reduction) -- verified: temp-0 sha256 unchanged vs the pre-split
+// binary on every arm incl. always-split. Default OFF: measured FLAT on the 2xV100 attn-native
+// config (panels 32..128 of 80 SMs), so it buys nothing there and costs one extra launch per
+// firing node. Kept for the shapes the occupancy model still favours (shexp-native panels=8,
+// low-SM cards) and for the rigorous interleaved A/B. PXA_PXQ4_2D_KSPLIT=1 enables.
+static bool pxa_pxq4_2d_ksplit() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_PXQ4_2D_KSPLIT");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+// Fire the re-grid only below a block-count threshold; at or above it the plain grid already
+// covers the machine and the extra launch is pure tax. Default = the device's SM count.
+// PXA_PXQ4_2D_KSPLIT_MINBLK overrides (0 = never split, a huge value = always split) for env-only A/B.
+static int pxa_pxq4_2d_ksplit_minblk(int device) {
+    static const int ov = [] {
+        const char * e = getenv("PXA_PXQ4_2D_KSPLIT_MINBLK");
+        return e ? atoi(e) : -1;
+    }();
+    return ov >= 0 ? ov : ggml_cuda_info().devices[device].nsm;
+}
+
+// The re-grid is bit-exact, so a config where it silently declines (no instantiation, or the
+// workspace can't grow under graph capture) is INDISTINGUISHABLE from one where it fires. Log the
+// first firing and the first decline per device so nobody has to chase a phantom lever.
+static void pxa_pxq4_2d_ksplit_log(int device, bool fired, int panels, int ny, int R, int K) {
+    static std::atomic<uint32_t> seen{0};
+    if (device < 0 || device >= 16) return;
+    const uint32_t bit = 1u << (2*device + (fired ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    fprintf(stderr, "PXA_PXQ4_2D_KSPLIT dev%d: %s (panels=%d ny=%d R=%d K=%d, split below %d blocks)\n",
+            device, fired ? "FIRING" : "DECLINED -> unsplit launch", panels, ny, R, K,
+            pxa_pxq4_2d_ksplit_minblk(device));
+}
+
 // returns 0 if it handled the node, -1 to decline (caller falls through to the stock paths)
 static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                           const ggml_tensor * src1, ggml_tensor * dst) {
@@ -3591,7 +3631,39 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     ggml_cuda_pool_alloc<int32_t> ids_zero(ctx.pool(), 1);
     CUDA_CHECK(cudaMemsetAsync(ids_zero.get(), 0, sizeof(int32_t), stream));
 
-    dim3 grid((unsigned)(R/PXQ4_BM), 1u, (unsigned)ny);
+    const int panels = (int)(R/PXQ4_BM);
+
+    // K1-2D: re-grid when the plain grid under-fills the machine. Bit-identical; every decline
+    // (no instantiation / workspace unavailable under graph capture) falls through to the
+    // single-launch form below, which produces the same bytes.
+    if (pxa_pxq4_2d_ksplit() && (int64_t)panels*ny < (int64_t)pxa_pxq4_2d_ksplit_minblk(ctx.device)) {
+        auto * ks = pxq6_pick_mmv_ksplit(fmt, pair, vecx);
+        if (ks) {
+            const size_t need = (size_t)ny*PXQ4_MMV_KSEG*(size_t)R;
+            float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
+            pxa_pxq4_2d_ksplit_log(ctx.device, ws != nullptr, panels, (int)ny, (int)R, (int)K);
+            if (ws) {
+                const size_t smem_ks = (size_t)K*sizeof(float);   // no red[] in the 64-thr form
+                dim3 grids((unsigned)(panels*PXQ4_MMV_KSEG), 1u, (unsigned)ny);
+                ks<<<grids, 64, smem_ks, stream>>>(
+                    (const uint8_t *)src0->data,
+                    (const char *)src1->data, src1->nb[1], /* x_slot_stride */ 0,
+                    ws,
+                    (const char *)ids_zero.get(), /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                    (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1);
+                CUDA_CHECK(cudaGetLastError());
+                dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
+                k_pxq_mmv_reduce<<<gridr, 256, 0, stream>>>(ws,
+                    (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
+                    (const char *)ids_zero.get(), /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                    (int)R, /* n_as */ 1, /* n_ids */ 1);
+                CUDA_CHECK(cudaGetLastError());
+                return 0;
+            }
+        }
+    }
+
+    dim3 grid((unsigned)panels, 1u, (unsigned)ny);
     kern<<<grid, 256, smem, stream>>>(
         (const uint8_t *)src0->data,
         (const char *)src1->data, src1->nb[1], /* x_slot_stride  */ 0,

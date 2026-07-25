@@ -840,6 +840,80 @@ static __global__ void k_pxq6_gateup_reduce(const float * __restrict__ ws,
     out[grow] = r;
 }
 
+// ---------------------------------------------------------------------------------------------
+// K1-2D KSPLIT — single-weight twin of k_pxq6_gateup_mmv_ksplit, for the plain 2D (non-MoE)
+// MUL_MAT driver. grid (panels*KSEG, n_ids, Ny), 64 threads: thread = row, block owns ONE of
+// k_pxq6_mmv's PXQ4_MMV_KSEG chains (kb ≡ kseg mod KSEG, ascending) => the per-thread fp32 chain
+// is byte-identical to k_pxq6_mmv's. k_pxq_mmv_reduce then replays k_pxq6_mmv's red[] combination
+// order (s = 0..KSEG-1 ascending) => bit-identical dst. Warps in flight are unchanged vs the
+// 256-thr form (8 per panel either way); what changes is that they spread over KSEG x more blocks,
+// which is what an under-filled launch (panels < n_SM) needs.
+// workspace layout: ws[((iy*n_ids + j)*KSEG + kseg)*R + grow]
+// ---------------------------------------------------------------------------------------------
+template <class POL, int MODE, bool VECX>
+static __global__ void __launch_bounds__(64)
+k_pxq6_mmv_ksplit(const uint8_t * __restrict__ W,
+                  const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+                  float * __restrict__ ws,
+                  const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                  const int R, const int K, const int n_as, const int n_ids) {
+    const int pk = blockIdx.x;
+    const int p    = pk / PXQ4_MMV_KSEG;
+    const int kseg = pk % PXQ4_MMV_KSEG;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    extern __shared__ float pxq6_smem[];
+    float * xs = pxq6_smem;                       // K floats (no red[] in the 64-thr form)
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride);
+    for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
+
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
+    __shared__ float sub[16];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 64);
+    __syncthreads();
+    pxq6_prmt_book pb{};
+    if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
+
+    const int row = threadIdx.x;
+    const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    float su = 0.f;
+    for (int kb = kseg; kb < kslabs; kb += PXQ4_MMV_KSEG) {
+        su += pxq6_dot32<POL, MODE, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                          xs + kb*PXQ6_QK, tab, sub, plut, pb);
+    }
+    float * wsj = ws + ((size_t)iy*n_ids + j)*PXQ4_MMV_KSEG*R;
+    wsj[(size_t)kseg*R + p*PXQ6_BM + row] = su;
+}
+
+// 2D reducer: one thread per (iy, j, grow). Sums the KSEG partials in k_pxq6_mmv's fixed ascending
+// order and writes dst — byte-identical to k_pxq6_mmv's kseg == 0 epilogue (no bias, no GLU).
+static __global__ void k_pxq_mmv_reduce(const float * __restrict__ ws,
+        char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+        const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+        const int R, const int n_as, const int n_ids) {
+    const int grow = blockIdx.x*blockDim.x + threadIdx.x;
+    if (grow >= R) return;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;   // SER slot: dst untouched (matches the proven kernel)
+    const float * wsj = ws + ((size_t)iy*n_ids + j)*PXQ4_MMV_KSEG*R;
+    float u = 0.f;
+    #pragma unroll
+    for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += wsj[(size_t)s*R + grow];
+    float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+    out[grow] = u;
+}
+
 // K1b generic S-split (NOT bit-exact; staged, G3-gated): 256-thr blocks, block pk handles the
 // K-chunk [chunk*Kc, (chunk+1)*Kc) with the full 64x4 kseg structure INSIDE the chunk. Stages
 // only its K-chunk slice of x (the smem rider from the deep-dive: dyn smem K/S + red).
@@ -1805,6 +1879,8 @@ typedef void (*pxq6_gateup_fn)(const uint8_t *, const uint8_t *, const char *, s
         const float *, size_t, const float *, size_t, int, int, int, int, float, float);
 typedef void (*pxq6_mmv_fn)(const uint8_t *, const char *, size_t, size_t,
         char *, size_t, size_t, const char *, size_t, size_t, int, int, int);
+typedef void (*pxq6_mmv_ks_fn)(const uint8_t *, const char *, size_t, size_t,
+        float *, const char *, size_t, size_t, int, int, int, int);
 typedef void (*pxq6_mmv_redfuse_fn)(const uint8_t *, const float *, char *, size_t, size_t,
         const char *, size_t, size_t, const float *, size_t, const float *, size_t,
         int, int, int, int, int, float, float);
@@ -1898,6 +1974,7 @@ static inline int pxa_pxq6_decode_mode() {
     }
 PXQ6_PICKM_FMT_GU(pxq6_gateup_fn,     pxq6_pick_gateup,            k_pxq6_gateup_mmv)
 PXQ6_PICKM_FMT(pxq6_mmv_fn,        pxq6_pick_mmv,               k_pxq6_mmv)
+PXQ6_PICKM_FMT(pxq6_mmv_ks_fn,     pxq6_pick_mmv_ksplit,        k_pxq6_mmv_ksplit)
 PXQ6_PICKM_FMT(pxq6_mmv_redfuse_fn, pxq6_pick_mmv_redfuse,      k_pxq6_mmv_redfuse)
 PXQ6_PICKM_FMT_GU(pxq6_gateup_ks_fn,  pxq6_pick_gateup_ksplit,     k_pxq6_gateup_mmv_ksplit)
 PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen, k_pxq6_gateup_mmv_ksplit_gen)
