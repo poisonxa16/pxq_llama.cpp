@@ -2,7 +2,7 @@
 
 The three capability sets behind the model-card scorecard, plus the runner. All were run
 against the PXQ4 flagship (formerly PXQ6) via the OpenAI-compatible server endpoint, temp 0.6 / top_p 0.95 /
-top_k 20, thinking enabled, 20k max tokens.
+top_k 20, NO-THINK (enable_thinking=false, the mode these models are actually served in), 20k max tokens. Set GAUNTLET_THINKING=1 for a thinking run; never compare across modes.
 
 | file | items | published score | what it probes |
 |---|---|---|---|

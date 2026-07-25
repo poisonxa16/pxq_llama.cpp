@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-# Generalized gauntlet runner: PORT SET_JSON OUT_JSONL. Thinking-on, delivery-guard, records timings+MTP.
-import json, time, urllib.request, sys
+# Generalized gauntlet runner: PORT SET_JSON OUT_JSONL. Delivery-guard, records timings+MTP.
+# NO-THINK BY DEFAULT: every model here is evaluated in the mode it is actually served in
+# (agent mode, enable_thinking=false). Set GAUNTLET_THINKING=1 to score a thinking run instead;
+# never mix the two in one comparison, and never compare a thinking run to a no-think one.
+import json, os, time, urllib.request, sys
 PORT=sys.argv[1]; SET=sys.argv[2]; OUT=sys.argv[3]
 LOG=OUT.replace("results_","run_").replace(".jsonl",".log")
 URL=f"http://127.0.0.1:{PORT}/v1/chat/completions"
 SAMP={"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0,"repeat_penalty":1.0}
 def log(m):
     line=f"[{time.strftime('%H:%M:%S')}] {m}"; open(LOG,"a").write(line+"\n"); print(line,flush=True)
-def call(messages, max_tokens, think=True, tools=None):
+def call(messages, max_tokens, think=THINK, tools=None):
     body={"messages":messages,"max_tokens":max_tokens,"chat_template_kwargs":{"enable_thinking":bool(think)}, **SAMP}
     if tools: body["tools"]=tools
     req=urllib.request.Request(URL,data=json.dumps(body).encode(),headers={"content-type":"application/json"})
@@ -17,7 +20,7 @@ def call(messages, max_tokens, think=True, tools=None):
            d["choices"][0].get("finish_reason"), tim
 raw=json.load(open(SET)); chs = raw if isinstance(raw,list) else raw.get("challenges",raw.get("items",raw.get("probes",[])))
 open(OUT,"w").close(); open(LOG,"w").close()
-log(f"{SET.split('/')[-1]}: {len(chs)} items -> {OUT} (model, THINKING, temp0.6)")
+log(f"{SET.split('/')[-1]}: {len(chs)} items -> {OUT} (model, {'THINKING' if THINK else 'NO-THINK'}, temp0.6)")
 for i,ch in enumerate(chs):
     pid=ch.get("id",f"item-{i}"); prompt=ch.get("prompt") or ch.get("content") or ""
     tools=None
