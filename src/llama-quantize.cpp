@@ -1042,10 +1042,67 @@ static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_t
 // rows % 64 == 0 (panel height), K % 32 == 0 (slab width).
 // (The id-250 MXFP4-repack legacy production path — pxq4_permute_from_mxfp4 — was removed
 //  2026-07-21 with the retirement of GGML_TYPE_PXQ4_LEGACY.)
+static bool pxa_name_ends(const std::string & name, const char * suf) {
+    const size_t n = strlen(suf);
+    return name.size() > n && name.compare(name.size() - n, n, suf) == 0;
+}
+
+// PXA_PXQ_NATIVE: opt-in widening of PXQ eligibility beyond the routed expert stacks,
+// for the "100% native PXQ" work (no inherited MXFP4). Comma-separated class list:
+//   shexp  shared-expert FFN   (ffn_{up,gate,down}_shexp.weight)
+//   attn   attention projections (attn_q/attn_qkv/attn_output/attn_gate.weight)
+//   embd   token_embd.weight
+//   ssm    Gated-DeltaNet state tensors (ssm_alpha/beta/out.weight)  [RISKY: recurrent]
+//   all    every class above
+// Unset (default) == historical behaviour: routed experts only, everything else MXFP4.
+// The geometry gate below still applies to every class -- a tensor that fails it is
+// demoted to MXFP4 by the caller, so a bad list can never produce an unloadable file.
+static unsigned pxa_pxq_native_mask() {
+    static const unsigned m = [] {
+        const char * e = getenv("PXA_PXQ_NATIVE");
+        if (!e || !*e) return 0u;
+        const std::string s(e);
+        unsigned v = 0;
+        auto has = [&](const char * k) { return s.find(k) != std::string::npos; };
+        if (has("all"))   return 0xFu;
+        if (has("shexp")) v |= 1u;
+        if (has("attn"))  v |= 2u;
+        if (has("embd"))  v |= 4u;
+        if (has("ssm"))   v |= 8u;
+        return v;
+    }();
+    return m;
+}
+
+// PXQ slab-tier eligibility (shared by every PXQ tier): routed expert tensors
+// (_exps.weight) always, plus any class opted in via PXA_PXQ_NATIVE; in all cases
+// rows % 64 == 0 (panel height) and K % 32 == 0 (slab width).
+// (The id-250 MXFP4-repack legacy production path — pxq4_permute_from_mxfp4 — was removed
+//  2026-07-21 with the retirement of GGML_TYPE_PXQ4_LEGACY.)
 static bool pxq4_tensor_eligible(const std::string & name, const ggml_tensor * t) {
-    constexpr size_t n = 12; // strlen("_exps.weight")
-    return name.size() > n && name.compare(name.size() - n, n, "_exps.weight") == 0 &&
-           ggml_n_dims(t) >= 2 && t->ne[1] % 64 == 0 && t->ne[0] % 32 == 0;
+    // geometry is non-negotiable: the slab codec needs 64-row panels and 32-wide blocks
+    if (ggml_n_dims(t) < 2 || t->ne[1] % 64 != 0 || t->ne[0] % 32 != 0) {
+        return false;
+    }
+    if (pxa_name_ends(name, "_exps.weight")) {
+        return true;
+    }
+    const unsigned m = pxa_pxq_native_mask();
+    if ((m & 1u) && pxa_name_ends(name, "_shexp.weight")) {
+        return true;
+    }
+    if ((m & 2u) && (pxa_name_ends(name, "attn_q.weight")   || pxa_name_ends(name, "attn_qkv.weight") ||
+                     pxa_name_ends(name, "attn_output.weight") || pxa_name_ends(name, "attn_gate.weight"))) {
+        return true;
+    }
+    if ((m & 4u) && pxa_name_ends(name, "token_embd.weight")) {
+        return true;
+    }
+    if ((m & 8u) && (pxa_name_ends(name, "ssm_alpha.weight") || pxa_name_ends(name, "ssm_beta.weight") ||
+                     pxa_name_ends(name, "ssm_out.weight"))) {
+        return true;
+    }
+    return false;
 }
 
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
