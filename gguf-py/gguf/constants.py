@@ -262,6 +262,7 @@ class MODEL_ARCH(IntEnum):
     ERNIE4_5     = auto()
     ERNIE4_5_MOE = auto()
     BAILINGMOE2  = auto()
+    HY_V3            = auto()
     MINIMAXM2    = auto()
     SMOLLM3      = auto()
     SEED_OSS     = auto()
@@ -432,6 +433,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.ERNIE4_5:       "ernie4_5",
     MODEL_ARCH.ERNIE4_5_MOE:   "ernie4_5-moe",
     MODEL_ARCH.BAILINGMOE2:    "bailingmoe2",
+    MODEL_ARCH.HY_V3:          "hy_v3",
     MODEL_ARCH.MINIMAXM2:      "minimax-m2",
     MODEL_ARCH.SMOLLM3:        "smollm3",
     MODEL_ARCH.SEED_OSS:       "seed_oss",
@@ -1436,6 +1438,39 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
+    MODEL_ARCH.HY_V3: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        # NextN/MTP draft head. Present in the arch list so a checkpoint that
+        # ships the MTP block converts; the abliterated Hy3 release does not
+        # carry one (layers 0..num_hidden_layers-1 only).
+        MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     MODEL_ARCH.BAILINGMOE2: [
         MODEL_TENSOR.TOKEN_EMBD,

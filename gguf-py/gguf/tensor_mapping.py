@@ -267,6 +267,7 @@ class TensorNameMap:
             "layers.{bid}.feed_forward.gate",             # mixtral
             "model.layers.{bid}.block_sparse_moe.gate",   # mixtral
             "model.layers.{bid}.mlp.gate",                # qwen2moe
+            "model.layers.{bid}.mlp.router.gate",         # hy_v3
             "transformer.decoder_layer.{bid}.router",     # Grok
             "transformer.blocks.{bid}.ffn.router.layer",  # dbrx
         ),
@@ -281,6 +282,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.gate.expert_bias",                  # bailingmoe2
             "model.layers.{bid}.block_sparse_moe.e_score_correction",   # minimax-m2
             "model.layers.{bid}.mlp.experts.e_score_correction",        # laguna
+            "model.layers.{bid}.mlp.expert_bias",                       # hy_v3
         ),
 
         # Feed-forward up
@@ -325,6 +327,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.up_proj",  # qwen2moe
+            "model.layers.{bid}.mlp.shared_mlp.up_proj",     # hy_v3
             "model.layers.{bid}.mlp.shared_experts.up_proj", # deepseek2
         ),
 
@@ -356,6 +359,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.FFN_GATE_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.gate_proj",  # qwen2moe
+            "model.layers.{bid}.mlp.shared_mlp.gate_proj",     # hy_v3
             "model.layers.{bid}.mlp.shared_experts.gate_proj", # deepseek2
         ),
 
@@ -395,6 +399,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.FFN_DOWN_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.down_proj",  # qwen2moe
+            "model.layers.{bid}.mlp.shared_mlp.down_proj",     # hy_v3
             "model.layers.{bid}.mlp.shared_experts.down_proj", # deepseek2
         ),
 

@@ -5423,6 +5423,120 @@ class LagunaModel(Model):
 
 
 
+@Model.register("HYV3ForCausalLM")
+class HYV3Model(Model):
+    model_arch = gguf.MODEL_ARCH.HY_V3
+    _experts: list[dict] | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # NextN/MTP blocks are appended past num_hidden_layers. Upstream gates this
+        # behind a --mtp/--no-mtp filter API this tree does not have; instead follow
+        # the idiom the other MTP archs here use (extend block_count so the appended
+        # block's tensors resolve to blk.<n>.*), and only when the checkpoint really
+        # ships one. The abliterated Hy3 release carries layers 0..num_hidden_layers-1
+        # and no MTP block, so this is a no-op there.
+        n_nextn = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+        if n_nextn > 0 and self._has_mtp_block():
+            self.block_count += n_nextn
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        else:
+            self._declared_nextn = n_nextn
+            if n_nextn > 0:
+                logger.warning(
+                    f"gguf: config declares num_nextn_predict_layers={n_nextn} but the checkpoint "
+                    f"has no layer >= {self.hparams['num_hidden_layers']}; converting without an MTP head")
+
+    def _has_mtp_block(self) -> bool:
+        """True only if tensors exist at a layer index past the trunk."""
+        n_main = int(self.hparams["num_hidden_layers"])
+        try:
+            names = self.get_tensor_names() if hasattr(self, "get_tensor_names") else None
+        except Exception:
+            names = None
+        if names is None:
+            # Fall back to the safetensors index, which is cheap and always present
+            # for a sharded HF checkpoint.
+            import json as _json
+            idx = self.dir_model / "model.safetensors.index.json"
+            if not idx.is_file():
+                return False
+            names = _json.loads(idx.read_text(encoding="utf-8")).get("weight_map", {}).keys()
+        for n in names:
+            m = re.match(r"model\.layers\.(\d+)\.", n)
+            if m and int(m.group(1)) >= n_main:
+                return True
+        return False
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+
+        # Hy3 spells the routed-expert count "num_experts"; the base only looks for
+        # num_local_experts, so expert_count would otherwise be omitted entirely.
+        self.gguf_writer.add_expert_count(self.find_hparam(["num_local_experts", "num_experts"]))
+        self.gguf_writer.add_expert_shared_count(hparams.get("num_shared_experts", 1))
+        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_feed_forward_length(
+            hparams["moe_intermediate_size"] * hparams.get("num_shared_experts", 1))
+
+        # Sigmoid router with a per-expert selection bias, sum-normalised after top-k.
+        self.gguf_writer.add_expert_weights_norm(hparams.get("route_norm", True))
+        self.gguf_writer.add_expert_weights_scale(float(hparams.get("router_scaling_factor", 1.0)))
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+
+        # Leading dense layers before the MoE stack.
+        if (dense_lead := hparams.get("first_k_dense_replace")) is not None:
+            self.gguf_writer.add_leading_dense_block_count(int(dense_lead))
+
+        # Plain RoPE (rope_type "default"); theta lives under rope_parameters.
+        rope = hparams.get("rope_parameters", {}) or {}
+        if rope_theta := (rope.get("rope_theta") or hparams.get("rope_theta")):
+            self.gguf_writer.add_rope_freq_base(float(rope_theta))
+
+        n_nextn = int(hparams.get("num_nextn_predict_layers", 0) or 0)
+        if n_nextn > 0 and self._has_mtp_block():
+            self.gguf_writer.add_nextn_predict_layers(n_nextn)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # The MTP block's trailing final_layernorm is the pre-head norm.
+        if ".final_layernorm." in name:
+            name = name.replace(".final_layernorm.", ".shared_head.norm.")
+
+        # Stack the numbered per-expert weights into the merged 3D expert tensors.
+        # mlp.expert_bias (the router bias) is NOT numbered and takes the normal path.
+        if name.startswith("model.layers.") and re.search(r"\.mlp\.experts\.\d+\.", name):
+            n_experts = self.find_hparam(["num_local_experts", "num_experts"])
+            assert bid is not None
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+            self._experts[bid][name] = data_torch
+            if len(self._experts[bid]) >= n_experts * 3:
+                for w_name in ("down_proj", "gate_proj", "up_proj"):
+                    datas = []
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+                    merged = torch.stack(datas, dim=0)
+                    yield from Model.modify_tensors(
+                        self, merged, f"model.layers.{bid}.mlp.experts.{w_name}.weight", bid)
+            return
+
+        yield from Model.modify_tensors(self, data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
+            experts = [k for d in self._experts for k in d.keys()]
+            if experts:
+                raise ValueError(f"Unprocessed experts: {experts}")
+
+
+
 ###### CONVERSION LOGIC ######
 
 
