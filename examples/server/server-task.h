@@ -246,6 +246,12 @@ struct server_task_result_cmpl_partial : server_task_result {
 };
 
 struct server_task_result_cmpl_final : server_task_result {
+    // The REAL reason generation ended. The inherited `bool stop` only says "this is the
+    // final result", so comparing it against stop_type values (as several finish_reason
+    // sites used to) silently reduced to `stop == true` and always reported "stop" — a
+    // runaway truncation was indistinguishable from a clean EOS. Set in send_final_response.
+    stop_type stop_kind = STOP_TYPE_NONE;
+
     std::string oai_resp_id;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;

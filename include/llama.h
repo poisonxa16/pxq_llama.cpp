@@ -620,9 +620,12 @@ extern "C" {
 
     LLAMA_API size_t llama_max_devices(void);
 
-    // true once any gguf loaded by this process contained a PXQ1 (type id 248) tensor —
-    // consumed by the common sampling layer's PXQ1 repetition guard.
+    // true once any gguf loaded by this process contained a PXQ1 (type id 248) tensor.
     LLAMA_API bool llama_pxa_pxq1_content(void);
+
+    // true once any gguf loaded by this process contained a tensor of ANY PXQ tier
+    // (PXQ1/2/3/4/4HQ/6) — consumed by the common sampling layer's repetition guard.
+    LLAMA_API bool llama_pxa_pxq_content(void);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);

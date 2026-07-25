@@ -16,9 +16,15 @@ using json = nlohmann::ordered_json;
 struct llama_sampler_adaptive_p * llama_clone_adaptive_p(const struct llama_sampler_adaptive_p * adapt_p_ctx);
 void llama_free_adaptive_p(struct llama_sampler_adaptive_p * adapt_p_ctx);
 
-// PXQ1 repetition guard (2026-07-23): the 1-bit tier (type id 248) measurably loops on
-// open-ended prompts (coding answers stay clean — measured on a 122B PXQU24 mixed file).
-// When the loaded model contains PXQ1 tensors, fill repetition-defense DEFAULTS for any
+// PXQ repetition guard (2026-07-23; widened to all PXQ tiers 2026-07-24): low-bit tiers
+// measurably loop on open-ended prompts (coding answers stay clean — measured on a 122B
+// PXQU24 mixed file). Originally gated on PXQ1 (248) alone, which made it dead code for
+// PXQ4 (252) — the tier the shipped PXA models actually use.
+// HONEST SCOPE: penalties were measured to make a runaway loop NON-VERBATIM, not to end
+// it, and the underlying prose-degeneration attractor is a property of a specific MERGE,
+// not of the codec. This is a runaway CAP, not the fix. The measured primary lever is
+// reasoning-off; `--reasoning-budget 0` was measured INERT (never arms for this template).
+// When the loaded model contains PXQ tensors, fill repetition-defense DEFAULTS for any
 // knob the user left at its default — explicit user settings ALWAYS win (only untouched
 // values are moved). Level logic mirrors PXA_SPEC_RELAXED below / pxa_config_level() in
 // ggml/src/ggml-cuda/pxa-enhance.cuh (non-CUDA TU, so the logic is mirrored): the guard is
@@ -27,10 +33,14 @@ void llama_free_adaptive_p(struct llama_sampler_adaptive_p * adapt_p_ctx);
 //   PXA_PXQ1_REP_GUARD=1  force on at any level
 static void pxa_pxq1_apply_rep_guard(common_params_sampling & sp) {
     static const int mode = [] {   // -1 = forced off, 0 = level default, 1 = forced on
-        const char * e = std::getenv("PXA_PXQ1_REP_GUARD");
+        // PXA_REP_GUARD is the current name; PXA_PXQ1_REP_GUARD kept for back-compat.
+        const char * e = std::getenv("PXA_REP_GUARD");
+        if (!e) {
+            e = std::getenv("PXA_PXQ1_REP_GUARD");
+        }
         return e ? (atoi(e) != 0 ? 1 : -1) : 0;
     }();
-    if (mode == -1 || !llama_pxa_pxq1_content()) {
+    if (mode == -1 || !llama_pxa_pxq_content()) {
         return;
     }
     if (mode == 0) {
@@ -50,7 +60,7 @@ static void pxa_pxq1_apply_rep_guard(common_params_sampling & sp) {
     static bool logged = false;
     if (!logged) {
         logged = true;
-        fprintf(stderr, "PXQ1 content detected: repetition guard ON [%s]%s (repeat_penalty=%.2f repeat_last_n=%d dry_multiplier=%.2f; PXA_PXQ1_REP_GUARD=0 disables)\n",
+        fprintf(stderr, "PXQ content detected: repetition guard ON [%s]%s (repeat_penalty=%.2f repeat_last_n=%d dry_multiplier=%.2f; runaway CAP, not a cure; PXA_REP_GUARD=0 disables)\n",
                 mode == 1 ? "FORCED" : "ENHANCE", applied ? "" : " — all knobs user-set, nothing filled",
                 sp.penalty_repeat, sp.penalty_last_n, sp.dry_multiplier);
     }

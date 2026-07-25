@@ -297,13 +297,38 @@ static void coalesce_ranges(std::vector<llama_file_range> & ranges) {
     ranges = std::move(merged);
 }
 
-// process-global PXQ1-content flag: set once any gguf loaded by this process contains a
-// PXQ1 (type id 248) tensor. Consumed by common/sampling.cpp's PXQ1 repetition guard —
-// the 1-bit tier measurably loops on open-ended prompts, so ENHANCE arms defenses.
-static bool g_llama_pxa_pxq1_content = false;
+// process-global PXQ-content flags: set once any gguf loaded by this process contains a
+// tensor of the given PXQ tier. Consumed by common/sampling.cpp's repetition guard.
+//
+// History (2026-07-24): the guard originally keyed on PXQ1 (248) alone, so it was dead code
+// for every other tier — notably PXQ4 (252), which is what the shipped PXA models actually
+// use. The tier is a PROXY signal, not the root cause: the measured prose-degeneration
+// attractor is a property of a specific MERGE (Fusion4-35B), not of the codec — a PXQ6 122B
+// of a different merge is clean. The guard is therefore a runaway CAP, not a cure; penalties
+// were measured to make a loop non-verbatim rather than to end it.
+static bool g_llama_pxa_pxq1_content = false;   // PXQ1 (248) specifically
+static bool g_llama_pxa_pxq_content  = false;   // any PXQ tier
 
 bool llama_pxa_pxq1_content(void) {
     return g_llama_pxa_pxq1_content;
+}
+
+bool llama_pxa_pxq_content(void) {
+    return g_llama_pxa_pxq_content;
+}
+
+static bool llama_pxa_type_is_pxq(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_PXQ1:
+        case GGML_TYPE_PXQ2:
+        case GGML_TYPE_PXQ3:
+        case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ:
+        case GGML_TYPE_PXQ6:
+            return true;
+        default:
+            return false;
+    }
 }
 
 llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors,
@@ -458,7 +483,11 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
 
             if (type == GGML_TYPE_PXQ1 && !g_llama_pxa_pxq1_content) {
                 g_llama_pxa_pxq1_content = true;
-                LLAMA_LOG_INFO("%s: PXQ1 (1-bit tier) content detected — repetition guard eligible (arms at ENHANCE; PXA_PXQ1_REP_GUARD overrides)\n", __func__);
+            }
+
+            if (llama_pxa_type_is_pxq(type) && !g_llama_pxa_pxq_content) {
+                g_llama_pxa_pxq_content = true;
+                LLAMA_LOG_INFO("%s: PXQ content detected (%s) — repetition guard eligible (arms at ENHANCE; PXA_REP_GUARD overrides)\n", __func__, ggml_type_name(type));
             }
 
             if (n_type_max < n_type[type]) {

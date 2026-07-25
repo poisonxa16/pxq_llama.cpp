@@ -2697,7 +2697,16 @@ void server_context::send_final_response(server_slot& slot) {
     res->id_multi = slot.id_multi;
     res->index = slot.task->index;
     res->error = false;
-    res->stop = true; // to do: set value
+    res->stop = true;   // "this is the final result" (base-class flag)
+    // The actual stop reason. EOS wins over WORD wins over LIMIT: the budget check runs
+    // before the EOG check, so a model that emits EOS exactly at the cap really did finish.
+    // Anything else is reported as a non-clean stop (-> finish_reason "length"), which is
+    // the safe direction: a false "length" only makes a harness re-check, while a false
+    // "stop" makes it append a truncated runaway to history and poison the next turn.
+    res->stop_kind = slot.stopped_eos   ? STOP_TYPE_EOS   :
+                       slot.stopped_word  ? STOP_TYPE_WORD  :
+                       slot.stopped_limit ? STOP_TYPE_LIMIT :
+                                            STOP_TYPE_NONE;
     res->stream = slot.params.stream;
     res->include_usage = slot.params.include_usage;
     res->content = slot.generated_text;
