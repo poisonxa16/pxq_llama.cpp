@@ -15,6 +15,8 @@
 #include <mutex>
 #include <fstream>
 #include <filesystem>
+#include <map>
+#include <set>
 
 //
 // quantization
@@ -1031,6 +1033,29 @@ static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_t
     }
 }
 
+// Dead-column imatrix guard, shared by every PXQ codec's `imx_for(e)`.
+// Every PXQ codec already CONSUMES the imatrix — `err += (w ? w[i] : 1.0) * e*e` inside the
+// anchor pick and the code/sub argmin, i.e. a diagonal-weighted SSE minimisation. The hazard
+// is a column of zeros: a routed expert that never fired during imatrix collection makes
+// EVERY candidate score exactly 0.0, so the fit stops minimising anything and silently
+// degenerates into the deterministic tie-break. On a 256-expert MoE a handful of experts
+// never firing over a few thousand chunks is normal and expected, so this is not a corner
+// case — it is the default outcome for some fraction of the file. Fall back to an unweighted
+// fit for such a column (also catches non-finite / negative weights from a damaged imatrix).
+static std::atomic<int64_t> g_pxq_imx_dead_cols{0};
+
+static bool pxq_imatrix_column_usable(const float * w, int64_t K) {
+    if (!w) return false;
+    double s = 0.0;
+    for (int64_t i = 0; i < K; ++i) {
+        if (!std::isfinite(w[i]) || w[i] < 0.0f) { g_pxq_imx_dead_cols.fetch_add(1); return false; }
+        s += (double) w[i];
+    }
+    if (s > 0.0) return true;
+    g_pxq_imx_dead_cols.fetch_add(1);
+    return false;
+}
+
 //
 #include "pxq6-quantize.inc.cpp"   // PXQ6/PXQ6HQ native quantizer (E16-row scales; 2026-07-17)
 #include "pxq2-quantize.inc.cpp"   // PXQ2 native quantizer (LM4 x E16-row; Q-G1/Q-G2 2026-07-17)
@@ -1045,6 +1070,20 @@ static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_t
 static bool pxa_name_ends(const std::string & name, const char * suf) {
     const size_t n = strlen(suf);
     return name.size() > n && name.compare(name.size() - n, n, suf) == 0;
+}
+
+// Whole-name match: the tensor IS <suf> (a top-level tensor such as token_embd.weight /
+// output.weight) or is the "blk.N." -qualified form ".<suf>".
+// pxa_name_ends() alone is wrong for both ends of this: it is a STRICT suffix test
+// (name.size() > n), so it silently misses the top-level tensors entirely — which is why
+// PXA_PXQ_NATIVE=embd has never actually promoted token_embd — and it matches on any
+// character boundary, so "output.weight" also matches "blk.0.attn_output.weight".
+static bool pxa_name_is(const std::string & name, const char * suf) {
+    if (name == suf) {
+        return true;
+    }
+    const std::string dotted = std::string(".") + suf;
+    return pxa_name_ends(name, dotted.c_str());
 }
 
 // PXA_PXQ_NATIVE: opt-in widening of PXQ eligibility beyond the routed expert stacks,
@@ -1074,16 +1113,17 @@ static unsigned pxa_pxq_native_mask() {
     return m;
 }
 
-// PXQ slab-tier eligibility (shared by every PXQ tier): routed expert tensors
-// (_exps.weight) always, plus any class opted in via PXA_PXQ_NATIVE; in all cases
-// rows % 64 == 0 (panel height) and K % 32 == 0 (slab width).
-// (The id-250 MXFP4-repack legacy production path — pxq4_permute_from_mxfp4 — was removed
-//  2026-07-21 with the retirement of GGML_TYPE_PXQ4_LEGACY.)
-static bool pxq4_tensor_eligible(const std::string & name, const ggml_tensor * t) {
+static bool pxq4_tensor_geometry_ok(const ggml_tensor * t) {
     // geometry is non-negotiable: the slab codec needs 64-row panels and 32-wide blocks
-    if (ggml_n_dims(t) < 2 || t->ne[1] % 64 != 0 || t->ne[0] % 32 != 0) {
-        return false;
-    }
+    return ggml_n_dims(t) >= 2 && t->ne[1] % 64 == 0 && t->ne[0] % 32 == 0;
+}
+
+// the pre-BACKBONE_REV2 eligibility classes: routed experts always, plus whatever
+// PXA_PXQ_NATIVE opts in. Kept separate because the "an untouched MXFP4 default resolves
+// to the whole-file tier" upgrade in the write loop must fire ONLY for these -- the rev-2
+// backbone classes carry an explicit resolved type and must never be re-derived from MXFP4
+// (that would silently override an explicit --attn-q-type mxfp4 / custom-q rule).
+static bool pxq4_legacy_native_class(const std::string & name) {
     if (pxa_name_ends(name, "_exps.weight")) {
         return true;
     }
@@ -1091,18 +1131,406 @@ static bool pxq4_tensor_eligible(const std::string & name, const ggml_tensor * t
     if ((m & 1u) && pxa_name_ends(name, "_shexp.weight")) {
         return true;
     }
-    if ((m & 2u) && (pxa_name_ends(name, "attn_q.weight")   || pxa_name_ends(name, "attn_qkv.weight") ||
-                     pxa_name_ends(name, "attn_output.weight") || pxa_name_ends(name, "attn_gate.weight"))) {
+    if ((m & 2u) && (pxa_name_is(name, "attn_q.weight")   || pxa_name_is(name, "attn_qkv.weight") ||
+                     pxa_name_is(name, "attn_output.weight") || pxa_name_is(name, "attn_gate.weight"))) {
         return true;
     }
-    if ((m & 4u) && pxa_name_ends(name, "token_embd.weight")) {
+    // NOTE: this used pxa_name_ends(), whose strict-suffix test can never match the top-level
+    // "token_embd.weight" — so PXA_PXQ_NATIVE=embd was a silent no-op. Fixed 2026-07-26; a
+    // measured "embd is a null" from before that date is null BY CONSTRUCTION, not evidence.
+    if ((m & 4u) && pxa_name_is(name, "token_embd.weight")) {
         return true;
     }
-    if ((m & 8u) && (pxa_name_ends(name, "ssm_alpha.weight") || pxa_name_ends(name, "ssm_beta.weight") ||
-                     pxa_name_ends(name, "ssm_out.weight"))) {
+    if ((m & 8u) && (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight") ||
+                     pxa_name_is(name, "ssm_out.weight"))) {
         return true;
     }
     return false;
+}
+
+// ============================================================================
+// PXQ backbone allocation table — BACKBONE_REV 2 (PXA_PXQ_BACKBONE), 2026-07-26
+// ============================================================================
+// Until rev 2, every PXQ tier quantized its routed expert stacks natively and then flattened
+// EVERYTHING ELSE to MXFP4 ("MXFP4 rules for the rest"). Measured on Laguna-S-2.1 against the
+// same bf16 source, relative RMS error vs the stock Q4_K_M recipe on the SAME tensors:
+//   attn_output 0.1157 vs 0.0362 (Q5_K)   -> 3.2x
+//   attn_gate   0.1609 vs 0.1006          -> 1.6x   (and the file was 8% BIGGER)
+//   attn_q / token_embd / ffn_*_shexp     -> 1.6x each
+// MXFP4 is a 3.54-effective-bit codec occupying 4.25 bpw with no salient-weight protection, so
+// the backbone was the weakest part of every tier we shipped. Laguna made it visible because its
+// attn_gate is PER-HEAD (72 softplus scalars/layer, high kurtosis, 0.03% of the file) that
+// multiplies whole attention heads: a 16% error there is a 31-38% functional error per head.
+//
+// Rev 2 replaces the flatten with a per-class table. It is RECIPE-level only: no on-disk slab
+// layout changes, so every previously shipped PXQ file still loads unchanged.
+//
+//   class                                PXQ2      PXQ3      PXQ4/PXQ4HQ   PXQ6
+//   attn_q / attn_qkv                    PXQ4      PXQ4HQ    PXQ6          PXQ6
+//   attn_output                          PXQ4HQ    PXQ4HQ    PXQ6          PXQ6
+//   attn_k / attn_v                      Q8_0      Q8_0      Q8_0          Q8_0   (already, keep)
+//   attn_gate  per-HEAD    (ne[1]<=256)  F16       F16       F16           F16    (the Laguna killer)
+//   attn_gate  per-CHANNEL (ne[1]> 256)  PXQ4      PXQ4HQ    PXQ6          PXQ6
+//   ffn_{up,gate,down}_shexp             PXQ4      PXQ4HQ    PXQ6          PXQ6
+//   dense ffn_{up,gate,down}             PXQ4      PXQ4HQ    PXQ6          PXQ6
+//   token_embd                           Q6_K      Q6_K      Q6_K          Q6_K   (row gather, not a GEMM)
+//   output (head)                        Q8_0 via pxa_pxq_head_type() — unchanged
+//   ssm_* / nextn.* / router / norms     unchanged (legacy pipeline)
+//   anything failing the slab geometry   Q8_0 fallback (never a silent MXFP4 demotion)
+//
+// Cost on Laguna-S-2.1: +0.45 GiB on a 62.0 GiB PXQ4 file (+0.73%).
+//
+// PXA_PXQ_BACKBONE (comma-separated tokens, evaluated once):
+//   unset / "1" / "v2"   rev-2 table on PXQ2/PXQ3/PXQ4/PXQ4HQ/PXQ6            [DEFAULT]
+//   "legacy" / "0"       exact pre-rev-2 behaviour (byte-reproduces old recipes)
+//   "hq"                 rev-2 with the PXQ4HQ backbone substituted for PXQ6 on the 4-/5-bit
+//                        tiers — the pre-registered fallback: ~82% of the modelled gain at
+//                        +0.26 bpw instead of +1.02, and PXQ4HQ (unlike PXQ6) has a CPU
+//                        panel-dequant, so the file stays partial-offload capable.
+//   "universal"          additionally apply the table to PXQ_UNIVERSAL and PXQ1 (off by
+//                        default: a PXQU tier map is user-authored per-tensor, and PXQ1 is a
+//                        closed tier — neither has measured backbone evidence).
+enum pxa_pxq_bb_mode {
+    PXA_BB_LEGACY = 0,
+    PXA_BB_REV2   = 1,
+};
+
+struct pxa_pxq_bb_cfg {
+    int  mode = PXA_BB_REV2;
+    bool hq   = false;   // PXQ4HQ backbone instead of PXQ6 on the 4-/5-bit tiers
+    bool univ = false;   // also cover PXQ_UNIVERSAL / PXQ1
+    bool lite = false;   // only the promotions that cost nothing at decode
+};
+
+static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
+    static const pxa_pxq_bb_cfg cfg = [] {
+        pxa_pxq_bb_cfg c;
+        const char * e = getenv("PXA_PXQ_BACKBONE");
+        std::string s = e ? e : "";
+        for (auto & ch : s) ch = std::tolower(ch);
+        auto has = [&](const char * k) { return s.find(k) != std::string::npos; };
+        if (!s.empty()) {
+            if (has("legacy") || has("off") || s == "0") c.mode = PXA_BB_LEGACY;
+            if (has("hq"))                               c.hq   = true;
+            if (has("lite"))                             c.lite = true;
+            if (has("universal") || has("all"))          c.univ = true;
+        }
+        if (c.mode == PXA_BB_LEGACY) {
+            LLAMA_LOG_INFO("PXQ backbone rules: LEGACY (flat MXFP4 for every non-expert tensor) "
+                           "— PXA_PXQ_BACKBONE=legacy\n");
+        } else {
+            LLAMA_LOG_INFO("PXQ backbone rules: REV 2 (per-class promotion%s%s%s) — "
+                           "PXA_PXQ_BACKBONE=legacy restores the old flat-MXFP4 backbone\n",
+                           c.lite ? ", LITE (decode-free classes only)" : (c.hq ? ", PXQ4HQ backbone" : ""),
+                           c.univ ? ", incl. PXQ_UNIVERSAL/PXQ1" : "", "");
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+// tier context for the table above. PXA_TIER_NONE == "this ftype has no backbone table".
+enum pxa_pxq_tier {
+    PXA_TIER_NONE = 0,
+    PXA_TIER_PXQ1,
+    PXA_TIER_PXQ2,
+    PXA_TIER_PXQ3,
+    PXA_TIER_PXQ4,
+    PXA_TIER_PXQ4HQ,
+    PXA_TIER_PXQ6,
+    PXA_TIER_PXQU,
+};
+
+// the classes the table maps onto a NATIVE PXQ slab type (so the write-loop dispatch must
+// treat them as eligible). token_embd (Q6_K), attn_k/v (Q8_0) and the per-head gate (F16)
+// are deliberately NOT here — they are stock types with full CPU codecs.
+static bool pxa_pxq_backbone_native_class(const std::string & name, const ggml_tensor * t) {
+    if (pxa_name_ends(name, "_exps.weight")) return false;   // owned by the expert path
+    if (name.find(".nextn.") != std::string::npos) return false;   // MTP companion: legacy in v1
+    if (pxa_name_is(name, "attn_q.weight") || pxa_name_is(name, "attn_qkv.weight") ||
+        pxa_name_is(name, "attn_output.weight")) {
+        return true;
+    }
+    // MLA (DeepSeek / GLM-family) splits the Q projection into a LoRA down/up pair. Same role,
+    // same error class as attn_q. The compressed K/V path (attn_kv_a_mqa / attn_kv_b / attn_k_b)
+    // is deliberately NOT here: the stock rules already give it q8_0, which is where the table
+    // wants K/V anyway. ⚠ Reasoned from the mechanism, not measured on an MLA model.
+    if (pxa_name_is(name, "attn_q_a.weight") || pxa_name_is(name, "attn_q_b.weight")) {
+        return true;
+    }
+    if (pxa_name_is(name, "attn_gate.weight")) {
+        return t->ne[1] > 256;                               // per-CHANNEL only; per-head -> F16
+    }
+    if (pxa_name_is(name, "ffn_up_shexp.weight") || pxa_name_is(name, "ffn_gate_shexp.weight") ||
+        pxa_name_is(name, "ffn_down_shexp.weight")) {
+        return true;
+    }
+    // dense (non-MoE, non-shared) FFN — suffix-disjoint from _exps.weight / _shexp.weight
+    if (pxa_name_is(name, "ffn_up.weight") || pxa_name_is(name, "ffn_gate.weight") ||
+        pxa_name_is(name, "ffn_down.weight")) {
+        return true;
+    }
+    return false;
+}
+
+// Mirrors the --custom-q / --pxq-universal regex scan inside llama_tensor_get_type() so the
+// backbone table can stand down for any tensor a user rule already claims. Deliberately a
+// second scan rather than a plumbed-through flag: llama_tensor_get_type() is on the public
+// path and its signature is not ours to churn. Called only for tensors the table wants to
+// move (a few dozen), so the duplicated regex work is negligible.
+static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, const std::string & name) {
+    if (!params || !params->custom_quants) {
+        return false;
+    }
+    using CustomQ = std::pair<std::string, ggml_type>;
+    const auto & rules = *static_cast<const std::vector<CustomQ>*>(params->custom_quants);
+    for (const auto & rule : rules) {
+        std::regex pattern(rule.first);
+        if (std::regex_search(name, pattern)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The resolver. Returns GGML_TYPE_COUNT for "not mine — leave to the legacy pipeline".
+static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier) {
+    const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
+    if (cfg.mode == PXA_BB_LEGACY || tier == PXA_TIER_NONE) {
+        return GGML_TYPE_COUNT;
+    }
+    if ((tier == PXA_TIER_PXQU || tier == PXA_TIER_PXQ1) && !cfg.univ) {
+        return GGML_TYPE_COUNT;
+    }
+    if (pxa_name_ends(name, "_exps.weight"))            return GGML_TYPE_COUNT;   // expert path owns it
+    if (pxa_name_is(name, "output.weight"))             return GGML_TYPE_COUNT;   // pxa_pxq_head_type()
+    if (name.find(".nextn.") != std::string::npos)      return GGML_TYPE_COUNT;   // MTP companion
+    if (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight") ||
+        pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
+
+    // token embeddings: a row GATHER, never a GEMM, so the P100 "k-quants are slow" rule does
+    // not apply. Q6_K kills 0.121 relative RMS + the MXFP4 gain bias for ~+0.08 GiB on Laguna.
+    if (pxa_name_is(name, "token_embd.weight")) {
+        return t->ne[0] % QK_K == 0 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
+    }
+    // K and V projections are already q8_0 in both our files and Q4_K_M's — parity, keep.
+    // attn_v_b is MLA's V projection and was inheriting flat MXFP4; same role, same rule.
+    if (pxa_name_is(name, "attn_k.weight") || pxa_name_is(name, "attn_v.weight") ||
+        pxa_name_is(name, "attn_v_b.weight")) {
+        return GGML_TYPE_Q8_0;
+    }
+    // THE Laguna killer: a per-HEAD attention gate is a handful of softplus scalars per layer
+    // (Laguna: 72 rows, 0.03% of the file) whose error multiplies an ENTIRE head. Never
+    // quantize it. It also fails the 64-row panel gate, so there is no native option anyway.
+    if (pxa_name_is(name, "attn_gate.weight") && t->ne[1] <= 256) {
+        return GGML_TYPE_F16;
+    }
+    if (!pxa_pxq_backbone_native_class(name, t)) {
+        return GGML_TYPE_COUNT;
+    }
+    // LITE: stop here. Everything above this line (per-head gate -> f16, token_embd -> q6_k,
+    // attn_k/v -> q8_0, geometry-fail -> q8_0) is free at decode — the gate is ~0.02% of the
+    // file and token_embd is a row GATHER, not a GEMM. Everything below promotes a DENSE GEMM
+    // weight onto the PXQ 2D decode path, and that path is measurably slower per byte than
+    // MXFP4's mmvq/DMMV on Pascal (Laguna-XS, 2xP100, indicative n=4: legacy 71.6 t/s,
+    // PXQ4HQ backbone 51.6, PXQ6 backbone 45.2). In a 256-expert MoE the always-resident
+    // backbone is roughly HALF the per-token decode traffic — only ~8/256 of the expert bytes
+    // are touched — so that per-byte gap shows up almost undiluted at the token level.
+    // LITE keeps the class that actually corrupted Laguna (the per-head attn_gate, 0.1609
+    // relative RMS multiplying a whole head) while leaving the GEMM backbone on MXFP4 until
+    // the 2D mmv is competitive. Not the default: it is a speed-vs-fidelity offer, and the
+    // full table is the fidelity answer.
+    if (cfg.lite) {
+        return GGML_TYPE_COUNT;
+    }
+    // GEMM backbone: one notch above the expert tier (the ~1.4-bit attention-over-experts gap
+    // implied by the measured per-parameter sensitivity ratio). Geometry failures take q8_0 —
+    // NEVER a silent MXFP4 demotion, which is the error class this whole revision removes.
+    if (!pxq4_tensor_geometry_ok(t)) {
+        return GGML_TYPE_Q8_0;
+    }
+    const ggml_type hi = cfg.hq ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ6;
+    switch (tier) {
+        case PXA_TIER_PXQ1:                                       // only via PXA_PXQ_BACKBONE=universal
+        case PXA_TIER_PXQ2:
+            // attn_output is the worst-measured class (3.2x) — give it the HQ 4-bit tier.
+            return pxa_name_is(name, "attn_output.weight") ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ4;
+        case PXA_TIER_PXQ3:
+        case PXA_TIER_PXQU:
+            return GGML_TYPE_PXQ4HQ;
+        case PXA_TIER_PXQ4:
+        case PXA_TIER_PXQ4HQ:
+        case PXA_TIER_PXQ6:
+            return hi;
+        default:
+            return GGML_TYPE_COUNT;
+    }
+}
+
+// PXQ slab-tier eligibility (shared by every PXQ tier): routed expert tensors (_exps.weight)
+// always, plus the rev-2 backbone classes and anything opted in via PXA_PXQ_NATIVE; in all
+// cases rows % 64 == 0 (panel height) and K % 32 == 0 (slab width).
+// (The id-250 MXFP4-repack legacy production path — pxq4_permute_from_mxfp4 — was removed
+//  2026-07-21 with the retirement of GGML_TYPE_PXQ4_LEGACY.)
+static bool pxq4_tensor_eligible(const std::string & name, const ggml_tensor * t) {
+    if (!pxq4_tensor_geometry_ok(t)) {
+        return false;
+    }
+    if (pxq4_legacy_native_class(name)) {
+        return true;
+    }
+    const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
+    return cfg.mode != PXA_BB_LEGACY && !cfg.lite && pxa_pxq_backbone_native_class(name, t);
+}
+
+// ============================================================================
+// Quantize-time error budget (PXA_PXQ_ERRBUDGET) — the acceptance instrument
+// ============================================================================
+// Dequantize every written tensor straight back and accumulate relative RMS error vs the f32
+// source, grouped by tensor CLASS (the name with the "blk.N." prefix stripped). Prints a table
+// at completion and drops a <output>.errbudget.tsv next to the artifact.
+//
+// Why it exists: the flat-MXFP4 backbone shipped TWO corrupt Laguna artifacts (PXQ4 and PXQ6)
+// that looked completely normal on disk and only revealed themselves in generated text. The
+// signature was sitting in the numbers the whole time — attn_gate 0.1609 relative RMS, and
+// attn_output at 3.2x the Q4_K_M control — i.e. one table print away from being caught before
+// a single token was generated.
+//
+//   PXA_PXQ_ERRBUDGET=1              enable (default off: it costs a full dequant pass)
+//   PXA_PXQ_ERRBUDGET_REF=<tsv>      compare against a stored budget; WARN at >1.5x any class
+//   PXA_PXQ_ERRBUDGET_MAXELEM=<n>    per-tensor sampling cap, whole rows (default 64M, 0 = all)
+//
+// LIMITATION, stated rather than hidden: the PXQ slab types are CUDA-only and have no CPU
+// to_float, so expert classes report "n/a". The report therefore covers the BACKBONE — which
+// is exactly the surface this revision changes and the entire surface the Laguna bug lived on.
+struct pxa_err_acc {
+    double sse = 0.0;
+    double ssq = 0.0;
+    double nel = 0.0;
+    int    ntensor = 0;
+    int    nskipped = 0;
+    std::set<std::string> types;
+};
+
+static bool pxa_errbudget_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_PXQ_ERRBUDGET");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+static int64_t pxa_errbudget_max_elem() {
+    static const int64_t v = [] {
+        const char * e = getenv("PXA_PXQ_ERRBUDGET_MAXELEM");
+        return e ? (int64_t) atoll(e) : (int64_t) 64*1024*1024;
+    }();
+    return v;
+}
+
+// "blk.24.attn_output.weight" -> "attn_output.weight"; non-layer names pass through.
+static std::string pxa_tensor_class(const std::string & name) {
+    if (name.compare(0, 4, "blk.") != 0) {
+        return name;
+    }
+    const size_t p1 = name.find('.', 4);
+    return p1 == std::string::npos ? name : name.substr(p1 + 1);
+}
+
+static void pxa_errbudget_accumulate(std::map<std::string, pxa_err_acc> & acc,
+                                     const std::string & name, ggml_type type,
+                                     const void * qdata, const float * src,
+                                     int64_t ne0, int64_t nrows) {
+    pxa_err_acc & a = acc[pxa_tensor_class(name)];
+    a.ntensor++;
+    a.types.insert(ggml_type_name(type));
+    const ggml_type_traits_t tt = ggml_internal_get_type_traits(type);
+    // no CPU codec (PXQ slab types), or a row-interleaved layout whose rows are not
+    // independently decodable -> honestly report it as unmeasured rather than guess
+    if (tt.to_float == nullptr || interleaved_properties(type).second != 1) {
+        a.nskipped++;
+        return;
+    }
+    const int64_t cap = pxa_errbudget_max_elem();
+    int64_t rows = nrows;
+    if (cap > 0 && ne0 > 0 && ne0*rows > cap) {
+        rows = std::max<int64_t>(1, cap/ne0);
+    }
+    const size_t rs = ggml_row_size(type, ne0);
+    std::vector<float> buf(ne0);
+    double sse = 0.0, ssq = 0.0;
+    for (int64_t r = 0; r < rows; ++r) {
+        tt.to_float((const char *)qdata + (size_t)r*rs, buf.data(), ne0);
+        const float * x = src + (size_t)r*ne0;
+        for (int64_t j = 0; j < ne0; ++j) {
+            const double d = (double)x[j] - (double)buf[j];
+            sse += d*d;
+            ssq += (double)x[j]*(double)x[j];
+        }
+    }
+    a.sse += sse;
+    a.ssq += ssq;
+    a.nel += (double)rows*ne0;
+}
+
+static std::map<std::string, double> pxa_errbudget_load_ref(const char * path) {
+    std::map<std::string, double> ref;
+    std::ifstream in(path);
+    if (!in) {
+        LLAMA_LOG_WARN("PXA_PXQ_ERRBUDGET_REF: cannot open %s — no comparison\n", path);
+        return ref;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        try {
+            ref[line.substr(0, tab)] = std::stod(line.substr(tab + 1));
+        } catch (...) { /* skip malformed row */ }
+    }
+    return ref;
+}
+
+static void pxa_errbudget_report(const std::map<std::string, pxa_err_acc> & acc, const std::string & fname_out) {
+    if (acc.empty()) return;
+    std::map<std::string, double> ref;
+    const char * refp = getenv("PXA_PXQ_ERRBUDGET_REF");
+    if (refp && refp[0]) ref = pxa_errbudget_load_ref(refp);
+
+    LLAMA_LOG_INFO("\n=============== PXQ error budget (relative RMS vs f32 source) ===============\n");
+    LLAMA_LOG_INFO("%-34s %-16s %7s %12s %9s %9s %7s\n",
+                   "class", "type(s)", "tensors", "elements", "rel_rms", "ref", "ratio");
+    int warned = 0;
+    std::ofstream tsv(fname_out + ".errbudget.tsv");
+    if (tsv) tsv << "# class\trel_rms\ttypes\ttensors\telements\n";
+    for (const auto & kv : acc) {
+        const pxa_err_acc & a = kv.second;
+        std::string types;
+        for (const auto & t : a.types) { if (!types.empty()) types += ","; types += t; }
+        if (a.nel <= 0.0 || a.ssq <= 0.0) {
+            LLAMA_LOG_INFO("%-34s %-16s %7d %12s %9s %9s %7s\n",
+                           kv.first.c_str(), types.c_str(), a.ntensor, "-", "n/a", "-", "-");
+            continue;
+        }
+        const double rel = std::sqrt(a.sse/a.ssq);
+        double refv = -1.0, ratio = -1.0;
+        auto it = ref.find(kv.first);
+        if (it != ref.end() && it->second > 0.0) { refv = it->second; ratio = rel/refv; }
+        char rbuf[32], qbuf[32];
+        if (refv >= 0.0) { snprintf(rbuf, sizeof rbuf, "%.4f", refv); snprintf(qbuf, sizeof qbuf, "%.2f", ratio); }
+        else             { snprintf(rbuf, sizeof rbuf, "-");          snprintf(qbuf, sizeof qbuf, "-"); }
+        LLAMA_LOG_INFO("%-34s %-16s %7d %12.3e %9.4f %9s %7s%s\n",
+                       kv.first.c_str(), types.c_str(), a.ntensor, a.nel, rel, rbuf, qbuf,
+                       ratio > 1.5 ? "  <== OVER BUDGET" : "");
+        if (ratio > 1.5) ++warned;
+        if (tsv) tsv << kv.first << "\t" << rel << "\t" << types << "\t" << a.ntensor << "\t" << (long long)a.nel << "\n";
+    }
+    if (warned) {
+        LLAMA_LOG_WARN("PXQ error budget: %d class(es) OVER 1.5x the reference — inspect before shipping this artifact\n", warned);
+    }
+    LLAMA_LOG_INFO("budget written to %s.errbudget.tsv\n", fname_out.c_str());
+    LLAMA_LOG_INFO("=============================================================================\n");
 }
 
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
@@ -1238,6 +1666,18 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     const bool pxq1_out = ftype == LLAMA_FTYPE_MOSTLY_PXQ1;
     if (pxq1_out) {
         ftype = LLAMA_FTYPE_MOSTLY_MXFP4;
+    }
+
+    // BACKBONE_REV 2: the tier context for pxa_pxq_backbone_type(). The MXFP4 flatten above
+    // stays -- it remains the carrier for everything the table does not claim (norms, router,
+    // ssm_*, MTP companions) and for PXA_PXQ_BACKBONE=legacy.
+    const pxa_pxq_tier pxq_tier =
+        pxq6_out   ? PXA_TIER_PXQ4   : pxq6hq_out ? PXA_TIER_PXQ4HQ :
+        pxq6r_out  ? PXA_TIER_PXQ6   : pxq2_out   ? PXA_TIER_PXQ2   :
+        pxq3_out   ? PXA_TIER_PXQ3   : pxq1_out   ? PXA_TIER_PXQ1   :
+        pxqu_out   ? PXA_TIER_PXQU   : PXA_TIER_NONE;
+    if (pxq_tier != PXA_TIER_NONE) {
+        (void) pxa_pxq_backbone_cfg();   // resolve + log the mode once, before the write loop
     }
 
     int nthread = params->nthread;
@@ -1398,6 +1838,22 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     }
 
     gguf_set_val_u32(ctx_out, "general.file_type", ftype); // TODO: use LLM_KV
+    if (pxq_tier != PXA_TIER_NONE) {
+        // BACKBONE_REV provenance: which allocation table produced this file's NON-expert
+        // tensors. 1 = the historical flat-MXFP4 backbone, 2 = the per-class table. The
+        // eval harness and the claims registry read this so "which build made this file"
+        // is a KV lookup, not archaeology.
+        const pxa_pxq_bb_cfg & bb = pxa_pxq_backbone_cfg();
+        const bool bb_on = bb.mode != PXA_BB_LEGACY &&
+                           !((pxq_tier == PXA_TIER_PXQU || pxq_tier == PXA_TIER_PXQ1) && !bb.univ);
+        gguf_set_val_u32(ctx_out, "pxa.pxq.backbone_rev", bb_on ? 2u : 1u);
+        const char * bb_map =
+            !bb_on   ? "legacy:mxfp4" :
+            bb.lite  ? "lite:attn_gate_head=f16;token_embd=q6_k;attn_k,attn_v=q8_0;output=q8_0;gemm_backbone=mxfp4" :
+            bb.hq    ? "attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=pxq4hq;attn_k,attn_v=q8_0;attn_gate_head=f16;token_embd=q6_k;output=q8_0"
+                     : "attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=tier+1;attn_k,attn_v=q8_0;attn_gate_head=f16;token_embd=q6_k;output=q8_0";
+        gguf_set_val_str(ctx_out, "pxa.pxq.backbone_map", bb_map);
+    }
     if (pxq6_out || pxq6hq_out) {   // 4-bit-tier provenance: the frozen tables this file was built with
         gguf_set_val_u32(ctx_out, "pxa.pxq6.version", 1);
         gguf_set_val_str(ctx_out, "pxa.pxq6.tier", pxq6hq_out ? "hq" : "core");
@@ -1452,6 +1908,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
+    std::map<std::string, pxa_err_acc> errbudget;   // PXA_PXQ_ERRBUDGET, empty unless enabled
 
     std::vector<std::thread> workers;
     workers.reserve(nthread);
@@ -1709,6 +2166,22 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             }
             else if (ggml_is_quantized(default_type)) {
                 new_type = llama_tensor_get_type(qs, new_type, tensor, ftype);
+
+                // BACKBONE_REV 2: per-class promotion for everything the native expert codecs
+                // do not own, replacing the flat-MXFP4 backbone. Priority order is deliberate:
+                //   --custom-q / --pxq-universal map  >  this table  >  the MXFP4 rules pipeline
+                // and the explicit --attn-q-type/--token-embedding-type/... overrides below
+                // still win over all of it. --pure stands down entirely (it means "no rules").
+                if (pxq_tier != PXA_TIER_NONE) {
+                    const ggml_type bb = pxa_pxq_backbone_type(name, tensor, pxq_tier);
+                    // the regex scan is the expensive half, so only pay it for a tensor the
+                    // table actually wants to move
+                    if (bb < GGML_TYPE_COUNT && bb != new_type && !pxa_custom_rule_matches(params, name)) {
+                        LLAMA_LOG_INFO("\nPXQ backbone rev2: %s -> %s ", ggml_type_name(new_type),
+                                       ggml_type_name(bb));
+                        new_type = bb;
+                    }
+                }
             }
             if (params->token_embedding_type < GGML_TYPE_COUNT && strcmp(tensor->name, "token_embd.weight") == 0) {
                 new_type = params->token_embedding_type;
@@ -1937,9 +2410,16 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                             new_type == GGML_TYPE_PXQ6)) {
                     // safety: a PXQ target on a non-eligible tensor (bad custom rule) — the
                     // native codecs need _exps geometry and there is no CPU codec to fall to.
-                    LLAMA_LOG_WARN("%s: %s is not PXQ-eligible — demoting %s -> mxfp4\n",
-                                   __func__, name.c_str(), ggml_type_name(new_type));
-                    new_type = GGML_TYPE_MXFP4;
+                    // BACKBONE_REV 2 changed the landing type from mxfp4 to q8_0: this path
+                    // only ever fires on rare, small tensors, and MXFP4's two failure channels
+                    // (a 3.54-effective-bit codec at 4.25 bpw, plus a systematic gain bias) make
+                    // it the one type we never want to fall into silently. Legacy mode keeps
+                    // the old mxfp4 landing so it byte-reproduces pre-rev-2 recipes.
+                    const bool bb_legacy = pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY;
+                    const ggml_type demoted = bb_legacy ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
+                    LLAMA_LOG_WARN("%s: %s is not PXQ-eligible — demoting %s -> %s\n",
+                                   __func__, name.c_str(), ggml_type_name(new_type), ggml_type_name(demoted));
+                    new_type = demoted;
                     do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
                             new_size, chunk_size_multiplier, params);
                 } else if (pxq4_tensor_eligible(name, tensor) &&
@@ -1947,7 +2427,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                             new_type == GGML_TYPE_PXQ4 || new_type == GGML_TYPE_PXQ4HQ ||
                             new_type == GGML_TYPE_PXQ6 ||
                             ((pxq1_out || pxq2_out || pxq3_out || pxq6_out || pxq6hq_out || pxq6r_out) &&
-                             new_type == GGML_TYPE_MXFP4))) {
+                             new_type == GGML_TYPE_MXFP4 && pxq4_legacy_native_class(name)))) {
                     // native PXQ quantize — per-tensor target wins (custom-q / --pxq-universal);
                     // an untouched MXFP4 default resolves to the whole-file ftype's tier.
                     ggml_type tgt = new_type;
@@ -2007,6 +2487,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                             new_size, chunk_size_multiplier, params);
                 }
 
+                if (pxa_errbudget_enabled()) {
+                    pxa_errbudget_accumulate(errbudget, name, new_type, new_data, f32_data,
+                                             tensor->ne[0], ggml_nelements(tensor)/tensor->ne[0]);
+                }
             }
             LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0, new_size/1024.0/1024.0);
         }
@@ -2037,6 +2521,17 @@ QuantizationDone:;
     if (qs.n_fallback > 0) {
         LLAMA_LOG_WARN("%s: WARNING: %d of %d tensor(s) required fallback quantization\n",
                 __func__, qs.n_fallback, qs.n_k_quantized + qs.n_fallback);
+    }
+
+    if (const int64_t dead = g_pxq_imx_dead_cols.load(); dead > 0) {
+        LLAMA_LOG_WARN("%s: imatrix: %lld expert column(s) had no usable weights (all-zero / "
+                       "non-finite) and were fit UNWEIGHTED — normal for routed experts that "
+                       "never fired during calibration; a large count means the corpus is too "
+                       "thin for this model's expert count\n", __func__, (long long) dead);
+    }
+
+    if (pxa_errbudget_enabled()) {
+        pxa_errbudget_report(errbudget, fname_out);
     }
 }
 

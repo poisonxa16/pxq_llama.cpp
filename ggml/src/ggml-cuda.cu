@@ -3543,10 +3543,18 @@ static bool pxa_pxq4_bufs_on_device(ggml_backend_cuda_context & ctx, std::initia
 //
 // Gate: PXA_PXQ4_2D=1 on, =0 off. PXA_PXQ4_2D_MAX_NY caps the token count we claim (default 8):
 // beyond that the dequant->cuBLAS GEMM amortizes and is the better path, so we decline.
+//
+// DEFAULT ON since BACKBONE_REV 2 (2026-07-26). Until then no shipped file carried a PXQ 2D
+// weight, so the default was irrelevant; the rev-2 backbone table puts attention, shared
+// experts and dense FFN on native PXQ types in EVERY tier, which makes this driver the
+// difference between a fused decode and a per-token dequant->cuBLAS expansion of the whole
+// tensor (measured -39.7% decode, 105.4 -> 63.5 t/s, when the shared experts alone went PXQ4).
+// Without the flip the recipe fix would be blamed on the codec. PXA_PXQ4_2D=0 restores the
+// old default for the interleaved A/B.
 static bool pxa_pxq4_2d_enabled() {
     static const bool v = [] {
         const char * e = getenv("PXA_PXQ4_2D");
-        return e && atoi(e) != 0;
+        return !(e && atoi(e) == 0);
     }();
     return v;
 }
@@ -4935,11 +4943,14 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * src0_2 = dst->src[1];
     const ggml_tensor * src1 = dst->src[2];
 
-    // Crash guard: dense FUSED_UP_GATE with PXQ-slab-typed up/gate tensors (a file that puts a
-    // PXQ type on a DENSE tensor, e.g. via external surgery -- llama-quantize itself demotes
-    // those). The stock q8_1 mmvq/mmq calls below have NO PXQ kernels and fault; divert to the
-    // generic dequant->cublas pair + fused GLU, correct at any ne11. No file produced by this
-    // repo's quantizer reaches this branch.
+    // Dense FUSED_UP_GATE with PXQ-slab-typed up/gate tensors. The stock q8_1 mmvq/mmq calls
+    // below have NO PXQ kernels and would fault; divert to a per-operand ggml_cuda_mul_mat
+    // (which reaches the PXQ 2D drivers, and the dequant->cublas fallback beyond their ny
+    // window) plus the fused GLU -- correct at any ne11.
+    // NOTE: since BACKBONE_REV 2 this is a NORMAL path, not just a surgery guard: the rev-2
+    // backbone table puts ffn_{up,gate}_shexp and dense ffn_{up,gate} on native PXQ types, so
+    // every rev-2 file reaches it. (The older "no file from this quantizer gets here" note is
+    // obsolete.)
     if (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type)) {
         const float limit_px = *(const float *)(dst->op_params + 1);
         ggml_cuda_pool_alloc<float> dst_up_px(ctx.pool(), ggml_nelements(dst));

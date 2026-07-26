@@ -154,9 +154,12 @@ static void pxq1_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     const int64_t exp_bytes = (R/64)*(PXQ1_HDR_BYTES + (K/32)*(int64_t)PXQ1_SLAB_BYTES);
     auto imx_for = [&](int64_t e) -> const float * {
         if (!imx) return nullptr;
-        if (imx_size == K*E) return imx + e*K;
-        if (imx_size == K)   return imx;
-        return nullptr;
+        // dead-column guard (llama-quantize.cpp): an all-zero / non-finite imatrix column
+        // makes every candidate score 0.0, degenerating the weighted argmin into a tie-break
+        const float * w = nullptr;
+        if      (imx_size == K*E) w = imx + e*K;
+        else if (imx_size == K)   w = imx;
+        return pxq_imatrix_column_usable(w, K) ? w : nullptr;
     };
     if (nthread <= 1 || E <= 1) {
         for (int64_t e = 0; e < E; ++e)
