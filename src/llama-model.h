@@ -119,6 +119,7 @@ enum e_model {
     MODEL_122B_A10B,
     MODEL_230B_A10B, // Minimax M2
     MODEL_235B_A22B,
+    MODEL_295B_A21B, // Hunyuan V3
     MODEL_310B_A15B,
     MODEL_300B_A47B, // Ernie MoE big
     MODEL_355B_A32B,

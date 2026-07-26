@@ -1660,6 +1660,45 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        // Hunyuan V3 (hy_v3). Same tensor set as Laguna minus the per-head
+        // attention gate, plus the NextN/MTP tail names so a future checkpoint
+        // that ships an MTP block still resolves (no MTP graph exists yet).
+        LLM_ARCH_HY_V3,
+        {
+            {   LLM_TENSOR_TOKEN_EMBD,             "token_embd" },
+            {   LLM_TENSOR_OUTPUT_NORM,            "output_norm" },
+            {   LLM_TENSOR_OUTPUT,                 "output" },
+            {   LLM_TENSOR_ATTN_NORM,              "blk.%d.attn_norm" },
+            {   LLM_TENSOR_ATTN_Q,                 "blk.%d.attn_q" },
+            {   LLM_TENSOR_ATTN_Q_NORM,            "blk.%d.attn_q_norm" },
+            {   LLM_TENSOR_ATTN_K,                 "blk.%d.attn_k" },
+            {   LLM_TENSOR_ATTN_K_NORM,            "blk.%d.attn_k_norm" },
+            {   LLM_TENSOR_ATTN_V,                 "blk.%d.attn_v" },
+            {   LLM_TENSOR_ATTN_OUT,               "blk.%d.attn_output" },
+            {   LLM_TENSOR_FFN_NORM,               "blk.%d.ffn_norm" },
+            {   LLM_TENSOR_FFN_GATE,               "blk.%d.ffn_gate" },
+            {   LLM_TENSOR_FFN_DOWN,               "blk.%d.ffn_down" },
+            {   LLM_TENSOR_FFN_UP,                 "blk.%d.ffn_up" },
+            {   LLM_TENSOR_FFN_GATE_INP,           "blk.%d.ffn_gate_inp" },
+            {   LLM_TENSOR_FFN_GATE_EXPS,          "blk.%d.ffn_gate_exps" },
+            {   LLM_TENSOR_FFN_DOWN_EXPS,          "blk.%d.ffn_down_exps" },
+            {   LLM_TENSOR_FFN_UP_EXPS,            "blk.%d.ffn_up_exps" },
+            {   LLM_TENSOR_FFN_GATE_UP_EXPS,       "blk.%d.ffn_gate_up_exps" },
+            {   LLM_TENSOR_FFN_GATE_SHEXP,         "blk.%d.ffn_gate_shexp" },
+            {   LLM_TENSOR_FFN_DOWN_SHEXP,         "blk.%d.ffn_down_shexp" },
+            {   LLM_TENSOR_FFN_UP_SHEXP,           "blk.%d.ffn_up_shexp" },
+            // NOTE: no ".bias" tail - Hy3 spells the router bias "mlp.expert_bias",
+            // which the gguf-py name map emits verbatim as "blk.N.exp_probs_b".
+            {   LLM_TENSOR_FFN_EXP_PROBS_B,        "blk.%d.exp_probs_b" },
+            {   LLM_TENSOR_NEXTN_EH_PROJ,          "blk.%d.nextn.eh_proj" },
+            {   LLM_TENSOR_NEXTN_EMBED_TOKENS,     "blk.%d.nextn.embed_tokens" },
+            {   LLM_TENSOR_NEXTN_ENORM,            "blk.%d.nextn.enorm" },
+            {   LLM_TENSOR_NEXTN_HNORM,            "blk.%d.nextn.hnorm" },
+            {   LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "blk.%d.nextn.shared_head_head" },
+            {   LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "blk.%d.nextn.shared_head_norm" },
+        },
+    },
+    {
         LLM_ARCH_GLM_DSA,
         {
             { LLM_TENSOR_TOKEN_EMBD,             "token_embd" },
@@ -1962,6 +2001,7 @@ const char * llama_model_type_name(e_model type) {
         case MODEL_122B_A10B:     return "122B.A10B";
         case MODEL_230B_A10B:     return "230B.A10B";
         case MODEL_235B_A22B:     return "235B.A22B";
+        case MODEL_295B_A21B:     return "295B.A21B";
         case MODEL_310B_A15B:     return "310B.A15B";
         case MODEL_300B_A47B:     return "300B.A47B";
         case MODEL_355B_A32B:     return "355B.A32B";

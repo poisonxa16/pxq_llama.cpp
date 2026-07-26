@@ -1478,6 +1478,48 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_HY_V3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // MoE. n_expert / n_expert_used come from the common loader above
+                // (192 / 8). Hy3 is a sigmoid router with a per-expert selection
+                // bias, sum-normalised top-k weights and a router_scaling_factor.
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);           // 1536
+                hparams.n_expert_shared = 1;
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
+                // The converter already writes moe_intermediate_size * num_shared_experts here,
+                // so this is the total shared-expert width - do NOT multiply by n_expert_shared again.
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);  // 1536
+                if (hparams.n_ff_shexp == 0) {
+                    hparams.n_ff_shexp = hparams.n_ff_exp * hparams.n_expert_shared;
+                }
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead,   false); // 1
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,      hparams.expert_weights_scale, false); // 2.826
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,       hparams.expert_weights_norm,  false); // true
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,        hparams.expert_gating_func,   false); // SIGMOID
+                if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                }
+
+                // NextN/MTP. config.json declares num_nextn_predict_layers=1 but the
+                // released checkpoint carries no MTP block, so the converter omits the
+                // key entirely and this stays 0 (trunk loop = n_layer, no MTP graph).
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                if (model.mtp) {
+                    hparams.n_layer_kv_from_start = hparams.n_layer;
+                } else {
+                    hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                }
+
+                // Plain RoPE ("rope_type": "default"): no YaRN, no sliding window.
+                // n_rot falls back to attention.key_length (128) in the common loader.
+                switch (hparams.n_layer) {
+                    case 80: model.type = e_model::MODEL_295B_A21B; break;
+                    case 81: model.type = e_model::MODEL_295B_A21B; break;  // + 1 MTP block
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_GLM_DSA:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
