@@ -5473,6 +5473,38 @@ class HYV3Model(Model):
 
     def set_vocab(self):
         self._set_vocab_gpt2()
+        self._fix_str_format_in_chat_template()
+
+    def _fix_str_format_in_chat_template(self):
+        """Rewrite Python str.format() calls in Hy3's chat template to jinja concat.
+
+        Hy3 builds its special tokens with a Python string method:
+
+            {%- set eos_token = '<|hy_eos{}|>'.format(HYTK) %}
+
+        minja, the jinja engine llama.cpp embeds, implements no .format method, so a
+        stock Hy3 conversion is unusable for chat at BOTH ends: llama-server --jinja
+        aborts at init with "Callee is not a function: got Undefined (hint: 'format')",
+        and without --jinja every /v1/chat/completions returns 500 because the built-in
+        C++ template matcher does not recognise the template either. Net effect on a
+        stock conversion: no chat completions and no tool calls, only /completion.
+
+        jinja's concat operator is semantically identical and minja does implement it:
+
+            {%- set eos_token = '<|hy_eos' ~ HYTK ~ '|>' %}
+        """
+        key = gguf.Keys.Tokenizer.CHAT_TEMPLATE
+        kv = self.gguf_writer.kv_data[0].get(key) if self.gguf_writer.kv_data else None
+        tmpl = getattr(kv, "value", None)
+        if not isinstance(tmpl, str):
+            return
+        pat = re.compile(r"'([^']*)\{\}([^']*)'\.format\(([A-Za-z_][A-Za-z0-9_]*)\)")
+        fixed, n = pat.subn(lambda m: "'%s' ~ %s ~ '%s'" % (m.group(1), m.group(3), m.group(2)), tmpl)
+        if n:
+            # kv_data is a dict, so re-adding the key replaces the existing entry.
+            self.gguf_writer.add_chat_template(fixed)
+            logger.info(f"gguf: rewrote {n} str.format() call(s) in the chat template to jinja "
+                        f"concat (minja has no .format; --jinja aborts at init without this)")
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
