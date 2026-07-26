@@ -1119,7 +1119,10 @@ llm_expert_gating_func_type   gating_op,
         ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        if (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_STEP35) {
+        // Archs whose reference implementation divides by (sum + eps) rather than by
+        // the bare sum. HY_V3: modeling_hy_v3.py uses sum(-1) + 1e-20.
+        if (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_STEP35 ||
+            lctx.model.arch == LLM_ARCH_HY_V3) {
             weights_sum = ggml_scale_bias(ctx, weights_sum, 1.0, 1e-20);
             cb(weights_sum, "ffn_moe_weights_sum_biased", il);
         }
@@ -2597,6 +2600,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_LAGUNA:
             {
                 result = llm.build_laguna();
+            } break;
+        case LLM_ARCH_HY_V3:
+            {
+                result = llm.build_hy3();
             } break;
         default:
             GGML_ABORT("fatal error");

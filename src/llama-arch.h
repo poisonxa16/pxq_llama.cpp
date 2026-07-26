@@ -81,6 +81,7 @@ enum llm_arch {
     LLM_ARCH_MISTRAL4,
     LLM_ARCH_GEMMA4,
     LLM_ARCH_GEMMA4_MTP,
+    LLM_ARCH_HY_V3,
     LLM_ARCH_UNKNOWN,
 };
 
