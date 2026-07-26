@@ -288,9 +288,12 @@ static void pxq6_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     const int64_t exp_bytes = (R/64)*(PXQ6_HDR_BYTES + (K/32)*(int64_t)(tier ? PXQ6HQ_SLAB_BYTES : PXQ6_SLAB_BYTES));
     auto imx_for = [&](int64_t e) -> const float * {
         if (!imx) return nullptr;
-        if (imx_size == K*E) return imx + e*K;
-        if (imx_size == K)   return imx;
-        return nullptr;
+        // dead-column guard (llama-quantize.cpp): an all-zero / non-finite imatrix column
+        // makes every candidate score 0.0, degenerating the weighted argmin into a tie-break
+        const float * w = nullptr;
+        if      (imx_size == K*E) w = imx + e*K;
+        else if (imx_size == K)   w = imx;
+        return pxq_imatrix_column_usable(w, K) ? w : nullptr;
     };
     (void)pxq6_book_q(); (void)pxq6_sub_q(0); (void)pxq6_mids_q();   // init tables before threading
     if (nthread <= 1 || E <= 1) {
