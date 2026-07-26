@@ -3802,6 +3802,7 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
                 pxa_pxq4_2d_split_log(ctx.device, ws != nullptr, S, panels, (int)ny, (int)R, (int)K);
                 if (ws) {
+                    int * ctrs = pxa_pxq_split_fusered() ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
                     const int kc_max = (kslabs + S - 1)/S;
                     const size_t smem_s = (size_t)kc_max*PXQ6_QK*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
                     dim3 grids((unsigned)(panels*S), 1u, (unsigned)ny);
@@ -3810,14 +3811,17 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                         (const char *)src1->data, src1->nb[1], /* x_slot_stride */ 0,
                         ws,
                         (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                        (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0, ctrs,
                         (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1, S);
                     CUDA_CHECK(cudaGetLastError());
-                    dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
-                    k_pxq_mmv_reduce_s<<<gridr, 256, 0, stream>>>(ws,
-                        (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
-                        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
-                        (int)R, /* n_as */ 1, /* n_ids */ 1, S);
-                    CUDA_CHECK(cudaGetLastError());
+                    if (!ctrs) {
+                        dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
+                        k_pxq_mmv_reduce_s<<<gridr, 256, 0, stream>>>(ws,
+                            (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
+                            (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                            (int)R, /* n_as */ 1, /* n_ids */ 1, S);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
                     return 0;
                 }
             }
@@ -4073,19 +4077,26 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 dim3 grids((unsigned)(R/PXQ4_BM*sgen), (unsigned)n_ids, (unsigned)Ny);
                 auto * ks = pxq6_pick_gateup_ksplit_gen(fmt, fmt_g, pair, vecx);
                 if (ks) {
+                int * ctrs = pxa_pxq_split_fusered() ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
                 ks<<<grids, 256, smem_s, stream>>>(
                     (const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
                     (const char *)src1->data, src1->nb[2], ws,
                     (const char *)ids->data, ids->nb[0], ids->nb[1],
-                    (int)R, (int)K, (int)n_as, (int)n_ids, sgen);
-                CUDA_CHECK(cudaGetLastError());
-                k_pxq6_gateup_reduce_gen<<<gridr, 256, 0, stream>>>(ws,
                     (char *)dst->data, dst->nb[2], dst->nb[1],
-                    (const char *)ids->data, ids->nb[0], ids->nb[1],
                     bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
                     bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
-                    (int)R, (int)n_as, (int)n_ids, unary, 1.702f, limit, sgen);
+                    ctrs, unary, 1.702f, limit,
+                    (int)R, (int)K, (int)n_as, (int)n_ids, sgen);
                 CUDA_CHECK(cudaGetLastError());
+                if (!ctrs) {
+                    k_pxq6_gateup_reduce_gen<<<gridr, 256, 0, stream>>>(ws,
+                        (char *)dst->data, dst->nb[2], dst->nb[1],
+                        (const char *)ids->data, ids->nb[0], ids->nb[1],
+                        bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
+                        bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
+                        (int)R, (int)n_as, (int)n_ids, unary, 1.702f, limit, sgen);
+                    CUDA_CHECK(cudaGetLastError());
+                }
                 gu_done = true;
                 }
             } else {
