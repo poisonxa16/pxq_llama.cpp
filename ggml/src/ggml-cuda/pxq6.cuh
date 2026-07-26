@@ -196,6 +196,23 @@ static inline int pxa_pxq6_ksplit_gen() {
     return s;
 }
 
+// Arch-aware effective S for the decode gateup split (2026-07-26). An explicit env ALWAYS wins
+// (including =0). Unset defaults to S=4 on the two target Teslas: the K1 64-thr form spreads
+// the SAME warp count over more blocks, while the 256-thr S=4 chunk form multiplies
+// warps-in-flight 4x — measured +2.6% decode on 2xV100 and +2.9% on 2xP100 (F35B pure-PXQ4,
+// fill ~6k; S=8 was worse on V100, keep 4). Other archs keep the K1 bit-exact default.
+static inline int pxa_pxq6_ksplit_gen_eff(int cc) {
+    static const bool has_env = getenv("PXA_PXQ6_KSPLIT_GEN") != nullptr;
+    if (has_env) return pxa_pxq6_ksplit_gen();
+    const bool on = (cc == 700 || cc == 600);
+    static const bool logged = [](bool o){
+        if (o) fprintf(stderr, "PXA_PXQ6_KSPLIT_GEN: S=4 (sm_60/70 decode default; env overrides)\n");
+        return true;
+    }(on);
+    (void)logged;
+    return on ? 4 : 0;
+}
+
 // env table overrides (PXA_PXQ6_BOOK / _SUB / _SUB_HQ + the PXQ6R 32-entry PXA_PXQ6R_BOOK),
 // fp16-snapped, per-device upload
 static inline void pxq6_maybe_upload_tables(int device) {
@@ -910,6 +927,98 @@ static __global__ void k_pxq_mmv_reduce(const float * __restrict__ ws,
     float u = 0.f;
     #pragma unroll
     for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += wsj[(size_t)s*R + grow];
+    float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+    out[grow] = u;
+}
+
+// fixed workspace row width for the K8-2D split (slots per (iy,j) row; S is capped at this)
+#define PXQ6_MMV_SPLIT_MAX 16
+
+// K8-2D S-SPLIT (2026-07-26): the single-weight 256-thr S-way twin of the gateup gen form
+// below, built for the 2D decode mmv's two pathological launch shapes (measured, nvprof
+// gpu-trace, Laguna-XS rev-2 backbone, 2xP100):
+//   R=2048 K=8192 (attn_output / ffn_down): 32 blocks + 33.8 KB dyn smem = 1 block/SM on 32 of
+//     56 SMs -> 87 GB/s achieved vs the SAME codec's 210 GB/s where the grid is healthy;
+//   R=512 K=2048 (ffn_{up,gate}_shexp): 8 blocks total -> 20 GB/s.
+// Where the plain grid already covers the machine (R=8192 K=2048 attn_q: 128 blocks, 9 KB) the
+// UNSPLIT kernel measures 210 GB/s vs mmvq-MXFP4's 161 GB/s on the same tensor -- the dot path
+// is not the deficit, the launch geometry is. Block pk = (panel p, chunk): the full 64x4 kseg
+// structure INSIDE K-chunk [kb0,kb1); stages only its x slice (dyn smem Kc + red) so smem stops
+// capping occupancy at large K. Partials to ws in fixed 16-slot rows; k_pxq_mmv_reduce_s sums
+// chunks in ascending order (deterministic run-to-run; differs from the proven chain order =>
+// NOT bit-exact vs the unsplit kernel -- G3/G4 gated like K1b/K6).
+template <class POL, int MODE, bool VECX>
+static __global__ void __launch_bounds__(256)
+k_pxq6_mmv_ksplit_gen(const uint8_t * __restrict__ W,
+                      const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+                      float * __restrict__ ws,
+                      const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                      const int R, const int K, const int n_as, const int n_ids, const int S) {
+    const int pk = blockIdx.x;
+    const int p     = pk / S;
+    const int chunk = pk % S;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    const int kslabs = K / PXQ6_QK;
+    const int kb0 = (kslabs*chunk)/S, kb1 = (kslabs*(chunk+1))/S;
+    const int Kc  = (kb1 - kb0)*PXQ6_QK;
+
+    extern __shared__ float pxq6_smem[];
+    float * xs  = pxq6_smem;                      // Kc floats (chunk slice only)
+    float * red = pxq6_smem + Kc;                 // KSEG*64
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride) + kb0*PXQ6_QK;
+    for (int idx = threadIdx.x; idx < Kc; idx += blockDim.x) xs[idx] = x[idx];
+
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
+    __shared__ float sub[16];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    __syncthreads();
+    pxq6_prmt_book pb{};
+    if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    float su = 0.f;
+    for (int kb = kb0 + kseg; kb < kb1; kb += PXQ4_MMV_KSEG) {
+        su += pxq6_dot32<POL, MODE, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                          xs + (kb - kb0)*PXQ6_QK, tab, sub, plut, pb);
+    }
+    red[kseg*64 + row] = su;
+    __syncthreads();
+    if (kseg == 0) {
+        float u = 0.f;
+        #pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += red[s*64 + row];
+        float * wsj = ws + ((size_t)iy*n_ids + j)*(size_t)PXQ6_MMV_SPLIT_MAX*R;   // fixed 16-slot rows
+        wsj[(size_t)chunk*R + p*PXQ6_BM + row] = u;
+    }
+}
+
+// generic-S reducer for k_pxq6_mmv_ksplit_gen: sums the S chunk partials in ascending chunk
+// order (fixed => deterministic) and writes dst. One thread per (iy, j, grow).
+static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
+        char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+        const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+        const int R, const int n_as, const int n_ids, const int S) {
+    const int grow = blockIdx.x*blockDim.x + threadIdx.x;
+    if (grow >= R) return;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;   // SER slot: dst untouched (matches the proven kernel)
+    const float * wsj = ws + ((size_t)iy*n_ids + j)*(size_t)PXQ6_MMV_SPLIT_MAX*R;
+    float u = 0.f;
+    for (int s = 0; s < S; ++s) u += wsj[(size_t)s*R + grow];
     float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
     out[grow] = u;
 }
@@ -1881,6 +1990,8 @@ typedef void (*pxq6_mmv_fn)(const uint8_t *, const char *, size_t, size_t,
         char *, size_t, size_t, const char *, size_t, size_t, int, int, int);
 typedef void (*pxq6_mmv_ks_fn)(const uint8_t *, const char *, size_t, size_t,
         float *, const char *, size_t, size_t, int, int, int, int);
+typedef void (*pxq6_mmv_ksg_fn)(const uint8_t *, const char *, size_t, size_t,
+        float *, const char *, size_t, size_t, int, int, int, int, int);
 typedef void (*pxq6_mmv_redfuse_fn)(const uint8_t *, const float *, char *, size_t, size_t,
         const char *, size_t, size_t, const float *, size_t, const float *, size_t,
         int, int, int, int, int, float, float);
@@ -1975,6 +2086,7 @@ static inline int pxa_pxq6_decode_mode() {
 PXQ6_PICKM_FMT_GU(pxq6_gateup_fn,     pxq6_pick_gateup,            k_pxq6_gateup_mmv)
 PXQ6_PICKM_FMT(pxq6_mmv_fn,        pxq6_pick_mmv,               k_pxq6_mmv)
 PXQ6_PICKM_FMT(pxq6_mmv_ks_fn,     pxq6_pick_mmv_ksplit,        k_pxq6_mmv_ksplit)
+PXQ6_PICKM_FMT(pxq6_mmv_ksg_fn,    pxq6_pick_mmv_ksplit_gen,    k_pxq6_mmv_ksplit_gen)
 PXQ6_PICKM_FMT(pxq6_mmv_redfuse_fn, pxq6_pick_mmv_redfuse,      k_pxq6_mmv_redfuse)
 PXQ6_PICKM_FMT_GU(pxq6_gateup_ks_fn,  pxq6_pick_gateup_ksplit,     k_pxq6_gateup_mmv_ksplit)
 PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen, k_pxq6_gateup_mmv_ksplit_gen)

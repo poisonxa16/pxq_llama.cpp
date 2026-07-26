@@ -3017,6 +3017,66 @@ static __global__ void k_pxa_router_gemv_f32(
     }
 }
 
+// PXA_F16_GEMV (2026-07-26): small-R F16 GEMV for ne11==1 decode nodes. Motivation: the rev-2
+// backbone table promotes the per-head attn_gate (ne[1] = n_head, 48..64 on the Laguna family)
+// to F16, and an F16 x F32 ne11==1 GEMV misses every fast dispatch path (dmmv/mmvq need a
+// quantized src0; the batched-cublas branch needs a real batch dim), landing on the generic
+// cuBLAS chain: convert x f32->f16 + gemmSN_TN_kernel_half + convert dst f16->f32 + a cpy —
+// measured (nvprof, Laguna-XS rev-2, 2xP100) ~31.5us + 3 helper kernels per call, 40 calls per
+// decode token = ~1.5 ms/token for what is a ~0.3 MB tensor read. This kernel does the row-dot
+// directly: f16 weights x f32 activations with fp32 per-thread partials + fixed warp/smem tree
+// (4 warps per row). NOTE the cuBLAS chain rounds x AND the result through f16; this path keeps
+// both in f32, so it is numerically DIFFERENT (strictly tighter) — behavior-gauntlet gated, not
+// sha-gated. Restricted to R <= 512 so it can never intercept a real dense projection.
+// PXA_F16_GEMV=0 rolls back to the cuBLAS chain.
+static __global__ void __launch_bounds__(128) k_pxa_gemv_f16(
+        const half * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int ne00, const size_t nb01) {
+    const int row = blockIdx.x;
+    const half2  * w2 = (const half2  *)((const char *) w + (size_t) row * nb01);
+    const float2 * x2 = (const float2 *)x;
+    const int k2max = ne00/2;
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < k2max; k += 128) {
+        const half2  hw = w2[k];
+        const float2 fx = x2[k];
+        sum += __low2float(hw)*fx.x + __high2float(hw)*fx.y;
+    }
+    __shared__ float warpsum[4];
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, off);
+    }
+    if ((threadIdx.x & (WARP_SIZE-1)) == 0) warpsum[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        y[row] = (warpsum[0] + warpsum[1]) + (warpsum[2] + warpsum[3]);
+    }
+}
+
+// Returns true if it fully handled the mul_mat (caller should return immediately).
+static bool ggml_cuda_small_gemv_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const bool on = [] {
+        const char * e = getenv("PXA_F16_GEMV");
+        return !(e && atoi(e) == 0);
+    }();
+    if (!on) return false;
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) return false;
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1)) return false;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (src0->ne[1] < 2 || src0->ne[1] > 512) return false;   // small-R family; ne01==1 stays with mul_mat_1row
+    if (src0->ne[0] % 2 != 0) return false;                    // half2 loads
+    if (src0->nb[0] != sizeof(half) || src1->nb[0] != sizeof(float)) return false;
+    if (src0->nb[1] % 4 != 0) return false;                    // half2 row alignment
+    if (!ggml_is_contiguous(src1)) return false;
+    k_pxa_gemv_f16<<<(unsigned)src0->ne[1], 128, 0, ctx.stream()>>>(
+        (const half *) src0->data, (const float *) src1->data, (float *) dst->data,
+        (int) src0->ne[0], src0->nb[1]);
+    return true;
+}
+
 // Returns true if it fully handled the mul_mat (caller should return immediately).
 static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // Per-ARCH gate (resolver in pxa-enhance.cuh, INT8_PREFILL-pattern): ENHANCE auto-enables
@@ -3071,6 +3131,11 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const ggml_cgraph * cgraph, int node_n) {
 
     if (ggml_cuda_router_gemv_f32(ctx, src0, src1, dst)) {
+        return node_n;
+    }
+
+    // Small-R F16 decode GEMV (rev-2 per-head attn_gate class) — see k_pxa_gemv_f16.
+    if (ggml_cuda_small_gemv_f16(ctx, src0, src1, dst)) {
         return node_n;
     }
 
@@ -3583,6 +3648,65 @@ static bool pxa_pxq4_2d_ksplit() {
     return v;
 }
 
+// K8-2D S-SPLIT gate (2026-07-26). Default ON; PXA_PXQ4_2D_SPLIT=0 rolls the dispatch back to
+// the unsplit/K1 forms. Motivation (nvprof gpu-trace, Laguna-XS rev-2, 2xP100): the unsplit
+// grid is panels = R/64 blocks, so R=2048 K=8192 (attn_output/ffn_down) = 32 blocks whose
+// 33.8 KB x-stage caps occupancy at 1 block/SM -> 87 GB/s, and R=512 (shexp up/gate) = 8
+// blocks -> 20 GB/s, while the SAME dot path with a healthy grid (R=8192: 128 blocks, 9 KB)
+// runs 210 GB/s and BEATS mmvq-MXFP4 (161 GB/s) per byte. The S-split multiplies blocks by S
+// and divides the x-stage by S, attacking both. NOT bit-exact vs the unsplit kernel (chunk
+// summation order) -- deterministic run-to-run; G3/G4 gated like K1b/K6.
+static bool pxa_pxq4_2d_split() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_PXQ4_2D_SPLIT");
+        return !(e && atoi(e) == 0);
+    }();
+    return v;
+}
+
+// Grid-coverage target the split aims for (blocks incl. the ny axis). Default 2x the device's
+// SM count; PXA_PXQ4_2D_SPLIT_TARGET overrides (0 = never split; large = always max split).
+static int pxa_pxq4_2d_split_target(int device) {
+    static const int ov = [] {
+        const char * e = getenv("PXA_PXQ4_2D_SPLIT_TARGET");
+        return e ? atoi(e) : -1;
+    }();
+    return ov >= 0 ? ov : 2*ggml_cuda_info().devices[device].nsm;
+}
+
+// First firing / first decline per device (same phantom-lever discipline as the K1 log).
+static void pxa_pxq4_2d_split_log(int device, bool fired, int S, int panels, int ny, int R, int K) {
+    static std::atomic<uint32_t> seen{0};
+    if (device < 0 || device >= 16) return;
+    const uint32_t bit = 1u << (2*device + (fired ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    fprintf(stderr, "PXA_PXQ4_2D_SPLIT dev%d: %s (S=%d panels=%d ny=%d R=%d K=%d, target %d blocks)\n",
+            device, fired ? "FIRING" : "DECLINED -> unsplit launch", S, panels, ny, R, K,
+            pxa_pxq4_2d_split_target(device));
+}
+
+// Persistent one-entry {0} ids buffer per device: every PXQ 2D node feeds the expert-stacked
+// kernels through the E==1 idiom, and a fresh pool alloc + cudaMemsetAsync per node was pure
+// per-call tax (200+ decode calls/token on a rev-2 backbone). cudaMalloc is illegal mid-capture:
+// callers get nullptr there and fall back to the pool form (replayed graphs stay correct).
+static const int32_t * pxa_pxq_zero_ids(int device, cudaStream_t stream) {
+    static int32_t * bufs[64] = {nullptr};
+    static std::mutex mtx;
+    if (device < 0 || device >= 64) return nullptr;
+    if (bufs[device]) return bufs[device];
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &st);
+    if (st != cudaStreamCaptureStatusNone) return nullptr;
+    std::lock_guard<std::mutex> lk(mtx);
+    if (!bufs[device]) {
+        int32_t * p = nullptr;
+        if (cudaMalloc(&p, sizeof(int32_t)) != cudaSuccess) { (void)cudaGetLastError(); return nullptr; }
+        if (cudaMemset(p, 0, sizeof(int32_t)) != cudaSuccess) { (void)cudaGetLastError(); cudaFree(p); return nullptr; }
+        bufs[device] = p;
+    }
+    return bufs[device];
+}
+
 // Fire the re-grid only below a block-count threshold; at or above it the plain grid already
 // covers the machine and the extra launch is pure tax. Default = the device's SM count.
 // PXA_PXQ4_2D_KSPLIT_MINBLK overrides (0 = never split, a huge value = always split) for env-only A/B.
@@ -3651,11 +3775,54 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     cudaStream_t stream = ctx.stream();
 
-    // one-entry ids buffer == {0}; both strides zero so every (token, slot) block reads it
-    ggml_cuda_pool_alloc<int32_t> ids_zero(ctx.pool(), 1);
-    CUDA_CHECK(cudaMemsetAsync(ids_zero.get(), 0, sizeof(int32_t), stream));
+    // one-entry ids buffer == {0}; both strides zero so every (token, slot) block reads it.
+    // Persistent per device; the pool form only mid-graph-capture.
+    const int32_t * idz = pxa_pxq_zero_ids(ctx.device, stream);
+    ggml_cuda_pool_alloc<int32_t> ids_pool(ctx.pool());
+    if (!idz) {
+        ids_pool.alloc(1);
+        CUDA_CHECK(cudaMemsetAsync(ids_pool.get(), 0, sizeof(int32_t), stream));
+        idz = ids_pool.get();
+    }
 
     const int panels = (int)(R/PXQ4_BM);
+
+    // K8-2D: S-way K-chunk split when the plain grid under-fills the machine (or its full-K
+    // x stage caps occupancy). S = smallest power of two reaching the block target, capped by
+    // PXQ6_MMV_SPLIT_MAX and by >= 4 slabs per chunk (one per kseg chain).
+    if (pxa_pxq4_2d_split()) {
+        const int kslabs = (int)(K/PXQ6_QK);
+        const int target = pxa_pxq4_2d_split_target(ctx.device);
+        int S = 1;
+        while (S < PXQ6_MMV_SPLIT_MAX && (int64_t)panels*ny*S < target && (S*2)*PXQ4_MMV_KSEG <= kslabs) S *= 2;
+        if (S > 1) {
+            auto * ksg = pxq6_pick_mmv_ksplit_gen(fmt, pair, vecx);
+            if (ksg) {
+                const size_t need = (size_t)ny*(size_t)PXQ6_MMV_SPLIT_MAX*(size_t)R;
+                float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
+                pxa_pxq4_2d_split_log(ctx.device, ws != nullptr, S, panels, (int)ny, (int)R, (int)K);
+                if (ws) {
+                    const int kc_max = (kslabs + S - 1)/S;
+                    const size_t smem_s = (size_t)kc_max*PXQ6_QK*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
+                    dim3 grids((unsigned)(panels*S), 1u, (unsigned)ny);
+                    ksg<<<grids, 256, smem_s, stream>>>(
+                        (const uint8_t *)src0->data,
+                        (const char *)src1->data, src1->nb[1], /* x_slot_stride */ 0,
+                        ws,
+                        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                        (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1, S);
+                    CUDA_CHECK(cudaGetLastError());
+                    dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
+                    k_pxq_mmv_reduce_s<<<gridr, 256, 0, stream>>>(ws,
+                        (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
+                        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                        (int)R, /* n_as */ 1, /* n_ids */ 1, S);
+                    CUDA_CHECK(cudaGetLastError());
+                    return 0;
+                }
+            }
+        }
+    }
 
     // K1-2D: re-grid when the plain grid under-fills the machine. Bit-identical; every decline
     // (no instantiation / workspace unavailable under graph capture) falls through to the
@@ -3673,13 +3840,13 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     (const uint8_t *)src0->data,
                     (const char *)src1->data, src1->nb[1], /* x_slot_stride */ 0,
                     ws,
-                    (const char *)ids_zero.get(), /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                    (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
                     (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1);
                 CUDA_CHECK(cudaGetLastError());
                 dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
                 k_pxq_mmv_reduce<<<gridr, 256, 0, stream>>>(ws,
                     (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
-                    (const char *)ids_zero.get(), /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                    (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
                     (int)R, /* n_as */ 1, /* n_ids */ 1);
                 CUDA_CHECK(cudaGetLastError());
                 return 0;
@@ -3692,7 +3859,7 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         (const uint8_t *)src0->data,
         (const char *)src1->data, src1->nb[1], /* x_slot_stride  */ 0,
         (char *)dst->data,        dst->nb[1],  /* dst_slot_stride*/ 0,
-        (const char *)ids_zero.get(), /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
         (int)R, (int)K, /* n_as */ 1);
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -3855,7 +4022,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     const int  pair = pxa_pxq6_decode_mode();   // sourcing MODE (tab/pairlut/prmt x cs) — name kept for call-site diff-min
     const bool vecx = pxa_pxq6_vecx();
-    const int  sgen = pxa_pxq6_ksplit_gen();
+    const int  sgen = pxa_pxq6_ksplit_gen_eff(ggml_cuda_info().devices[ctx.device].cc);
     const bool newfam = fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6 || pair || vecx || sgen || pxa_pxq6_ksplit();
 
     dim3 grid((unsigned)(R/PXQ4_BM), (unsigned)n_ids, (unsigned)Ny);
