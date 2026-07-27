@@ -53,6 +53,93 @@ static inline const char * pxa_config_level_name() {
     return l == 0 ? "REFERENCE" : l == 2 ? "ENHANCE" : "DEFAULT";
 }
 
+// -----------------------------------------------------------------------------
+// PXA topology detection (2026-07-23) — the per-TOPOLOGY ENHANCE decision path.
+//
+// The measured best-in-class levers depend not just on a single device's arch but on the
+// SHAPE of the whole device set the model runs on: {single vs multi} x {same-type vs
+// mixed-type} x arch. Basis (isolated silicon A/B, PXQ2/PXQ4-35B-MTP, 588-tok prompt):
+//   T1 single V100 (sm_70)          -> spec1row on, router_fuse ON, volta_cublas 64, ub1024
+//   T3 2x V100 (sm_70, same-type)   -> router_fuse ON, volta_cublas 64, ts 1,1, ub1024
+//   T2 single P100 (sm_60)          -> deltanet on, p100_fp16 on, router_fuse OFF (no-op sm_60)
+//   T4 mixed V100+P100 (-sm layer)  -> router_fuse OFF (measured NEUTRAL-to-NEGATIVE, -3% at
+//                                      the V100-heavy ts; P100 gates -sm-layer decode so a
+//                                      V100-only GEMV fusion cannot pay), volta_cublas 64,
+//                                      p100_fp16 on, spec1row on (harmless), ts 1.4,0.6
+// The ONE topology-dependent KERNEL flip vs the old flat per-arch gating: router_fuse, which
+// the old cc==700 gate would light up on the V100 slice of a MIXED rig where it measured a
+// regression. ENHANCE now gates it on a PURE-sm_70 (non-mixed) topology. (-ts/-ub are serve
+// flags, reported in the DBG line, not settable from here.)
+//
+// The detected topology is computed ONCE from the enumerated device list in ggml_cuda_init()
+// and stashed in a single process-global with external linkage (defined in ggml-cuda.cu), so
+// every TU's inline resolvers read the same detection without the header-static-per-TU trap.
+struct pxa_topology_t {
+    bool valid;       // populated by pxa_enhance_init_topology()
+    int  ndev;
+    bool multi;       // ndev > 1
+    bool mixed;       // > 1 distinct arch class among the devices
+    bool has_sm60;    // P100 (cc==600)
+    bool has_sm61;    // 1080 Ti (cc==610)
+    bool has_sm70;    // V100 (cc==700)
+    bool has_other;   // Ampere+/anything else
+    int  n_distinct;  // number of distinct arch classes present
+    int  primary_cc;  // fastest arch present (representative)
+};
+
+// Defined in ggml-cuda.cu; populated by pxa_enhance_init_topology(), read by the resolvers.
+extern pxa_topology_t g_pxa_topology;
+
+// Classify a cc into a coarse arch class id (for distinct-count / mixed detection).
+static inline int pxa_arch_class(int cc) {
+    if (cc == 600) return 1;                 // sm_60 P100
+    if (cc == 610) return 2;                 // sm_61 1080 Ti
+    if (cc >= 700 && cc < 750) return 3;     // sm_70 V100
+    return 4;                                // Ampere+/other
+}
+
+// Compute the topology ONCE from the device-cc list. Called from ggml_cuda_init() BEFORE the
+// startup report and before any dispatch reads a resolver, so the cached resolver statics see
+// the populated global. Idempotent-safe (last write wins).
+static inline void pxa_enhance_init_topology(int ndev, const int * ccs) {
+    pxa_topology_t t = {};
+    t.ndev = ndev;
+    int classes = 0;      // bitmask of seen arch classes
+    int fastest = 0;
+    for (int i = 0; i < ndev; ++i) {
+        const int cc = ccs[i];
+        const int cl = pxa_arch_class(cc);
+        classes |= (1 << cl);
+        if (cc == 600) t.has_sm60 = true;
+        else if (cc == 610) t.has_sm61 = true;
+        else if (cc >= 700 && cc < 750) t.has_sm70 = true;
+        else t.has_other = true;
+        if (cc > fastest) fastest = cc;
+    }
+    int distinct = 0;
+    for (int b = 0; b < 8; ++b) if (classes & (1 << b)) ++distinct;
+    t.n_distinct = distinct;
+    t.multi      = ndev > 1;
+    t.mixed      = distinct > 1;
+    t.primary_cc = fastest;
+    t.valid      = ndev > 0;
+    g_pxa_topology = t;
+}
+
+// A short human name for the detected topology (for the DBG log).
+static inline const char * pxa_topology_name() {
+    const pxa_topology_t & t = g_pxa_topology;
+    if (!t.valid)                       return "unknown";
+    if (t.mixed) {
+        if (t.has_sm70 && t.has_sm60)   return "mixed V100+P100 (sm_70+sm_60)";
+        return "mixed (multi-arch)";
+    }
+    if (t.has_sm70)                     return t.multi ? "multi same-type V100 (sm_70)" : "single V100 (sm_70)";
+    if (t.has_sm60)                     return t.multi ? "multi same-type P100 (sm_60)" : "single P100 (sm_60)";
+    if (t.has_sm61)                     return t.multi ? "multi same-type 1080Ti (sm_61)" : "single 1080Ti (sm_61)";
+    return t.multi ? "multi same-type (other arch)" : "single (other arch)";
+}
+
 // level-aware default for the bit-exact PXA_PXQ6_GATE lever family (pxq6.cuh):
 // REFERENCE -> false (pure reference kernels); DEFAULT/ENHANCE -> the shipped default.
 static inline bool pxa_gate_default(bool shipped_dflt) {
@@ -92,18 +179,28 @@ static inline int pxa_int8_prefill_mode_resolve() {
 // PXA_ROUTER_FUSE canonical resolver (ggml-cuda.cu router-GEMV dispatch + the startup report).
 // B3: the MoE router-logits F32 GEMV (ffn_gate_inp x one decode token) misses every fast
 // dispatch path and lands on a bare cublasSgemm; a dedicated warp-per-row GEMV kernel takes it
-// instead. ENHANCE defaults mode 1 — the cc==700-only ship gate (same shape as INT8_PREFILL's
-// sm_61 gate: the arch check lives at the dispatch site): +5.1..+7.0% decode measured on the
-// V100 (2026-07-22 fair-battle, reproduced), a +1.6% KILL on sm_60, so Pascal stays off.
-// REFERENCE/DEFAULT -> 0 (OFF, byte-identical dispatch). Explicit env wins at any level
-// (0 forces OFF, 1 = the sm_70 ship gate, 2 = TEST all-arch). G3-class (the fuse reorders FP
-// math vs cuBLAS: ULP logit deltas can flap expert ties — expert-id-stream gated, not sha).
+// instead. +5.1..+7.0% decode measured on the V100 (2026-07-22 fair-battle, reproduced), a
+// +1.6% KILL on sm_60 so Pascal stays off (the dispatch-site cc==700 arch gate handles that).
+//
+// TOPOLOGY-AWARE ENHANCE default (2026-07-23): the ENHANCE-derived mode is 1 ONLY on a
+// PURE-sm_70 (non-mixed) topology — single or multi V100. On a MIXED V100+P100 rig it is 0
+// (OFF): T4 measured router_fuse NEUTRAL-to-NEGATIVE there (-3.1% at the winning -ts 1.4,0.6),
+// because -sm layer makes the P100 the decode bottleneck and a V100-only GEMV fusion can't pay
+// while adding tie-flap risk. Pure P100 stays 0 via both this gate and the cc check.
+// REFERENCE/DEFAULT -> 0 (OFF, byte-identical dispatch). Explicit env ALWAYS wins at any level
+// and is NOT topology-masked (0 forces OFF, 1 = the sm_70 ship gate on any cc==700 device,
+// 2 = TEST all-arch). G3-class (the fuse reorders FP math vs cuBLAS: ULP logit deltas can flap
+// expert ties — expert-id-stream gated, not sha).
 static inline int pxa_router_fuse_mode_resolve() {
     static const int mode = [](){
         const char * e = getenv("PXA_ROUTER_FUSE");
-        int m = e ? atoi(e) : (pxa_config_level() == 2 ? 1 : 0);
-        if (m < 0 || m > 2) m = 0;
-        return m;
+        if (e) { int m = atoi(e); return (m < 0 || m > 2) ? 0 : m; }
+        // ENHANCE auto-set: ON (mode 1) only for a pure-sm_70 non-mixed topology.
+        if (pxa_config_level() == 2 && g_pxa_topology.valid
+            && g_pxa_topology.has_sm70 && !g_pxa_topology.mixed) {
+            return 1;
+        }
+        return 0;
     }();
     return mode;
 }
@@ -122,6 +219,27 @@ static inline bool pxa_spec_relaxed_resolve() {
     const char * e = getenv("PXA_SPEC_RELAXED");
     if (e) return atoi(e) != 0;
     return pxa_config_level() == 2;
+}
+
+// PXA_SPEC_1ROW canonical resolver (consumer: ggml-cuda.cu mul_mat dispatch). Folds the
+// former stand-alone PXA_SPEC_1ROW env into the config-level system so ENHANCE owns it in the
+// auto-set. When ON, a single-output-row src0 GEMV also takes the 1-row path at spec-verify
+// batch sizes (Ny<=8, MMVQ_MAX_BATCH_SIZE); OFF rolls back to the ne11==1-only dispatch.
+//   DEFAULT/ENHANCE -> ON  (matches the shipped default-ON — behavior byte-identical to today
+//                           when PXA_ENHANCE is unset; invariant #1 preserved).
+//   REFERENCE       -> OFF (pure reference: the ne11==1-only dispatch).
+// TOPOLOGY note: this is a V100 (sm_70, DP4A/int8) 1-row spec-verify win (documented +6.6%;
+// on the enhance-sweep PXQ2 it measured neutral, inside the ~4% serve noise). It is a MEASURED
+// NO-OP + bit-exact on sm_60 P100 (no DP4A path to engage) and neutral on the mixed rig, so
+// keeping it ON everywhere is harmless — it only matters where an sm_70 device is present.
+// Explicit env ALWAYS wins (PXA_SPEC_1ROW=0 rolls back at any level).
+static inline bool pxa_spec_1row_resolve() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_SPEC_1ROW");
+        if (e) return atoi(e) != 0;
+        return pxa_config_level() != 0;   // REFERENCE off; DEFAULT/ENHANCE on
+    }();
+    return v;
 }
 
 // PXA_P100_FP16_GEMM level-aware resolver (consumed by ggml-cuda.cu, dense cuBLAS mul_mat).
@@ -198,12 +316,43 @@ static inline int pxa_fa_prefill_split_ne11() {
         const char * e = getenv("PXA_FA_PREFILL_SPLIT");
         if (e) { int t = atoi(e); return t <= 0 ? 0 : (t < 9 ? 9 : t); }
         if (pxa_config_level() == 0) return 0;    // REFERENCE
-        (void) pxa_mode();
-        return 0;   // EXPERIMENTAL opt-in ONLY (2026-07-24): ENHANCE no longer auto-enables FA_PREFILL_SPLIT.
-                    // It 2.35x-ed the compute buffer (1956->4607 MiB) for +2%% prefill, OOMing 16GB cards.
-                    // Set PXA_FA_PREFILL_SPLIT=64 explicitly to opt in.
+        return pxa_mode() == 1 ? 0 : 64;          // MAX -> inert; BALANCE -> 64
     }();
     return v;
+}
+
+// PXA_ENHANCE_DBG topology debug line (2026-07-23). Gated behind PXA_ENHANCE_DBG (any non-zero
+// value). Names the DETECTED topology and the CHOSEN per-topology ENHANCE config (the kernel
+// levers this topology auto-set resolves, plus the recommended serve-flags -ub/-ts which are
+// applied at launch, not from here). Called from ggml_cuda_init() AFTER pxa_enhance_init_topology.
+static inline void pxa_enhance_log_topology_dbg() {
+    const char * d = getenv("PXA_ENHANCE_DBG");
+    if (!(d && atoi(d) != 0)) return;
+    const pxa_topology_t & t = g_pxa_topology;
+    fprintf(stderr, "PXA_ENHANCE_DBG: topology=\"%s\" ndev=%d multi=%d mixed=%d n_distinct=%d "
+                    "[sm60=%d sm61=%d sm70=%d other=%d] level=%s\n",
+            pxa_topology_name(), t.ndev, t.multi, t.mixed, t.n_distinct,
+            t.has_sm60, t.has_sm61, t.has_sm70, t.has_other, pxa_config_level_name());
+    // Chosen config for this topology (the kernel levers ENHANCE resolves + recommended serve flags).
+    fprintf(stderr, "PXA_ENHANCE_DBG: chosen{ spec1row=%s router_fuse=%s volta_cublas_ne11=%d "
+                    "p100_fp16_gemm=%s fuse_deltanet=%d int8_prefill=%d fa_mask_skip_tile=%s "
+                    "fa_prefill_split=%d spec_relaxed=%s }",
+            pxa_spec_1row_resolve() ? "on" : "off",
+            (pxa_router_fuse_mode_resolve() != 0) ? "on" : "off",
+            pxa_volta_cublas_ne11(),
+            pxa_p100_fp16_gemm() ? "on" : "off",
+            pxa_fuse_deltanet_default(),
+            pxa_int8_prefill_mode_resolve(),
+            pxa_fa_mask_skip_tile() ? "on" : "off",
+            pxa_fa_prefill_split_ne11(),
+            pxa_spec_relaxed_resolve() ? "on" : "off");
+    // Recommended serve flags per the measured decision table (NOT set from here — launch flags).
+    const char * rec_ub = "2048";
+    const char * rec_ts = "n/a (single card)";
+    if (t.mixed && t.has_sm70 && t.has_sm60) { rec_ub = "2048"; rec_ts = "1.4,0.6 (heavy on V100, OOM edge)"; }
+    else if (t.has_sm70)                     { rec_ub = "1024"; rec_ts = t.multi ? "1,1 (balanced same-type)" : "n/a (single card)"; }
+    else if (t.has_sm60)                     { rec_ub = "2048"; rec_ts = t.multi ? "1,1 (balanced same-type)" : "n/a (single card)"; }
+    fprintf(stderr, " serve{ ub=%s ts=%s }\n", rec_ub, rec_ts);
 }
 
 // One-time startup report (stderr), called from ggml_cuda_init() with the enumerated device

@@ -97,6 +97,12 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+// PXA topology (2026-07-23): the single process-global backing the topology-aware ENHANCE
+// decision path in pxa-enhance.cuh. Populated once by pxa_enhance_init_topology() from the
+// enumerated device list in ggml_cuda_init(); read by the header-inline lever resolvers across
+// every CUDA TU (external linkage avoids a header-static-per-TU split-brain).
+pxa_topology_t g_pxa_topology = {};
+
 static void ggml_cuda_default_log_callback(enum ggml_log_level level, const char * msg, void * user_data) {
     GGML_UNUSED(level);
     GGML_UNUSED(user_data);
@@ -308,6 +314,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
     }
 
     // PXA master config tiers (PXA_REFERENCE / default / PXA_ENHANCE): one-time per-device report
+    // PXA topology detection FIRST (populates g_pxa_topology so the level resolvers below and
+    // every later dispatch read the same detection), then the reports.
+    pxa_enhance_init_topology(info.device_count, pxa_ccs);
+    pxa_enhance_log_topology_dbg();
     pxa_enhance_log_startup(info.device_count, pxa_ccs, pxa_names);
 
     for (int id = 0; id < info.device_count; ++id) {
