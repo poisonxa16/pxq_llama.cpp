@@ -281,7 +281,18 @@ static void pxq3_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
         return pxq_imatrix_column_usable(w, K) ? w : nullptr;
     };
     (void)pxq3_book_q(); (void)pxq3_sub_q(); (void)pxq3_mids_q();   // init tables before threading
-    if (nthread <= 1 || E <= 1) {
+    // P15 (2026-07-27): thread over (expert, panel-chunk) jobs, not experts alone. A DENSE
+    // tensor (E == 1) previously fell into the serial branch and ran its whole R x K on ONE
+    // thread (measured: 103% CPU at -t 32 quantizing the dense 27B, ~9.7 s/tensor). Panels
+    // are independent and panel-major with per-panel headers, so a 64-row slice at a panel
+    // boundary is self-contained and the output is byte-identical to the serial order by
+    // construction (verified: -t 1 vs -t 32 md5-identical on a mixed dense+MoE fixture).
+    const int64_t panels      = R/64;
+    const int64_t panel_bytes = panels > 0 ? exp_bytes/panels : 0;
+    const int64_t CHUNK       = 8;                              // panels per job (512 rows)
+    const int64_t chunks_per_e = panels > 0 ? (panels + CHUNK - 1)/CHUNK : 1;
+    const int64_t n_jobs      = E*chunks_per_e;
+    if (nthread <= 1 || n_jobs <= 1) {
         for (int64_t e = 0; e < E; ++e) {
             pxq3_quantize_expert(src + e*exp_elems, dst + e*exp_bytes, R, K, imx_for(e));
         }
@@ -290,13 +301,19 @@ static void pxq3_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     std::atomic<int64_t> counter{0};
     auto compute = [&]() {
         while (true) {
-            const int64_t e = counter.fetch_add(1);
-            if (e >= E) break;
-            pxq3_quantize_expert(src + e*exp_elems, dst + e*exp_bytes, R, K, imx_for(e));
+            const int64_t j = counter.fetch_add(1);
+            if (j >= n_jobs) break;
+            const int64_t e  = j / chunks_per_e;
+            const int64_t c  = j % chunks_per_e;
+            const int64_t p0 = c*CHUNK;
+            const int64_t nr = std::min<int64_t>(CHUNK, panels - p0)*64;
+            pxq3_quantize_expert(src + e*exp_elems + p0*64*K,
+                 dst + e*exp_bytes + p0*panel_bytes,
+                 nr, K, imx_for(e));
         }
     };
     std::vector<std::thread> th;
-    const int n = (int) std::min<int64_t>(nthread, E);
+    const int n = (int) std::min<int64_t>(nthread, n_jobs);
     th.reserve(n);
     for (int i = 0; i < n; ++i) th.emplace_back(compute);
     for (auto & t : th) t.join();
