@@ -16,6 +16,134 @@
 #include <map>
 #include <unordered_map>
 
+// ============================================================================
+// PXA_MTP_PREFETCH (Layer 1) — overlap the single MTP companion COMMIT decode
+// with the same step's process_token + HTTP streaming write.
+//   env PXA_MTP_PREFETCH=1  (default 0 => byte-for-byte the serial path).
+// One dedicated worker thread owns every async ctx_mtp write; every other
+// ctx_mtp writer (draft / ensure / on_target_* / context_shift / clear) waits
+// on the pending job first (cancel-before-mutate). The commit code executed is
+// IDENTICAL to the serial function — only its thread + timing move — so the
+// token stream and the acceptance trajectory are bit-exact. Because the proxy
+// caps brainInflightCap=1 (single seq), at most one job is ever in flight.
+// ============================================================================
+#include <thread>
+#include <future>
+#include <deque>
+#include <condition_variable>
+#include <mutex>
+#include <functional>
+#include <memory>
+#include <vector>
+
+static bool pxa_mtp_prefetch_enabled() {
+    static const int v = getenv("PXA_MTP_PREFETCH") ? atoi(getenv("PXA_MTP_PREFETCH")) : 0;
+    return v != 0;
+}
+
+// Set while the worker thread runs a commit job. Guarded ctx_mtp entry points that the job may
+// re-enter (e.g. clear_sequence_hidden on a failed commit) must NOT wait on the job's own future
+// -> that would deadlock. When true, the wait helpers below are no-ops (the worker already owns
+// ctx_mtp exclusively for the duration of the job).
+static thread_local bool pxa_mtp_in_worker = false;
+
+// self-contained copy of a commit request (the caller's hidden-row buffers are
+// stack/locals that die when update_slots returns, so the job must own them).
+struct pxa_mtp_owned_req {
+    llama_seq_id             seq_id = -1;
+    llama_pos                pos_base = 0;
+    llama_token              sampled_before = -1;
+    std::vector<llama_token> ids;
+    std::vector<float>       hidden;
+};
+
+struct pxa_mtp_prefetch_worker {
+    std::thread                       th;
+    std::mutex                        qmtx;
+    std::condition_variable           qcv;
+    std::deque<std::function<void()>> q;
+    bool                              stop = false;
+    bool                              started = false;
+
+    std::mutex                                                 jmtx;
+    std::unordered_map<llama_seq_id, std::shared_future<void>> jobs; // pending future per seq
+
+    void ensure_started() {
+        std::lock_guard<std::mutex> lk(qmtx);
+        if (started) return;
+        started = true;
+        th = std::thread([this]{
+            for (;;) {
+                std::function<void()> job;
+                {
+                    std::unique_lock<std::mutex> ul(qmtx);
+                    qcv.wait(ul, [this]{ return stop || !q.empty(); });
+                    if (stop && q.empty()) return;
+                    job = std::move(q.front());
+                    q.pop_front();
+                }
+                pxa_mtp_in_worker = true;
+                job(); // runs the (identical) commit function on ctx_mtp
+                pxa_mtp_in_worker = false;
+            }
+        });
+    }
+
+    // Register the future for every seq in `seqs` AND enqueue the task under one lock scope,
+    // so any wait_seq()/wait_all() (which take jmtx) either runs entirely before registration
+    // or sees the registered+enqueued future — never a gap where the job is live but unfindable.
+    void submit_for_seqs(const std::vector<llama_seq_id> & seqs, std::function<void()> fn) {
+        ensure_started();
+        auto task = std::make_shared<std::packaged_task<void()>>(std::move(fn));
+        std::shared_future<void> fut = task->get_future().share();
+        {
+            std::lock_guard<std::mutex> jlk(jmtx);
+            for (llama_seq_id s : seqs) jobs[s] = fut;      // register first (visible under jmtx)
+            {
+                std::lock_guard<std::mutex> qlk(qmtx);      // then enqueue (FIFO single-thread => ordering)
+                q.push_back([task]{ (*task)(); });
+            }
+        }
+        qcv.notify_one();
+    }
+
+    void wait_seq(llama_seq_id seq_id) {
+        std::shared_future<void> fut;
+        {
+            std::lock_guard<std::mutex> jlk(jmtx);
+            auto it = jobs.find(seq_id);
+            if (it == jobs.end() || !it->second.valid()) return;
+            fut = it->second;
+            jobs.erase(it);
+        }
+        fut.wait();
+    }
+
+    void wait_all() {
+        std::vector<std::shared_future<void>> futs;
+        {
+            std::lock_guard<std::mutex> jlk(jmtx);
+            for (auto & kv : jobs) if (kv.second.valid()) futs.push_back(kv.second);
+            jobs.clear();
+        }
+        for (auto & f : futs) f.wait();
+    }
+};
+
+static pxa_mtp_prefetch_worker & pxa_mtp_prefetch() {
+    static pxa_mtp_prefetch_worker w;
+    return w;
+}
+
+static inline void pxa_mtp_prefetch_wait_seq(llama_seq_id seq_id) {
+    if (pxa_mtp_in_worker) return;
+    if (pxa_mtp_prefetch_enabled()) pxa_mtp_prefetch().wait_seq(seq_id);
+}
+static inline void pxa_mtp_prefetch_wait_all() {
+    if (pxa_mtp_in_worker) return;
+    if (pxa_mtp_prefetch_enabled()) pxa_mtp_prefetch().wait_all();
+}
+
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -1428,6 +1556,8 @@ llama_tokens common_speculative_draft(
         llama_seq_id draft_seq_id) {
     llama_tokens result;
 
+    pxa_mtp_prefetch_wait_seq(draft_seq_id); // PXA_MTP_PREFETCH: drain in-flight companion commit before touching ctx_mtp
+
     spec->t_step_start_us = ggml_time_us();
 
     // apply autotune proposal if enabled
@@ -1715,6 +1845,7 @@ bool common_speculative_ensure_sequence_hidden(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_pos pos) {
+    pxa_mtp_prefetch_wait_seq(seq_id); // PXA_MTP_PREFETCH: drain in-flight companion commit before touching ctx_mtp
     if (!common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_MTP) || common_speculative_has_sequence_hidden(spec, seq_id)) {
         return true;
     }
@@ -1728,6 +1859,7 @@ int32_t common_speculative_on_target_seq_batch(
         const llama_batch & batch,
         llama_seq_id seq_id,
         bool is_prompt_warmup) {
+    pxa_mtp_prefetch_wait_seq(seq_id); // PXA_MTP_PREFETCH: drain in-flight companion commit before touching ctx_mtp
     llama_context * ctx_mtp = common_speculative_get_companion_ctx(spec);
     ctx_mtp = ctx_mtp ? ctx_mtp : ctx_tgt;
     if (ctx_tgt == nullptr || ctx_mtp == nullptr || batch.n_tokens <= 0) {
@@ -2077,6 +2209,7 @@ bool common_speculative_has_sequence_hidden(const common_speculative * spec, lla
 }
 
 void common_speculative_clear_sequence_hidden(common_speculative * spec, llama_seq_id seq_id) {
+    pxa_mtp_prefetch_wait_seq(seq_id); // PXA_MTP_PREFETCH: drain in-flight companion commit before touching ctx_mtp
     auto * mtp_state = common_speculative_get_mtp_state(spec);
     if (mtp_state == nullptr) {
         return;
@@ -2265,11 +2398,89 @@ std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched
     return failed;
 }
 
+// PXA_MTP_PREFETCH async wrappers. Each submits the EXACT serial commit function to the worker
+// (so the ctx_mtp result is bit-identical) and returns immediately, letting the caller proceed
+// to process_token + the HTTP streaming write while the companion decode runs off-thread. With
+// the env gate off, both fall through to the synchronous serial call unchanged.
+bool common_speculative_commit_accepted_hidden_rows_async(
+        common_speculative * spec,
+        common_speculative_type spec_type_used,
+        llama_seq_id seq_id,
+        llama_pos pos_base,
+        llama_token sampled_before,
+        const std::vector<llama_token> & ids,
+        const std::vector<float> & hidden_rows) {
+    // Overlap applies to the MTP companion decode only; non-MTP "commit" is a cheap hidden
+    // sync -> keep it serial. Off-gate -> serial.
+    if (!pxa_mtp_prefetch_enabled() || spec_type_used != COMMON_SPECULATIVE_TYPE_MTP) {
+        return common_speculative_commit_accepted_hidden_rows(
+            spec, spec_type_used, seq_id, pos_base, sampled_before, ids, hidden_rows);
+    }
+    auto owned = std::make_shared<pxa_mtp_owned_req>();
+    owned->seq_id = seq_id;
+    owned->pos_base = pos_base;
+    owned->sampled_before = sampled_before;
+    owned->ids = ids;
+    owned->hidden = hidden_rows;
+    pxa_mtp_prefetch().submit_for_seqs({ seq_id }, [spec, spec_type_used, owned]{
+        const bool ok = common_speculative_commit_accepted_hidden_rows(
+            spec, spec_type_used, owned->seq_id, owned->pos_base,
+            owned->sampled_before, owned->ids, owned->hidden);
+        if (!ok) {
+            common_speculative_clear_sequence_hidden(spec, owned->seq_id); // same fail-safe as inline
+        }
+    });
+    return true; // optimistic; a failed commit clears its own seq hidden inside the job
+}
+
+std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched_async(
+        common_speculative * spec,
+        common_speculative_type spec_type_used,
+        const std::vector<common_speculative_commit_req> & reqs) {
+    if (!pxa_mtp_prefetch_enabled()) {
+        return common_speculative_commit_accepted_hidden_rows_batched(spec, spec_type_used, reqs);
+    }
+    auto owned = std::make_shared<std::vector<pxa_mtp_owned_req>>();
+    owned->reserve(reqs.size());
+    std::vector<llama_seq_id> seqs;
+    seqs.reserve(reqs.size());
+    for (const auto & r : reqs) {
+        pxa_mtp_owned_req o;
+        o.seq_id = r.seq_id;
+        o.pos_base = r.pos_base;
+        o.sampled_before = r.sampled_before;
+        o.ids = r.ids;
+        if (r.hidden_rows) o.hidden = *r.hidden_rows;
+        owned->push_back(std::move(o));
+        seqs.push_back(r.seq_id);
+    }
+    pxa_mtp_prefetch().submit_for_seqs(seqs, [spec, spec_type_used, owned]{
+        std::vector<common_speculative_commit_req> jreqs;
+        jreqs.reserve(owned->size());
+        for (auto & o : *owned) {
+            common_speculative_commit_req r;
+            r.seq_id = o.seq_id;
+            r.pos_base = o.pos_base;
+            r.sampled_before = o.sampled_before;
+            r.ids = o.ids;
+            r.hidden_rows = &o.hidden; // points into owned storage (kept alive by the shared_ptr capture)
+            jreqs.push_back(std::move(r));
+        }
+        const std::vector<llama_seq_id> failed =
+            common_speculative_commit_accepted_hidden_rows_batched(spec, spec_type_used, jreqs);
+        for (llama_seq_id sid : failed) {
+            common_speculative_clear_sequence_hidden(spec, sid); // same fail-safe as the serial flush
+        }
+    });
+    return {}; // async: failures handled inside the job
+}
+
 int32_t common_speculative_on_target_batch(
         common_speculative * spec,
         const llama_batch & batch,
         const common_speculative_feature_view & features,
     bool is_prompt_warmup) {
+    pxa_mtp_prefetch_wait_all(); // PXA_MTP_PREFETCH: drain in-flight companion commit before touching ctx_mtp
     auto * mtp_state = common_speculative_get_mtp_state(spec);
     if (mtp_state == nullptr) {
         return 0;
@@ -2367,6 +2578,7 @@ void common_speculative_context_shift(
         llama_pos            kv_keep,
         llama_pos            kv_discard,
         llama_pos            kv_past) {
+    pxa_mtp_prefetch_wait_seq(seq_id); // PXA_MTP_PREFETCH: drain in-flight companion commit before touching ctx_mtp
     if (auto * ctx_mtp = common_speculative_get_companion_ctx(spec); ctx_mtp != nullptr) {
         // PXA_HYBRID_CTX_SHIFT_v3: do NOT mirror the target's shift into the companion with
         // seq_add — that marks has_shift on the MTP context, and its deferred K-shift triggers
