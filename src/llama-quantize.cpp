@@ -16,6 +16,9 @@
 #include <fstream>
 #include <filesystem>
 #include <map>
+#include <algorithm>
+#include <cstdio>
+#include <vector>
 #include <set>
 
 //
@@ -1908,6 +1911,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
+    // PXQ-P5 composition guard (2026-07-27): per-output-type stats for the end-of-run
+    // composition summary + the target/composition assertion. Keyed by ggml tensor type id.
+    std::map<int, std::pair<int64_t, size_t>> comp_stats;   // type -> {count, bytes}
+    std::vector<std::string> comp_written_files;            // every path this run opened for write
     std::map<std::string, pxa_err_acc> errbudget;   // PXA_PXQ_ERRBUDGET, empty unless enabled
 
     std::vector<std::thread> workers;
@@ -2026,6 +2033,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
 
         ensure_output_directory(fname);
+        comp_written_files.push_back(fname);
         fout = std::ofstream(fname, std::ios::binary);
         fout.exceptions(std::ofstream::failbit); // fail fast on write errors
         const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split]);
@@ -2499,6 +2507,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 QuantizationDone:;
         total_size_org += ggml_nbytes(tensor);
         total_size_new += new_size;
+        comp_stats[(int) new_type].first  += 1;
+        comp_stats[(int) new_type].second += new_size;
 
         if (!params->dry_run && !split_skipped[cur_split]) {
             // update the gguf meta data as we go
@@ -2517,6 +2527,79 @@ QuantizationDone:;
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
+
+    // ------------------------------------------------------------------------------------------
+    // PXQ-P5 composition summary + assertion (2026-07-27). Motivation: a dense (no-expert)
+    // model quantized with PXA_PXQ_BACKBONE=legacy under a PXQ4 target emitted a file that was
+    // 91% MXFP4 / 0% PXQ, exit 0 — a plausible artifact whose NAME misrepresents its contents.
+    // The summary prints EVERY run; the assertion fires only for PXQ-family targets:
+    //   FAIL if PXQ-family bytes < 50% of the output (majority floor — the smallest legitimate
+    //   shipped artifact, the pre-rev-2 uniform PXQ1 35B, is 70.7% PXQ by bytes), or if a
+    //   UNIFORM PXQ target contributed ZERO bytes of its named tier (catches a PXQ6 target
+    //   emitting PXQ4HQ — the 122B naming-migration class). On failure every file this run
+    //   wrote is removed and the run exits non-zero. Explicit override:
+    //   --pxq-composition-override (env PXA_PXQ_COMPOSITION_OVERRIDE=1) downgrades to a WARN.
+    // ------------------------------------------------------------------------------------------
+    {
+        std::vector<std::pair<int, std::pair<int64_t, size_t>>> rows(comp_stats.begin(), comp_stats.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.second > y.second.second; });
+        LLAMA_LOG_INFO("%s: ---- output composition (by bytes) ----\n", __func__);
+        for (const auto & r : rows) {
+            LLAMA_LOG_INFO("%s:   %-10s %5lld tensors  %9.2f MiB  %5.1f%%\n", __func__,
+                    ggml_type_name((ggml_type) r.first), (long long) r.second.first,
+                    r.second.second/1024.0/1024.0,
+                    total_size_new ? 100.0*r.second.second/total_size_new : 0.0);
+        }
+
+        static const std::set<int> pxq_family = { 248, 252, 253, 254, 255, 256 };   // PXQ1,4,4HQ,2,3,6
+        int spec_type = -1;          // the single tier a UNIFORM PXQ target names (-1 = none/map)
+        bool pxq_target = true;
+        switch (params->ftype) {
+            case LLAMA_FTYPE_MOSTLY_PXQ1:           spec_type = 248; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ2:           spec_type = 254; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ3:           spec_type = 255; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ4:           spec_type = 252; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ4HQ:         spec_type = 253; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ6:           spec_type = 256; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL:  spec_type = -1;  break;   // map-defined mix
+            default: pxq_target = false; break;
+        }
+        if (pxq_target && total_size_new > 0) {
+            size_t fam_bytes = 0, spec_bytes = 0;
+            for (const auto & r : comp_stats) {
+                if (pxq_family.count(r.first))  fam_bytes  += r.second.second;
+                if (r.first == spec_type)       spec_bytes += r.second.second;
+            }
+            const double fam_share = (double) fam_bytes / (double) total_size_new;
+            const bool below_floor = fam_share < 0.50;
+            const bool tier_absent = (spec_type >= 0) && (spec_bytes == 0);
+            if (below_floor || tier_absent) {
+                const bool override_on = getenv("PXA_PXQ_COMPOSITION_OVERRIDE")
+                                      && atoi(getenv("PXA_PXQ_COMPOSITION_OVERRIDE")) != 0;
+                const pxa_pxq_bb_cfg & bb = pxa_pxq_backbone_cfg();
+                char msg[512];
+                snprintf(msg, sizeof(msg),
+                        "PXQ composition assertion: target %s produced %.1f%% PXQ-family bytes"
+                        "%s%s (floor 50%%; backbone=%s). The output would misrepresent its"
+                        " contents.",
+                        llama_model_ftype_name(params->ftype).c_str(), 100.0*fam_share,
+                        tier_absent ? " and ZERO bytes of the named tier " : "",
+                        tier_absent ? ggml_type_name((ggml_type) spec_type) : "",
+                        bb.mode == PXA_BB_LEGACY ? "legacy" : (bb.lite ? "lite" : (bb.hq ? "hq" : "v2")));
+                if (override_on) {
+                    LLAMA_LOG_WARN("%s: %s OVERRIDDEN by --pxq-composition-override — file kept.\n",
+                            __func__, msg);
+                } else {
+                    for (const auto & f : comp_written_files) {
+                        if (std::remove(f.c_str()) == 0) {
+                            LLAMA_LOG_ERROR("%s: removed mislabelled output %s\n", __func__, f.c_str());
+                        }
+                    }
+                    throw std::runtime_error(msg);
+                }
+            }
+        }
+    }
 
     if (qs.n_fallback > 0) {
         LLAMA_LOG_WARN("%s: WARNING: %d of %d tensor(s) required fallback quantization\n",
