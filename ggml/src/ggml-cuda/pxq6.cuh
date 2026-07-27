@@ -508,6 +508,18 @@ static __global__ void k_pxq6_dequant_matrix(const uint8_t * __restrict__ wq, ds
                                              const int kslabs, const int64_t K) {
     __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
+    // STORE COALESCING (2026-07-27). Decoding is naturally row-major -- one thread owns one row
+    // and produces its PXQ6_QK consecutive outputs -- but writing that straight to y has 32
+    // threads storing addresses K elements apart, so each store instruction touches 32 sectors
+    // to deliver 64 useful bytes (~1/16 efficiency). This kernel is the incumbent for every PXQ
+    // 2D MUL_MAT wider than PXA_PXQ4_2D_MAX_NY, which on a DENSE model is the entire FFN at
+    // prefill, so that pattern was the dominant dense prefill cost (61.7 t/s vs MXFP4's 276 on
+    // 2xV100). Stage the tile here and write it out along K below.
+    //
+    // +2 pads the row stride to 34, i.e. 17 4-byte banks per row for a 2-byte dst_t; gcd(17,32)
+    // = 1, so the column-major fill in phase 1 is conflict-free. A 4-byte dst_t pads to 2-way,
+    // which is not worth a second layout -- the f16 path is the one cuBLAS takes.
+    __shared__ dst_t tile[PXQ6_BM][PXQ6_QK + 2];
     POL::stage_tabs(tab, sub, threadIdx.x);
     __syncthreads();
     const int64_t slab_id = blockIdx.x;
@@ -519,15 +531,23 @@ static __global__ void k_pxq6_dequant_matrix(const uint8_t * __restrict__ wq, ds
     const float anch = POL::HDR ? POL::anchor(panel, row) : 0.f;
     float eff[POL::NEFF];
     POL::row_effs(slab, row, anch, sub, eff);
-    dst_t * dst = y + (p*PXQ6_BM + row)*K + kb*PXQ6_QK;
     uint32_t q[POL::CODE_WORDS];
     pxq6_ldcodes<POL>(slab + POL::CODE_OFF + row*POL::CODE_BYTES, q);
     #pragma unroll
     for (int b = 0; b < 16; ++b) {                 // b = element-pair index
         const float e = eff[(b*POL::NEFF) >> 4];
         const float2 v = POL::pair(q, b, tab);
-        dst[2*b]   = (dst_t)(e * v.x);
-        dst[2*b+1] = (dst_t)(e * v.y);
+        tile[row][2*b]   = (dst_t)(e * v.x);
+        tile[row][2*b+1] = (dst_t)(e * v.y);
+    }
+    __syncthreads();
+    // Same values, same addresses, different instruction mapping: one warp per row, lane == the
+    // k offset, so a store covers PXQ6_QK contiguous elements. Bit-identical output.
+    const int lane  = threadIdx.x & 31;
+    const int warp  = threadIdx.x >> 5;
+    const int nwarp = blockDim.x   >> 5;
+    for (int r = warp; r < PXQ6_BM; r += nwarp) {
+        y[(p*PXQ6_BM + r)*K + kb*PXQ6_QK + lane] = tile[r][lane];
     }
 }
 

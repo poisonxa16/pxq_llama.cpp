@@ -3767,8 +3767,33 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     if (!pxa_pxq4_bufs_on_device(ctx, {src0, src1, dst})) return -1;
 
-    const size_t smem = (size_t)K*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
-    if (smem > 46*1024) return -1;                  // x is staged in shared memory
+    // K1-2D x-STAGE CAP. The plain (S == 1) driver stages the WHOLE x vector in shared memory,
+    // which caps K at (46K - KSEG*64*4)/4 = 11264 floats. A dense ffn_down is [17408, 5120], so
+    // every layer of a dense model blew this cap and the node fell through to
+    // k_pxq6_dequant_matrix + cuBLAS -- a full dequantize to f32 on EVERY token. Measured on
+    // Qwable-27B (2xV100 decode): 3.35 t/s vs MXFP4's 36.3, and disabling this driver outright
+    // costs a further 18x, which places the cost on that fallback. Invisible on MoE, where
+    // ffn_down_exps is a 3D _exps tensor owned by the MoE grouped driver.
+    //
+    // The K8-2D S-split below already stages x in K/S-sized chunks and so fits any K we can
+    // reach; it was simply unreachable, because this gate declined the node before it. Compute
+    // the smallest S that fits rather than declining, and let the occupancy heuristic raise it
+    // from there. S_min == 1 for every shape that passed before, so those shapes keep their
+    // exact previous launch geometry and byte-reproduce.
+    const int    kslabs   = (int)(K/PXQ6_QK);
+    const size_t smem_fix = PXQ4_MMV_KSEG*64*sizeof(float);
+    const size_t smem_cap = 46*1024;
+    auto smem_for_S = [&](int S) {
+        return (size_t)((kslabs + S - 1)/S)*PXQ6_QK*sizeof(float) + smem_fix;
+    };
+    int S_min = 1;
+    while (S_min < PXQ6_MMV_SPLIT_MAX && smem_for_S(S_min) > smem_cap) S_min *= 2;
+    if (smem_for_S(S_min) > smem_cap)     return -1;   // wider than even S=MAX can stage
+    if (S_min*PXQ4_MMV_KSEG > kslabs)     return -1;   // needs >= KSEG slabs per chunk
+    const bool must_split = S_min > 1;                 // the plain form cannot stage this K
+    if (must_split && !pxa_pxq4_2d_split()) return -1;
+
+    const size_t smem = (size_t)K*sizeof(float) + smem_fix;   // plain form only (!must_split)
 
     // Belt (2026-07-25): the fused MoE drivers upload the env-override book/SUB16 tables and the
     // P2/P3 books on their first call, and every shipped file so far has a PXQ MoE node ahead of
@@ -3801,9 +3826,8 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     // x stage caps occupancy). S = smallest power of two reaching the block target, capped by
     // PXQ6_MMV_SPLIT_MAX and by >= 4 slabs per chunk (one per kseg chain).
     if (pxa_pxq4_2d_split()) {
-        const int kslabs = (int)(K/PXQ6_QK);
         const int target = pxa_pxq4_2d_split_target(ctx.device);
-        int S = 1;
+        int S = S_min;               // >= 1; above 1 only when the x stage demands it
         while (S < PXQ6_MMV_SPLIT_MAX && (int64_t)panels*ny*S < target && (S*2)*PXQ4_MMV_KSEG <= kslabs) S *= 2;
         if (S > 1) {
             auto * ksg = pxq6_pick_mmv_ksplit_gen(fmt, pair, vecx);
@@ -3841,6 +3865,11 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     // K1-2D: re-grid when the plain grid under-fills the machine. Bit-identical; every decline
     // (no instantiation / workspace unavailable under graph capture) falls through to the
     // single-launch form below, which produces the same bytes.
+    // Both remaining forms stage the full K (smem_ks = K*4 below, smem in the plain launch),
+    // so neither can serve a must_split shape. Decline instead: dequant+cuBLAS is 18x slower
+    // than this driver but it is correct, whereas launching either of these at 68 KB is not.
+    if (must_split) return -1;
+
     if (pxa_pxq4_2d_ksplit() && (int64_t)panels*ny < (int64_t)pxa_pxq4_2d_ksplit_minblk(ctx.device)) {
         auto * ks = pxq6_pick_mmv_ksplit(fmt, pair, vecx);
         if (ks) {
