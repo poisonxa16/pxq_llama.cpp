@@ -27,6 +27,23 @@ typedef uint16_t ggml_fp16_t;
 static inline float ggml_fp16_to_fp32(ggml_fp16_t h) { return _cvtsh_ss(h); }
 static inline ggml_fp16_t ggml_fp32_to_fp16(float f) { return _cvtss_sh(f, 0 /*RN*/); }
 
+// dead-column guard helper — mirror of the static in src/llama-quantize.cpp (the .inc.cpp
+// quantizers grew a call to it 2026-07-2x; this standalone tool must supply the same symbol).
+#include <atomic>
+#include <cmath>
+static std::atomic<int64_t> g_pxq_imx_dead_cols{0};
+static bool pxq_imatrix_column_usable(const float * w, int64_t K) {
+    if (!w) return false;
+    double s = 0.0;
+    for (int64_t i = 0; i < K; ++i) {
+        if (!std::isfinite(w[i]) || w[i] < 0.0f) { g_pxq_imx_dead_cols.fetch_add(1); return false; }
+        s += (double) w[i];
+    }
+    if (s > 0.0) return true;
+    g_pxq_imx_dead_cols.fetch_add(1);
+    return false;
+}
+
 #include "../src/pxq2-quantize.inc.cpp"
 #include "../src/pxq3-quantize.inc.cpp"
 
