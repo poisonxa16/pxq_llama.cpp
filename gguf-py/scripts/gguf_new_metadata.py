@@ -28,7 +28,8 @@ class MetadataDetails(NamedTuple):
 
 
 def get_byteorder(reader: gguf.GGUFReader) -> gguf.GGUFEndian:
-    if np.uint32(1) == np.uint32(1).newbyteorder("<"):
+    import sys as _sys
+    if _sys.byteorder == "little":
         # Host is little endian
         host_endian = gguf.GGUFEndian.LITTLE
         swapped_endian = gguf.GGUFEndian.BIG

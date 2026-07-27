@@ -321,6 +321,7 @@ class GGUFWriter:
 
     @staticmethod
     def ggml_pad(x: int, n: int) -> int:
+        x = int(x); n = int(n)  # PXA: coerce numpy uint32 -> python int (>4GB offset overflow fix)
         return ((x + n - 1) // n) * n
 
     def add_tensor_info(
