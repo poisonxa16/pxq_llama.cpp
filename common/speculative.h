@@ -110,6 +110,22 @@ std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched
     common_speculative_type spec_type_used,
     const std::vector<common_speculative_commit_req> & reqs);
 
+// PXA_MTP_PREFETCH (Layer 1): async variants that submit the identical commit to a dedicated
+// ctx_mtp worker thread and return immediately (env PXA_MTP_PREFETCH=1; off => serial call).
+bool common_speculative_commit_accepted_hidden_rows_async(
+    common_speculative * spec,
+    common_speculative_type spec_type_used,
+    llama_seq_id seq_id,
+    llama_pos pos_base,
+    llama_token sampled_before,
+    const std::vector<llama_token> & ids,
+    const std::vector<float> & hidden_rows);
+
+std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched_async(
+    common_speculative * spec,
+    common_speculative_type spec_type_used,
+    const std::vector<common_speculative_commit_req> & reqs);
+
 bool common_speculative_has_sequence_hidden(const common_speculative * spec, llama_seq_id seq_id);
 
 void common_speculative_clear_sequence_hidden(common_speculative * spec, llama_seq_id seq_id);
