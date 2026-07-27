@@ -169,7 +169,11 @@ static void pxq1_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     // construction (verified: -t 1 vs -t 32 md5-identical on a mixed dense+MoE fixture).
     const int64_t panels      = R/64;
     const int64_t panel_bytes = panels > 0 ? exp_bytes/panels : 0;
-    const int64_t CHUNK       = 8;                              // panels per job (512 rows)
+    // Job granularity: fixed CHUNK=8 leaves the box idle on wide-and-short tensors --
+    // a dense R=5120 gives 80 panels = 10 jobs, so 10 of 72 cores work. Size it so there
+    // are ~4 jobs per thread, clamped to [1,8] panels (a 64-row panel x K is already
+    // substantial work, so CHUNK=1 costs nothing in scheduling overhead).
+    const int64_t CHUNK       = std::max<int64_t>(1, std::min<int64_t>(8, (panels*E)/(4*(int64_t)std::max(1, nthread))));
     const int64_t chunks_per_e = panels > 0 ? (panels + CHUNK - 1)/CHUNK : 1;
     const int64_t n_jobs      = E*chunks_per_e;
     if (nthread <= 1 || n_jobs <= 1) {

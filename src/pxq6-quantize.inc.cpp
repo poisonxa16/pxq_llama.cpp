@@ -200,7 +200,8 @@ static float pxq6_pick_anchor(const float * x, const float * w, int64_t K,
 
 // one [R,K] expert -> PXQ6 panels. tier 0: bs16 subs, slab 1088; tier 1 (HQ): bs8 subs, slab 1152.
 static void pxq6_quantize_expert(const float * src, uint8_t * dst, int64_t R, int64_t K,
-                                 const float * imx /*K vals or null*/, int tier) {
+                                 const float * imx /*K vals or null*/, int tier,
+                                 int64_t row0 /*absolute row of src's first row*/) {
     const float  * book = pxq6_book_q();
     const double * mids = pxq6_mids_q();
     const float  * sub  = pxq6_sub_q(tier);
@@ -217,7 +218,7 @@ static void pxq6_quantize_expert(const float * src, uint8_t * dst, int64_t R, in
         ggml_fp16_t * anchors = (ggml_fp16_t *)panel;      // 64 x fp16 header
         for (int64_t r = 0; r < 64; ++r) {
             const float * x = src + (p*64 + r)*K;
-            const int64_t row = p*64 + r;
+            const int64_t row = row0 + p*64 + r;
             const float anchor = tier
                 ? pxq6_pick_anchor<8> (x, imx, K, book, mids, sub, s4.data(), codes.data(), row)
                 : pxq6_pick_anchor<16>(x, imx, K, book, mids, sub, s4.data(), codes.data(), row);
@@ -300,16 +301,21 @@ static void pxq6_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     // tensor (E == 1) previously fell into the serial branch and ran its whole R x K on ONE
     // thread (measured: 103% CPU at -t 32 quantizing the dense 27B, ~9.7 s/tensor). Panels
     // are independent and panel-major with per-panel headers, so a 64-row slice at a panel
-    // boundary is self-contained and the output is byte-identical to the serial order by
-    // construction (verified: -t 1 vs -t 32 md5-identical on a mixed dense+MoE fixture).
+    // boundary is self-contained. The chunk's ABSOLUTE row offset (row0) must be passed in:
+    // `row` seeds pxq_tie_take_hi, so a chunk-local row would flip the deterministic
+    // tie-break and make the artifact differ across thread counts.
     const int64_t panels      = R/64;
     const int64_t panel_bytes = panels > 0 ? exp_bytes/panels : 0;
-    const int64_t CHUNK       = 8;                              // panels per job (512 rows)
+    // Job granularity: fixed CHUNK=8 leaves the box idle on wide-and-short tensors --
+    // a dense R=5120 gives 80 panels = 10 jobs, so 10 of 72 cores work. Size it so there
+    // are ~4 jobs per thread, clamped to [1,8] panels (a 64-row panel x K is already
+    // substantial work, so CHUNK=1 costs nothing in scheduling overhead).
+    const int64_t CHUNK       = std::max<int64_t>(1, std::min<int64_t>(8, (panels*E)/(4*(int64_t)std::max(1, nthread))));
     const int64_t chunks_per_e = panels > 0 ? (panels + CHUNK - 1)/CHUNK : 1;
     const int64_t n_jobs      = E*chunks_per_e;
     if (nthread <= 1 || n_jobs <= 1) {
         for (int64_t e = 0; e < E; ++e) {
-            pxq6_quantize_expert(src + e*exp_elems, dst + e*exp_bytes, R, K, imx_for(e), tier);
+            pxq6_quantize_expert(src + e*exp_elems, dst + e*exp_bytes, R, K, imx_for(e), tier, 0);
         }
         return;
     }
@@ -324,7 +330,7 @@ static void pxq6_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
             const int64_t nr = std::min<int64_t>(CHUNK, panels - p0)*64;
             pxq6_quantize_expert(src + e*exp_elems + p0*64*K,
                  dst + e*exp_bytes + p0*panel_bytes,
-                 nr, K, imx_for(e), tier);
+                 nr, K, imx_for(e), tier, p0*64);
         }
     };
     std::vector<std::thread> th;
