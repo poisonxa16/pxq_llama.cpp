@@ -182,6 +182,8 @@ static void usage(const char * executable) {
     printf("  --ffn-gate-inp-type ggml_type: use this ggml_type for the ffn_gate_inp tensors.\n\n");
     printf("  --custom-q regex1=type1,regex2=type2...: use this to specify custom quantization type rules.\n\n");
     printf("  --pxq-universal {12g|16g|16g-hq|/path/to/map.tiers}: PXQ-UNIVERSAL per-tensor tier map.\n");
+    printf("  --pxq-composition-override: keep a PXQ-target output that FAILS the composition assertion\n");
+    printf("        (PXQ family < 50%% of bytes, or zero bytes of the named tier). Default: abort + remove.\n");
     printf("        Presets resolve to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
     printf("        The file is '#'-commented lines of regex=type (pxq1|pxq2|pxq3|pxq4; pxq6 = the 5-bit tier since 2026-07-21), fed through --custom-q.\n\n");
     printf("  --repack Repack all tensors to the corresponding _r4/8 variant if available.\n\n");
@@ -387,7 +389,11 @@ int main(int argc, char ** argv) {
     bool hide_imatrix = false;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
-        if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
+        if (strcmp(argv[arg_idx], "--pxq-composition-override") == 0) {
+            // explicit opt-out of the PXQ composition assertion (see src/llama-quantize.cpp):
+            // keeps an output whose PXQ byte-share is below the 50% floor / missing its named tier.
+            setenv("PXA_PXQ_COMPOSITION_OVERRIDE", "1", 1);
+        } else if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
             params.quantize_output_tensor = false;
         } else if (strcmp(argv[arg_idx], "--ignore-imatrix-rules") == 0) {
             params.ignore_imatrix_rules = true;
