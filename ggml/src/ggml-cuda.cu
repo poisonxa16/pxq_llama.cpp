@@ -5170,12 +5170,25 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
     // obsolete.)
     if (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type)) {
         const float limit_px = *(const float *)(dst->op_params + 1);
+        // PXA_DENSE_FUG_PREC_v1: op_params[0] on a FUSED_UP_GATE node is the UNARY OP id
+        // (GGML_UNARY_OP_SILU == 10), NOT a ggml_prec. Both ggml_cuda_op_mul_mat_cublas (which
+        // gates cublasGemmEx CUDA_R_16F + TENSOR_OP on op_params[0] == GGML_PREC_DEFAULT) and
+        // pxa_pxq_gemm_2d read it as a precision, so the alias vetoed fp16 on BOTH the up and the
+        // gate GEMM and dropped them to dequant-to-f32 + cublasSgemm. On sm_60 that costs the 2:1
+        // hgemm; on sm_70 it costs the tensor cores outright (volta_sgemm ~15.7 TFLOPS vs HMMA
+        // ~112). Same defect, same fix as PXA_P100_FP16_GEMM_v1 on the MoE path -- that one only
+        // ever cleared the alias for MUL_MAT_ID, and the dense node was left leaking.
+        // Read the op and the limit from the ORIGINAL dst, then hand both GEMMs clean copies.
+        const ggml_unary_op uop_px = (ggml_unary_op)dst->op_params[0];
         ggml_cuda_pool_alloc<float> dst_up_px(ctx.pool(), ggml_nelements(dst));
         auto local_dst = *dst;
         local_dst.data = dst_up_px.get();
+        local_dst.op_params[0] = GGML_PREC_DEFAULT;
+        auto gate_dst = *dst;                 // same data pointer: the result still lands in dst
+        gate_dst.op_params[0] = GGML_PREC_DEFAULT;
         ggml_cuda_mul_mat(ctx, src0_1, src1, &local_dst, nullptr, 0);
-        ggml_cuda_mul_mat(ctx, src0_2, src1, dst, nullptr, 0);
-        ggml_fused_mul_unary(ctx, (ggml_unary_op)dst->op_params[0], ggml_nelements(dst),
+        ggml_cuda_mul_mat(ctx, src0_2, src1, &gate_dst, nullptr, 0);
+        ggml_fused_mul_unary(ctx, uop_px, ggml_nelements(dst),
                         (const float *)dst->data, dst_up_px.get(), (float *)dst->data, limit_px);
         CUDA_CHECK(cudaGetLastError());
         return;
