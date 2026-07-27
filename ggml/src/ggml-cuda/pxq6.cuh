@@ -1181,12 +1181,18 @@ static __global__ void k_pxq6_gateup_reduce_gen(const float * __restrict__ ws,
     out[grow] = r;
 }
 
-// FUSERED gate (default ON; =0 restores the separate reduce launch — the two paths produce
-// identical values, the fused form just removes one kernel launch per split node).
+// FUSERED gate (default OFF — measured LOSS, kept as a documented dead end; =1 enables).
+// The fence-and-flag fused finish produces byte-identical output (verified) but the LAST
+// split block then reduces S*R floats ALONE while the rest of the machine drains — the wide
+// k_pxq_mmv_reduce_s runs the same reduction across R/256 parallel blocks in ~2.4us, and the
+// launch it saves was being hidden by async submission anyway. Protocol (F35B matched-bytes,
+// fill 5992, n=8/arm, 4 interleaved blocks): fused-ON decode 83.81 vs two-kernel 85.17 on
+// 2xV100 (-1.6%), 59.45 vs 60.92 on 2xP100 (-2.4%). Verdict: launch count was NOT the wall
+// gap; do not re-enable without new evidence.
 static inline bool pxa_pxq_split_fusered() {
     static const bool v = [] {
         const char * e = getenv("PXA_PXQ_SPLIT_FUSERED");
-        return !(e && atoi(e) == 0);
+        return e && atoi(e) != 0;
     }();
     return v;
 }
