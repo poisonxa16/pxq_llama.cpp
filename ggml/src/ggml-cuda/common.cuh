@@ -579,6 +579,23 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qi = QI4_NL;
 };
 
+// PXQ slab tiers: 32 values / block, 4 packed nibble ints per block -- the same (qk, qr, qi)
+// shape as MXFP4/IQ4_NL, so the MMVQ thread mapping is identical. The panel/slab addressing
+// difference lives entirely in vec_dot_pxq_q8_1 (pxq-mmvq.cuh).
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PXQ4> {
+    static constexpr int qk = QK4_NL;
+    static constexpr int qr = QR4_NL;
+    static constexpr int qi = QI4_NL;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PXQ4HQ> {
+    static constexpr int qk = QK4_NL;
+    static constexpr int qr = QR4_NL;
+    static constexpr int qi = QI4_NL;
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
     static constexpr int qk = QK_K;
