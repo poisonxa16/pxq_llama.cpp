@@ -9,9 +9,82 @@
 #include "mmvq.cuh"
 #include "iqk_mmvq.cuh"
 #include "vecdotq.cuh"
+#include <type_traits>
+#include "pxq-mmvq.cuh"
 #include "mmvq-args.h"
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+// PXQ tiers do not use the flat-block-index vec_dot: their panel/slab layout needs (row, kb) and
+// the blocks-per-row count separately. Compile-time switch, so no other type's codegen changes.
+template <ggml_type type>
+static constexpr bool pxq_mmvq_layout = (type == GGML_TYPE_PXQ4 || type == GGML_TYPE_PXQ4HQ);
+
+// ROWS PER BLOCK. A PXQ slab holds 64 rows x 16 B of codes contiguously, so a k-block of ONE row
+// is a 16 B island and the next k-block of that row is a whole slab (1088/1152 B) away: with the
+// stock 1-row block a warp's 16 k-blocks touch 16 different 32 B sectors and use half of each,
+// and the per-row scale bytes are 16 more sectors at ~3% use. Giving the block 16 ADJACENT rows
+// makes the same warp read those rows' code rows (16 x 16 B = 256 B) and their scale bytes
+// (16 x 2 B = 32 B) as contiguous runs -- full sectors, same total work, grid/16.
+// ncols_y > 2 (spec-verify widths) keeps a smaller tile so the accumulator file stays sane.
+// ROWS is the PXQ tile height, chosen at launch time (PXA_PXQ_MMVQ_ROWS). It is bounded for the
+// spec-verify widths so the accumulator file cannot explode: at ncols_y > 2 a PXQ block keeps 2
+// rows. Non-PXQ types ignore ROWS entirely and keep the stock rule.
+template <ggml_type type, int ncols_y, int ROWS>
+static constexpr int mmvq_rows_per_block = pxq_mmvq_layout<type>
+        ? (ncols_y <= 2 ? ROWS : (ROWS > 2 ? 2 : ROWS))
+        : (ncols_y < 4 ? 1 : 2);
+
+template <ggml_type type>
+static constexpr int pxq_mmvq_slab = (type == GGML_TYPE_PXQ4) ? PXQ6_SLAB_BYTES : PXQ6HQ_SLAB_BYTES;
+
+template <ggml_type type>
+using pxq_mmvq_pol = std::conditional_t<type == GGML_TYPE_PXQ4, pxq_mmvq_pol_p6, pxq_mmvq_pol_p6hq>;
+
+template <ggml_type type, int VDR, int ROWS>
+static __device__ __forceinline__ float pxq_mmvq_dot(
+        const uint8_t * __restrict__ slab, const int r, const int i, const float anch,
+        const float * __restrict__ sub, const pxq_mmvq_scales<pxq_mmvq_pol<type>, ROWS> & sc,
+        const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    return vec_dot_pxq_q8_1<pxq_mmvq_pol<type>, VDR, ROWS>(slab, r, i, anch, sub, sc, bq8_1, iqs);
+}
+
+// The 16-entry sub-scale table is the one lookup PXQ has that MXFP4's E8M0 exponent trick does
+// not: its index is a 4-bit field of the weight stream, so it is divergent across the warp and
+// the compiler cannot hoist it out of the k loop the way it hoists the uniform code book. Stage
+// it in shared memory once per block and the per-k-block cost drops from an L1 global load to LDS.
+template <ggml_type type>
+static __device__ __forceinline__ const float * pxq_mmvq_stage_sub(float * s_sub, int tid) {
+    if (tid < 16) {
+        if constexpr (type == GGML_TYPE_PXQ4) s_sub[tid] = pxq_mmvq_pol_p6::subtab()[tid];
+        else                                  s_sub[tid] = pxq_mmvq_pol_p6hq::subtab()[tid];
+    }
+    __syncthreads();
+    return s_sub;
+}
+
+// Per-block PXQ row invariants: every row of one block lives in the same 64-row panel (ROWS
+// divides 64 and row0 is a multiple of ROWS), so the panel base is one address for the block and
+// each row contributes exactly one fp16 anchor read for the whole K sweep. The 1/127 book fold
+// rides along in the anchor so the inner loop carries one fewer multiply.
+template <ggml_type type, int ROWS>
+struct pxq_mmvq_rowbase {
+    const uint8_t * pan;
+    int   r0;
+    float anch[ROWS];
+    __device__ pxq_mmvq_rowbase(const void * __restrict__ vx, int row0, int kslabs) {
+        pan = (const uint8_t *) vx
+            + (size_t)(row0 >> 6) * ((size_t) PXQ6_HDR_BYTES + (size_t) kslabs * pxq_mmvq_slab<type>);
+        r0  = row0 & 63;
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            anch[i] = __half2float(((const half *) pan)[r0 + i]) * PXQ_MMVQ_BFOLD;
+        }
+    }
+    __device__ const uint8_t * slab(int kbx) const {
+        return pan + PXQ6_HDR_BYTES + (size_t) kbx * pxq_mmvq_slab<type>;
+    }
+};
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
@@ -60,12 +133,14 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ3_S   : return VDR_IQ3_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL  : return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4   : return VDR_MXFP4_Q8_1_MMVQ;
+        case GGML_TYPE_PXQ4    : return VDR_PXQ_Q8_1_MMVQ;
+        case GGML_TYPE_PXQ4HQ  : return VDR_PXQ_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS  : return VDR_IQ4_XS_Q8_1_MMVQ;
         default                : return 1;
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
 static __device__ void k_mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy,
     const float * bias, float * __restrict__ dst,
@@ -73,7 +148,7 @@ static __device__ void k_mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int vdr = pxq_mmvq_layout<type> ? VDRP : get_vdr_mmvq(type);
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -83,7 +158,7 @@ static __device__ void k_mul_mat_vec_q(
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    constexpr int rows_per_cuda_block = mmvq_rows_per_block<type, ncols_y, ROWS>;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -97,6 +172,24 @@ static __device__ void k_mul_mat_vec_q(
 
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
+    if constexpr (pxq_mmvq_layout<type>) {
+        __shared__ float s_sub[16];
+        const float * sub = pxq_mmvq_stage_sub<type>(s_sub, tid);
+        const pxq_mmvq_rowbase<type, rows_per_cuda_block> rb(vx, row0, blocks_per_row_x);
+        const int kqs = vdr * (tid % (qi/vdr));
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const uint8_t * slab = rb.slab(kbx);
+            pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> sc; sc.load(slab, rb.r0);
+#pragma unroll
+            for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(slab, rb.r0 + i, i, rb.anch[i], sub, sc, &y[j*blocks_per_col_y + kby], kqs);
+                }
+            }
+        }
+    } else
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -149,7 +242,7 @@ static __device__ void k_mul_mat_vec_q(
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
 static __device__ void k_fused_mul_mat_vec_q(
     const void * __restrict__ vup, const void * __restrict__ vgate,
     const float * __restrict__ bias_u, const float * __restrict__ bias_g,
@@ -158,7 +251,7 @@ static __device__ void k_fused_mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int vdr = pxq_mmvq_layout<type> ? VDRP : get_vdr_mmvq(type);
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -168,7 +261,7 @@ static __device__ void k_fused_mul_mat_vec_q(
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    constexpr int rows_per_cuda_block = mmvq_rows_per_block<type, ncols_y, ROWS>;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -191,6 +284,28 @@ static __device__ void k_fused_mul_mat_vec_q(
 
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
+    if constexpr (pxq_mmvq_layout<type>) {
+        __shared__ float s_sub[16];
+        const float * sub = pxq_mmvq_stage_sub<type>(s_sub, tid);
+        const pxq_mmvq_rowbase<type, rows_per_cuda_block> ru(vup,   row0, blocks_per_row_x);
+        const pxq_mmvq_rowbase<type, rows_per_cuda_block> rg(vgate, row0, blocks_per_row_x);
+        const int kqs = vdr * (tid % (qi/vdr));
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const uint8_t * su = ru.slab(kbx);
+            const uint8_t * sg = rg.slab(kbx);
+            pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> scu; scu.load(su, ru.r0);
+            pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> scg; scg.load(sg, rg.r0);
+#pragma unroll
+            for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp_u[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(su, ru.r0 + i, i, ru.anch[i], sub, scu, &y[j*blocks_per_col_y + kby], kqs);
+                    tmp_g[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(sg, rg.r0 + i, i, rg.anch[i], sub, scg, &y[j*blocks_per_col_y + kby], kqs);
+                }
+            }
+        }
+    } else
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -271,7 +386,7 @@ static __device__ void k_fused_mul_mat_vec_q(
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
 __launch_bounds__(nwarps*WARP_SIZE, 1)
@@ -291,10 +406,10 @@ static __global__ void mul_mat_vec_q(
     const char * cx = (const char *)vx + i02*nb02;
     const char * cy = (const char *)vy + i2*nb12;
     const float * b = (const float *)(bias ? ids_data ? (const char *)bias + i02*bias_nb1 : bias : nullptr);
-    k_mul_mat_vec_q<type, ncols_y, nwarps>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    k_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
 __launch_bounds__(nwarps*WARP_SIZE, 1)
@@ -317,12 +432,12 @@ static __global__ void fused_mul_mat_vec_q(
     const float * cx_u_b = bias_u ? (const float *)((const char *)bias_u + i02*bias_nb1) : nullptr;
     const float * cx_g_b = bias_g ? (const float *)((const char *)bias_g + i02*bias_nb1) : nullptr;
     const char * cy = (const char *)vy + i2*nb12;
-    k_fused_mul_mat_vec_q<type, ncols_y, nwarps>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
+    k_fused_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
             unary_op, limit);
 }
 
-template <ggml_type type, int nwarps>
-static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
+template <ggml_type type, int nwarps, int ROWS, int VDRP>
+static void mul_mat_vec_q_cuda_R(const mmvq_args & args, cudaStream_t stream) {
 
     GGML_ASSERT(args.ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(args.ncols_y <= MMVQ_MAX_BATCH_SIZE);
@@ -331,6 +446,9 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
 
     int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
         args.ncols_y < 4 ? 1 : 2 : 1;
+    if constexpr (pxq_mmvq_layout<type>) {                  // must match mmvq_rows_per_block
+        rows_per_cuda_block = args.ncols_y <= 2 ? ROWS : (ROWS > 2 ? 2 : ROWS);
+    }
 
     const int64_t nblocks = (args.nrows_x + rows_per_cuda_block - 1) / rows_per_cuda_block;
     const dim3 block_nums(nblocks, args.ne2, 1);
@@ -339,49 +457,49 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     if (args.vx_u && args.vx_g && args.unary_op != GGML_UNARY_OP_COUNT) {
     switch (args.ncols_y) {
         case 1:
-            fused_mul_mat_vec_q<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 1, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
             break;
         case 2:
-            fused_mul_mat_vec_q<type, 2, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 2, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
             break;
         case 3:
-            fused_mul_mat_vec_q<type, 3, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 3, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
             break;
         case 4:
-            fused_mul_mat_vec_q<type, 4, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 4, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
             break;
         case 5:
-            fused_mul_mat_vec_q<type, 5, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 5, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
             break;
         case 6:
-            fused_mul_mat_vec_q<type, 6, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 6, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
             break;
         case 7:
-            fused_mul_mat_vec_q<type, 7, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 7, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
             break;
         case 8:
-            fused_mul_mat_vec_q<type, 8, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+            fused_mul_mat_vec_q<type, 8, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
                     args.unary_op, args.limit);
@@ -393,35 +511,35 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     } else {
     switch (args.ncols_y) {
         case 1:
-            mul_mat_vec_q<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 1, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         case 2:
-            mul_mat_vec_q<type, 2, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 2, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         case 3:
-            mul_mat_vec_q<type, 3, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 3, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         case 4:
-            mul_mat_vec_q<type, 4, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 4, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         case 5:
-            mul_mat_vec_q<type, 5, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 5, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         case 6:
-            mul_mat_vec_q<type, 6, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 6, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         case 7:
-            mul_mat_vec_q<type, 7, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 7, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         case 8:
-            mul_mat_vec_q<type, 8, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+            mul_mat_vec_q<type, 8, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
         default:
@@ -429,6 +547,34 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
             break;
     }
     }
+}
+
+// PXQ tile-height dispatch. A PXQ k-block is a 16 B island inside a 64-row slab, so the stock
+// 1-row block reads half of every 32 B sector it touches and the per-row scale bytes at ~3%;
+// widening the block to R adjacent rows turns both into contiguous runs. R is bounded by the
+// register file (measured: R=16 puts the plain kernel at 231 regs and makes the fused twin spill
+// 384 B/thread, vs MXFP4's 40/59), hence the sweep.
+template <ggml_type type, int nwarps>
+static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
+    if constexpr (pxq_mmvq_layout<type>) {
+        const int r = pxa_pxq_mmvq_rows();
+        if (pxa_pxq_mmvq_vdr() == 4) {
+            switch (r) {
+                case 1:  mul_mat_vec_q_cuda_R<type, nwarps, 1, 4>(args, stream); return;
+                case 2:  mul_mat_vec_q_cuda_R<type, nwarps, 2, 4>(args, stream); return;
+                case 8:  mul_mat_vec_q_cuda_R<type, nwarps, 8, 4>(args, stream); return;
+                default: mul_mat_vec_q_cuda_R<type, nwarps, 4, 4>(args, stream); return;
+            }
+        }
+        switch (r) {
+            case 1:  mul_mat_vec_q_cuda_R<type, nwarps, 1 , 2>(args, stream); return;
+            case 2:  mul_mat_vec_q_cuda_R<type, nwarps, 2 , 2>(args, stream); return;
+            case 8:  mul_mat_vec_q_cuda_R<type, nwarps, 8 , 2>(args, stream); return;
+            case 16: mul_mat_vec_q_cuda_R<type, nwarps, 16, 2>(args, stream); return;
+            default: mul_mat_vec_q_cuda_R<type, nwarps, 4 , 2>(args, stream); return;
+        }
+    }
+    mul_mat_vec_q_cuda_R<type, nwarps, 1, 2>(args, stream);
 }
 
 template <ggml_type type>
@@ -477,6 +623,8 @@ extern void mul_mat_vec_iq1_s_q8_1_cuda(const mmvq_args & args, cudaStream_t str
 extern void mul_mat_vec_iq1_m_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_iq4_nl_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_mxfp4_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_pxq4_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_pxq4hq_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_iq4_xs_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_iq3_s_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 

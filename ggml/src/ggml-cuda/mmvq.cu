@@ -106,6 +106,12 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
         case GGML_TYPE_MXFP4:
             mul_mat_vec_mxfp4_q8_1_cuda(args, stream);
             break;
+        case GGML_TYPE_PXQ4:
+            mul_mat_vec_pxq4_q8_1_cuda(args, stream);
+            break;
+        case GGML_TYPE_PXQ4HQ:
+            mul_mat_vec_pxq4hq_q8_1_cuda(args, stream);
+            break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_iq4_xs_q8_1_cuda(args, stream);
             break;
@@ -350,6 +356,11 @@ bool ggml_cuda_mmvq_type_supported(ggml_type src0_type) {
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
             return true;
+        // PXQ tiers ride MMVQ only when PXA_PXQ_MMVQ is on; otherwise the bespoke PXQ drivers
+        // own them exactly as before (this function is what routes a node to mmvq at all).
+        case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ:
+            return pxa_pxq_mmvq_mode() != 0;
         default:
             return false;
     }
