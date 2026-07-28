@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
-sys.path.insert(0, "<local-path>")
+import os, pathlib
+sys.path.insert(0, str(pathlib.Path(os.environ.get("GGUF_PY", pathlib.Path(__file__).resolve().parents[1] / "gguf-py"))))
 import gguf
 
 path = sys.argv[1]

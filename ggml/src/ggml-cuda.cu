@@ -3946,6 +3946,15 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 // Complete rank separation within both the cold-rep and warm-rep strata on both arches, so the
 // direction is not noise -- but both are BELOW the +3% pre-registered keep line, hence default 0.
 //
+// >>> SUPERSEDED ON sm_70 (2026-07-28). The +2.30% above was measured against the PRE-COALESCING
+// k_pxq6_dequant_matrix, which stored one thread per row -- 32 sectors for 64 useful bytes -- so
+// the incumbent this beat no longer exists. Re-measured against the coalesced dequant on the same
+// 2xV100 cell: mode 2 is -18.6% on DENSE, and on MoE it is inside run-to-run noise (~1.8% here).
+// A lever's value is relative to the incumbent it replaces, and that incumbent got fixed.
+// Mode 2 is therefore CLAMPED to sm_60 below, same as mode 1, and says so once on stderr rather
+// than silently regressing. sm_60 is untouched: the P100 number (+35% dense prefill on the
+// coalesced binary) is why this code still ships at all. <<<
+//
 // The pre-implementation spec predicted a MULTI-X REGRESSION on sm_70 and had this gated to sm_60
 // only. That prediction is wrong, and the reason is worth keeping: it compared this half2 tile
 // (~15-20 TF) against cuBLAS HMMA (~90 TF) alone, but the incumbent is not cuBLAS alone -- it is
@@ -4005,8 +4014,18 @@ static int pxa_pxq_gemm_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) return -1;
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const bool arch_ok = mode == 1 ? (cc < CC_VOLTA  && fast_fp16_available(cc))
-                                   : (cc < CC_TURING && fast_fp16_available(cc));
+    // Both modes are sm_60-only as of 2026-07-28: mode 2's sm_70 admission was justified by a
+    // measurement against the pre-coalescing dequant, and re-measuring flipped it to -18.6%.
+    // Mode 2 is kept as an accepted value (rather than rejected) so existing scripts still run,
+    // but it is clamped here and announced once per device so the clamp is never silent.
+    if (mode == 2 && cc >= CC_VOLTA) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            fprintf(stderr, "PXA_PXQ_GEMM_2D=2 clamped to sm_60 on cc=%d "
+                    "(measured -18.6%% on sm_70 against the coalesced dequant)\n", cc);
+        }
+    }
+    const bool arch_ok = cc < CC_VOLTA && fast_fp16_available(cc);
     if (!arch_ok) { pxa_pxq_gemm_2d_log(ctx.device, false, (int)R, (int)K, (int)ny, cc); return -1; }
 
     const int64_t ntiles = (ny + PXQ4_BN - 1)/PXQ4_BN;

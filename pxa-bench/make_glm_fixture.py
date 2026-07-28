@@ -19,7 +19,8 @@ matter for the G3 spec are kept literal:
 import sys
 import numpy as np
 
-sys.path.insert(0, "<local-path>")
+import os, pathlib
+sys.path.insert(0, str(pathlib.Path(os.environ.get("GGUF_PY", pathlib.Path(__file__).resolve().parents[1] / "gguf-py"))))
 import gguf  # noqa: E402
 
 N_LAYER = 47          # blk.0 dense, blk.1..46 MoE  (real GLM-4.7-Flash)
@@ -42,7 +43,7 @@ def f32(shape):
     return (rng.standard_normal(shape) * 0.02).astype(np.float32)
 
 
-OUT = "<local-path>"
+OUT = os.environ.get("GLM_FIXTURE_OUT", "glm47-fixture.gguf")
 
 w = gguf.GGUFWriter(OUT, "deepseek2", endianess=gguf.GGUFEndian.LITTLE)
 
