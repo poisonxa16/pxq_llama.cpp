@@ -21,6 +21,41 @@ GPU-resident, 200-token temp-0 generations, median of ≥3, speed read from the 
 baseline-spread guard. "U16-q8out" = `fusion2-35b-U16-q8head.gguf` (PXQU-16 + q8_0 output head),
 the artifact behind the published P100/V100 decode rows.
 
+## ⚠ 0a. SUPERSEDED NUMBERS — read before trusting any row below (2026-07-28)
+
+Three engine fixes in this release changed **what the incumbent code path is**, so rows measured
+against the previous incumbent no longer describe the shipping binary. Corrections, in order of how
+badly they would mislead you:
+
+| row | what it says below | what it measures NOW | why |
+|---|---|---|---|
+| `PXA_PXQ_GEMM_2D=2` (sm_70) | +2.30% V100 prefill | **−18.6% on dense sm_70**, **+0.1% (neutral) on MoE sm_70** | It was measured against the *pre-coalescing* `k_pxq6_dequant_matrix`. That kernel wrote one thread per row — 32 sectors per 64 useful bytes — so beating it was easy. Now that the dequant is coalesced and cuBLAS keeps its HMMA GEMM, the half2 tile loses on Volta. **Ship arch-split: ON for sm_60 (+35% P100 dense prefill), hard-veto on cc>=700.** |
+| `PXA_PXQ4_2D_SPLIT_TARGET` | tuned default, K8-2D split | **+7.6% decode on a 122B A5B MoE, no-op on a 35B MoE**, and it **changes greedy output at temp 0** | Workload-dependent, and not output-equivalent. Not shipped as a default. |
+| dense prefill baselines (61.7 V100 / 77.4 P100) | quoted in several rows | **dead numbers** | The K≤11264 smem cliff made every wide-K tensor fall to dequant+cuBLAS per token; that fallback path costs 18×. Any plan written against those baselines is planning against a bug. |
+
+**The general lesson, which applies to every row here:** a lever's measured value is relative to the
+incumbent it replaces. When a fix improves the incumbent, every lever that was beating the old
+incumbent must be re-measured. **Three of ours flipped sign or went to zero.**
+
+### The cell matters more than the lever
+
+The same binary change measured **+56.2% decode on a 122B A5B MoE** and **+12.3% on a 35B MoE**,
+because the fraction recovered depends on how much stall was present to begin with. And the codec
+comparison inverts by workload on identical silicon:
+
+| cell (2×V100) | PXQ4 vs MXFP4 |
+|---|---|
+| **MoE** (Fusion4-35B, PXQ4 17.9711 GiB vs MXFP4 17.7978 GiB) | **+18.9% prefill, +7.7% decode** — PXQ wins *while being 0.97% larger* |
+| **dense** (Qwable-27B, genuine byte parity 4.2526 vs 4.2500 bpw) | −4.57% decode — PXQ loses |
+
+The dense-decode ceiling is structural, not a tuning failure: MXFP4 dense decode runs at **76% of
+HBM peak with DRAM traffic equal to weight bytes**, i.e. bandwidth-bound on weights. At equal bytes
+the ceiling is a tie by construction, so a dense-decode ratio win requires **fewer bytes at
+equal-or-better error**, not a faster kernel. MoE is not bound the same way, which is why the kernel
+work wins there. **Quote the cell, not an average.**
+
+---
+
 ## 0. Three config tiers — `PXA_REFERENCE` / default / `PXA_ENHANCE` (master switches, 2026-07-21)
 
 One knob picks the whole posture; **every per-lever env var below still overrides its own
@@ -182,6 +217,21 @@ The published per-card numbers in `bench/README.md` were measured with section-2
 | `PXA_F16_GEMV` | **on** (2026-07-26; `=0` restores the cuBLAS chain) | small-R F16 decode GEMV (`k_pxa_gemv_f16`): an F16×F32 `ne11==1` node misses every fast dispatch path (dmmv/mmvq need a quantized src0; batched-cuBLAS needs a real batch dim) and lands on the generic cuBLAS chain — convert x f32→f16 + `gemmSN_TN_kernel_half` + convert dst + a cpy = measured **31.5 µs + 3 helper kernels per call** (nvprof, 2×P100) for what is a ~0.3 MB tensor read. The rev-2 backbone's per-head `attn_gate` → `f16` promotion creates exactly this node per layer (40/token on Laguna-XS ≈ **1.5 ms/token**, the bulk of the `lite` recipe's measured decode cost). The kernel does the row dot directly: 4 warps/row, f16 weights × f32 activations, fp32 per-thread partials, fixed warp/smem reduction tree. Restricted to 2 ≤ R ≤ 512, contiguous, `ne11==1`, so it can never intercept a real dense projection; `ne01==1` stays with `mul_mat_1row` | isolated contribution inside the rev-2 Laguna fix above (70.5 with, ~68.5 without, short-fill n=1 — the 2D split dominates; the chain it removes is 1.5 ms/token of GPU time plus its CPU launch pressure). NOTE the replaced cuBLAS chain rounds x AND the result through f16; this path keeps both f32, so it is numerically DIFFERENT (strictly tighter) — behavior-gauntlet class, not sha class | G3-class, ON |
 | `PXA_PXQ_GEMM_2D` | 0 (off) | E==1 **prefill** GEMM for plain 2D PXQ weights (attention projections, shared-expert FFN, `ssm_out`, `token_embd`, `nextn.eh_proj`) in the `ny > PXA_PXQ4_2D_MAX_NY` window - the exact complement of `PXA_PXQ4_2D`'s decode claim, so on a gated arch a PXQ 2D weight never reaches dequant->cuBLAS at any batch size. Reuses `k_pxq6_gemm_grouped` unchanged with a one-expert tile map (`tile.e == 0` => `pxq6_panel()` degenerates to `W + p*stride`, the same degeneration the mmv driver gets from its one-entry zero-`ids` buffer); the map is built by a device kernel rather than the MoE driver's pageable H2D, so it stays legal under stream capture. `=1` sm_60 only, `=2` sm_60 + sm_70 (any fast-fp16 pre-Turing arch). Declines `GGML_PREC_F32` nodes - the cuBLAS fallback honours that with an fp32 SGEMM and this tile accumulates in half2 (MUL_MAT_ID never sets it, which is why the MoE driver has no such check). Only relevant to files quantized with `PXA_PXQ_NATIVE` beyond the routed experts (see §8) | attn-native Fusion4-35B, fill 5739 / n_predict 256 / temp 0, **n=8 per arm, 4 interleaved blocks, fresh server per arm per block**, `-c 8192 -b 2048 -ub 2048`: **2xV100** `-ts 1.05,0.95` mode 2 - prefill **1718.3 -> 1757.9 t/s = +2.30%**, decode 85.08 -> 85.41 (flat). **4xP100** `-ts 1,1,1,1` mode 1 - prefill **799.6 -> 806.7 t/s = +0.89%**, decode 57.24 -> 57.22 (flat). Complete rank separation within *both* the cold-rep and warm-rep strata on *both* arches (firing proven per device by the one-shot `PXA_PXQ_GEMM_2D dev0: FIRING (...)` stderr line), so the direction is real - but both are **below the +3% pre-registered keep line, hence default OFF**. Decode is untouched by construction (`ny <= MAX_NY` is declined here and owned by `PXA_PXQ4_2D`). WARNING: the design spec predicted a *multi-x regression* on sm_70 and would have shipped this sm_60-only; that was **wrong**, and why is worth keeping: it weighed this half2 tile (~15-20 TF) against cuBLAS HMMA (~90 TF) *alone*, but the incumbent is `k_pxq6_dequant_matrix` (32 scalar 2-byte stores per thread at a row stride of `K`) **plus** cuBLAS. Corollary for the prefill deficit: claiming *both* halves of the incumbent buys only +2.3%, so coalescing that dequant while KEEPING cuBLAS's HMMA GEMM should dominate this on Volta. **Independently re-measured (n=8/arm, 4 interleaved blocks, fresh server per arm per block): 2×V100 prefill 1747.2 → 1753.5 pooled, per-block paired median +1.53% (range −2.65%…+2.30%, 6/8 blocks positive) — i.e. the +2.30% above is the top of the range, not its centre; with `PXA_PXQ4_2D_KSPLIT=1` also on, 1727.1 → 1751.7 = +1.48%, 8/8 blocks positive. 4×P100 `-ts 1,1,1,1` 800.1 → 807.8 = +0.93% paired, 8/8 positive (confirms the +0.89%). Decode flat on both (−0.19% / −0.01%).** | **G3-class - gate on perplexity, not sha.** Strict-k half2 chain vs dequant + `cublasGemmEx(COMPUTE_16F)`: different accumulation order and intermediate handling. Gated: 200-chunk paired perplexity (`-c 512 -b 512 -ub 512 --seed 1`, `ppl-eval-half.txt`, 2xP100, same binary/model/cards) - **off 5.7880 +/-0.06762 vs on 5.7842 +/-0.06753**, delta -0.0038 = 18x inside the error bar. **The sm_70 path was gated separately** (mode 2 is the arm that enables it, and it was not covered by the sm_60 run above): 2×V100 `-ts 1.05,0.95`, 200 chunks, two independent replicates per arm — off **5.7713 ±0.06737** (both runs), on **5.7692 ±0.06732** (both runs), delta −0.0021 = 32× inside the error bar, firing proven per device. Flag OFF is byte-identical dispatch. ⚠ The temp-0 sha256 is NOT a meaningful gate here — the same hash is produced by the MXFP4-baseline *model file* — so the quality claim rests on the two perplexity runs alone |
 | `PXA_PXQ6_FORCE_PREFILL` | off | TEST ONLY: bypasses the sm_60/70 prefill arch gate so correctness A/Bs can run on other archs | correctness testing only | never in production |
+
+### New in 2026-07-28 — both default OFF
+
+| lever | default | what it does | measured | gate |
+|---|---|---|---|---|
+| `PXA_PXQ_MMVQ` | `0` (off) | Routes the **decode** GEMV for the PXQ4 / PXQ4HQ tiers to the stock q8_1 **MMVQ** kernel (`mul_mat_vec_q`) instead of the bespoke PXQ 2D driver, and lets the fused up+gate pair reach `ggml_cuda_op_fused_mul_mat_vec_q_id` — one kernel walking the activation once for both, which is the fusion MXFP4 already gets and the per-operand divert throws away. Only the MMVQ batch window (`ny <= MMVQ_MAX_BATCH_SIZE`) is handed over; prefill keeps the 2D drivers untouched. `=1` cc>=CC_VOLTA, `=2` cc>=610 (real DP4A only — sm_60 would run the DP4A *emulation* and lose). Declines if `PXA_PXQ6_BOOK` / `PXA_PXQ6_SUB` / `PXA_PXQ6_SUB_HQ` are set: this TU holds frozen copies of the book/SUB tables and a runtime override would silently diverge from the fused kernels. | **Motivation, not yet a shipping number.** ncu on the bespoke PXQ mmv shows it **register-limited at 19.8–38.6% occupancy** — precisely the failure mode MMVQ's design avoids — and PXQ was absent from all three MMVQ registration points while MXFP4 rides it on sm_70. Cost is ~1 `vec_dot` plus 3 switch arms. Enable and measure on your own cell before trusting it. | G3-class — different accumulation path; gate on perplexity, not sha |
+| `PXA_PXQ_KV` | unset (= `q8_0`, table default) | Overrides the BACKBONE_REV 2 pin that holds `attn_k` / `attn_v` / `attn_v_b` at `q8_0`. Accepts `q8_0｜pxq4｜pxq4hq｜pxq6｜mxfp4`. **Quantizer-side, not runtime.** ⚠ Three gates had to agree before this could work, and each failed *silently*: (1) `--custom-q` registers a rule but `pxa_pxq_backbone_type()` never receives `params`, so the table wins regardless; (2) the rev-2 table pins K/V; (3) `pxq4_tensor_eligible()` excludes attn_k/v **by name** and demoted the tier straight back. All three now clear when the env names a `pxq*` tier. | On Qwable-27B, `attn_k` per layer **10.00 MiB → 2.66 MiB** (vs 5.00 MiB at q8_0); 17 layers each of k and v. Speed effect **NOT yet measured** — the first arm built against a pre-patch binary and came out **byte-identical to its control**, i.e. it tested nothing. | Changes the artifact, not the kernel. **Diff the tier table of the arm against its control before benching** — that is what caught the null arm |
+
+**Method note that generalises.** An A/B arm whose tier table matches its control in every class did
+not test your flag; it tested nothing, and it will read as "the lever is worth zero". Dump and diff
+tier tables before spending a bench window. Likewise, put a **known-answer coherence gate before any
+timing** — an empty completion scores perfectly on tokens/sec — and make that gate tolerant of a
+`<think>` block, or reasoning models will report false failures.
+
+---
 
 ## 5. Documented dead ends (kept for reproducibility — measured no-gain or loss, default OFF)
 
