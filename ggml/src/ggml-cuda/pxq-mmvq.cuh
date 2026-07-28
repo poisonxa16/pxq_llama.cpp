@@ -118,17 +118,26 @@ struct pxq_mmvq_scales {
 // One thread covers 16 of the 32 k-values of one (row, slab): iqs == 0 -> code words 0,1
 // (k 0..15), iqs == 2 -> words 2,3 (k 16..31).
 // ---------------------------------------------------------------------------------------------
-// Everything that depends only on (row) or only on (kb) is hoisted by the caller: `slab` is the
-// per-kb slab base (one 64-bit IMAD per k iteration instead of two per row-and-k), and `anch` is
-// the row's fp16 anchor with the frozen 1/127 book fold already applied (one LDG.U16 per row for
-// the whole K instead of one per k-block). What is left is the irreducible per-(row,kb) work:
-// one 8 B code load, one scale byte, the book gather, 4 dp4a.
+// Everything that depends only on (row) or only on (kb) is hoisted OUT of this function: `slab`
+// is the per-kb slab base (one 64-bit IMAD per k iteration instead of two per row-and-k); the
+// row's fp16 anchor (with the frozen 1/127 book fold) is applied ONCE per row at writeback by
+// the caller (it is a common factor of every k term); the q8_1 activation scale ds is applied
+// once per (j,kb) by the caller (it is uniform across the block's rows). What is left is the
+// irreducible per-(row,kb) work: one 8 B code load, one scale byte, the book gather, 4 dp4a.
+//
+// FIXUP CHAINING (the sm_70 gap mechanism): SUB16 covers 16 elements = TWO code words, so the
+// dp4a chain runs across every word sharing one sub-scale before the single float fixup fires.
+// For p6 that is ONE (LDS + I2F + FMUL + FADD) per 16 values instead of the per-8 fixup the
+// first cut paid — the same one-fixup-per-scale-scope structure MXFP4's vec_dot has. p6hq's
+// SUB8 genuinely changes per word, so it keeps the per-word fixup (that is the bs8 tier's cost).
+//
 // VDR = code words (8 k-values each) this thread owns: 2 -> a thread pair splits the 16 B code
 // row and each issues LDG.64; 4 -> one thread owns the whole row and issues a single LDG.128,
 // halving the memory instructions per useful byte at the cost of half the k-parallelism.
+// Returns sum_g SUB_g * (int dot of group g) — NO anch, NO ds (caller owns both).
 template <class POL, int VDR, int ROWS>
 static __device__ __forceinline__ float vec_dot_pxq_q8_1(
-        const uint8_t * __restrict__ slab, const int r, const int i, const float anch,
+        const uint8_t * __restrict__ slab, const int r, const int i,
         const float * __restrict__ sub, const pxq_mmvq_scales<POL, ROWS> & sc,
         const block_q8_1 * __restrict__ bq8_1, const int iqs) {
 
@@ -141,17 +150,26 @@ static __device__ __forceinline__ float vec_dot_pxq_q8_1(
 
     const int * q8 = (const int *) bq8_1->qs;
 
+    // GW = code words per sub-scale scope (p6: 2 words / 16 elems; p6hq: 1 word / 8 elems).
+    constexpr int GW = (POL::NEFF == 2) ? 2 : 1;
+    static_assert(VDR % GW == 0, "VDR must cover whole sub-scale groups");
+
     float sum = 0.0f;
 #pragma unroll
-    for (int l = 0; l < VDR; ++l) {
-        const int  m = iqs + l;                            // code word == 8-element k group
-        const int2 v = pxq_mmvq_table16_seq((int) qw[l], pxq_mmvq_book_s8);
-        int s = ggml_cuda_dp4a(v.x, q8[2*m + 0], 0);
-        s     = ggml_cuda_dp4a(v.y, q8[2*m + 1], s);
-        sum  += sub[POL::snib(sc.byte(POL::sidx(i, m)), m)] * (float) s;
+    for (int g = 0; g < VDR/GW; ++g) {
+        int s = 0;
+#pragma unroll
+        for (int l = 0; l < GW; ++l) {
+            const int  m = iqs + GW*g + l;                 // code word == 8-element k group
+            const int2 v = pxq_mmvq_table16_seq((int) qw[GW*g + l], pxq_mmvq_book_s8);
+            s = ggml_cuda_dp4a(v.x, q8[2*m + 0], s);
+            s = ggml_cuda_dp4a(v.y, q8[2*m + 1], s);
+        }
+        const int m0 = iqs + GW*g;
+        sum += sub[POL::snib(sc.byte(POL::sidx(i, m0)), m0)] * (float) s;
     }
 
-    return anch * __low2float(bq8_1->ds) * sum;
+    return sum;
 }
 
 // ---------------------------------------------------------------------------------------------
