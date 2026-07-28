@@ -43,6 +43,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/pxq-mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
@@ -2865,8 +2866,8 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         if (fusion && cgraph && node_n + 5 < cgraph->n_nodes &&
             cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
             cgraph->nodes[node_n+2]->op == GGML_OP_MUL_MAT &&
-            ggml_is_quantized(cgraph->nodes[node_n+1]->src[0]->type) &&
-            ggml_is_quantized(cgraph->nodes[node_n+2]->src[0]->type) &&
+            ggml_cuda_mmvq_type_supported(cgraph->nodes[node_n+1]->src[0]->type) &&
+            ggml_cuda_mmvq_type_supported(cgraph->nodes[node_n+2]->src[0]->type) &&
             cgraph->nodes[node_n+3]->op == GGML_OP_ADD &&
             cgraph->nodes[node_n+4]->op == GGML_OP_ADD &&
             cgraph->nodes[node_n+5]->op == GGML_OP_ADD &&
@@ -2915,6 +2916,9 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
             ++node_n; continue;
         }
         if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type)) break;
+        // the GEMV arm below dispatches straight into mmvq; a quantized type without an mmvq
+        // kernel (PXQ6/PXQ2/... tiers) would GGML_ABORT there. Stop the chain instead.
+        if (is_gemv && !ggml_cuda_mmvq_type_supported(dst->src[0]->type)) break;
         if (!is_gemv && mmq_get_q8_1_ds_layout(src0->type) != mmq_get_q8_1_ds_layout(dst->src[0]->type)) break;
         if (is_gemv) {
             if (fusion && node_n + 2 < cgraph->n_nodes &&
@@ -3389,6 +3393,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         ggml_is_quantized(src0->type) &&
         ggml_cuda_mmvq_type_supported(src0->type) &&   // no mmvq kernel (e.g. PXQ slabs) -> per-expert dequant/cublas loop below
+        !pxa_pxq_mmvq_type(src0->type) &&              // PXQ MMVQ is dense-decode only; MoE keeps its grouped drivers
         ggml_backend_buffer_is_cuda(src0->buffer) &&
         ggml_backend_buffer_is_cuda(src1->buffer) &&
         ggml_backend_buffer_is_cuda(dst->buffer) &&
@@ -3745,6 +3750,18 @@ static void pxa_pxq4_2d_ksplit_log(int device, bool fired, int panels, int ny, i
 static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                           const ggml_tensor * src1, ggml_tensor * dst) {
     if (!pxa_pxq4_2d_enabled()) return -1;
+
+    // PXA_PXQ_MMVQ: hand the dense decode GEMV to the q8_1 MMVQ kernel instead. Declining here
+    // is what routes it -- ggml_cuda_mul_mat tries this driver first. Only the MMVQ batch window
+    // (ny <= 8) is handed over; prefill keeps the bespoke 2D drivers untouched.
+    if (pxa_pxq_mmvq_type(src0->type)
+        && pxa_pxq_mmvq_on(ggml_cuda_info().devices[ctx.device].cc)
+        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE
+        && src1->ne[2] == 1 && src1->ne[3] == 1
+        && src0->ne[2] == 1 && src0->ne[3] == 1
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        return -1;
+    }
 
     const int fmt = pxa_pxq_fmt(src0->type);
     if (fmt == PXA_PXQ_FMT_NONE) return -1;
@@ -5168,7 +5185,15 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
     // backbone table puts ffn_{up,gate}_shexp and dense ffn_{up,gate} on native PXQ types, so
     // every rev-2 file reaches it. (The older "no file from this quantizer gets here" note is
     // obsolete.)
-    if (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type)) {
+    // PXA_PXQ_MMVQ: when both operands are an MMVQ-registered PXQ tier at decode width, fall
+    // through to the generic path below -- it reaches ggml_cuda_op_fused_mul_mat_vec_q_id, i.e.
+    // ONE kernel that walks the activation once for up and gate together (the fusion MXFP4 gets
+    // and the per-operand divert below throws away).
+    const bool pxq_mmvq_fug = pxa_pxq_mmvq_type(src0_1->type) && src0_1->type == src0_2->type
+        && pxa_pxq_mmvq_on(ggml_cuda_info().devices[ctx.device].cc)
+        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1
+        && src0_1->ne[2] == 1 && src0_1->ne[3] == 1 && src1->type == GGML_TYPE_F32;
+    if (!pxq_mmvq_fug && (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type))) {
         const float limit_px = *(const float *)(dst->op_params + 1);
         // PXA_DENSE_FUG_PREC_v1: op_params[0] on a FUSED_UP_GATE node is the UNARY OP id
         // (GGML_UNARY_OP_SILU == 10), NOT a ggml_prec. Both ggml_cuda_op_mul_mat_cublas (which
