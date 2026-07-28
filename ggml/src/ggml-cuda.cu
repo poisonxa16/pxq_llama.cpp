@@ -5347,19 +5347,20 @@ static int pxa_pxq_gateup_2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         idz = ids_pool.get();
     }
 
-    // ---- S-split form: same occupancy target the K8-2D mmv split aims at, capped at the 8
-    // chunk slots the gen workspace reserves. S must also leave >= KSEG slabs per chunk.
-    const int S_CAP = 8;
+    // ---- S-split form: same occupancy target the K8-2D mmv split aims at, capped at the
+    // canonical chunk count (PXQ_CANON_v1: S must divide NFIX so the split stays bit-exact).
+    const int nfix_gu = pxq6_canon_nfix(kslabs, PXQ6_GU_SPLIT_MAX);
     if (pxa_pxq4_2d_split() && pxa_pxq_dense_gateup_split()) {
         const int target = pxa_pxq_dense_gateup_target(ctx.device);
         int S = 1;
-        while (S < S_CAP && (int64_t)panels*ny*S < target && (S*2)*PXQ4_MMV_KSEG <= kslabs) S *= 2;
+        while (S < nfix_gu && (int64_t)panels*ny*S < target) S *= 2;
         if (S > 1) {
             auto * ksg = pxq6_pick_gateup_ksplit_gen(fmt, fmt_g, pair, vecx);
             const int    kc_max  = ((kslabs + S - 1)/S)*PXQ6_QK;
-            const size_t smem_s  = (size_t)kc_max*sizeof(float) + 2*PXQ4_MMV_KSEG*64*sizeof(float);
+            const size_t smem_s  = (size_t)kc_max*sizeof(float);
             if (ksg && smem_s <= 46*1024) {
-                const size_t need = (size_t)ny*2*(size_t)S_CAP*(size_t)R;
+                // PXQ_CANON_v1 workspace: raw per-(fixed-chunk, lane) partials, u then g halves
+                const size_t need = (size_t)ny*2*(size_t)(PXQ6_GU_SPLIT_MAX*PXQ4_MMV_KSEG)*(size_t)R;
                 float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
                 if (ws) {
                     pxa_pxq_dense_gateup_log(ctx.device, true, S, panels, (int)ny, (int)R, (int)K, nullptr);
@@ -5381,7 +5382,7 @@ static int pxa_pxq_gateup_2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                             (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
                             (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
                             /* bias_u */ nullptr, 0, /* bias_g */ nullptr, 0,
-                            (int)R, /* n_as */ 1, /* n_ids */ 1, /* unary SILU */ 0, 1.702f, limit, S);
+                            (int)R, /* n_as */ 1, /* n_ids */ 1, /* unary SILU */ 0, 1.702f, limit, kslabs);
                         CUDA_CHECK(cudaGetLastError());
                     }
                     return 0;
