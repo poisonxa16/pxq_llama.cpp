@@ -3798,15 +3798,18 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     // from there. S_min == 1 for every shape that passed before, so those shapes keep their
     // exact previous launch geometry and byte-reproduce.
     const int    kslabs   = (int)(K/PXQ6_QK);
-    const size_t smem_fix = PXQ4_MMV_KSEG*64*sizeof(float);
+    // PXQ_CANON_v1: NFIX fixed canonical chunks for this shape; any split S must divide it.
+    const int    nfix     = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);
+    const size_t smem_fix = PXQ4_MMV_KSEG*64*sizeof(float);   // red[] — plain form only
     const size_t smem_cap = 46*1024;
     auto smem_for_S = [&](int S) {
-        return (size_t)((kslabs + S - 1)/S)*PXQ6_QK*sizeof(float) + smem_fix;
+        // split kernels stage only their x slice (the canon rewrite dropped their red[])
+        return (size_t)((kslabs + S - 1)/S)*PXQ6_QK*sizeof(float) + (S == 1 ? smem_fix : 0);
     };
     int S_min = 1;
     while (S_min < PXQ6_MMV_SPLIT_MAX && smem_for_S(S_min) > smem_cap) S_min *= 2;
     if (smem_for_S(S_min) > smem_cap)     return -1;   // wider than even S=MAX can stage
-    if (S_min*PXQ4_MMV_KSEG > kslabs)     return -1;   // needs >= KSEG slabs per chunk
+    if (S_min > nfix)                     return -1;   // canonical chunking cannot cover this S
     const bool must_split = S_min > 1;                 // the plain form cannot stage this K
     if (must_split && !pxa_pxq4_2d_split()) return -1;
 
@@ -3841,21 +3844,22 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     // K8-2D: S-way K-chunk split when the plain grid under-fills the machine (or its full-K
     // x stage caps occupancy). S = smallest power of two reaching the block target, capped by
-    // PXQ6_MMV_SPLIT_MAX and by >= 4 slabs per chunk (one per kseg chain).
+    // NFIX (so S always divides the canonical chunking => bit-exact vs unsplit).
     if (pxa_pxq4_2d_split()) {
         const int target = pxa_pxq4_2d_split_target(ctx.device);
         int S = S_min;               // >= 1; above 1 only when the x stage demands it
-        while (S < PXQ6_MMV_SPLIT_MAX && (int64_t)panels*ny*S < target && (S*2)*PXQ4_MMV_KSEG <= kslabs) S *= 2;
+        while (S < nfix && (int64_t)panels*ny*S < target) S *= 2;
         if (S > 1) {
             auto * ksg = pxq6_pick_mmv_ksplit_gen(fmt, pair, vecx);
             if (ksg) {
-                const size_t need = (size_t)ny*(size_t)PXQ6_MMV_SPLIT_MAX*(size_t)R;
+                // PXQ_CANON_v1 workspace: raw per-(fixed-chunk, lane) partials
+                const size_t need = (size_t)ny*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*(size_t)R;
                 float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
                 pxa_pxq4_2d_split_log(ctx.device, ws != nullptr, S, panels, (int)ny, (int)R, (int)K);
                 if (ws) {
                     int * ctrs = pxa_pxq_split_fusered() ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
                     const int kc_max = (kslabs + S - 1)/S;
-                    const size_t smem_s = (size_t)kc_max*PXQ6_QK*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
+                    const size_t smem_s = (size_t)kc_max*PXQ6_QK*sizeof(float);
                     dim3 grids((unsigned)(panels*S), 1u, (unsigned)ny);
                     ksg<<<grids, 256, smem_s, stream>>>(
                         (const uint8_t *)src0->data,
@@ -3870,7 +3874,7 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                         k_pxq_mmv_reduce_s<<<gridr, 256, 0, stream>>>(ws,
                             (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
                             (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
-                            (int)R, /* n_as */ 1, /* n_ids */ 1, S);
+                            (int)R, /* n_as */ 1, /* n_ids */ 1, kslabs);
                         CUDA_CHECK(cudaGetLastError());
                     }
                     return 0;
@@ -4136,20 +4140,26 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
         }
     }
 
+    // PXQ_CANON_v1: clamp the gen split S to the canonical chunk count so it always divides
+    // NFIX (bit-exactness precondition); an S clamped below 2 falls back to the K1/unsplit path.
+    const int kslabs_gu = (int)(K/PXQ4_QK);
+    const int nfix_gu   = pxq6_canon_nfix(kslabs_gu, PXQ6_GU_SPLIT_MAX);
+    const int sgen_eff  = sgen > nfix_gu ? nfix_gu : sgen;
+
     bool gu_done = false;
-    if (newfam && (pxa_pxq6_ksplit() || sgen)) {
+    if (newfam && (pxa_pxq6_ksplit() || sgen_eff >= 2)) {
         // K1: split gateup launch + fixed-order reducer. Workspace grows only outside graph
         // capture; if unavailable we fall through to the unsplit kernel (bit-identical for the
         // bit-exact form, so replayed graphs stay correct whatever capture saw).
-        const size_t need = (size_t)Ny*n_ids*2*(sgen ? 8 : PXQ4_MMV_KSEG)*R;
+        const size_t need = (size_t)Ny*n_ids*2*(sgen_eff >= 2 ? PXQ6_GU_SPLIT_MAX*PXQ4_MMV_KSEG : PXQ4_MMV_KSEG)*R;
         float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
         if (ws) {
             dim3 gridr((unsigned)((R + 255)/256), (unsigned)n_ids, (unsigned)Ny);
-            if (sgen) {
-                const int kslabs = (int)(K/PXQ4_QK);
-                const int kcmax  = ((kslabs + sgen - 1)/sgen)*PXQ4_QK;
-                const size_t smem_s = (size_t)kcmax*sizeof(float) + 2*PXQ4_MMV_KSEG*64*sizeof(float);
-                dim3 grids((unsigned)(R/PXQ4_BM*sgen), (unsigned)n_ids, (unsigned)Ny);
+            if (sgen_eff >= 2) {
+                const int kslabs = kslabs_gu;
+                const int kcmax  = ((kslabs + sgen_eff - 1)/sgen_eff)*PXQ4_QK;
+                const size_t smem_s = (size_t)kcmax*sizeof(float);
+                dim3 grids((unsigned)(R/PXQ4_BM*sgen_eff), (unsigned)n_ids, (unsigned)Ny);
                 auto * ks = pxq6_pick_gateup_ksplit_gen(fmt, fmt_g, pair, vecx);
                 if (ks) {
                 int * ctrs = pxa_pxq_split_fusered() ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
@@ -4161,7 +4171,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
                     bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
                     ctrs, unary, 1.702f, limit,
-                    (int)R, (int)K, (int)n_as, (int)n_ids, sgen);
+                    (int)R, (int)K, (int)n_as, (int)n_ids, sgen_eff);
                 CUDA_CHECK(cudaGetLastError());
                 if (!ctrs) {
                     k_pxq6_gateup_reduce_gen<<<gridr, 256, 0, stream>>>(ws,
@@ -4169,7 +4179,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         (const char *)ids->data, ids->nb[0], ids->nb[1],
                         bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
                         bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
-                        (int)R, (int)n_as, (int)n_ids, unary, 1.702f, limit, sgen);
+                        (int)R, (int)n_as, (int)n_ids, unary, 1.702f, limit, kslabs);
                     CUDA_CHECK(cudaGetLastError());
                 }
                 gu_done = true;

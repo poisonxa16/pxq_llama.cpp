@@ -1307,9 +1307,22 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     }
     if (pxa_name_ends(name, "_exps.weight"))            return GGML_TYPE_COUNT;   // expert path owns it
     if (pxa_name_is(name, "output.weight"))             return GGML_TYPE_COUNT;   // pxa_pxq_head_type()
-    if (name.find(".nextn.") != std::string::npos)      return GGML_TYPE_COUNT;   // MTP companion
-    if (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight") ||
-        pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
+    // MTP companion (eh_proj etc., non-expert): draft-path only, but a contaminated draft costs
+    // acceptance rate, and these are a handful of small tensors. Q8_0 instead of the old flat
+    // MXFP4 (zero-MXFP4 rule, 2026-07-28). The nextn _exps stacks are caught above.
+    if (name.find(".nextn.") != std::string::npos)      return GGML_TYPE_Q8_0;
+    // DeltaNet per-head decay/gate projections: 32 rows < the 64-row PXQ panel — geometrically
+    // impossible for the slab codecs, and their error acts multiplicatively on the recurrent
+    // state. Q8_0 (+0.011% file size on the 35B) instead of the old flat-MXFP4 landing
+    // (zero-MXFP4 rule, 2026-07-28).
+    if (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight")) {
+        return GGML_TYPE_Q8_0;
+    }
+    // ssm_out (DeltaNet output projection, geometry-eligible): measured on Fusion4-35B
+    // 2026-07-28 — see the measurement note at this table's header. Left on the legacy landing
+    // until that measurement says otherwise; use --custom-q '(ssm_out\.weight)=pxq4' to build
+    // the native arm.
+    if (pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
 
     // token embeddings: a row GATHER, never a GEMM, so the P100 "k-quants are slow" rule does
     // not apply. Q6_K kills 0.121 relative RMS + the MXFP4 gain bias for ~+0.08 GiB on Laguna.
@@ -2412,25 +2425,32 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         new_size, 1, params);
 
                     name = extra.name;
-                } else if (!pxq4_tensor_eligible(name, tensor) &&
+                } else if (!pxq4_tensor_geometry_ok(tensor) &&
                            (new_type == GGML_TYPE_PXQ1 || new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
                             new_type == GGML_TYPE_PXQ4 || new_type == GGML_TYPE_PXQ4HQ ||
                             new_type == GGML_TYPE_PXQ6)) {
-                    // safety: a PXQ target on a non-eligible tensor (bad custom rule) — the
-                    // native codecs need _exps geometry and there is no CPU codec to fall to.
-                    // BACKBONE_REV 2 changed the landing type from mxfp4 to q8_0: this path
-                    // only ever fires on rare, small tensors, and MXFP4's two failure channels
-                    // (a 3.54-effective-bit codec at 4.25 bpw, plus a systematic gain bias) make
-                    // it the one type we never want to fall into silently. Legacy mode keeps
-                    // the old mxfp4 landing so it byte-reproduces pre-rev-2 recipes.
+                    // safety: a PXQ target on a geometry-ineligible tensor (bad custom rule) —
+                    // the slab codecs need 64-row panels / 32-wide blocks and there is no CPU
+                    // codec to fall to. BACKBONE_REV 2 changed the landing type from mxfp4 to
+                    // q8_0: this path only ever fires on rare, small tensors, and MXFP4's two
+                    // failure channels (a 3.54-effective-bit codec at 4.25 bpw, plus a
+                    // systematic gain bias) make it the one type we never want to fall into
+                    // silently. Legacy mode keeps the old mxfp4 landing so it byte-reproduces
+                    // pre-rev-2 recipes.
+                    // NOTE (2026-07-28): this gate used to be the full CLASS-based
+                    // pxq4_tensor_eligible(), which silently demoted an EXPLICIT --custom-q PXQ
+                    // target under PXA_PXQ_BACKBONE=legacy — the arm came out byte-identical to
+                    // its control. An explicit PXQ target is now honoured whenever the GEOMETRY
+                    // allows it, in every backbone mode.
                     const bool bb_legacy = pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY;
                     const ggml_type demoted = bb_legacy ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
-                    LLAMA_LOG_WARN("%s: %s is not PXQ-eligible — demoting %s -> %s\n",
-                                   __func__, name.c_str(), ggml_type_name(new_type), ggml_type_name(demoted));
+                    LLAMA_LOG_WARN("%s: %s fails PXQ slab geometry (ne0=%" PRId64 ", ne1=%" PRId64 ") — demoting %s -> %s\n",
+                                   __func__, name.c_str(), tensor->ne[0], tensor->ne[1],
+                                   ggml_type_name(new_type), ggml_type_name(demoted));
                     new_type = demoted;
                     do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
                             new_size, chunk_size_multiplier, params);
-                } else if (pxq4_tensor_eligible(name, tensor) &&
+                } else if (pxq4_tensor_geometry_ok(tensor) &&
                            (new_type == GGML_TYPE_PXQ1 || new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
                             new_type == GGML_TYPE_PXQ4 || new_type == GGML_TYPE_PXQ4HQ ||
                             new_type == GGML_TYPE_PXQ6 ||
