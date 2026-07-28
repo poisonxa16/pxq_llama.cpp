@@ -5221,12 +5221,24 @@ static bool pxa_pxq_dense_gateup_split() {
     }();
     return v;
 }
+// MEASURED 2026-07-27 (Qwable-27B dense, PXQ4core, 4 timed reps/arm, spread < 0.2%): the two
+// target Teslas want OPPOSITE answers here, which is why this is its own knob.
+//   2xV100 (sm_70): follow the shared target 33.618 t/s | never split 33.905  (+0.85%)
+//   2xP100 (sm_60): follow the shared target 20.793 t/s | never split 18.997  (-8.6%)
+// The fused gateup carries TWO weights per block, so panels = R/64 blocks already do the work
+// of 2*panels mmv blocks. On sm_70 (80 SMs) the dense ffn_up/gate grid is 272 blocks, which is
+// already past the point where more parallelism pays, so every S > 1 buys nothing and still
+// costs a dependent k_pxq6_gateup_reduce_gen. On sm_60 (56 SMs) the same grid is well short of
+// the machine's appetite and the split is strongly positive. Other arches follow the shared
+// target (unmeasured -- do not guess). 0 == never split.
 static int pxa_pxq_dense_gateup_target(int device) {
     static const int ov = [] {
         const char * e = getenv("PXA_PXQ_DENSE_GATEUP_TARGET");
         return e ? atoi(e) : -1;
     }();
-    return ov >= 0 ? ov : pxa_pxq4_2d_split_target(device);
+    if (ov >= 0) return ov;
+    if (ggml_cuda_info().devices[device].cc == 700) return 0;   // sm_70: never split the fused gateup
+    return pxa_pxq4_2d_split_target(device);
 }
 
 // returns 0 if it handled the node, -1 to decline (caller falls through to the split path)
