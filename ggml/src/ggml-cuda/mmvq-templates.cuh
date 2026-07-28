@@ -43,10 +43,10 @@ using pxq_mmvq_pol = std::conditional_t<type == GGML_TYPE_PXQ4, pxq_mmvq_pol_p6,
 
 template <ggml_type type, int VDR, int ROWS>
 static __device__ __forceinline__ float pxq_mmvq_dot(
-        const uint8_t * __restrict__ slab, const int r, const int i,
+        const uint8_t * __restrict__ slab, const int r, const int i, const float anch,
         const float * __restrict__ sub, const pxq_mmvq_scales<pxq_mmvq_pol<type>, ROWS> & sc,
         const block_q8_1 * __restrict__ bq8_1, const int iqs) {
-    return vec_dot_pxq_q8_1<pxq_mmvq_pol<type>, VDR, ROWS>(slab, r, i, sub, sc, bq8_1, iqs);
+    return vec_dot_pxq_q8_1<pxq_mmvq_pol<type>, VDR, ROWS>(slab, r, i, anch, sub, sc, bq8_1, iqs);
 }
 
 // The 16-entry sub-scale table is the one lookup PXQ has that MXFP4's E8M0 exponent trick does
@@ -183,23 +183,10 @@ static __device__ void k_mul_mat_vec_q(
             pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> sc; sc.load(slab, rb.r0);
 #pragma unroll
             for (int j = 0; j < ncols_y; ++j) {
-                // q8_1 activation scale: uniform across the block's rows -> one load+convert
-                // per (j, kb) instead of one per (j, kb, row).
-                const float dsv = __low2float(y[j*blocks_per_col_y + kby].ds);
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp[j][i] += dsv * pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(slab, rb.r0 + i, i, sub, sc, &y[j*blocks_per_col_y + kby], kqs);
+                    tmp[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(slab, rb.r0 + i, i, rb.anch[i], sub, sc, &y[j*blocks_per_col_y + kby], kqs);
                 }
-            }
-        }
-        // the row anchor is a common factor of every k term: apply it ONCE per row here
-        // instead of per (row, kb) in the inner loop. Distributes over the partial sums, so
-        // reassociation-class only (this path is G3 already).
-#pragma unroll
-        for (int j = 0; j < ncols_y; ++j) {
-#pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] *= rb.anch[i];
             }
         }
     } else
@@ -311,21 +298,11 @@ static __device__ void k_fused_mul_mat_vec_q(
             pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> scg; scg.load(sg, rg.r0);
 #pragma unroll
             for (int j = 0; j < ncols_y; ++j) {
-                const float dsv = __low2float(y[j*blocks_per_col_y + kby].ds);
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp_u[j][i] += dsv * pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(su, ru.r0 + i, i, sub, scu, &y[j*blocks_per_col_y + kby], kqs);
-                    tmp_g[j][i] += dsv * pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(sg, rg.r0 + i, i, sub, scg, &y[j*blocks_per_col_y + kby], kqs);
+                    tmp_u[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(su, ru.r0 + i, i, ru.anch[i], sub, scu, &y[j*blocks_per_col_y + kby], kqs);
+                    tmp_g[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(sg, rg.r0 + i, i, rg.anch[i], sub, scg, &y[j*blocks_per_col_y + kby], kqs);
                 }
-            }
-        }
-        // row anchors applied once per row (common factor; see the plain-kernel note).
-#pragma unroll
-        for (int j = 0; j < ncols_y; ++j) {
-#pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp_u[j][i] *= ru.anch[i];
-                tmp_g[j][i] *= rg.anch[i];
             }
         }
     } else
