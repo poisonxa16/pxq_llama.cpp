@@ -1,5 +1,5 @@
 <!-- GitHub README for the kernel repo (pxq_llama, a fork of ik_llama.cpp). -->
-<p align="center"><img src="banner.png" alt="pxq_llama — the fastest quant for landfill GPUs" width="100%"></p>
+<p align="center"><img src="banner.png" alt="pxq_llama — PXQ quants and a MoE accelerator for landfill GPUs" width="100%"></p>
 
 # pxq_llama — run PXQ-quantized models (revive your landfill GPUs)
 
@@ -37,6 +37,113 @@ Best config for **both** sides — upstream at its own documented best (its best
 5.8k-token prompt, temp 0, median of 3. Full methodology + raw runs: [`bench/fair-battle.md`](bench/fair-battle.md).
 
 <p align="center"><img src="bench/fair-battle.svg" alt="pxq_llama vs upstream ik_llama.cpp benchmark" width="100%"></p>
+
+## PXQ vs MXFP4 — every cell we measured, including the one we lose
+
+Same engine, same cards, same protocol, tier/codec the only variable. Dense = Qwable-27B,
+MoE = Fusion4-35B, `llama-server /completion`, temp 0, coherence-gated, n=7, median reported.
+
+| cell | PXQ4 | MXFP4 | result |
+|---|---|---|---|
+| **MoE decode**, 2×V100 | 104.06 | 96.59 | **+7.7%** |
+| **MoE prefill**, 2×V100 | 1394.0 | 1172.8 | **+18.9%** |
+| **Dense prefill**, 2×V100 | 543.9 | 265.6 | **+104.8%** |
+| **Dense prefill**, 2×P100 | 128.0 | 107.4 | **+19.2%** |
+| **Dense decode**, 2×P100 | 15.18 | 14.32 | **+6.0%** |
+| **Dense decode**, 2×V100 *(default)* | 29.79 | 36.40 | **−18.2%** ← we lose this one |
+| **Dense decode**, 2×V100 *(with opt-in `PXA_PXQ_MMVQ=1`)* | 33.82 | 36.38 | **−7.0%** |
+
+**The loss is real and we are not going to hide it.** On Volta (sm_70), dense-model *decode* is
+~7% slower on PXQ4 than MXFP4. The cause is understood: MXFP4's block layout maps onto DP4A with a
+single scale fixup per 32-value block, while PXQ4's sub-scale hierarchy costs a second fixup chain
+and a second cache sector for the scale. It has survived roughly eight distinct kernel-side attacks
+across three sessions — including a rewritten `vec_dot` that we built, measured, and **reverted**
+when it came in slightly worse (see the revert commit, which carries its own numbers). At equal bit
+width against a kernel already running at ~76% of HBM peak, the ceiling is a tie, not a win.
+
+**What you get for those 7%:**
+
+| | MXFP4 | PXQ4 |
+|---|---|---|
+| nominal | 4.25 bpw | 4.25 bpw |
+| **effective** | **3.64 bpw** | **4.25 bpw** |
+| reconstruction error | baseline | **38% lower** |
+| **perplexity** (paired, same bytes) | **6.9704** | **6.5527 — −6.0%** |
+
+MXFP4 occupies 4.25 bits but spends none of them protecting salient weights. PXQ4 does, and it
+shows up where it matters. **On that one cell the trade is ~7% decode speed for ~6% perplexity at
+identical file size.** Whether that is worth it is your call, not ours — which is why the table
+above exists.
+
+### Which should you actually run?
+
+| your setup | honest answer |
+|---|---|
+| **MoE** (any size) | **PXQ4** — faster on both axes (fidelity vs MXFP4 measured on dense, not yet on MoE) |
+| **Pascal** (P100/GP100) | **PXQ4** — faster on both axes; dense fidelity measured (below) |
+| **Dense, long prompts / agentic** | **PXQ4** — ~2× prefill, better quality |
+| **Dense, decode-bound, on Volta** | **MXFP4 is faster.** Take PXQ4 only if you want the fidelity |
+
+## Bonus: this fork speeds up quants we did not invent
+
+Several fixes in this fork are **not PXQ-specific** and benefit any quant on these cards: an sm_60
+fp16-GEMM gate that wrongly excluded GP100 (full-rate fp16 silicon that was taking the fp32 path), a
+flash-attention regime fix, MoE-path fixes, and correct `np>1` hybrid concurrency that upstream
+corrupts. The upstream head-to-head above is measured on **upstream's own best IQ_K quant**, not on
+PXQ — that comparison is the evidence for this claim.
+
+⚠ **What we have NOT isolated:** we measured a same-file MXFP4 A/B (Fusion4-35B, 2×V100) at
+**+2.7% prefill / +7.6% decode**, but the two builds span ~9 days of commits, so that delta is
+**not attributable to any single fix** and we are not presenting it as one. The specific
+`op_params` precision-alias fix from this cycle is recorded in our own notes as leaving MXFP4
+**unchanged** — its guard is PXQ-scoped. A clean per-fix attribution for non-PXQ codecs has not
+been done.
+
+## Updates — 2026-07-28
+
+**Four engine fixes, one new opt-in lever, and one optimization we reverted after measuring it.**
+
+- **Quantizer threaded over `(expert, panel-chunk)`.** It previously threaded over experts only, so
+  a *dense* model (`E==1`) quantized single-threaded: **8400s → 359s (23×)**, 103% → 5111% CPU, with
+  `md5(-t72) == md5(-t8)` proving the output is unchanged.
+- **The 2D decode driver was unreachable for wide-K tensors.** It staged the whole activation vector
+  in shared memory and declined above 46 KB, capping `K ≤ 11264` — but a dense `ffn_down` is
+  `[17408, 5120]`, so **every layer fell back to dequant+cuBLAS per token**, a path measured at 18×
+  the cost. The K8-2D S-split that handles this already existed and sat below the gate, unreachable.
+  Decode **3.35 → 28.2** (V100), **2.33 → 15.07** (P100).
+- **Dequant stores were ~1/16 efficient.** `k_pxq6_dequant_matrix` mapped one thread per *row*, so a
+  store instruction had 32 threads writing addresses `K` apart — 32 sectors moved to deliver 64
+  useful bytes. Now staged in shared memory and written along K.
+- **A unary-op id was posing as a precision flag.** `ggml_cuda_up_gate_unary` passed `dst` into
+  `ggml_cuda_mul_mat` while `dst->op_params[0]` held the SILU op id; the callee read it as
+  `ggml_prec` and vetoed fp16 on two thirds of the expert GEMMs. The fix itself is generic, but our own
+  notes record it leaving **MXFP4 unchanged** (its guard is PXQ-scoped), so it is a PXQ-side ratio
+  win rather than a lift for every codec.
+
+- **New: `PXA_PXQ_MMVQ` (default OFF).** Routes PXQ4/PXQ4HQ decode to the stock q8_1 MMVQ kernel.
+  **+13.7% dense decode** (29.787 → 33.861, 2×V100) and **+6.7% on MoE** when paired with PXQ4
+  attention. Quality-neutral: paired perplexity **at `-b 8`** gives Δ +0.0036 dense (44× inside the
+  error bar) and Δ −0.0031 MoE — opposite signs, i.e. noise. **G3-class**: token output changes, so
+  set `=0` if you need bit-reproducibility.
+  ⚠ **Do not gate this lever with default-batch perplexity.** `llama-perplexity` at `-b 512` is pure
+  prefill and the MMVQ dispatch gate is `ne11 <= 8`, so the kernel never fires and both arms return
+  *identical* perplexity — a false pass from a run in which the feature was switched off. Applies to
+  any decode-window lever.
+
+- **`PXA_PXQ_GEMM_2D=2` is now clamped to sm_60.** Its previous +2.30% sm_70 figure was measured
+  against the pre-coalescing dequant; against the current one it is **−18.6%** on dense. sm_60 is
+  unaffected (+35% dense prefill), which is why the mode still exists.
+
+- **Reverted: a reworked MMVQ `vec_dot`** that chained the integer dot across the full SUB16 scope to
+  pay one float fixup per block instead of two. Sound in theory, measured **worse** on silicon
+  (33.49 vs the incumbent 33.86 at ROWS=4; ROWS=8 regressed further). Reverted with the numbers in
+  the commit message. The sm_70 dense-decode floor of **−7%** now stands on ~8 distinct attacks.
+
+- **Backbone note for MoE:** `BACKBONE_REV 2` promotes attention to PXQ6, which costs **12.2% MoE
+  decode** and — measured on Fusion4-35B — buys **no detectable fidelity** (PXQ6 attn 5.6810±0.065
+  vs PXQ4 attn 5.6766±0.065). Shipping attention at **PXQ4** recovers 6.7 of those points and makes
+  the class MMVQ-eligible. Do **not** revert attention to MXFP4 for the remaining points; that
+  re-opens the 3.2×-error regression rev2 exists to prevent.
 
 ## Updates — 2026-07-24
 
@@ -110,7 +217,7 @@ decode, gate/up fusion) tuned for Pascal/Volta.
 | PXQ3 | 3.27 bpw | ~2.1× | 3-bit, bit-plane packed |
 | PXQ2 | 2.27 bpw | ~4.4× | 2-bit, LM4 codebook |
 
-The backbone (attention / router / embeddings) stays MXFP4 (standard mixed-precision). Numerics are
+The backbone (attention / router / embeddings) is assigned per class by `BACKBONE_REV 2` (see `docs/LEVERS.md`); `ssm_*` and a few legacy classes stay MXFP4. Earlier releases flattened the whole backbone to MXFP4 — that is no longer the case. Numerics are
 imatrix-calibrated and gated byte-exact against a reference (Q-G1 byte-parity + Q-G2 wrel).
 
 ## Scales up — one card to a rack
