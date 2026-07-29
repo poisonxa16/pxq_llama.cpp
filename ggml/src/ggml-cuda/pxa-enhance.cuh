@@ -316,7 +316,12 @@ static inline int pxa_fa_prefill_split_ne11() {
         const char * e = getenv("PXA_FA_PREFILL_SPLIT");
         if (e) { int t = atoi(e); return t <= 0 ? 0 : (t < 9 ? 9 : t); }
         if (pxa_config_level() == 0) return 0;    // REFERENCE
-        return pxa_mode() == 1 ? 0 : 64;          // MAX -> inert; BALANCE -> 64
+        // EXPERIMENTAL opt-in ONLY (merged from private 178a357, 2026-07-28): ENHANCE/BALANCE
+        // no longer auto-enable FA_PREFILL_SPLIT — the non-FA prefill chain inflates the
+        // compute buffer ~2.35x (1956 -> 4607 MiB measured) and OOMs 16 GB cards at ub2048.
+        // The +45% P100 prefill is real but must be bought explicitly (PXA_FA_PREFILL_SPLIT=64)
+        // on configs with the headroom.
+        return 0;
     }();
     return v;
 }
