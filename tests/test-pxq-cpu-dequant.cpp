@@ -39,6 +39,20 @@ static inline float    test_fp16_to_fp32(uint16_t h) { return _cvtsh_ss(h); }
 static inline uint16_t test_fp32_to_fp16(float f)    { return _cvtss_sh(f, 0 /*RN*/); }
 #define ggml_fp16_to_fp32 test_fp16_to_fp32
 #define ggml_fp32_to_fp16 test_fp32_to_fp16
+// shim for the inc.cpp dead-column guard (defined in src/llama-quantize.cpp in the real build)
+#include <atomic>
+static std::atomic<int64_t> g_pxq_imx_dead_cols{0};
+static bool pxq_imatrix_column_usable(const float * w, int64_t K) {
+    if (!w) return false;
+    double s = 0.0;
+    for (int64_t i = 0; i < K; ++i) {
+        if (!std::isfinite(w[i]) || w[i] < 0.0f) { g_pxq_imx_dead_cols.fetch_add(1); return false; }
+        s += (double) w[i];
+    }
+    if (s > 0.0) return true;
+    g_pxq_imx_dead_cols.fetch_add(1);
+    return false;
+}
 #include "../src/pxq6-quantize.inc.cpp"
 #include "../src/pxq2-quantize.inc.cpp"
 #include "../src/pxq3-quantize.inc.cpp"
@@ -199,19 +213,19 @@ static void test_roundtrip(ggml_type t, const char * name, double max_rel) {
 
     switch (t) {
         case GGML_TYPE_PXQ4:
-            pxq6_quantize_expert(src.data(), q.data(), R, K, nullptr, 0);
+            pxq6_quantize_expert(src.data(), q.data(), R, K, nullptr, 0, 0);
             pxq6_dequant_expert(q.data(), ref_deq.data(), R, K, 0);
             break;
         case GGML_TYPE_PXQ4HQ:
-            pxq6_quantize_expert(src.data(), q.data(), R, K, nullptr, 1);
+            pxq6_quantize_expert(src.data(), q.data(), R, K, nullptr, 1, 0);
             pxq6_dequant_expert(q.data(), ref_deq.data(), R, K, 1);
             break;
         case GGML_TYPE_PXQ2:
-            pxq2_quantize_expert(src.data(), q.data(), R, K, nullptr);
+            pxq2_quantize_expert(src.data(), q.data(), R, K, nullptr, 0);
             pxq2_dequant_expert(q.data(), ref_deq.data(), R, K);
             break;
         case GGML_TYPE_PXQ3:
-            pxq3_quantize_expert(src.data(), q.data(), R, K, nullptr);
+            pxq3_quantize_expert(src.data(), q.data(), R, K, nullptr, 0);
             pxq3_dequant_expert(q.data(), ref_deq.data(), R, K);
             break;
         default: abort();
@@ -257,8 +271,8 @@ static void test_fused(int unary_op, float limit, const char * opname) {
     // real quantized PXQ6 up + PXQ2 gate (a mixed PXQ-UNIVERSAL pair)
     std::vector<float> upf = rand_matrix(R, K, 100), gatef = rand_matrix(R, K, 101);
     std::vector<uint8_t> up_q(ref::buf_size(GGML_TYPE_PXQ4, R, K)), gate_q(ref::buf_size(GGML_TYPE_PXQ2, R, K));
-    pxq6_quantize_expert(upf.data(), up_q.data(), R, K, nullptr, 0);
-    pxq2_quantize_expert(gatef.data(), gate_q.data(), R, K, nullptr);
+    pxq6_quantize_expert(upf.data(), up_q.data(), R, K, nullptr, 0, 0);
+    pxq2_quantize_expert(gatef.data(), gate_q.data(), R, K, nullptr, 0);
 
     std::vector<float> up_d(R*K), gate_d(R*K);
     pxa_pxq_dequant_2d(GGML_TYPE_PXQ4, up_q.data(), up_d.data(), R, K);
@@ -344,7 +358,7 @@ static void test_mul_mat() {
     const int64_t R = 128, K = 64;
     std::vector<float> af = rand_matrix(R, K, 200);
     std::vector<uint8_t> aq(ref::buf_size(GGML_TYPE_PXQ3, R, K));
-    pxq3_quantize_expert(af.data(), aq.data(), R, K, nullptr);
+    pxq3_quantize_expert(af.data(), aq.data(), R, K, nullptr, 0);
     std::vector<float> ad(R*K);
     pxa_pxq_dequant_2d(GGML_TYPE_PXQ3, aq.data(), ad.data(), R, K);
 
