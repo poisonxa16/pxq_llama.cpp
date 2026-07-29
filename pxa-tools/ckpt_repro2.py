@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Recurrent-checkpoint contamination repro/verify (hybrid qwen35moe).
+"""Recurrent-checkpoint contamination repro/verify v2 (hybrid qwen35moe) — WITHIN-INSTANCE.
 
-Test: on ONE slot, ask P1 (long generation, creates in-generation checkpoints), then ask P2
-(shares a short prefix with P1, then diverges), then ask P1 and P2 again. Compare every answer
-against the same question asked on a FRESH server (ground truth). A correct engine gives
-byte-identical temp-0 answers regardless of what the slot served before. The contamination bug
-makes post-P1 answers differ (recurrent state restored from the wrong generation).
+On ONE server/slot: ask P2 (clean, its own per-instance truth), P3, then P1 (a long listing
+generation that advances the recurrent state far past the shared prefix), then P2/P3 again.
+On a correct engine the repeats are byte-identical to their first ask (temp 0). With the
+contamination bug the recurrent conv/SSM state left by P1 leaks into the P2/P3 re-asks
+(prefix reuse rolls attention back but not the DeltaNet state).
 
-Usage: ckpt_repro.py <model> <gpus> <ts> <build> <ckpts_n> <tag>
+Usage: ckpt_repro2.py <model> <gpus> <ts> <build> <ckpts_n> <tag>
 """
 import json, sys, time, subprocess, urllib.request, hashlib, os
 
@@ -16,9 +16,9 @@ IMG = "nvidia/cuda:12.8.1-devel-ubuntu24.04"
 PORT = 8463
 NAME = "pxq-ckptrepro"
 
-SYS = "You are a terse assistant. " * 40   # shared prefix ~ 360 tokens
+SYS = "You are a terse assistant. " * 40
 P1 = SYS + "\nList the numbers from 1 to 400, comma-separated, no spaces."
-P2 = SYS + "\nWhat is the capital of France? Answer with just the city name."
+P2 = SYS + "\nDescribe the water cycle in detail, covering evaporation, condensation, precipitation and collection."
 P3 = SYS + "\nCompute 17*23. Reply with just the number."
 
 def sh(c):
@@ -56,27 +56,26 @@ def ask(prompt, n):
 def h(s):
     return hashlib.sha256(s.encode()).hexdigest()[:12]
 
-# ground truth: each question on a fresh server
-truth = {}
-for tagq, (p, n) in {"P1": (P1, 700), "P2": (P2, 32), "P3": (P3, 32)}.items():
-    serve()
-    truth[tagq] = ask(p, n)
-    print("[truth %s] %s %r" % (tagq, h(truth[tagq]), truth[tagq][:60]), flush=True)
-sh("docker rm -f %s" % NAME)
-
-# contamination sequence on ONE server / one slot
 serve()
-seq = [("P1", P1, 700), ("P2", P2, 32), ("P1", P1, 700), ("P3", P3, 32), ("P2", P2, 32)]
+seq = [("P2", P2, 300), ("P3", P3, 32), ("P1", P1, 700),
+       ("P2", P2, 300), ("P3", P3, 32), ("P1", P1, 700), ("P2", P2, 300)]
+first = {}
 results = []
 ok_all = True
 for i, (tq, p, n) in enumerate(seq):
     out = ask(p, n)
-    match = out == truth[tq]
-    ok_all &= match
-    results.append({"step": i, "q": tq, "match": match, "hash": h(out), "truth_hash": h(truth[tq]),
-                    "head": out[:60]})
-    print("[seq %d %s] match=%s %s vs truth %s %r" % (i, tq, match, h(out), h(truth[tq]), out[:60]), flush=True)
+    if tq not in first:
+        first[tq] = out
+        match = None
+    else:
+        match = out == first[tq]
+        ok_all &= match
+    results.append({"step": i, "q": tq, "match": match, "hash": h(out), "head": out[:60]})
+    print("[seq %d %s] match=%s %s %r" % (i, tq, match, h(out), out[:60]), flush=True)
+roll = sh("docker logs %s 2>&1 | grep -cE 'restored HYBRID context checkpoint'" % NAME).stdout.strip()
+reset = sh("docker logs %s 2>&1 | grep -cE 'forcing full prompt re-processing'" % NAME).stdout.strip()
 sh("docker rm -f %s" % NAME)
-json.dump({"tag": TAG, "ckpts": CKPTS, "ok": ok_all, "truth": {k: h(v) for k, v in truth.items()},
+json.dump({"tag": TAG, "ckpts": CKPTS, "ok": ok_all, "hybrid_restores": roll, "full_resets": reset,
            "seq": results}, open("<local-path>%s.json" % TAG, "w"), indent=1)
-print("CKPT_REPRO %s: %s" % (TAG, "CLEAN (all match)" if ok_all else "CONTAMINATED (mismatch)"))
+print("hybrid_restores=%s full_resets=%s" % (roll, reset))
+print("CKPT_REPRO2 %s: %s" % (TAG, "CLEAN (repeats byte-identical)" if ok_all else "CONTAMINATED (repeat mismatch)"))

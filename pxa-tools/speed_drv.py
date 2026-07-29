@@ -32,7 +32,7 @@ def serve(path, env):
     sh("docker rm -f %s" % NAME)
     envs = " ".join("-e %s=%s" % kv for kv in env.items())
     cmd = ("docker run -d --name %s --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=%s "
-           "-e LD_LIBRARY_PATH=/build/bin:/build/src:/build/ggml/src %s "
+           "-e LD_LIBRARY_PATH=/build/bin:/build/src:/build/ggml/src:/build/examples/mtmd %s "
            "-p 127.0.0.1:%d:8080 -v %s:/build:ro -v %s:/mdir:ro %s "
            "/build/bin/llama-server -m /mdir/%s -c 8192 -np 1 -ngl 99 -sm layer -ts %s "
            "-b 2048 -ub 2048 -fa on -ctk f16 -ctv f16 --ctx-checkpoints 0 "

@@ -1203,6 +1203,7 @@ struct pxa_pxq_bb_cfg {
     bool hq   = false;   // PXQ4HQ backbone instead of PXQ6 on the 4-/5-bit tiers
     bool univ = false;   // also cover PXQ_UNIVERSAL / PXQ1
     bool lite = false;   // only the promotions that cost nothing at decode
+    bool core = false;   // GEMM backbone at the byte-parity PXQ4 core tier (MMVQ-eligible)
 };
 
 static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
@@ -1216,6 +1217,7 @@ static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
             if (has("legacy") || has("off") || s == "0") c.mode = PXA_BB_LEGACY;
             if (has("hq"))                               c.hq   = true;
             if (has("lite"))                             c.lite = true;
+            if (has("core"))                             c.core = true;
             if (has("universal") || has("all"))          c.univ = true;
         }
         if (c.mode == PXA_BB_LEGACY) {
@@ -1224,7 +1226,9 @@ static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
         } else {
             LLAMA_LOG_INFO("PXQ backbone rules: REV 2 (per-class promotion%s%s%s) — "
                            "PXA_PXQ_BACKBONE=legacy restores the old flat-MXFP4 backbone\n",
-                           c.lite ? ", LITE (decode-free classes only)" : (c.hq ? ", PXQ4HQ backbone" : ""),
+                           c.lite ? ", LITE (decode-free classes only)"
+                                  : (c.core ? ", CORE (byte-parity PXQ4 GEMM backbone)"
+                                            : (c.hq ? ", PXQ4HQ backbone" : "")),
                            c.univ ? ", incl. PXQ_UNIVERSAL/PXQ1" : "", "");
         }
         return c;
@@ -1329,11 +1333,30 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     if (pxa_name_is(name, "token_embd.weight")) {
         return t->ne[0] % QK_K == 0 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
     }
-    // K and V projections are already q8_0 in both our files and Q4_K_M's — parity, keep.
+    // K and V projections default to q8_0 (parity with our shipped files and Q4_K_M).
     // attn_v_b is MLA's V projection and was inheriting flat MXFP4; same role, same rule.
+    // PXA_PXQ_KV (documented in docs/LEVERS.md but never landed in source until 2026-07-28 —
+    // the docs row described three silent gates; all three clear here because the resolver
+    // returns an EXPLICIT type and the write loop's eligibility is geometry-only now):
+    // overrides the pin. Accepts q8_0|pxq4|pxq4hq|pxq6|mxfp4. NOTE the q8_0 "parity" premise is
+    // false against a flat-MXFP4 legacy file (its K/V are MXFP4) — `mxfp4` restores true byte
+    // parity for A/B work; the pxq tiers are the native option.
     if (pxa_name_is(name, "attn_k.weight") || pxa_name_is(name, "attn_v.weight") ||
         pxa_name_is(name, "attn_v_b.weight")) {
-        return GGML_TYPE_Q8_0;
+        static const ggml_type kv = [] {
+            const char * e = getenv("PXA_PXQ_KV");
+            if (!e || !*e) return GGML_TYPE_Q8_0;
+            std::string s(e);
+            for (auto & ch : s) ch = std::tolower(ch);
+            if (s == "q8_0")   return GGML_TYPE_Q8_0;
+            if (s == "pxq4")   return GGML_TYPE_PXQ4;
+            if (s == "pxq4hq") return GGML_TYPE_PXQ4HQ;
+            if (s == "pxq6")   return GGML_TYPE_PXQ6;
+            if (s == "mxfp4")  return GGML_TYPE_MXFP4;
+            LLAMA_LOG_WARN("PXA_PXQ_KV: unknown type '%s' — keeping q8_0\n", s.c_str());
+            return GGML_TYPE_Q8_0;
+        }();
+        return kv;
     }
     // THE Laguna killer: a per-HEAD attention gate is a handful of softplus scalars per layer
     // (Laguna: 72 rows, 0.03% of the file) whose error multiplies an ENTIRE head. Never
@@ -1364,6 +1387,12 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     // NEVER a silent MXFP4 demotion, which is the error class this whole revision removes.
     if (!pxq4_tensor_geometry_ok(t)) {
         return GGML_TYPE_Q8_0;
+    }
+    // CORE (2026-07-28, the sm_70 dense-decode recipe): the whole GEMM backbone at the
+    // byte-parity PXQ4 core tier — 4.2526 bpw vs MXFP4's 4.2500, MMVQ-eligible on every class.
+    // Previously only expressible via --custom-q (the PXQ4core arm in the sm_70 campaign).
+    if (cfg.core) {
+        return GGML_TYPE_PXQ4;
     }
     const ggml_type hi = cfg.hq ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ6;
     switch (tier) {

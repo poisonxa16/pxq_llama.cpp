@@ -33,7 +33,7 @@ def serve(env):
     sh("docker rm -f %s" % NAME)
     envs = " ".join("-e %s=%s" % kv for kv in env.items())
     cmd = ("docker run -d --name %s --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=%s "
-           "-e LD_LIBRARY_PATH=/build/bin:/build/src:/build/ggml/src %s "
+           "-e LD_LIBRARY_PATH=/build/bin:/build/src:/build/ggml/src:/build/examples/mtmd %s "
            "-p 127.0.0.1:%d:8080 -v %s:/build:ro -v %s:/mdir:ro %s "
            "/build/bin/llama-server -m /mdir/%s -c 8192 -np 1 -ngl 99 -sm layer -ts %s "
            "-fa on -ctk f16 -ctv f16 --ctx-checkpoints 0 --host 0.0.0.0 --port 8080 -t 8"
@@ -51,15 +51,20 @@ def serve(env):
     raise RuntimeError("timeout")
 
 def gen(prompt):
-    body = json.dumps({"prompt": prompt, "n_predict": 384, "temperature": 0, "top_k": 1,
-                       "cache_prompt": False, "ignore_eos": True, "n_probs": 5}).encode()
-    r = urllib.request.Request("http://127.0.0.1:%d/completion" % PORT, data=body,
-                               headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(r, timeout=900) as resp:
-        d = json.load(resp)
-    probs = d.get("completion_probabilities", [])
-    blob = d.get("content", "") + "||" + json.dumps(probs, sort_keys=True)
-    return hashlib.sha256(blob.encode()).hexdigest(), d.get("content", "")[:50]
+    # (n_probs omitted: the fork 500s on partial-UTF8 token pieces in completion_probabilities)
+    # Two probes per prompt: 384-token greedy, plus a fixed-seed temp-1.0 sampled run — the
+    # sampled run is a near-tie AMPLIFIER: with an identical RNG stream the token choice flips
+    # if ANY step probability differs at the drawn uniform, far more sensitive than greedy.
+    blob = ""
+    for extra in ({"temperature": 0, "top_k": 1}, {"temperature": 1.0, "seed": 42}):
+        body = json.dumps({"prompt": prompt, "n_predict": 384,
+                           "cache_prompt": False, "ignore_eos": True, **extra}).encode()
+        r = urllib.request.Request("http://127.0.0.1:%d/completion" % PORT, data=body,
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=900) as resp:
+            d = json.load(resp)
+        blob += d.get("content", "") + "||"
+    return hashlib.sha256(blob.encode()).hexdigest(), blob[:50]
 
 out = {}
 for vtag, env in VARIANTS.items():
