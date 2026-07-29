@@ -19,8 +19,8 @@ import json, os, sys, time, subprocess, urllib.request, collections, re
 
 BUILD = "<local-path>"
 IMG = "nvidia/cuda:12.8.1-devel-ubuntu24.04"
-PORT = 8489
-NAME = "kaskalfix"
+PORT = 8491
+NAME = "kaskalold"
 GPUS = "0,1,2,4,6"
 MAXTOK = 2048
 
@@ -28,8 +28,7 @@ PUB = "<local-path>"
 FIX = "<local-path>"
 
 CELLS = [
-    ("fix_PXQ4attn_newbin_default", FIX, {}),
-    ("fix_PXQ4attn_newbin_SPLIT0",  FIX, {"PXA_PXQ4_2D_SPLIT": "0"}),
+    ("fix_SPLIT0_oldbin", FIX, {"PXA_PXQ4_2D_SPLIT": "0"}),
 ]
 
 
