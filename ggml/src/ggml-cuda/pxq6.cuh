@@ -351,7 +351,8 @@ struct pxq6_pol_p6r {
 };
 
 // per-row code load: CODE_WORDS LE u32 words. 16 B formats keep the proven uint4 load;
-// 8 B uses uint2 (8-aligned: CODE_OFF 64 + row*8); 12 B uses 3 u32 (4-aligned: row*12).
+// 8 B uses uint2 (8-aligned: CODE_OFF 64 + row*8); 12 B uses 3 u32 (4-aligned: row*12);
+// 4 B (P1) uses ONE u32.
 // CS variant (K7): identical addresses/values through ld.global.cs — the decode weight stream
 // is read exactly once per token, so mark it evict-first and keep L2 for the hot working set
 // (activations/tables/KV). Cache policy cannot change loaded values => bit-exact by construction.
@@ -363,6 +364,16 @@ static __device__ __forceinline__ void pxq6_ldcodes(const uint8_t * p, uint32_t 
     } else if constexpr (POL::CODE_WORDS == 2) {
         if constexpr (CS) { *(uint2 *)q = __ldcs((const uint2 *)p); }
         else              { *(uint2 *)q = *(const uint2 *)p; }
+    } else if constexpr (POL::CODE_WORDS == 1) {
+        // P1 4 B row (CODE_OFF 64 + row*4): 4-aligned only -> ONE scalar u32.
+        // Without this arm CODE_WORDS == 1 fell through to the trailing 3-load branch (the
+        // P3 12 B case), which wrote q[1]/q[2] on a `uint32_t q[1]` array and read 8 B past
+        // the row -- past the tensor entirely on the last row of the last slab. Latent because
+        // pxq6_pol_p1 is only instantiated by k_pxq6_dequant_matrix and pol_p1::pair() reads
+        // q[0] alone, so the over-read was never consumed; the OOB global access was real.
+        const uint32_t * s = (const uint32_t *)p;
+        if constexpr (CS) { q[0] = __ldcs(s); }
+        else              { q[0] = s[0]; }
     } else if constexpr (POL::CODE_WORDS == 5) {
         // P6R 20 B row: only 4-aligned (odd rows) -> five scalar u32 loads, NEVER vector
         const uint32_t * s = (const uint32_t *)p;
