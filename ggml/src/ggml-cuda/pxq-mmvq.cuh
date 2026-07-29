@@ -26,6 +26,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "pxa-enhance.cuh"   // pxa_pxq_mmvq_auto_default: ENHANCE x model x device auto-set
 #include "../../include/ggml-pxq6-tables.h"
 
 // ---------------------------------------------------------------------------------------------
@@ -161,22 +162,33 @@ static inline bool pxa_pxq_mmvq_type(ggml_type t) {
     return t == GGML_TYPE_PXQ4 || t == GGML_TYPE_PXQ4HQ;
 }
 
+// MODEL-AWARE DEFAULT (2026-07-29): explicit PXA_PXQ_MMVQ always wins; with the env
+// unset, ENHANCE auto-sets the mode from (model PXQ4/PXQ4HQ census x device DP4A
+// capability) — see pxa_pxq_mmvq_auto_default() in pxa-enhance.cuh. Cached against the
+// model-profile generation (the profile can land after CUDA init in the server flow).
 static inline int pxa_pxq_mmvq_mode() {
-    static const int mode = [](){
-        const char * e = getenv("PXA_PXQ_MMVQ");
-        int m = e ? atoi(e) : 0;
-        if (m < 0 || m > 2) m = 0;
-        // this TU holds frozen copies of the book / SUB tables; a runtime override would silently
-        // diverge from the fused kernels, so decline instead.
-        if (m && (getenv("PXA_PXQ6_BOOK") || getenv("PXA_PXQ6_SUB") || getenv("PXA_PXQ6_SUB_HQ"))) {
-            fprintf(stderr, "PXA_PXQ_MMVQ: DISABLED — a PXA_PXQ6_BOOK/_SUB/_SUB_HQ override is set\n");
-            m = 0;
-        }
-        if (m) fprintf(stderr, "PXA_PXQ_MMVQ: mode %d (PXQ4/PXQ4HQ decode via the q8_1 MMVQ kernel, "
-                       "s8 book snap — NOT bit-exact vs the fused fp16 mmv, fidelity-gated)\n", m);
-        return m;
-    }();
-    return mode;
+    static int cached_gen = -1;
+    static int cached     = 0;
+    const int gen = ggml_pxa_model_profile_generation();
+    if (cached_gen == gen) return cached;
+    const char * e = getenv("PXA_PXQ_MMVQ");
+    int m = e ? atoi(e) : pxa_pxq_mmvq_auto_default();
+    if (m < 0 || m > 2) m = 0;
+    // this TU holds frozen copies of the book / SUB tables; a runtime override would silently
+    // diverge from the fused kernels, so decline instead — LOUDLY, auto-set or not.
+    if (m && (getenv("PXA_PXQ6_BOOK") || getenv("PXA_PXQ6_SUB") || getenv("PXA_PXQ6_SUB_HQ"))) {
+        fprintf(stderr, "PXA_PXQ_MMVQ: DISABLED — a PXA_PXQ6_BOOK/_SUB/_SUB_HQ override is set%s\n",
+                e ? "" : " (declining the ENHANCE auto-set)");
+        m = 0;
+    }
+    if (m) {
+        fprintf(stderr, "PXA_PXQ_MMVQ: mode %d%s (PXQ4/PXQ4HQ decode via the q8_1 MMVQ kernel, "
+                        "s8 book snap — NOT bit-exact vs the fused fp16 mmv, fidelity-gated)\n",
+                m, e ? "" : " [AUTO: ENHANCE x PXQ4-bearing model x DP4A device; override PXA_PXQ_MMVQ=0]");
+    }
+    cached = m;
+    cached_gen = gen;
+    return m;
 }
 
 // PXQ tile height for the MMVQ block, 1|2|4|8|16 (default 4). See mmvq-templates.cuh.

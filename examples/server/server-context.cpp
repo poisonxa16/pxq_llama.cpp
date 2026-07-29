@@ -769,7 +769,16 @@ void server_slot::reset() {
 // Under lazy, prompt tokens are flagged exactly like a non-MTP slot; the prompt-done path still
 // flags the final token (sampling + the lazy self-seed hidden row). Eager mode is byte-unchanged.
 static bool pxa_mtp_lazy_prompt_flags() {
-    static const bool on = getenv("PXA_MTP_LAZY_WARMUP") && atoi(getenv("PXA_MTP_LAZY_WARMUP")) == 1;
+    // In lockstep with pxa_mtp_lazy_warmup_enabled() (src/llama.cpp) — keep the three in lockstep:
+    // explicit env wins; else ENHANCE -> on (bit-identical, measured), REFERENCE/DEFAULT -> off.
+    static const bool on = [](){
+        const char * e = getenv("PXA_MTP_LAZY_WARMUP");
+        if (e) return atoi(e) == 1;
+        const char * r = getenv("PXA_REFERENCE");
+        if (r && atoi(r) != 0) return false;
+        const char * l = getenv("PXA_ENHANCE");
+        return l && atoi(l) != 0;
+    }();
     return on;
 }
 

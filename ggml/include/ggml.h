@@ -3249,6 +3249,40 @@ extern "C" {
             struct ggml_tensor          * dst,
             struct ggml_tensor          * src);
 
+    // ------------------------------------------------------------------------
+    // PXA model profile (2026-07-29) — the MODEL half of the PXA_ENHANCE adaptive
+    // (device capability x model arch x runtime regime) lever-selection system.
+    // The loader (src/llama.cpp) registers the loaded model's identity ONCE, as
+    // soon as arch/hparams/vocab and the tensor-type census are known (before any
+    // graph is built); backends consume it to key per-(device x model) decisions.
+    // A backend can register a hook to be told when the profile lands — the CUDA
+    // backend uses it to print its decision ledger regardless of whether the
+    // backend or the model initializes first.
+    enum ggml_pxa_model_class {
+        GGML_PXA_MODEL_UNKNOWN              = 0,
+        GGML_PXA_MODEL_DENSE                = 1, // dense transformer (no experts)
+        GGML_PXA_MODEL_MOE                  = 2, // plain MoE
+        GGML_PXA_MODEL_MOE_HYBRID_RECURRENT = 3, // MoE + linear/recurrent hybrid (Gated-DeltaNet class)
+        GGML_PXA_MODEL_MOE_HYBRID_SWA       = 4, // MoE + full/SWA interleave (gpt-oss / laguna class)
+    };
+
+    struct ggml_pxa_model_profile {
+        int  valid;
+        int  model_class;         // enum ggml_pxa_model_class
+        int  n_expert;            // 0 for dense
+        int  n_expert_used;
+        int  n_vocab;
+        int  has_mtp_head;        // model carries an MTP/nextn head
+        int  mtp_active;          // MTP requested for this run
+        int  n_pxq_mmvq_tensors;  // tensors of an MMVQ-eligible PXQ type (PXQ4/PXQ4HQ)
+        char arch_name[32];       // gguf general.architecture
+    };
+
+    GGML_API void ggml_pxa_set_model_profile(const struct ggml_pxa_model_profile * profile);
+    GGML_API const struct ggml_pxa_model_profile * ggml_pxa_get_model_profile(void);
+    GGML_API int  ggml_pxa_model_profile_generation(void); // bumped on every set
+    GGML_API void ggml_pxa_register_model_profile_hook(void (*hook)(void));
+
 #ifdef  __cplusplus
 }
 #endif

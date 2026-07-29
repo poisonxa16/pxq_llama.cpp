@@ -36,6 +36,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "ggml.h"   // ggml_pxa_model_profile — the MODEL half of the adaptive decisions
+
 // 0 = REFERENCE, 1 = DEFAULT, 2 = ENHANCE. REFERENCE wins if both env vars are set.
 static inline int pxa_config_level() {
     static const int level = [](){
@@ -140,6 +142,54 @@ static inline const char * pxa_topology_name() {
     return t.multi ? "multi same-type (other arch)" : "single (other arch)";
 }
 
+// -----------------------------------------------------------------------------
+// PXA model-aware decision layer (2026-07-29) — the MODEL half of the adaptive
+// (device capability x model arch x runtime regime) lever selection. The loader
+// registers a ggml_pxa_model_profile once arch/hparams/tensor census are known
+// (ggml_pxa_set_model_profile, src/llama.cpp) — ALWAYS before the first graph
+// build, but possibly AFTER ggml_cuda_init (the server probes CUDA for its
+// posture layer before loading the model). Model-dependent decisions are
+// therefore cached against the profile GENERATION, not in one-shot statics:
+// they recompute when the profile lands and are stable afterwards.
+static inline const ggml_pxa_model_profile & pxa_model() {
+    return *ggml_pxa_get_model_profile();
+}
+static inline bool pxa_model_known()  { return pxa_model().valid != 0; }
+static inline bool pxa_model_is_moe() { return pxa_model().n_expert > 0; }
+static inline bool pxa_model_is_deltanet() {
+    return pxa_model().model_class == GGML_PXA_MODEL_MOE_HYBRID_RECURRENT;
+}
+static inline const char * pxa_model_class_name() {
+    switch (pxa_model().model_class) {
+        case GGML_PXA_MODEL_DENSE:                return "dense";
+        case GGML_PXA_MODEL_MOE:                  return "moe";
+        case GGML_PXA_MODEL_MOE_HYBRID_RECURRENT: return "moe-hybrid-recurrent(deltanet)";
+        case GGML_PXA_MODEL_MOE_HYBRID_SWA:       return "moe-hybrid-swa";
+        default:                                  return "unknown";
+    }
+}
+
+// PXA_PXQ_MMVQ ENHANCE auto-default (device x model). The ship recipe (A4m,
+// KERNEL-CANONICAL-2026-07-29) runs MMVQ ON: fidelity-neutral measured PAIRED at
+// matched batch (dppl +0.016%, inside +/-0.054 error bars; run's paired test
+// +0.053%, t=17 — detectable, irrelevant). Auto ON only when the model actually
+// carries MMVQ-eligible tensors (PXQ4/PXQ4HQ census from the loader) AND a
+// DP4A-capable device exists:
+//   sm_70+ present            -> mode 1 (Volta+ devices only — the ship gate)
+//   all-sm_61 fleet           -> mode 2 (real DP4A; sm_60 absent so no emulation risk)
+//   pure sm_60 / no census    -> 0 (P100 has no DP4A — the emulation path is not a win)
+// The pxq-mmvq.cuh resolver keeps its own loud print + the BOOK/SUB-override
+// decline; explicit PXA_PXQ_MMVQ always wins.
+static inline int pxa_pxq_mmvq_auto_default() {
+    if (pxa_config_level() != 2) return 0;
+    if (!pxa_model_known() || pxa_model().n_pxq_mmvq_tensors <= 0) return 0;
+    const pxa_topology_t & t = g_pxa_topology;
+    if (!t.valid) return 0;
+    if (t.has_sm70 || t.has_other) return 1;
+    if (t.has_sm61 && !t.has_sm60) return 2;
+    return 0;
+}
+
 // level-aware default for the bit-exact PXA_PXQ6_GATE lever family (pxq6.cuh):
 // REFERENCE -> false (pure reference kernels); DEFAULT/ENHANCE -> the shipped default.
 static inline bool pxa_gate_default(bool shipped_dflt) {
@@ -191,17 +241,30 @@ static inline int pxa_int8_prefill_mode_resolve() {
 // and is NOT topology-masked (0 forces OFF, 1 = the sm_70 ship gate on any cc==700 device,
 // 2 = TEST all-arch). G3-class (the fuse reorders FP math vs cuBLAS: ULP logit deltas can flap
 // expert ties — expert-id-stream gated, not sha).
+// MODEL-AWARE (2026-07-29): additionally keyed on the model profile — a DENSE
+// model has no ffn_gate_inp router GEMV, so the fuse can never fire there; the
+// resolver now says so in the ledger instead of silently arming a dead lever.
+// Cached against the profile generation (see the model-layer comment above):
+// recomputes when the loader registers the model, stable afterwards.
 static inline int pxa_router_fuse_mode_resolve() {
-    static const int mode = [](){
-        const char * e = getenv("PXA_ROUTER_FUSE");
-        if (e) { int m = atoi(e); return (m < 0 || m > 2) ? 0 : m; }
-        // ENHANCE auto-set: ON (mode 1) only for a pure-sm_70 non-mixed topology.
-        if (pxa_config_level() == 2 && g_pxa_topology.valid
-            && g_pxa_topology.has_sm70 && !g_pxa_topology.mixed) {
-            return 1;
-        }
-        return 0;
-    }();
+    static int cached_gen  = -1;
+    static int cached_mode = 0;
+    const int gen = ggml_pxa_model_profile_generation();
+    if (cached_gen == gen) return cached_mode;
+    int mode = 0;
+    const char * e = getenv("PXA_ROUTER_FUSE");
+    if (e) {
+        int m = atoi(e);
+        mode = (m < 0 || m > 2) ? 0 : m;
+    } else if (pxa_config_level() == 2 && g_pxa_topology.valid
+               && g_pxa_topology.has_sm70 && !g_pxa_topology.mixed
+               && (!pxa_model_known() || pxa_model_is_moe())) {
+        // ENHANCE auto-set: pure-sm_70 non-mixed topology x MoE model (or model not yet
+        // registered — the router GEMV op only exists on MoE, so this is self-gating).
+        mode = 1;
+    }
+    cached_mode = mode;
+    cached_gen  = gen;
     return mode;
 }
 
@@ -404,4 +467,86 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
         fprintf(stderr, " | spec: SPEC_RELAXED ON [G3, spec lanes]");
     }
     fprintf(stderr, "\n");
+}
+
+// -----------------------------------------------------------------------------
+// PXA per-(device x model) DECISION LEDGER (2026-07-29). Silent failure is this
+// project's recurring defect class (phantom levers, silent demotes, silently
+// ignored flags) — so every auto decision prints its VALUE, its REASON, and its
+// OVERRIDE env, and a lever that cannot engage says why instead of no-opping
+// quietly. Printed once both halves are known: ggml_cuda_init registers a
+// profile hook (ggml-cuda.cu); whichever of {CUDA init, model registration}
+// happens second triggers this.
+static inline void pxa_enhance_log_model_decisions() {
+    const ggml_pxa_model_profile & m = pxa_model();
+    if (!m.valid || !g_pxa_topology.valid) return;
+    fprintf(stderr,
+            "PXA model=%s class=%s experts=%d(top%d) vocab=%d mtp_head=%s mtp_active=%s "
+            "pxq_mmvq_tensors=%d | topology=\"%s\" | level=%s\n",
+            m.arch_name[0] ? m.arch_name : "?", pxa_model_class_name(),
+            m.n_expert, m.n_expert_used, m.n_vocab,
+            m.has_mtp_head ? "yes" : "no", m.mtp_active ? "yes" : "no",
+            m.n_pxq_mmvq_tensors, pxa_topology_name(), pxa_config_level_name());
+    if (pxa_config_level() != 2) {
+        fprintf(stderr, "PXA_AUTO: level=%s — model-adaptive auto-set engages only under "
+                        "PXA_ENHANCE=1 (per-lever envs still win at any level)\n",
+                pxa_config_level_name());
+        return;
+    }
+    const pxa_topology_t & t = g_pxa_topology;
+    // ROUTER_FUSE
+    {
+        const int  mode = pxa_router_fuse_mode_resolve();
+        const char * why =
+            getenv("PXA_ROUTER_FUSE")        ? "explicit env override" :
+            mode == 1                        ? "pure-sm_70 topology x MoE model (+5.1..7.0% dec measured, single V100, PXQ2-35B)" :
+            (m.n_expert == 0)                ? "OFF: dense model — no router GEMV exists, the fuse can never fire" :
+            t.mixed                          ? "OFF: mixed topology (T4 measured -3.1% at -ts 1.4,0.6 — P100 gates -sm-layer decode)" :
+            !t.has_sm70                      ? "OFF: no sm_70 device (+1.6% KILL measured on sm_60)" :
+                                               "OFF";
+        fprintf(stderr, "PXA_AUTO: ROUTER_FUSE=%d (%s; override PXA_ROUTER_FUSE)\n", mode, why);
+    }
+    // FUSE_DELTANET — self-gating by op presence; the ledger states relevance.
+    fprintf(stderr, "PXA_AUTO: FUSE_DELTANET=%d (%s; override PXA_FUSE_DELTANET)\n",
+            pxa_fuse_deltanet_default(),
+            pxa_model_is_deltanet()
+                ? "deltanet hybrid arch — both fusions active (+3.7% P100 decode measured, bit-exact)"
+                : "INERT on this arch — no Gated-DeltaNet ops in the graph");
+    // PXQ_MMVQ
+    {
+        const char * e = getenv("PXA_PXQ_MMVQ");
+        const int auto_mode = pxa_pxq_mmvq_auto_default();
+        const char * why =
+            e                                ? "explicit env override" :
+            auto_mode == 1                   ? "ENHANCE x PXQ4/PXQ4HQ-bearing model x sm_70+ present (ship recipe A4m; fidelity-neutral paired dppl +0.016%)" :
+            auto_mode == 2                   ? "ENHANCE x PXQ4/PXQ4HQ-bearing model x all-sm_61 fleet (real DP4A)" :
+            (m.n_pxq_mmvq_tensors <= 0)      ? "OFF: model carries no MMVQ-eligible PXQ4/PXQ4HQ tensors" :
+            (t.has_sm60 && !t.has_sm70)      ? "OFF: sm_60-only fleet — P100 has no DP4A, the emulation path is not a win" :
+                                               "OFF";
+        fprintf(stderr, "PXA_AUTO: PXQ_MMVQ=%s (%s; override PXA_PXQ_MMVQ)\n",
+                e ? e : (auto_mode == 1 ? "1" : auto_mode == 2 ? "2" : "0"), why);
+    }
+    // The device-only levers, restated with model context so ONE ledger holds every decision.
+    fprintf(stderr, "PXA_AUTO: VOLTA_CUBLAS_NE11=%d (%s; override PXA_VOLTA_CUBLAS_NE11)\n",
+            pxa_volta_cublas_ne11(),
+            t.has_sm70 ? "sm_70 present: dense-GEMM fp16-cuBLAS route at ne11>=threshold (+9.4% pf single V100; +6.5% 35B np2)"
+                       : "INERT: no sm_70 device");
+    fprintf(stderr, "PXA_AUTO: P100_FP16_GEMM=%s (%s; override PXA_P100_FP16_GEMM)\n",
+            pxa_p100_fp16_gemm() ? "on" : "off",
+            t.has_sm60 ? "sm_60 present: GP100 2:1 fp16 hgemm on dense GEMMs (+51% gpt-oss prefill measured); sm_61 excluded (1:64 fp16)"
+                       : "INERT: no sm_60 device");
+    fprintf(stderr, "PXA_AUTO: FA_MASK_SKIP_TILE=%s (%s; override PXA_FA_MASK_SKIP_TILE)\n",
+            pxa_fa_mask_skip_tile() ? "on" : "off",
+            "bit-identical by construction; engages on fully-masked KV tiles (np2 co-resident slots)");
+    fprintf(stderr, "PXA_AUTO: INT8_PREFILL=%d (%s; override PXA_PXQ_INT8_PREFILL)\n",
+            pxa_int8_prefill_mode_resolve(),
+            t.has_sm61 ? "sm_61 present: DP4A int8 prefill (+182% pf 1080Ti, PXQ2 5.8k cold)"
+                       : "INERT: dispatch ship-gate is cc==610 and no sm_61 device is present");
+    fprintf(stderr, "PXA_AUTO: SPEC_1ROW=%s SPEC_RELAXED=%s (spec lanes; measured no-op when no spec decode runs)\n",
+            pxa_spec_1row_resolve() ? "on" : "off", pxa_spec_relaxed_resolve() ? "on" : "off");
+    if (m.has_mtp_head) {
+        fprintf(stderr, "PXA_AUTO: MTP model — PXA_MTP_LAZY_WARMUP defaults ON under ENHANCE "
+                        "(bit-identical, +12%% then +47%% 35B prefill measured; resolver lives in "
+                        "src/llama.cpp + server-context.cpp; override PXA_MTP_LAZY_WARMUP=0)\n");
+    }
 }

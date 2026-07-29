@@ -693,6 +693,107 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // PXA AUTO-TS (2026-07-29): fill -ts on the ONE measured mixed cell. T4 (ENHANCE
+    // topology tune, 2026-07-23) measured a V100-heavy -ts 1.4,0.6 as the DOMINANT mixed-rig
+    // lever: +9.78% decode (76.27 -> 83.73 t/s, PXQ4-35B split V100+P100, -sm layer, 588-tok
+    // prompt), where every kernel lever was neutral; 1.45 loses decode and 1.5+ OOMs the V100.
+    // Scope is deliberately NARROW: exactly 2 CUDA devices, one sm_70 + one sm_60, -ts unset,
+    // ENHANCE level — every other topology keeps the stock proportional-by-VRAM default (the
+    // measured basis does not generalize; a wrong -ts can OOM). CLI -ts always wins;
+    // PXA_AUTO_TS=0 forces off, =1 forces on at any level (never under PXA_REFERENCE=1).
+    {
+#if defined(GGML_USE_CUDA)
+        const char * at = getenv("PXA_AUTO_TS");
+        const char * rr2 = getenv("PXA_REFERENCE");
+        const bool  ref2 = rr2 && atoi(rr2) != 0;
+        const char * en2 = getenv("PXA_ENHANCE");
+        const bool  enh2 = !ref2 && en2 && atoi(en2) != 0;
+        const bool  active = at ? (atoi(at) != 0 && !ref2) : enh2;
+        const bool  ts_explicit = pxa_argv_has(argc, argv, {"-ts", "--tensor-split"});
+        bool ts_unset = true;
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            if (params.tensor_split[i] != 0.0f) { ts_unset = false; break; }
+        }
+        if (active && !ts_explicit && ts_unset && ggml_backend_cuda_get_device_count() == 2) {
+            const int cc0 = ggml_backend_cuda_get_device_cc(0);
+            const int cc1 = ggml_backend_cuda_get_device_cc(1);
+            const bool mixed_70_60 = (cc0 == 700 && cc1 == 600) || (cc0 == 600 && cc1 == 700);
+            if (mixed_70_60) {
+                const int hi = (cc0 == 700) ? 0 : 1;
+                params.tensor_split[hi]     = 1.4f;
+                params.tensor_split[1 - hi] = 0.6f;
+                fprintf(stderr, "PXA_AUTO: tensor_split dev%d(sm_70)=1.4 dev%d(sm_60)=0.6 "
+                                "(measured T4 cell: +9.78%% decode vs balanced, PXQ4-35B V100+P100 "
+                                "-sm layer; override -ts or PXA_AUTO_TS=0)\n", hi, 1 - hi);
+            }
+        }
+#endif
+    }
+
+    // PXA AUTO-SAMPLERS (2026-07-29): model-family sampler DEFAULTS, ENHANCE-level only.
+    // Fills only fields the CLI left unset (per-field --temp/--top-k/--top-p/--min-p
+    // explicitness check); per-request sampler params still override per request as always.
+    // Gate: PXA_AUTO_SAMPLERS=0 forces off, =1 forces on at any level; unset -> engages only
+    // under PXA_ENHANCE=1 (and never under PXA_REFERENCE=1), so DEFAULT-level behavior is
+    // byte-identical to before this layer existed. Every applied default logs value+reason.
+    // The one PERFORMANCE-critical rule (measured): top_k<=0 means a full-vocab CPU sort
+    // EVERY token — on a ~201k vocab that HALVED decode (31 vs 65 t/s, gpt-oss-120b,
+    // 6-card cell, 2026-07-04). The guard clamps an unset-or-0 top_k to 100.
+    {
+        const char * as = getenv("PXA_AUTO_SAMPLERS");
+        const char * rr = getenv("PXA_REFERENCE");
+        const bool  ref = rr && atoi(rr) != 0;
+        const char * en = getenv("PXA_ENHANCE");
+        const bool  enh = !ref && en && atoi(en) != 0;
+        const bool  active = as ? (atoi(as) != 0 && !ref) : enh;
+        if (active) {
+            const std::string arch = pxa_gguf_arch(params.model);
+            const bool t_exp = pxa_argv_has(argc, argv, {"--temp"});
+            const bool k_exp = pxa_argv_has(argc, argv, {"--top-k"});
+            const bool p_exp = pxa_argv_has(argc, argv, {"--top-p"});
+            const bool m_exp = pxa_argv_has(argc, argv, {"--min-p"});
+            struct pxa_sampler_row { const char * arch; float temp; int top_k; float top_p; float min_p; const char * why; };
+            static const pxa_sampler_row tab[] = {
+                // gpt-oss "official" is top_k=0 — measured to HALVE decode (full-vocab sort);
+                // top_k=100 is the measured-negligible-quality fix (2026-07-04).
+                { "gpt-oss",   1.0f, 100, 1.00f, 0.00f, "gpt-oss family defaults; top_k=100 not 0 (top_k=0 halves decode: full-201k-vocab CPU sort/token)" },
+                { "qwen35moe", 0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
+                { "qwen3next", 0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
+                { "qwen35",    0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
+                { "laguna",    0.7f,  20, 0.80f, 0.00f, "qwen-family hybrid — qwen no-think defaults (HEURISTIC: no per-model sampler sweep yet)" },
+            };
+            const pxa_sampler_row * row = nullptr;
+            for (const auto & r : tab) {
+                if (arch == r.arch) { row = &r; break; }
+            }
+            if (row) {
+                if (!t_exp) params.sparams.temp  = row->temp;
+                if (!k_exp) params.sparams.top_k = row->top_k;
+                if (!p_exp) params.sparams.top_p = row->top_p;
+                if (!m_exp) params.sparams.min_p = row->min_p;
+                fprintf(stderr, "PXA_AUTO: samplers arch=%s -> temp=%.2f%s top_k=%d%s top_p=%.2f%s min_p=%.2f%s (%s; "
+                                "override: the CLI flag or PXA_AUTO_SAMPLERS=0)\n",
+                        arch.c_str(),
+                        params.sparams.temp,  t_exp ? "(cli)" : "",
+                        params.sparams.top_k, k_exp ? "(cli)" : "",
+                        params.sparams.top_p, p_exp ? "(cli)" : "",
+                        params.sparams.min_p, m_exp ? "(cli)" : "",
+                        row->why);
+            } else {
+                fprintf(stderr, "PXA_AUTO: samplers arch=%s -> no family row, stock defaults kept "
+                                "(temp=%.2f top_k=%d top_p=%.2f min_p=%.2f)\n",
+                        arch.empty() ? "?" : arch.c_str(),
+                        params.sparams.temp, params.sparams.top_k, params.sparams.top_p, params.sparams.min_p);
+            }
+            // The generic performance guard, independent of the family table.
+            if (!k_exp && params.sparams.top_k <= 0) {
+                params.sparams.top_k = 100;
+                fprintf(stderr, "PXA_AUTO: top_k<=0 clamped to 100 (top_k=0 forces a full-vocab CPU sort "
+                                "every token — measured decode HALVED on a 201k vocab; override --top-k)\n");
+            }
+        }
+    }
+
     LOG_INFO("build info", {
         {"build",  LLAMA_BUILD_NUMBER},
         {"commit", LLAMA_COMMIT}

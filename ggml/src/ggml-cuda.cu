@@ -104,6 +104,12 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 // every CUDA TU (external linkage avoids a header-static-per-TU split-brain).
 pxa_topology_t g_pxa_topology = {};
 
+// C-linkage-compatible trampoline for ggml_pxa_register_model_profile_hook (the ledger
+// itself is inline in pxa-enhance.cuh; this TU owns the single registration).
+static void pxa_enhance_model_profile_hook(void) {
+    pxa_enhance_log_model_decisions();
+}
+
 static void ggml_cuda_default_log_callback(enum ggml_log_level level, const char * msg, void * user_data) {
     GGML_UNUSED(level);
     GGML_UNUSED(user_data);
@@ -320,6 +326,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
     pxa_enhance_init_topology(info.device_count, pxa_ccs);
     pxa_enhance_log_topology_dbg();
     pxa_enhance_log_startup(info.device_count, pxa_ccs, pxa_names);
+    // PXA model-aware decisions (2026-07-29): print the per-(device x model) decision
+    // ledger once BOTH halves are known. Registering the hook covers both orders —
+    // if the loader already registered the model profile, the hook fires right here;
+    // otherwise it fires when ggml_pxa_set_model_profile lands (src/llama.cpp).
+    ggml_pxa_register_model_profile_hook(&pxa_enhance_model_profile_hook);
 
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;

@@ -30413,3 +30413,41 @@ int ggml_cpu_has_matmul_int8(void) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////
+// PXA model profile (see ggml.h) — written once by the loader, read by backends.
+// The hook fires on registration in EITHER order: set-then-register (backend came
+// up late) or register-then-set (backend came up first). Last write wins.
+
+static struct ggml_pxa_model_profile g_pxa_model_profile;
+static int  g_pxa_model_profile_gen  = 0;
+static void (*g_pxa_model_profile_hook)(void) = NULL;
+
+void ggml_pxa_set_model_profile(const struct ggml_pxa_model_profile * profile) {
+    if (profile) {
+        g_pxa_model_profile = *profile;
+        g_pxa_model_profile.valid = 1;
+        g_pxa_model_profile.arch_name[sizeof(g_pxa_model_profile.arch_name) - 1] = 0;
+    } else {
+        memset(&g_pxa_model_profile, 0, sizeof(g_pxa_model_profile));
+    }
+    g_pxa_model_profile_gen++;
+    if (g_pxa_model_profile_hook) {
+        g_pxa_model_profile_hook();
+    }
+}
+
+const struct ggml_pxa_model_profile * ggml_pxa_get_model_profile(void) {
+    return &g_pxa_model_profile;
+}
+
+int ggml_pxa_model_profile_generation(void) {
+    return g_pxa_model_profile_gen;
+}
+
+void ggml_pxa_register_model_profile_hook(void (*hook)(void)) {
+    g_pxa_model_profile_hook = hook;
+    if (hook && g_pxa_model_profile.valid) {
+        hook();
+    }
+}
