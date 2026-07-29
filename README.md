@@ -82,14 +82,30 @@ exps    : MXFP4:3 / PXQ4:120
 ssm_out : MXFP4:30
 ```
 
-**The file labelled "PXQ4" is ~90% MXFP4 by tensor count** — only the routed experts are PXQ4.
-So that row did not compare PXQ4 against MXFP4; it compared *MXFP4-with-PXQ4-experts* against
-*MXFP4*. It also explains the MMVQ null: only `PXQ4`/`PXQ4HQ` gain from that flag, and MXFP4 is
-already on the same kernel path.
+Full census: `F32:308  MXFP4:300  PXQ4:120  Q8_0:23  F16:2` — 753 tensors, 443 quantized.
+**Only 120 of the 443 quantized tensors (27%) are PXQ4**, and attention and the shared expert
+carry none. So that row did not compare PXQ4 against MXFP4; it compared *MXFP4-with-PXQ4-experts*
+against *MXFP4*. It also explains the MMVQ null: only `PXQ4`/`PXQ4HQ` gain from that flag, and
+MXFP4 is already on the same kernel path.
 
-**† The remaining rows have not had their artifacts' tier tables audited.** If the dense
-artifact carries the same composition, those rows are mislabelled the same way — including the
-dense-decode loss reported below. Treat every daggered row as provisional until re-verified.
+**† The dense rows: audited, and the artifacts are sound — but the comparison's identity is not
+recorded.**
+
+| artifact | quantized tensors | PXQ share |
+|---|---|---|
+| `Qwable-27B-PXQ4core` | 470 | 69% |
+| `Qwable-27B-MXFP4-lite` | 470 | 0% |
+| `Qwable-27B-MXFP4-legacy` | 506 | 0% |
+
+`PXQ4core` and `MXFP4-lite` are a properly matched pair: identical tensor counts and identical
+`Q8_0`/`Q6_K` promotions, with exactly 325 tensors differing and only in codec. `MXFP4-legacy` is
+**not** matched — it has 36 more quantized tensors and lacks those promotions.
+
+The published table does not say which of the two MXFP4 files the dense rows used. Against `lite`
+they are sound; against `legacy` they confound codec with backbone allocation. The rows stay
+daggered until re-run against a named file — not because they are known wrong, but because we
+cannot currently prove which comparison was made.
+
 Nothing here is a claim that PXQ regressed: the corrected MoE-decode figure matches the current
 build within measurement noise.
 
