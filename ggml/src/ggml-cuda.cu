@@ -4007,13 +4007,31 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 // incumbent and nets only +2.3%, so a fix that coalesces the dequant and KEEPS cuBLAS's HMMA
 // GEMM should dominate this on sm_70. Decode is untouched either way (ny <= PXA_PXQ4_2D_MAX_NY
 // is declined here and owned by pxa_pxq_mmv_2d).
+// gemm_2d ENHANCE auto (2026-07-29, model-aware): mode 1 (sm_60 only) when an sm_60 device is
+// present AND the loaded model is DENSE AND it carries PXQ tensors. Basis: +35% P100 dense
+// prefill on the coalesced binary (2026-07-28 arch-split note above). The sm_60 x MoE cell was
+// only ever measured against the PRE-coalescing incumbent (+0.89% prefill, decode flat) — post-
+// coalescing it is UNMEASURED and the sm_70 dense flip (-18.6%) shows the coalescing fix can
+// invert a win, so MoE stays OFF until someone measures it. Explicit env always wins; cached
+// against the model-profile generation (profile can land after CUDA init in the server flow).
 static int pxa_pxq_gemm_2d_mode() {
-    static const int v = [] {
-        const char * e = getenv("PXA_PXQ_GEMM_2D");
-        const int m = e ? atoi(e) : 0;
-        return (m < 0 || m > 2) ? 0 : m;
-    }();
-    return v;
+    static int cached_gen = -1;
+    static int cached     = 0;
+    const int gen = ggml_pxa_model_profile_generation();
+    if (cached_gen == gen) return cached;
+    const char * e = getenv("PXA_PXQ_GEMM_2D");
+    int m = e ? atoi(e) : 0;
+    if (!e && pxa_config_level() == 2 && g_pxa_topology.valid && g_pxa_topology.has_sm60
+        && pxa_model_known() && !pxa_model_is_moe() && pxa_model().n_pxq_mmvq_tensors > 0) {
+        m = 1;
+        fprintf(stderr, "PXA_AUTO: PXQ_GEMM_2D=1 (ENHANCE x sm_60 present x dense PXQ model: "
+                        "+35%% P100 dense prefill measured 2026-07-28; MoE stays off — post-"
+                        "coalescing sm_60 MoE cell unmeasured; override PXA_PXQ_GEMM_2D)\n");
+    }
+    if (m < 0 || m > 2) m = 0;
+    cached = m;
+    cached_gen = gen;
+    return m;
 }
 
 // The claim is silent when it declines, and a decline is indistinguishable from a firing that did

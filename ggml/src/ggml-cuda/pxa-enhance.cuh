@@ -542,6 +542,14 @@ static inline void pxa_enhance_log_model_decisions() {
             pxa_int8_prefill_mode_resolve(),
             t.has_sm61 ? "sm_61 present: DP4A int8 prefill (+182% pf 1080Ti, PXQ2 5.8k cold)"
                        : "INERT: dispatch ship-gate is cc==610 and no sm_61 device is present");
+    // PXQ_GEMM_2D relevance (resolver + auto-set live in ggml-cuda.cu, printed there when it
+    // fires; this line covers the cannot-engage cases so the decision is never silent).
+    if (!(t.has_sm60 && m.n_expert == 0 && m.n_pxq_mmvq_tensors > 0) && !getenv("PXA_PXQ_GEMM_2D")) {
+        fprintf(stderr, "PXA_AUTO: PXQ_GEMM_2D=0 (%s; override PXA_PXQ_GEMM_2D)\n",
+                !t.has_sm60                 ? "OFF: no sm_60 device (sm_70 measured -18.6% dense post-coalescing)" :
+                (m.n_expert > 0)            ? "OFF: MoE model — post-coalescing sm_60 MoE cell unmeasured" :
+                                              "OFF: model carries no PXQ tensors");
+    }
     fprintf(stderr, "PXA_AUTO: SPEC_1ROW=%s SPEC_RELAXED=%s (spec lanes; measured no-op when no spec decode runs)\n",
             pxa_spec_1row_resolve() ? "on" : "off", pxa_spec_relaxed_resolve() ? "on" : "off");
     if (m.has_mtp_head) {

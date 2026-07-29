@@ -148,6 +148,7 @@ What ENHANCE now auto-sets from the (device × model) pair, on top of the §0 ta
 | server sampler defaults | gguf `general.architecture` (server-side, `PXA_AUTO_SAMPLERS`) | see §6 row | top_k=0 measured to HALVE decode on a ~201k vocab |
 | server `-ts` fill (`PXA_AUTO_TS`) | exactly-2-device mixed sm_70+sm_60, `-ts` unset | `1.4,0.6` V100-heavy | +9.78% decode (T4 cell: PXQ4-35B split V100+P100, `-sm layer`, 588-tok prompt, 2026-07-23); other topologies deliberately untouched — the basis does not generalize |
 | `PXA_FUSE_DELTANET` | ledger relevance only | unchanged (default 3) — ledger states `INERT on this arch` for non-DeltaNet models | +3.5% P100 decode where active |
+| `PXA_PXQ_GEMM_2D` | sm_60 present **× dense × PXQ-bearing model** | auto mode 1 (sm_60-only kernel) | +35% P100 dense prefill (coalesced-binary cell, 2026-07-28); MoE deliberately stays OFF — the post-coalescing sm_60 MoE cell is unmeasured and the sm_70 flip (−18.6%) proves the coalescing fix can invert a win |
 
 Implementation: `ggml_pxa_set_model_profile` (`ggml.h`/`ggml.c`, registered from `src/llama.cpp`
 before any graph is built), consumed by `pxa-enhance.cuh` resolvers cached against the profile
