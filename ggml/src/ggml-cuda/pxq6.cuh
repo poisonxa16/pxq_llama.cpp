@@ -2198,6 +2198,12 @@ k_pxq6_gemm_down_scat_wmma(const uint8_t * __restrict__ W, const half * __restri
 #define PXA_PXQ_FMT_P2   5      // ADD
 #define PXA_PXQ_FMT_P3   6      // ADD
 #define PXA_PXQ_FMT_P6R  7      // ADD: real-PXQ6 tier (TAB/TAB_CS modes only, like P2/P3)
+// ADD 2026-07-29: PXQ1, 1-bit sign tier (TAB/TAB_CS modes only, like P2/P3).
+// ⚠ THE VALUE MUST STAY > PXA_PXQ_FMT_P2 — the driver tests RANGES, not equality:
+//     fmt >= PXA_PXQ_FMT_P6 (3) == "is a PXA slab format"  -> upload the shared SUB16 LUT
+//     fmt >= PXA_PXQ_FMT_P2 (5) == "sub-nibble code packing" -> no PRMT/PAIRLUT, no K6 v1 WMMA
+// Numbering P1 below P2 would silently route 1-bit codes into the 4-bit nibble kernels.
+#define PXA_PXQ_FMT_P1   8
 
 static inline int pxa_pxq_fmt(ggml_type t) {
     switch (t) {
@@ -2206,6 +2212,7 @@ static inline int pxa_pxq_fmt(ggml_type t) {
         case GGML_TYPE_PXQ2:   return pxa_pxq2_enabled() ? PXA_PXQ_FMT_P2   : PXA_PXQ_FMT_NONE;
         case GGML_TYPE_PXQ3:   return pxa_pxq3_enabled() ? PXA_PXQ_FMT_P3   : PXA_PXQ_FMT_NONE;
         case GGML_TYPE_PXQ6:  return pxa_pxq6r_enabled() ? PXA_PXQ_FMT_P6R : PXA_PXQ_FMT_NONE;
+        case GGML_TYPE_PXQ1:   return pxa_pxq1_enabled() ? PXA_PXQ_FMT_P1   : PXA_PXQ_FMT_NONE;
         default:               return PXA_PXQ_FMT_NONE;
     }
 }
@@ -2248,6 +2255,7 @@ typedef void (*pxq6_scat_fn)(const uint8_t *, const half *, char *, size_t, size
             case PXA_PXQ_FMT_P2: return PXQ6_PICK2(K, pxq6_pol_p2, false, b2); \
             case PXA_PXQ_FMT_P3: return PXQ6_PICK2(K, pxq6_pol_p3, false, b2); \
             case PXA_PXQ_FMT_P6R: return PXQ6_PICK2(K, pxq6_pol_p6r, false, b2); \
+            case PXA_PXQ_FMT_P1: return PXQ6_PICK2(K, pxq6_pol_p1, false, b2); \
             default:             return PXQ6_PICK2(K, pxq6_pol_p6hq, b1, b2); \
         } \
     }
@@ -2280,6 +2288,7 @@ static inline int pxa_pxq6_decode_mode() {
             case PXA_PXQ_FMT_P2: return PXQ6_PICKM23(K, pxq6_pol_p2, m, vx); \
             case PXA_PXQ_FMT_P3: return PXQ6_PICKM23(K, pxq6_pol_p3, m, vx); \
             case PXA_PXQ_FMT_P6R: return PXQ6_PICKM23(K, pxq6_pol_p6r, m, vx); \
+            case PXA_PXQ_FMT_P1: return PXQ6_PICKM23(K, pxq6_pol_p1, m, vx); \
             default:             return PXQ6_PICKM(K, pxq6_pol_p6hq, m, vx); \
         } \
     }
@@ -2301,6 +2310,7 @@ static inline int pxa_pxq6_decode_mode() {
             case PXA_PXQ_FMT_P2: return PXQ6_PICKMU23(K, pxq6_pol_p2, pxq6_pol_p2, m, vx); \
             case PXA_PXQ_FMT_P3: return PXQ6_PICKMU23(K, pxq6_pol_p3, pxq6_pol_p3, m, vx); \
             case PXA_PXQ_FMT_P6R: return PXQ6_PICKMU23(K, pxq6_pol_p6r, pxq6_pol_p6r, m, vx); \
+            case PXA_PXQ_FMT_P1: return PXQ6_PICKMU23(K, pxq6_pol_p1, pxq6_pol_p1, m, vx); \
             default:             return PXQ6_PICKMU(K, pxq6_pol_p6hq, pxq6_pol_p6hq, m, vx); \
         } \
         switch (fu*8 + fg) {   /* mixed pairs: universal files only (P2/P3/P6), tab modes only */ \
@@ -2310,6 +2320,12 @@ static inline int pxa_pxq6_decode_mode() {
             case PXA_PXQ_FMT_P3*8+PXA_PXQ_FMT_P6: return PXQ6_PICKMU23(K, pxq6_pol_p3, pxq6_pol_p6, m, vx); \
             case PXA_PXQ_FMT_P6*8+PXA_PXQ_FMT_P2: return PXQ6_PICKMU23(K, pxq6_pol_p6, pxq6_pol_p2, m, vx); \
             case PXA_PXQ_FMT_P6*8+PXA_PXQ_FMT_P3: return PXQ6_PICKMU23(K, pxq6_pol_p6, pxq6_pol_p3, m, vx); \
+            case PXA_PXQ_FMT_P1*8+PXA_PXQ_FMT_P2: return PXQ6_PICKMU23(K, pxq6_pol_p1, pxq6_pol_p2, m, vx); \
+            case PXA_PXQ_FMT_P1*8+PXA_PXQ_FMT_P3: return PXQ6_PICKMU23(K, pxq6_pol_p1, pxq6_pol_p3, m, vx); \
+            case PXA_PXQ_FMT_P1*8+PXA_PXQ_FMT_P6: return PXQ6_PICKMU23(K, pxq6_pol_p1, pxq6_pol_p6, m, vx); \
+            case PXA_PXQ_FMT_P2*8+PXA_PXQ_FMT_P1: return PXQ6_PICKMU23(K, pxq6_pol_p2, pxq6_pol_p1, m, vx); \
+            case PXA_PXQ_FMT_P3*8+PXA_PXQ_FMT_P1: return PXQ6_PICKMU23(K, pxq6_pol_p3, pxq6_pol_p1, m, vx); \
+            case PXA_PXQ_FMT_P6*8+PXA_PXQ_FMT_P1: return PXQ6_PICKMU23(K, pxq6_pol_p6, pxq6_pol_p1, m, vx); \
             default: return nullptr;   /* unsupported mix -> driver declines (fallback) */ \
         } \
     }
@@ -2332,6 +2348,7 @@ static inline pxq6_gufuse_h_fn pxq6_pick_gufuse_h(int fmt, bool rag, bool pipe) 
         case PXA_PXQ_FMT_P2: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p2,   half, rag, pipe);
         case PXA_PXQ_FMT_P3: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p3,   half, rag, pipe);
         case PXA_PXQ_FMT_P6R: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6r, half, rag, pipe);
+        case PXA_PXQ_FMT_P1: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p1,  half, rag, pipe);
         default:             return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6hq, half, rag, pipe);
     }
 }
@@ -2341,6 +2358,7 @@ static inline pxq6_gufuse_f_fn pxq6_pick_gufuse_f(int fmt, bool rag, bool pipe) 
         case PXA_PXQ_FMT_P2: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p2,   float, rag, pipe);
         case PXA_PXQ_FMT_P3: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p3,   float, rag, pipe);
         case PXA_PXQ_FMT_P6R: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6r, float, rag, pipe);
+        case PXA_PXQ_FMT_P1: return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p1,  float, rag, pipe);
         default:             return PXQ6_PICK2T(k_pxq6_gemm_gufuse, pxq6_pol_p6hq, float, rag, pipe);
     }
 }

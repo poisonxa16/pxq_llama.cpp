@@ -7996,8 +7996,11 @@ bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate)
     // PXQ-UNIVERSAL mixed tiers (CUDA-only slab types): the fused CUDA MoE kernels
     // handle mixed up/gate pairs over {PXQ2, PXQ3, PXQ4} with independent per-operand
     // policies (ggml-cuda/pxq6.cuh PXQ6_PICK_FMT_GU mixed-pair table).
-    const bool up_ok   = type_up   == GGML_TYPE_PXQ2 || type_up   == GGML_TYPE_PXQ3 || type_up   == GGML_TYPE_PXQ4;
-    const bool gate_ok = type_gate == GGML_TYPE_PXQ2 || type_gate == GGML_TYPE_PXQ3 || type_gate == GGML_TYPE_PXQ4;
+    // PXQ1 added 2026-07-29 alongside its decode dispatch. Without it a mixed P1 pair (e.g.
+    // 122B PXQU24 blk.38: gate=pxq1, up=pxq2) never becomes a fused node, so the CUDA mixed-pair
+    // arms are unreachable and those layers run two separate mul_mat_id ops + a standalone GLU.
+    const bool up_ok   = type_up   == GGML_TYPE_PXQ1 || type_up   == GGML_TYPE_PXQ2 || type_up   == GGML_TYPE_PXQ3 || type_up   == GGML_TYPE_PXQ4;
+    const bool gate_ok = type_gate == GGML_TYPE_PXQ1 || type_gate == GGML_TYPE_PXQ2 || type_gate == GGML_TYPE_PXQ3 || type_gate == GGML_TYPE_PXQ4;
     return up_ok && gate_ok;
 }
 

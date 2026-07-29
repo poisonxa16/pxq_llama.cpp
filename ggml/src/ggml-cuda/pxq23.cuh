@@ -59,6 +59,37 @@ static inline bool pxa_pxq23_book_ok(const float * b, int n) {
     return ok;
 }
 
+// PXQ1's book is the SIGN book {-1,+1}: the scale (anchor x SUB16) carries all magnitude, so the
+// LS-optimal 1-bit levels are exactly +/-1. It therefore CANNOT use pxa_pxq23_book_ok(), which
+// requires |v| < 1 (right for the Lloyd-fit LM4/LM8 books, wrong here) -- reusing it would fail
+// the self-check and silently disable the fused kernels. Same shape of check, |v| <= 1.
+static inline bool pxa_pxq1_book_ok(const float * b) {
+    return b[0] < 0.0f && b[1] > 0.0f && b[0] < b[1]
+        && fabsf(b[0]) <= 1.0f && fabsf(b[1]) <= 1.0f
+        && __half2float(__float2half_rn(b[0])) == b[0]
+        && __half2float(__float2half_rn(b[1])) == b[1];
+}
+
+static inline bool pxa_pxq1_enabled() {
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ1");
+        bool v = !(e && atoi(e) == 0);
+        if (v) {
+            static const float book[2] = PXQ1_BOOK_INIT;
+            if (!pxa_pxq1_book_ok(book)) {
+                fprintf(stderr, "PXA_PXQ1: sign-book self-check FAILED — fused kernels DISABLED (fallback in use)\n");
+                v = false;
+            } else {
+                fprintf(stderr, "PXA_PXQ1 fused kernels: ON (sign-book self-check PASS; PXA_PXQ1=0 disables)\n");
+            }
+        } else {
+            fprintf(stderr, "PXA_PXQ1 fused kernels: OFF (dequant->cublas fallback)\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 static inline bool pxa_pxq2_enabled() {
     static const bool on = [](){
         const char * e = getenv("PXA_PXQ2");
@@ -136,8 +167,9 @@ static inline void pxq23_maybe_upload_books(int device) {
 // eff-group split in the shared kernels is by ELEMENT-PAIR index b: eff[(b*NEFF)>>4].
 // ---------------------------------------------------------------------------------------------
 // PXQ1 (sub-2-bit tier): 1-bit sign codes, single LE u32 code word / 32-elem row-block.
-// Dequant-only in v1 -- instantiated ONLY by k_pxq6_dequant_matrix (the dequant->GEMM
-// serve path); no fused-kernel picker names this policy (pxa_pxq_fmt(PXQ1) == NONE).
+// 2026-07-29: NO LONGER dequant-only. pxa_pxq_fmt(PXQ1) now returns PXA_PXQ_FMT_P1 and this
+// policy is named by the decode/GEMM pickers exactly as pol_p2/pol_p3 are (TAB / TAB_CS modes
+// only -- PRMT and PAIRLUT are 4-bit-nibble-addressed and are forced off for P1 by PICKM23).
 struct pxq6_pol_p1 {
     static constexpr int SLAB = PXQ1_SLAB_BYTES, HDR = PXQ1_HDR_BYTES, CODE_OFF = 64, NEFF = 2;
     static constexpr int CODE_WORDS = 1, CODE_BYTES = 4;

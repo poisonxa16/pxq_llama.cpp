@@ -3759,6 +3759,20 @@ static void pxa_pxq4_2d_ksplit_log(int device, bool fired, int panels, int ny, i
             pxa_pxq4_2d_ksplit_minblk(device));
 }
 
+
+// PXA_PXQ_DISPATCH_DBG=1 -> print each distinct (up,gate) format pair the fused MoE drivers
+// actually accept, once. Exists so "the new tier is on the fused path" is a PRINTED FACT rather
+// than an inference from a speed delta (a decline is silent and looks exactly like a slow kernel).
+static inline void pxa_pxq_dispatch_note(const char * where, int fu, int fg) {
+    static const bool on = [](){ const char * e = getenv("PXA_PXQ_DISPATCH_DBG"); return e && atoi(e) != 0; }();
+    if (!on) return;
+    static std::atomic<uint64_t> seen{0};
+    const int bit = (fu*9 + fg) & 63;
+    const uint64_t m = 1ull << bit;
+    if (seen.fetch_or(m) & m) return;
+    fprintf(stderr, "PXA_PXQ_DISPATCH: %s fmt_up=%d fmt_gate=%d (3=P6 4=P6HQ 5=P2 6=P3 7=P6R 8=P1)\n", where, fu, fg);
+}
+
 // returns 0 if it handled the node, -1 to decline (caller falls through to the stock paths)
 static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                           const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4097,6 +4111,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int fmt   = pxa_pxq_fmt(src0_1->type);                       // up
     const int fmt_g = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;  // gate
     if (!src0_2 || fmt == PXA_PXQ_FMT_NONE || fmt_g == PXA_PXQ_FMT_NONE) return -1;
+    pxa_pxq_dispatch_note("moe_gateup_decode", fmt, fmt_g);
     if (fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P2 || fmt_g >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
     const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
@@ -4293,6 +4308,7 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int fmt   = pxa_pxq_fmt(src0_1->type);                       // up
     const int fmt_g = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;  // gate
     if (!src0_2 || fmt == PXA_PXQ_FMT_NONE || fmt_g == PXA_PXQ_FMT_NONE) return -1;
+    pxa_pxq_dispatch_note("moe_gateup_prefill", fmt, fmt_g);
     if (fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P2 || fmt_g >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
     const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
@@ -4355,8 +4371,12 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int  wmma_env  = cc == 700 ? pxa_pxq6_wmma() : 0;   // K6: exactly Volta (sm_70)
     // v1 (modes 1/2) excludes 2/3-bit + mixed pairs; v2 (mode 3) covers P2/P3/P6/P6HQ + mixed
     // pairs but excludes P6R and requires GUFUSE (its fused kernel IS the up+gate path).
+    // P1 is excluded from K6 v2 for the same reason as P6R: PXQ6_WMMA_GU_PICK has no arm for
+    // it, and both gufuse call sites launch the picked pointer WITHOUT a null check. P1 keeps
+    // the (policy-generic) non-WMMA K5 gufuse path, which does have a P1 arm.
     const int  wmma_mode = wmma_env == 3
-        ? ((fmt != PXA_PXQ_FMT_P6R && fmt_g != PXA_PXQ_FMT_P6R && pxa_pxq6_gufuse()) ? 3 : 0)
+        ? ((fmt != PXA_PXQ_FMT_P6R && fmt_g != PXA_PXQ_FMT_P6R &&
+            fmt != PXA_PXQ_FMT_P1  && fmt_g != PXA_PXQ_FMT_P1  && pxa_pxq6_gufuse()) ? 3 : 0)
         : ((fmt < PXA_PXQ_FMT_P2 && fmt == fmt_g) ? wmma_env : 0);
     const bool wmma2     = wmma_mode == 3;   // K6 v2: double-buffered, GUFUSE-fused, WMMA scat down
     const bool rag    = pxa_pxq6_ragtail();
@@ -6599,8 +6619,10 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
                 const int cfu = pxa_pxq_fmt(src0_1->type);
                 const int cfg = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;
                 const bool pair_ok = cfu != PXA_PXQ_FMT_NONE && cfg != PXA_PXQ_FMT_NONE &&
-                    (cfu == cfg || ((cfu == PXA_PXQ_FMT_P2 || cfu == PXA_PXQ_FMT_P3 || cfu == PXA_PXQ_FMT_P6) &&
-                                    (cfg == PXA_PXQ_FMT_P2 || cfg == PXA_PXQ_FMT_P3 || cfg == PXA_PXQ_FMT_P6)));
+                    (cfu == cfg || ((cfu == PXA_PXQ_FMT_P1 || cfu == PXA_PXQ_FMT_P2 ||
+                                     cfu == PXA_PXQ_FMT_P3 || cfu == PXA_PXQ_FMT_P6) &&
+                                    (cfg == PXA_PXQ_FMT_P1 || cfg == PXA_PXQ_FMT_P2 ||
+                                     cfg == PXA_PXQ_FMT_P3 || cfg == PXA_PXQ_FMT_P6)));
                 moe_capturable = pair_ok &&
                     src0_2 &&
                     (puop == GGML_UNARY_OP_SWIGLU_OAI || puop == GGML_UNARY_OP_SILU) &&
