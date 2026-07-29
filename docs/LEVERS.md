@@ -479,3 +479,25 @@ release notes.*
 **Backbone rev additions (2026-07-28, same branch):** `ssm_alpha`/`ssm_beta` (geometrically impossible for the 64-row PXQ panel) and non-expert `nextn.*` MTP companions now land on **q8_0** instead of flat MXFP4 (zero-MXFP4 rule; +0.01% file size). `ssm_out` stays on the legacy landing pending measurement — build the native arm with `--custom-q "(ssm_out\.weight)=pxq4"`. **Explicit `--custom-q` PXQ targets are now honoured in every backbone mode whenever slab geometry allows** — before this, `PXA_PXQ_BACKBONE=legacy` + a custom PXQ rule silently demoted back to MXFP4 and the arm came out byte-identical to its control (two agents measured "nothing" this way).
 
 **⚠ Gate-methodology warning (systemic, 2026-07-28):** any DECODE-window lever (dispatch gated on `ne11 <= 8`-class conditions) that was certified with default-batch `llama-perplexity` was certified by a run in which the lever NEVER EXECUTED — `-b 512` perplexity is pure prefill, both arms are bit-identical, and the gate returns a false PASS. Gate decode levers at `-b 8 -ub 8` (the arms DIFFERING is what proves the kernel engaged), or with temp-0 + fixed-seed-sampling generation hashes as PXQ_CANON_v1 was. Audit note: `PXA_PXQ4_2D_SPLIT`/`PXA_PXQ6_KSPLIT_GEN` were certified partly through 64-chunk NLL aggregates; their real generation-level failure mode (the 122B kaskal runaway) was invisible to that gate and is now covered by the canon bit-exactness regression instead.
+
+## Updates — 2026-07-29 — ship-recipe measurements (all on the merged engine, main c99f1d9 lineage)
+
+- **`PXA_PXQ_MMVQ` — measured for the ship decision (35B MoE, 2×V100 ts1.05,0.95, fill 6018, n=9/arm
+  interleaved):** core-backbone file 75.97 → **93.43-93.89 t/s (+23%)**; ship file (core+ssm_out→PXQ4)
+  75.07 → **95.17 (+27%, legacy-recipe parity)**. Fidelity, HONEST decode-window protocol (`-b 8 -ub 8`,
+  300 paired chunks, V100 — the kernel provably engaged: series differ): **+0.053% ppl (t=17)** — real,
+  precisely quantified, and 1/50th of the recipe's −2.72% quality win. **Ships ON in the 35B serve env.**
+  ⚠ CAVEATS THAT NOW MATTER (default-on ship): (1) the MMVQ TU carries **frozen copies** of the book/SUB
+  tables and does NOT honour `PXA_PXQ6_BOOK`/`_SUB`/`_SUB_HQ` runtime uploads — the dispatch declines when
+  those envs are set, so an override experiment silently reverts to the bespoke path; (2) `=1` gates on
+  cc≥7.0 — on sm_60 it is an intentional no-op (P100 keeps the bespoke path, which beats MXFP4 there);
+  a "null" measured on P100s at `=1` is null by ARCH GATE, not evidence (this bit us once this session).
+- **`PXA_PXQ_KV=pxq4` — first-ever measurement (the lever was a docs-only phantom until 2026-07-28):**
+  artifact verified (all 20 attn_k/v tensors land PXQ4, file −11 MB vs q8_0 pin); paired 1000-chunk ppl
+  + V100 speed cells queued (`nll-A6-kv4.txt` / speed matrix follow-up) — row to be completed with those
+  numbers before any public release.
+- **`PXA_PXQ4_2D_SPLIT` / canon price:** the coordinator's 2×2 on the published 35B artifact priced
+  PXQ_CANON_v1 at **−1.9% decode** on the bespoke MoE path (the ~27% regression hypothesis was tested
+  and killed; the 104.06 figure it was anchored to was retracted as an artifact-composition error).
+  Bit-exactness costs 1.9% and is worth it: it retires the entire config-dependent greedy-flip class
+  (S, target, device SM count, lever toggles).
