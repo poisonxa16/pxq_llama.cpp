@@ -1300,6 +1300,10 @@ static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, 
     return false;
 }
 
+// LOUD-DEMOTE counter: explicit --custom-q PXQ targets that geometry forced off their
+// requested type in this run (printed in the end-of-run summary; see the write loop).
+static int g_pxa_customq_demoted = 0;
+
 // The resolver. Returns GGML_TYPE_COUNT for "not mine — leave to the legacy pipeline".
 static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier) {
     const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
@@ -2473,6 +2477,17 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     // allows it, in every backbone mode.
                     const bool bb_legacy = pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY;
                     const ggml_type demoted = bb_legacy ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
+                    // LOUD-DEMOTE (2026-07-28, owner-requested): a silently demoted EXPLICIT
+                    // --custom-q target is how an A/B arm ends up byte-identical to its control
+                    // and "measures" nothing. Scream, count, and summarize at the end.
+                    if (pxa_custom_rule_matches(params, name)) {
+                        ++g_pxa_customq_demoted;
+                        LLAMA_LOG_ERROR("\n⚠⚠ CUSTOM-Q DEMOTED: %s — your --custom-q rule targeted %s but the tensor "
+                                        "fails PXQ slab geometry (ne0=%" PRId64 ", ne1=%" PRId64 "; needs rows%%64==0, K%%32==0). "
+                                        "Landing on %s instead. The output will NOT test your rule for this tensor.\n",
+                                        name.c_str(), ggml_type_name(new_type), tensor->ne[0], tensor->ne[1],
+                                        ggml_type_name(demoted));
+                    }
                     LLAMA_LOG_WARN("%s: %s fails PXQ slab geometry (ne0=%" PRId64 ", ne1=%" PRId64 ") — demoting %s -> %s\n",
                                    __func__, name.c_str(), tensor->ne[0], tensor->ne[1],
                                    ggml_type_name(new_type), ggml_type_name(demoted));
@@ -2576,6 +2591,11 @@ QuantizationDone:;
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
+    if (g_pxa_customq_demoted > 0) {
+        LLAMA_LOG_ERROR("\n⚠⚠ %d tensor(s) targeted by --custom-q were DEMOTED off their requested PXQ type "
+                        "(slab-geometry failures — see the CUSTOM-Q DEMOTED lines above). "
+                        "Dump and diff the tier table before benching this artifact.\n", g_pxa_customq_demoted);
+    }
 
     // ------------------------------------------------------------------------------------------
     // PXQ-P5 composition summary + assertion (2026-07-27). Motivation: a dense (no-expert)
