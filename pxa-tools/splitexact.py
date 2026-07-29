@@ -56,13 +56,26 @@ def gen(prompt):
     # sampled run is a near-tie AMPLIFIER: with an identical RNG stream the token choice flips
     # if ANY step probability differs at the drawn uniform, far more sensitive than greedy.
     blob = ""
-    for extra in ({"temperature": 0, "top_k": 1}, {"temperature": 1.0, "seed": 42}):
+    for extra in ({"temperature": 0, "top_k": 1}, {"temperature": 1.0, "seed": 7}):
         body = json.dumps({"prompt": prompt, "n_predict": 384,
                            "cache_prompt": False, "ignore_eos": True, **extra}).encode()
         r = urllib.request.Request("http://127.0.0.1:%d/completion" % PORT, data=body,
                                    headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(r, timeout=900) as resp:
-            d = json.load(resp)
+        # The fork intermittently 500s serialising a response whose content ends on a partial
+        # UTF-8 sequence (same class as the documented completion_probabilities 500).
+        # Generation itself succeeds: the server log shows 384 tokens and a clean slot release
+        # immediately before the 500. Retry rather than lose a 5-variant run.
+        d = None
+        for _a in range(4):
+            try:
+                with urllib.request.urlopen(r, timeout=900) as resp:
+                    d = json.load(resp)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 500 or _a == 3:
+                    raise
+                sys.stderr.write("  [retry %d] transient 500\n" % (_a + 1))
+                time.sleep(3)
         blob += d.get("content", "") + "||"
     return hashlib.sha256(blob.encode()).hexdigest(), blob[:50]
 
