@@ -46,7 +46,19 @@
 // gates the weight placement on the same var). Read once. Default OFF.
 // ---------------------------------------------------------------------------
 static inline bool pxa_expert_shard_enabled() {
-    static const bool v = getenv("PXA_EXPERT_SHARD") != nullptr;
+    // 2026-07-30: was presence-tested, so PXA_EXPERT_SHARD=0 armed the shard OP path while
+    // the M3 loader (src/llama.cpp) correctly refused to shard (it needs a >=2-device group).
+    // Mirror the loader semantic: live only when the value parses to >= 2 group devices.
+    static const bool v = [](){
+        const char * e = getenv("PXA_EXPERT_SHARD");
+        if (!e) return false;
+        int n = 0; bool in_tok = false;
+        for (const char * p = e; ; ++p) {
+            if (*p == ',' || *p == 0) { if (in_tok) ++n; in_tok = false; if (*p == 0) break; }
+            else if (*p != ' ') in_tok = true;
+        }
+        return n >= 2;
+    }();
     return v;
 }
 

@@ -104,6 +104,12 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 // every CUDA TU (external linkage avoids a header-static-per-TU split-brain).
 pxa_topology_t g_pxa_topology = {};
 
+// C-linkage-compatible trampoline for ggml_pxa_register_model_profile_hook (the ledger
+// itself is inline in pxa-enhance.cuh; this TU owns the single registration).
+static void pxa_enhance_model_profile_hook(void) {
+    pxa_enhance_log_model_decisions();
+}
+
 static void ggml_cuda_default_log_callback(enum ggml_log_level level, const char * msg, void * user_data) {
     GGML_UNUSED(level);
     GGML_UNUSED(user_data);
@@ -320,6 +326,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
     pxa_enhance_init_topology(info.device_count, pxa_ccs);
     pxa_enhance_log_topology_dbg();
     pxa_enhance_log_startup(info.device_count, pxa_ccs, pxa_names);
+    // PXA model-aware decisions (2026-07-29): print the per-(device x model) decision
+    // ledger once BOTH halves are known. Registering the hook covers both orders —
+    // if the loader already registered the model profile, the hook fires right here;
+    // otherwise it fires when ggml_pxa_set_model_profile lands (src/llama.cpp).
+    ggml_pxa_register_model_profile_hook(&pxa_enhance_model_profile_hook);
 
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;
@@ -3681,12 +3692,25 @@ static bool pxa_pxq4_2d_split() {
 
 // Grid-coverage target the split aims for (blocks incl. the ny axis). Default 2x the device's
 // SM count; PXA_PXQ4_2D_SPLIT_TARGET overrides (0 = never split; large = always max split).
+// TUNED 2026-07-27 (Qwable-27B dense, decode, 5 reps/arm, spread < 0.4%). The shipped 2*nsm
+// default sat far below the knee on both target Teslas -- it only ever split the shapes whose
+// x-stage forced it, leaving every well-shaped node at 1 block/SM:
+//   2xP100 (nsm 56): T=112 (2*nsm) 14.81 t/s | 224 17.45 | 336 19.17 | 448 19.17 | 560 19.15
+//                    | 672 18.86 | 1120 18.11 | 2240 16.44   -> knee 336-560, take 8*nsm = 448
+//   2xV100 (nsm 80): T=160 (2*nsm) 27.89 t/s | 320 29.31 | 640 29.59 | 1280 30.70 | 2560 30.19
+//                    -> knee 1280 = 16*nsm
+// Both are broad plateaus, not spikes. Other arches keep 2*nsm (unmeasured -- do not guess).
 static int pxa_pxq4_2d_split_target(int device) {
     static const int ov = [] {
         const char * e = getenv("PXA_PXQ4_2D_SPLIT_TARGET");
         return e ? atoi(e) : -1;
     }();
-    return ov >= 0 ? ov : 2*ggml_cuda_info().devices[device].nsm;
+    if (ov >= 0) return ov;
+    const int nsm = ggml_cuda_info().devices[device].nsm;
+    const int cc  = ggml_cuda_info().devices[device].cc;
+    if (cc == 700) return 16*nsm;
+    if (cc == 600) return  8*nsm;
+    return 2*nsm;
 }
 
 // First firing / first decline per device (same phantom-lever discipline as the K1 log).
@@ -3746,6 +3770,20 @@ static void pxa_pxq4_2d_ksplit_log(int device, bool fired, int panels, int ny, i
             pxa_pxq4_2d_ksplit_minblk(device));
 }
 
+
+// PXA_PXQ_DISPATCH_DBG=1 -> print each distinct (up,gate) format pair the fused MoE drivers
+// actually accept, once. Exists so "the new tier is on the fused path" is a PRINTED FACT rather
+// than an inference from a speed delta (a decline is silent and looks exactly like a slow kernel).
+static inline void pxa_pxq_dispatch_note(const char * where, int fu, int fg) {
+    static const bool on = [](){ const char * e = getenv("PXA_PXQ_DISPATCH_DBG"); return e && atoi(e) != 0; }();
+    if (!on) return;
+    static std::atomic<uint64_t> seen{0};
+    const int bit = (fu*9 + fg) & 63;
+    const uint64_t m = 1ull << bit;
+    if (seen.fetch_or(m) & m) return;
+    fprintf(stderr, "PXA_PXQ_DISPATCH: %s fmt_up=%d fmt_gate=%d (3=P6 4=P6HQ 5=P2 6=P3 7=P6R 8=P1)\n", where, fu, fg);
+}
+
 // returns 0 if it handled the node, -1 to decline (caller falls through to the stock paths)
 static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                           const ggml_tensor * src1, ggml_tensor * dst) {
@@ -3798,15 +3836,18 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     // from there. S_min == 1 for every shape that passed before, so those shapes keep their
     // exact previous launch geometry and byte-reproduce.
     const int    kslabs   = (int)(K/PXQ6_QK);
-    const size_t smem_fix = PXQ4_MMV_KSEG*64*sizeof(float);
+    // PXQ_CANON_v1: NFIX fixed canonical chunks for this shape; any split S must divide it.
+    const int    nfix     = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);
+    const size_t smem_fix = PXQ4_MMV_KSEG*64*sizeof(float);   // red[] — plain form only
     const size_t smem_cap = 46*1024;
     auto smem_for_S = [&](int S) {
-        return (size_t)((kslabs + S - 1)/S)*PXQ6_QK*sizeof(float) + smem_fix;
+        // split kernels stage only their x slice (the canon rewrite dropped their red[])
+        return (size_t)((kslabs + S - 1)/S)*PXQ6_QK*sizeof(float) + (S == 1 ? smem_fix : 0);
     };
     int S_min = 1;
     while (S_min < PXQ6_MMV_SPLIT_MAX && smem_for_S(S_min) > smem_cap) S_min *= 2;
     if (smem_for_S(S_min) > smem_cap)     return -1;   // wider than even S=MAX can stage
-    if (S_min*PXQ4_MMV_KSEG > kslabs)     return -1;   // needs >= KSEG slabs per chunk
+    if (S_min > nfix)                     return -1;   // canonical chunking cannot cover this S
     const bool must_split = S_min > 1;                 // the plain form cannot stage this K
     if (must_split && !pxa_pxq4_2d_split()) return -1;
 
@@ -3841,21 +3882,23 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     // K8-2D: S-way K-chunk split when the plain grid under-fills the machine (or its full-K
     // x stage caps occupancy). S = smallest power of two reaching the block target, capped by
-    // PXQ6_MMV_SPLIT_MAX and by >= 4 slabs per chunk (one per kseg chain).
+    // NFIX (so S always divides the canonical chunking => bit-exact vs unsplit).
     if (pxa_pxq4_2d_split()) {
         const int target = pxa_pxq4_2d_split_target(ctx.device);
         int S = S_min;               // >= 1; above 1 only when the x stage demands it
-        while (S < PXQ6_MMV_SPLIT_MAX && (int64_t)panels*ny*S < target && (S*2)*PXQ4_MMV_KSEG <= kslabs) S *= 2;
+        while (S < nfix && (int64_t)panels*ny*S < target) S *= 2;
         if (S > 1) {
             auto * ksg = pxq6_pick_mmv_ksplit_gen(fmt, pair, vecx);
             if (ksg) {
-                const size_t need = (size_t)ny*(size_t)PXQ6_MMV_SPLIT_MAX*(size_t)R;
+                // PXQ_CANON_v1 workspace: raw per-(fixed-chunk, lane) partials
+                const size_t need = (size_t)ny*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*(size_t)R;
                 float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
                 pxa_pxq4_2d_split_log(ctx.device, ws != nullptr, S, panels, (int)ny, (int)R, (int)K);
                 if (ws) {
-                    int * ctrs = pxa_pxq_split_fusered() ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
+                    int * ctrs = pxa_pxq_split_fusered()
+                        ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
                     const int kc_max = (kslabs + S - 1)/S;
-                    const size_t smem_s = (size_t)kc_max*PXQ6_QK*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
+                    const size_t smem_s = (size_t)kc_max*PXQ6_QK*sizeof(float);
                     dim3 grids((unsigned)(panels*S), 1u, (unsigned)ny);
                     ksg<<<grids, 256, smem_s, stream>>>(
                         (const uint8_t *)src0->data,
@@ -3870,7 +3913,7 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                         k_pxq_mmv_reduce_s<<<gridr, 256, 0, stream>>>(ws,
                             (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
                             (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
-                            (int)R, /* n_as */ 1, /* n_ids */ 1, S);
+                            (int)R, /* n_as */ 1, /* n_ids */ 1, kslabs);
                         CUDA_CHECK(cudaGetLastError());
                     }
                     return 0;
@@ -3964,13 +4007,31 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 // incumbent and nets only +2.3%, so a fix that coalesces the dequant and KEEPS cuBLAS's HMMA
 // GEMM should dominate this on sm_70. Decode is untouched either way (ny <= PXA_PXQ4_2D_MAX_NY
 // is declined here and owned by pxa_pxq_mmv_2d).
+// gemm_2d ENHANCE auto (2026-07-29, model-aware): mode 1 (sm_60 only) when an sm_60 device is
+// present AND the loaded model is DENSE AND it carries PXQ tensors. Basis: +35% P100 dense
+// prefill on the coalesced binary (2026-07-28 arch-split note above). The sm_60 x MoE cell was
+// only ever measured against the PRE-coalescing incumbent (+0.89% prefill, decode flat) — post-
+// coalescing it is UNMEASURED and the sm_70 dense flip (-18.6%) shows the coalescing fix can
+// invert a win, so MoE stays OFF until someone measures it. Explicit env always wins; cached
+// against the model-profile generation (profile can land after CUDA init in the server flow).
 static int pxa_pxq_gemm_2d_mode() {
-    static const int v = [] {
-        const char * e = getenv("PXA_PXQ_GEMM_2D");
-        const int m = e ? atoi(e) : 0;
-        return (m < 0 || m > 2) ? 0 : m;
-    }();
-    return v;
+    static int cached_gen = -1;
+    static int cached     = 0;
+    const int gen = ggml_pxa_model_profile_generation();
+    if (cached_gen == gen) return cached;
+    const char * e = getenv("PXA_PXQ_GEMM_2D");
+    int m = e ? atoi(e) : 0;
+    if (!e && pxa_config_level() == 2 && g_pxa_topology.valid && g_pxa_topology.has_sm60
+        && pxa_model_known() && !pxa_model_is_moe() && pxa_model().n_pxq_mmvq_tensors > 0) {
+        m = 1;
+        fprintf(stderr, "PXA_AUTO: PXQ_GEMM_2D=1 (ENHANCE x sm_60 present x dense PXQ model: "
+                        "+35%% P100 dense prefill measured 2026-07-28; MoE stays off — post-"
+                        "coalescing sm_60 MoE cell unmeasured; override PXA_PXQ_GEMM_2D)\n");
+    }
+    if (m < 0 || m > 2) m = 0;
+    cached = m;
+    cached_gen = gen;
+    return m;
 }
 
 // The claim is silent when it declines, and a decline is indistinguishable from a firing that did
@@ -4079,6 +4140,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int fmt   = pxa_pxq_fmt(src0_1->type);                       // up
     const int fmt_g = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;  // gate
     if (!src0_2 || fmt == PXA_PXQ_FMT_NONE || fmt_g == PXA_PXQ_FMT_NONE) return -1;
+    pxa_pxq_dispatch_note("moe_gateup_decode", fmt, fmt_g);
     if (fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P2 || fmt_g >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
     const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
@@ -4136,23 +4198,30 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
         }
     }
 
+    // PXQ_CANON_v1: clamp the gen split S to the canonical chunk count so it always divides
+    // NFIX (bit-exactness precondition); an S clamped below 2 falls back to the K1/unsplit path.
+    const int kslabs_gu = (int)(K/PXQ4_QK);
+    const int nfix_gu   = pxq6_canon_nfix(kslabs_gu, PXQ6_GU_SPLIT_MAX);
+    const int sgen_eff  = sgen > nfix_gu ? nfix_gu : sgen;
+
     bool gu_done = false;
-    if (newfam && (pxa_pxq6_ksplit() || sgen)) {
+    if (newfam && (pxa_pxq6_ksplit() || sgen_eff >= 2)) {
         // K1: split gateup launch + fixed-order reducer. Workspace grows only outside graph
         // capture; if unavailable we fall through to the unsplit kernel (bit-identical for the
         // bit-exact form, so replayed graphs stay correct whatever capture saw).
-        const size_t need = (size_t)Ny*n_ids*2*(sgen ? 8 : PXQ4_MMV_KSEG)*R;
+        const size_t need = (size_t)Ny*n_ids*2*(sgen_eff >= 2 ? PXQ6_GU_SPLIT_MAX*PXQ4_MMV_KSEG : PXQ4_MMV_KSEG)*R;
         float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
         if (ws) {
             dim3 gridr((unsigned)((R + 255)/256), (unsigned)n_ids, (unsigned)Ny);
-            if (sgen) {
-                const int kslabs = (int)(K/PXQ4_QK);
-                const int kcmax  = ((kslabs + sgen - 1)/sgen)*PXQ4_QK;
-                const size_t smem_s = (size_t)kcmax*sizeof(float) + 2*PXQ4_MMV_KSEG*64*sizeof(float);
-                dim3 grids((unsigned)(R/PXQ4_BM*sgen), (unsigned)n_ids, (unsigned)Ny);
+            if (sgen_eff >= 2) {
+                const int kslabs = kslabs_gu;
+                const int kcmax  = ((kslabs + sgen_eff - 1)/sgen_eff)*PXQ4_QK;
+                const size_t smem_s = (size_t)kcmax*sizeof(float);
+                dim3 grids((unsigned)(R/PXQ4_BM*sgen_eff), (unsigned)n_ids, (unsigned)Ny);
                 auto * ks = pxq6_pick_gateup_ksplit_gen(fmt, fmt_g, pair, vecx);
                 if (ks) {
-                int * ctrs = pxa_pxq_split_fusered() ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
+                int * ctrs = pxa_pxq_split_fusered()
+                    ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
                 ks<<<grids, 256, smem_s, stream>>>(
                     (const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
                     (const char *)src1->data, src1->nb[2], ws,
@@ -4161,7 +4230,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
                     bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
                     ctrs, unary, 1.702f, limit,
-                    (int)R, (int)K, (int)n_as, (int)n_ids, sgen);
+                    (int)R, (int)K, (int)n_as, (int)n_ids, sgen_eff);
                 CUDA_CHECK(cudaGetLastError());
                 if (!ctrs) {
                     k_pxq6_gateup_reduce_gen<<<gridr, 256, 0, stream>>>(ws,
@@ -4169,7 +4238,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         (const char *)ids->data, ids->nb[0], ids->nb[1],
                         bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
                         bg ? (const float *)bg->data : nullptr, bg ? bg->nb[1] : 0,
-                        (int)R, (int)n_as, (int)n_ids, unary, 1.702f, limit, sgen);
+                        (int)R, (int)n_as, (int)n_ids, unary, 1.702f, limit, kslabs);
                     CUDA_CHECK(cudaGetLastError());
                 }
                 gu_done = true;
@@ -4268,6 +4337,7 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int fmt   = pxa_pxq_fmt(src0_1->type);                       // up
     const int fmt_g = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;  // gate
     if (!src0_2 || fmt == PXA_PXQ_FMT_NONE || fmt_g == PXA_PXQ_FMT_NONE) return -1;
+    pxa_pxq_dispatch_note("moe_gateup_prefill", fmt, fmt_g);
     if (fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
     if (fmt >= PXA_PXQ_FMT_P2 || fmt_g >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
     const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
@@ -4330,8 +4400,12 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int  wmma_env  = cc == 700 ? pxa_pxq6_wmma() : 0;   // K6: exactly Volta (sm_70)
     // v1 (modes 1/2) excludes 2/3-bit + mixed pairs; v2 (mode 3) covers P2/P3/P6/P6HQ + mixed
     // pairs but excludes P6R and requires GUFUSE (its fused kernel IS the up+gate path).
+    // P1 is excluded from K6 v2 for the same reason as P6R: PXQ6_WMMA_GU_PICK has no arm for
+    // it, and both gufuse call sites launch the picked pointer WITHOUT a null check. P1 keeps
+    // the (policy-generic) non-WMMA K5 gufuse path, which does have a P1 arm.
     const int  wmma_mode = wmma_env == 3
-        ? ((fmt != PXA_PXQ_FMT_P6R && fmt_g != PXA_PXQ_FMT_P6R && pxa_pxq6_gufuse()) ? 3 : 0)
+        ? ((fmt != PXA_PXQ_FMT_P6R && fmt_g != PXA_PXQ_FMT_P6R &&
+            fmt != PXA_PXQ_FMT_P1  && fmt_g != PXA_PXQ_FMT_P1  && pxa_pxq6_gufuse()) ? 3 : 0)
         : ((fmt < PXA_PXQ_FMT_P2 && fmt == fmt_g) ? wmma_env : 0);
     const bool wmma2     = wmma_mode == 3;   // K6 v2: double-buffered, GUFUSE-fused, WMMA scat down
     const bool rag    = pxa_pxq6_ragtail();
@@ -5191,6 +5265,205 @@ static inline bool pxa_is_pxq_type(ggml_type t) {
            t == GGML_TYPE_PXQ6;
 }
 
+// ================= DENSE FUSED up+gate+GLU decode driver (PXA_PXQ_DENSE_GATEUP) =================
+// A dense GGML_OP_FUSED_UP_GATE node whose up/gate are PXQ-slab-typed had NO fused kernel: the
+// handler below split it into two independent ggml_cuda_mul_mat calls (two k_pxq6_mmv launches,
+// each staging the WHOLE x vector into smem and each carrying its own tab/anchor prologue) plus a
+// third elementwise GLU kernel over the R-wide intermediate. The MoE path has ridden the fused
+// k_pxq6_gateup_mmv family since day one; the dense path simply never reached it, even though the
+// kernel is expert-agnostic (the one-entry {0} ids idiom already used by pxa_pxq_mmv_2d degenerates
+// pxq6_panel() to W + p*panel_stride).
+//
+// The mechanism that matters at decode is NOT the saved launches: this driver is register-limited
+// and latency-bound (ncu: 19.8-38.6% achieved occupancy, Block Limit = Registers, DRAM 6-36% of
+// peak), so the win is memory-level parallelism -- one thread issuing the up-slab and gate-slab
+// loads back to back doubles the outstanding loads per thread at identical weight bytes.
+//
+// Both launch geometries are supported so this composes with the K8-2D S-split rather than
+// undoing it: with S == 1 it is the plain k_pxq6_gateup_mmv, above 1 the S-way chunk form plus
+// k_pxq6_gateup_reduce_gen (the gen workspace reserves 8 chunk slots, so S is capped at 8).
+static bool pxa_pxq_dense_gateup() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_PXQ_DENSE_GATEUP");
+        return !(e && atoi(e) == 0);
+    }();
+    return v;
+}
+
+// Same phantom-lever discipline as the K1/K8 logs: a driver that silently declines is
+// indistinguishable from one that fires, so record the first of each per device.
+static void pxa_pxq_dense_gateup_log(int device, bool fired, int S, int panels, int ny,
+                                     int R, int K, const char * why) {
+    static std::atomic<uint32_t> seen{0};
+    if (device < 0 || device >= 16) return;
+    const uint32_t bit = 1u << (2*device + (fired ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    fprintf(stderr, "PXA_PXQ_DENSE_GATEUP dev%d: %s (S=%d panels=%d ny=%d R=%d K=%d)%s%s\n",
+            device, fired ? "FIRING" : "DECLINED -> split up/gate mul_mat", S, panels, ny, R, K,
+            why ? " why=" : "", why ? why : "");
+}
+
+// Independent split control for the FUSED dense gateup. The shared K8-2D target is tuned on the
+// single-weight mmv, whose grids are half the size (one weight, not two): at the sm_70 knee the
+// fused gateup already launches panels = R/64 = 272 blocks on 80 SMs before any split, so it may
+// want a different S -- and every S > 1 buys its occupancy at the price of one dependent
+// k_pxq6_gateup_reduce_gen. 1 = follow the shared target (default), 0 = never split the fused
+// gateup; PXA_PXQ_DENSE_GATEUP_TARGET overrides the block target for this node class only.
+static bool pxa_pxq_dense_gateup_split() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_PXQ_DENSE_GATEUP_SPLIT");
+        return !(e && atoi(e) == 0);
+    }();
+    return v;
+}
+// MEASURED 2026-07-27 (Qwable-27B dense, PXQ4core, 4 timed reps/arm, spread < 0.2%): the two
+// target Teslas want OPPOSITE answers here, which is why this is its own knob.
+//   2xV100 (sm_70): follow the shared target 33.618 t/s | never split 33.905  (+0.85%)
+//   2xP100 (sm_60): follow the shared target 20.793 t/s | never split 18.997  (-8.6%)
+// The fused gateup carries TWO weights per block, so panels = R/64 blocks already do the work
+// of 2*panels mmv blocks. On sm_70 (80 SMs) the dense ffn_up/gate grid is 272 blocks, which is
+// already past the point where more parallelism pays, so every S > 1 buys nothing and still
+// costs a dependent k_pxq6_gateup_reduce_gen. On sm_60 (56 SMs) the same grid is well short of
+// the machine's appetite and the split is strongly positive. Other arches follow the shared
+// target (unmeasured -- do not guess). 0 == never split.
+static int pxa_pxq_dense_gateup_target(int device) {
+    static const int ov = [] {
+        const char * e = getenv("PXA_PXQ_DENSE_GATEUP_TARGET");
+        return e ? atoi(e) : -1;
+    }();
+    if (ov >= 0) return ov;
+    if (ggml_cuda_info().devices[device].cc == 700) return 0;   // sm_70: never split the fused gateup
+    return pxa_pxq4_2d_split_target(device);
+}
+
+// returns 0 if it handled the node, -1 to decline (caller falls through to the split path)
+static int pxa_pxq_gateup_2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!pxa_pxq_dense_gateup() || !pxa_pxq4_2d_enabled()) return -1;
+
+    const ggml_tensor * src0_1 = dst->src[0];   // up
+    const ggml_tensor * src0_2 = dst->src[1];   // gate
+    const ggml_tensor * src1   = dst->src[2];   // x
+    if (!src0_1 || !src0_2 || !src1) return -1;
+
+    const int fmt   = pxa_pxq_fmt(src0_1->type);
+    const int fmt_g = pxa_pxq_fmt(src0_2->type);
+    if (fmt == PXA_PXQ_FMT_NONE || fmt_g == PXA_PXQ_FMT_NONE) return -1;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return -1;
+
+    // pxq4_glu_apply covers SILU-swiglu and SWIGLU_OAI. The split path it replaces routes the
+    // op through ggml_fused_mul_unary, which asserts on anything but SILU/RELU/GELU -- so SILU
+    // is the only op both forms can serve. Keep the fused path to exactly that.
+    const ggml_unary_op uop = (ggml_unary_op)dst->op_params[0];
+    if (uop != GGML_UNARY_OP_SILU) return -1;
+
+    // dense: no expert axis anywhere, no ids, no per-expert bias sources
+    if (src0_1->ne[2] != 1 || src0_1->ne[3] != 1) return -1;
+    if (src0_2->ne[2] != 1 || src0_2->ne[3] != 1) return -1;
+    if (src1->ne[2]   != 1 || src1->ne[3]   != 1) return -1;
+    if (dst->ne[2]    != 1 || dst->ne[3]    != 1) return -1;
+    if (dst->src[3] || dst->src[4] || dst->src[5]) return -1;
+    if (!ggml_is_contiguous(src0_1) || !ggml_is_contiguous(src0_2) ||
+        !ggml_is_contiguous(src1)   || !ggml_is_contiguous(dst)) return -1;
+
+    const int64_t K = src0_1->ne[0], R = src0_1->ne[1];
+    if (src0_2->ne[0] != K || src0_2->ne[1] != R) return -1;
+    if (K % PXQ6_QK || R % PXQ6_BM) return -1;
+    if (src1->ne[0] != K || dst->ne[0] != R) return -1;
+
+    const int64_t ny = src1->ne[1];
+    if (ny < 1 || ny > pxa_pxq4_2d_max_ny()) return -1;
+    if (dst->ne[1] != ny) return -1;
+
+    if (!pxa_pxq4_bufs_on_device(ctx, {src0_1, src0_2, src1, dst})) return -1;
+
+    if (fmt >= PXA_PXQ_FMT_P6 || fmt_g >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
+    if (fmt >= PXA_PXQ_FMT_P2 || fmt_g >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
+
+    const int  pair = pxa_pxq6_decode_mode();
+    const bool vecx = pxa_pxq6_vecx();
+
+    cudaStream_t stream = ctx.stream();
+    const int    kslabs = (int)(K/PXQ6_QK);
+    const int    panels = (int)(R/PXQ6_BM);
+    const float  limit  = *(const float *)(dst->op_params + 1);
+
+    // one-entry ids buffer == {0}; both strides zero so every (token, slot) block reads it.
+    const int32_t * idz = pxa_pxq_zero_ids(ctx.device, stream);
+    ggml_cuda_pool_alloc<int32_t> ids_pool(ctx.pool());
+    if (!idz) {
+        ids_pool.alloc(1);
+        CUDA_CHECK(cudaMemsetAsync(ids_pool.get(), 0, sizeof(int32_t), stream));
+        idz = ids_pool.get();
+    }
+
+    // ---- S-split form: same occupancy target the K8-2D mmv split aims at, capped at the
+    // canonical chunk count (PXQ_CANON_v1: S must divide NFIX so the split stays bit-exact).
+    const int nfix_gu = pxq6_canon_nfix(kslabs, PXQ6_GU_SPLIT_MAX);
+    if (pxa_pxq4_2d_split() && pxa_pxq_dense_gateup_split()) {
+        const int target = pxa_pxq_dense_gateup_target(ctx.device);
+        int S = 1;
+        while (S < nfix_gu && (int64_t)panels*ny*S < target) S *= 2;
+        if (S > 1) {
+            auto * ksg = pxq6_pick_gateup_ksplit_gen(fmt, fmt_g, pair, vecx);
+            const int    kc_max  = ((kslabs + S - 1)/S)*PXQ6_QK;
+            const size_t smem_s  = (size_t)kc_max*sizeof(float);
+            if (ksg && smem_s <= 46*1024) {
+                // PXQ_CANON_v1 workspace: raw per-(fixed-chunk, lane) partials, u then g halves
+                const size_t need = (size_t)ny*2*(size_t)(PXQ6_GU_SPLIT_MAX*PXQ4_MMV_KSEG)*(size_t)R;
+                float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
+                if (ws) {
+                    pxa_pxq_dense_gateup_log(ctx.device, true, S, panels, (int)ny, (int)R, (int)K, nullptr);
+                    int * ctrs = pxa_pxq_split_fusered()
+                        ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
+                    dim3 grids((unsigned)(panels*S), 1u, (unsigned)ny);
+                    ksg<<<grids, 256, smem_s, stream>>>(
+                        (const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
+                        (const char *)src1->data, src1->nb[1], ws,
+                        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                        (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
+                        /* bias_u */ nullptr, 0, /* bias_g */ nullptr, 0,
+                        ctrs, /* unary SILU */ 0, 1.702f, limit,
+                        (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1, S);
+                    CUDA_CHECK(cudaGetLastError());
+                    if (!ctrs) {
+                        dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
+                        k_pxq6_gateup_reduce_gen<<<gridr, 256, 0, stream>>>(ws,
+                            (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
+                            (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                            /* bias_u */ nullptr, 0, /* bias_g */ nullptr, 0,
+                            (int)R, /* n_as */ 1, /* n_ids */ 1, /* unary SILU */ 0, 1.702f, limit, kslabs);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // ---- plain form: stages the whole x vector, so it owns the same K cap as the K1-2D mmv.
+    const size_t smem_gu = (size_t)K*sizeof(float) + 2*PXQ4_MMV_KSEG*64*sizeof(float);
+    if (smem_gu > 46*1024) {
+        pxa_pxq_dense_gateup_log(ctx.device, false, 1, panels, (int)ny, (int)R, (int)K, "x-stage>46K");
+        return -1;
+    }
+    auto * kern = pxq6_pick_gateup(fmt, fmt_g, pair, vecx);
+    if (!kern) {
+        pxa_pxq_dense_gateup_log(ctx.device, false, 1, panels, (int)ny, (int)R, (int)K, "no-instantiation");
+        return -1;
+    }
+    pxa_pxq_dense_gateup_log(ctx.device, true, 1, panels, (int)ny, (int)R, (int)K, nullptr);
+    dim3 grid((unsigned)panels, 1u, (unsigned)ny);
+    kern<<<grid, 256, smem_gu, stream>>>(
+        (const uint8_t *)src0_1->data, (const uint8_t *)src0_2->data,
+        (const char *)src1->data, src1->nb[1],
+        (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
+        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+        /* bias_u */ nullptr, 0, /* bias_g */ nullptr, 0,
+        (int)R, (int)K, /* n_as */ 1, /* unary SILU */ 0, 1.702f, limit);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
 static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0_1 = dst->src[0];
     const ggml_tensor * src0_2 = dst->src[1];
@@ -5213,6 +5486,9 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1
         && src0_1->ne[2] == 1 && src0_1->ne[3] == 1 && src1->type == GGML_TYPE_F32;
     if (!pxq_mmvq_fug && (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type))) {
+        // Fused single-launch decode form first; it declines to the split path below for any
+        // shape/op/geometry it cannot serve.
+        if (pxa_pxq_gateup_2d(ctx, dst) == 0) return;
         const float limit_px = *(const float *)(dst->op_params + 1);
         // PXA_DENSE_FUG_PREC_v1: op_params[0] on a FUSED_UP_GATE node is the UNARY OP id
         // (GGML_UNARY_OP_SILU == 10), NOT a ggml_prec. Both ggml_cuda_op_mul_mat_cublas (which
@@ -6129,7 +6405,9 @@ static bool pxa_cuda_graph_batch_enabled() {
         // The E2 union probe (PXA_MOE_DEBUG) does a cudaMemcpy D2H + stream sync INSIDE the MoE op,
         // and the A1 shadow-verify (PXA_MOE_GROUPED_VERIFY) relies on device-printf flushing at
         // stream syncs -- both are incompatible with (or defeated by) graph capture/replay.
-        if (getenv("PXA_MOE_DEBUG") || getenv("PXA_MOE_GROUPED_VERIFY")) return false;
+        // (PXA_MOE_GROUPED_VERIFY goes through its value-tested resolver since 2026-07-30 —
+        // a presence test here would disable graphs on an explicit =0.)
+        if (getenv("PXA_MOE_DEBUG") || pxa_moe_grouped_shadow()) return false;
         return true;
     }();
     return on;
@@ -6372,8 +6650,10 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
                 const int cfu = pxa_pxq_fmt(src0_1->type);
                 const int cfg = src0_2 ? pxa_pxq_fmt(src0_2->type) : PXA_PXQ_FMT_NONE;
                 const bool pair_ok = cfu != PXA_PXQ_FMT_NONE && cfg != PXA_PXQ_FMT_NONE &&
-                    (cfu == cfg || ((cfu == PXA_PXQ_FMT_P2 || cfu == PXA_PXQ_FMT_P3 || cfu == PXA_PXQ_FMT_P6) &&
-                                    (cfg == PXA_PXQ_FMT_P2 || cfg == PXA_PXQ_FMT_P3 || cfg == PXA_PXQ_FMT_P6)));
+                    (cfu == cfg || ((cfu == PXA_PXQ_FMT_P1 || cfu == PXA_PXQ_FMT_P2 ||
+                                     cfu == PXA_PXQ_FMT_P3 || cfu == PXA_PXQ_FMT_P6) &&
+                                    (cfg == PXA_PXQ_FMT_P1 || cfg == PXA_PXQ_FMT_P2 ||
+                                     cfg == PXA_PXQ_FMT_P3 || cfg == PXA_PXQ_FMT_P6)));
                 moe_capturable = pair_ok &&
                     src0_2 &&
                     (puop == GGML_UNARY_OP_SWIGLU_OAI || puop == GGML_UNARY_OP_SILU) &&
