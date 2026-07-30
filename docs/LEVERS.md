@@ -580,3 +580,13 @@ Documented so the sm_70 dead ends are reproducible instead of folklore:
 | `PXA_ENHANCE_DBG` | off | `pxa-enhance.cuh` | prints the detected topology + every chosen ENHANCE config (diagnostic; use it to audit what the adaptive layer decided) |
 | `PXA_CUDA_GRAPH_MOE` / `_LRU` / `_REARM` / `_BATCH_MAX_NY` | — | `ggml-cuda.cu` | CUDA-graph capture family for the MoE decode path (graphs measured null ×3 on the sm_70 dense cell — see §G of the action register — but the knobs are live for other cells) |
 | `PXA_PXQ6R_ANCHOR_FIT` / `PXA_PXQ6R_SUB` | — | `pxq6.cuh` | PXQ6R tier lab knobs (anchor-fit strategy / sub-scale LUT override) |
+
+### 2026-07-30 late — sampler blast radius + the checkpoint flags documented
+
+| var / flag | default | what it does |
+|---|---|---|
+| `PXA_SAMPLE_SOFTFAIL_v1` (behavior, no env to enable) / `PXA_SAMPLE_ABORT` | soft-fail ON; `PXA_SAMPLE_ABORT=1` restores the old fatal | An unsampleable probability vector (NaN-cascade from garbage logits) used to `GGML_ABORT` the WHOLE server at `llama-sampling.cpp` — one poisoned slot killing every co-resident generation, the same blast-radius class as the old ret=-3 unwind. Observed live 2026-07-30 on the DGX teacher (hy_v3, checkpoint-restore → full-reprocess → "Failed to sample token" → abort → the abort-path fork hang). Now: forensic dump on first occurrence (`probabilities.txt` kept), loud `PXA_SAMPLE_SOFTFAIL_v1` log, deterministic fallback token (max finite logit, else first candidate) — the request may degenerate, the server survives |
+| `--ctx-checkpoints N` | **32** per slot | max recurrent/KV context checkpoints per slot (0 disables checkpointing). ⚠ Load-bearing operational knowledge: **`--ctx-checkpoints 0` was the H2 mitigation** for the recurrent-checkpoint contamination on `qwen35moe` hybrids **on pre-2026-07-28 binaries**; the canonical tree carries `PXA_CKPT_HYBRID_ROLLBACK_v1` which fixes the contamination properly (rollback gate on `seq_pos_max`, checkpoint match on `cur.pos_max`). Any binary WITHOUT that fix (e.g. the DGX `build-pxa-new`, `build-mmfast`) must either serve `cache_prompt:false` client-side or be upgraded — the 2026-07-30 DGX fatal chain started exactly here. Note some older builds do not have this flag at all: check `--help` before relying on it |
+| `--ctx-checkpoints-interval N` | 512 | min tokens between checkpoints |
+| `--ctx-checkpoints-tolerance N` | 5 | tokens-before-full-prompt at which a checkpoint is created |
+| `--ctx-checkpoints-eviction NAME` | variance | eviction strategy: `fifo`, `variance`, `auto`(=variance); variance keeps uniform positional coverage |
