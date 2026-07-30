@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -325,12 +326,24 @@ static int prepare_imatrix(const std::string & imatrix_file,
     return m_last_call;
 }
 
+// PXA_TYPEARG_STRICT_v1 (2026-07-30): case-insensitive name compare. The canonical ggml
+// names are mixed-case ("q6_K", "q4_K") while every human types lowercase — and the old
+// strcmp-exact match made `--token-embedding-type q6_k` parse to GGML_TYPE_COUNT, which the
+// consumer treats as "flag not given": a silently different model that benches normally.
+// (Verified 2026-07-29: token_embd landed on mxfp4, exit 0, no warning.)
+static bool pxa_type_name_eq(const char * a, const char * b) {
+    for (; *a && *b; ++a, ++b) {
+        if (tolower((unsigned char) *a) != tolower((unsigned char) *b)) return false;
+    }
+    return *a == *b; // both at NUL
+}
+
 static ggml_type parse_ggml_type(const char * arg) {
     ggml_type result = GGML_TYPE_COUNT;
     for (int j = 0; j < GGML_TYPE_COUNT; ++j) {
         auto type = ggml_type(j);
         const auto * name = ggml_type_name(type);
-        if (name && strcmp(arg, name) == 0) {
+        if (name && pxa_type_name_eq(arg, name)) {
             result = type; break;
         }
     }
@@ -339,11 +352,31 @@ static ggml_type parse_ggml_type(const char * arg) {
         // lowercase "pxq6" now resolves via ggml_type_name to the REAL 5-bit tier (id 256) —
         // the transitional 2026-07-19 alias pxq6->pxq4 is gone. "pxq6hq" stays a deprecated
         // alias for the 4-bit HQ tier (id 253).
-        if      (strcmp(arg, "pxq6hq")  == 0) result = GGML_TYPE_PXQ4HQ;  // deprecated: displayed "pxq4hq"
-        else if (strcmp(arg, "pxq4-hq") == 0) result = GGML_TYPE_PXQ4HQ;
-        else if (strcmp(arg, "pxq4_hq") == 0) result = GGML_TYPE_PXQ4HQ;
+        if      (pxa_type_name_eq(arg, "pxq6hq")  ) result = GGML_TYPE_PXQ4HQ;  // deprecated: displayed "pxq4hq"
+        else if (pxa_type_name_eq(arg, "pxq4-hq") ) result = GGML_TYPE_PXQ4HQ;
+        else if (pxa_type_name_eq(arg, "pxq4_hq") ) result = GGML_TYPE_PXQ4HQ;
     }
     return result;
+}
+
+// PXA_TYPEARG_STRICT_v1: hard-fail on an unparseable type name. All 12 --*-type flags used
+// to assign parse_ggml_type()'s failure value (GGML_TYPE_COUNT) unconditionally, and the
+// consumer guard `if (type < GGML_TYPE_COUNT)` then skipped the flag IN SILENCE — exit 0,
+// clean logs, wrong artifact. --custom-q always validated; the asymmetry was the bug.
+static ggml_type parse_ggml_type_or_die(const char * arg) {
+    const ggml_type t = parse_ggml_type(arg);
+    if (t == GGML_TYPE_COUNT) {
+        fprintf(stderr,
+            "\n============================================================\n"
+            "ERROR: invalid/unknown ggml type name '%s' for a --*-type flag.\n"
+            "Names are matched case-insensitively against ggml_type_name()\n"
+            "(e.g. q6_K, q4_K, iq4_ks, mxfp4, pxq4, pxq6). Refusing to run:\n"
+            "silently ignoring a tensor-type override would produce a model\n"
+            "that differs from build intent while benching normally.\n"
+            "============================================================\n\n", arg);
+        exit(1);
+    }
+    return t;
 }
 
 using CustomQ = std::pair<std::string, ggml_type>;
@@ -414,73 +447,73 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--output-tensor-type") == 0) {
             if (arg_idx < argc-1) {
-                params.output_tensor_type = parse_ggml_type(argv[++arg_idx]);
+                params.output_tensor_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--extra-output-tensor") == 0) {
             if (arg_idx < argc-1) {
-                params.extra_output_type = parse_ggml_type(argv[++arg_idx]);
+                params.extra_output_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--token-embedding-type") == 0) {
             if (arg_idx < argc-1) {
-                params.token_embedding_type = parse_ggml_type(argv[++arg_idx]);
+                params.token_embedding_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--ffn-gate-inp-type") == 0) {
             if (arg_idx < argc-1) {
-                params.ffn_gate_inp_type = parse_ggml_type(argv[++arg_idx]);
+                params.ffn_gate_inp_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--attn-q-type") == 0) {
             if (arg_idx < argc-1) {
-                params.attn_q_type = parse_ggml_type(argv[++arg_idx]);
+                params.attn_q_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--attn-k-type") == 0) {
             if (arg_idx < argc-1) {
-                params.attn_k_type = parse_ggml_type(argv[++arg_idx]);
+                params.attn_k_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--attn-v-type") == 0) {
             if (arg_idx < argc-1) {
-                params.attn_v_type = parse_ggml_type(argv[++arg_idx]);
+                params.attn_v_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--attn-qkv-type") == 0) {
             if (arg_idx < argc-1) {
-                params.attn_qkv_type = parse_ggml_type(argv[++arg_idx]);
+                params.attn_qkv_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--attn-output-type") == 0) {
             if (arg_idx < argc-1) {
-                params.attn_output_type = parse_ggml_type(argv[++arg_idx]);
+                params.attn_output_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--ffn-gate-type") == 0) {
             if (arg_idx < argc-1) {
-                params.ffn_gate_type = parse_ggml_type(argv[++arg_idx]);
+                params.ffn_gate_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--ffn-down-type") == 0) {
             if (arg_idx < argc-1) {
-                params.ffn_down_type = parse_ggml_type(argv[++arg_idx]);
+                params.ffn_down_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--ffn-up-type") == 0) {
             if (arg_idx < argc-1) {
-                params.ffn_up_type = parse_ggml_type(argv[++arg_idx]);
+                params.ffn_up_type = parse_ggml_type_or_die(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
