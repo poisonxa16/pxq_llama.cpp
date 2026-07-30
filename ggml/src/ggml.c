@@ -163,6 +163,8 @@ typedef pthread_t ggml_thread_t;
     (!defined(TARGET_OS_TV) && !defined(TARGET_OS_WATCH))
 
 #include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
 
 #if defined(__ANDROID__)
 #include <unwind.h>
@@ -222,9 +224,29 @@ static void ggml_print_backtrace_symbols(void) {
 #endif
 
 static void ggml_print_backtrace(void) {
+    // PXA_BT_NOFORK_v1 (2026-07-30): this helper fork()s to attach a debugger on abort.
+    // Two defects made it able to DUPLICATE a live server:
+    //   1. the child called exit() (not _exit()) when gdb/lldb were not found. exit() runs
+    //      atexit handlers / library destructors in a fork child of a heavily multithreaded
+    //      CUDA process whose driver mutexes were held by other threads at fork time — the
+    //      child deadlocks FOREVER, wearing the parent's argv in ps and holding dups of every
+    //      fd including the HTTP listening socket. Observed live (bare-metal DGX, 2026-07-30):
+    //      a second "llama-server" with PPID = the real server, port fights, dead /health.
+    //   2. the parent blocked in waitpid() with no deadline — the aborting thread never
+    //      reached abort(), so the half-dead parent kept serving alongside its stuck child.
+    // Fixes: honor GGML_NO_BACKTRACE (skip the fork entirely), child uses _exit(), parent
+    // waits with a 15 s deadline then SIGKILLs the child and falls back to symbols.
+    if (getenv("GGML_NO_BACKTRACE")) {
+        ggml_print_backtrace_symbols();
+        return;
+    }
     char attach[32];
     snprintf(attach, sizeof(attach), "attach %d", getpid());
     int pid = fork();
+    if (pid < 0) {
+        ggml_print_backtrace_symbols();
+        return;
+    }
     if (pid == 0) {
         // try gdb
         execlp("gdb", "gdb", "--batch",
@@ -240,10 +262,33 @@ static void ggml_print_backtrace(void) {
             "-o", "quit",
             "-p", attach,
             (char *) NULL);
-        exit(EXIT_FAILURE);
+        // NEVER exit() here: atexit/dtor handlers in a fork child of a multithreaded CUDA
+        // process deadlock on mutexes that were held at fork time, leaving an immortal
+        // duplicate of the server. _exit() bypasses all handlers.
+        _exit(EXIT_FAILURE);
     } else {
-        int wstatus;
-        waitpid(pid, &wstatus, 0);
+        int wstatus = 0;
+        int waited_ms = 0;
+        for (;;) {
+            pid_t r = waitpid(pid, &wstatus, WNOHANG);
+            if (r == pid) {
+                break;
+            }
+            if (r < 0) {
+                ggml_print_backtrace_symbols();
+                return;
+            }
+            if (waited_ms >= 15000) {
+                // debugger attached to a wedged CUDA process can itself hang — do not
+                // let the aborting thread block forever behind it
+                kill(pid, SIGKILL);
+                waitpid(pid, &wstatus, 0);
+                ggml_print_backtrace_symbols();
+                return;
+            }
+            usleep(100 * 1000);
+            waited_ms += 100;
+        }
         if (WIFEXITED(wstatus)) {
             if (WEXITSTATUS(wstatus) == EXIT_FAILURE) {
                 // gdb failed, fallback to backtrace_symbols
