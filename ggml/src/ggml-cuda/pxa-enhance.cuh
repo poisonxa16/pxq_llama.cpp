@@ -377,7 +377,7 @@ static inline bool pxa_fa_mask_skip_tile() {
 // REFERENCE, DEFAULT and ENHANCE, BALANCE and MAX alike — because the non-FA prefill chain
 // inflates the compute buffer (see the resolver body). It has to be bought explicitly, e.g.
 // PXA_FA_PREFILL_SPLIT=64. (The 2026-07-22 posture directive originally auto-set 64 at
-// BALANCE/ENHANCE; that auto-default was withdrawn 2026-07-28 — notes quoting 64 as a default
+// BALANCE/ENHANCE; that auto-default was withdrawn 2026-07-24 — notes quoting 64 as a default
 // are stale.) Env wins (values 1..8 are clamped to 9 for decode/MTP-verify safety). The actual
 // consumer is src/llama-build-context.cpp (a non-CUDA TU) which keeps an in-sync mirror —
 // keep the two in lockstep.
@@ -389,7 +389,7 @@ static inline int pxa_fa_prefill_split_ne11() {
         const char * e = getenv("PXA_FA_PREFILL_SPLIT");
         if (e) { int t = atoi(e); return t <= 0 ? 0 : (t < 9 ? 9 : t); }
         if (pxa_config_level() == 0) return 0;    // REFERENCE
-        // EXPERIMENTAL opt-in ONLY (2026-07-28): ENHANCE/BALANCE
+        // EXPERIMENTAL opt-in ONLY (2026-07-24): ENHANCE/BALANCE
         // no longer auto-enable FA_PREFILL_SPLIT — the non-FA prefill chain inflates the
         // compute buffer ~2.35x (1956 -> 4607 MiB measured) and OOMs 16 GB cards at ub2048.
         // The +45% P100 prefill is real but must be bought explicitly (PXA_FA_PREFILL_SPLIT=64)
