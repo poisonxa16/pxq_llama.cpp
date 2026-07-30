@@ -1203,6 +1203,7 @@ struct pxa_pxq_bb_cfg {
     bool hq   = false;   // PXQ4HQ backbone instead of PXQ6 on the 4-/5-bit tiers
     bool univ = false;   // also cover PXQ_UNIVERSAL / PXQ1
     bool lite = false;   // only the promotions that cost nothing at decode
+    bool core = false;   // GEMM backbone at the byte-parity PXQ4 core tier (MMVQ-eligible)
 };
 
 static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
@@ -1216,6 +1217,7 @@ static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
             if (has("legacy") || has("off") || s == "0") c.mode = PXA_BB_LEGACY;
             if (has("hq"))                               c.hq   = true;
             if (has("lite"))                             c.lite = true;
+            if (has("core"))                             c.core = true;
             if (has("universal") || has("all"))          c.univ = true;
         }
         if (c.mode == PXA_BB_LEGACY) {
@@ -1224,7 +1226,9 @@ static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
         } else {
             LLAMA_LOG_INFO("PXQ backbone rules: REV 2 (per-class promotion%s%s%s) — "
                            "PXA_PXQ_BACKBONE=legacy restores the old flat-MXFP4 backbone\n",
-                           c.lite ? ", LITE (decode-free classes only)" : (c.hq ? ", PXQ4HQ backbone" : ""),
+                           c.lite ? ", LITE (decode-free classes only)"
+                                  : (c.core ? ", CORE (byte-parity PXQ4 GEMM backbone)"
+                                            : (c.hq ? ", PXQ4HQ backbone" : "")),
                            c.univ ? ", incl. PXQ_UNIVERSAL/PXQ1" : "", "");
         }
         return c;
@@ -1296,6 +1300,10 @@ static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, 
     return false;
 }
 
+// LOUD-DEMOTE counter: explicit --custom-q PXQ targets that geometry forced off their
+// requested type in this run (printed in the end-of-run summary; see the write loop).
+static int g_pxa_customq_demoted = 0;
+
 // The resolver. Returns GGML_TYPE_COUNT for "not mine — leave to the legacy pipeline".
 static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier) {
     const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
@@ -1307,20 +1315,52 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     }
     if (pxa_name_ends(name, "_exps.weight"))            return GGML_TYPE_COUNT;   // expert path owns it
     if (pxa_name_is(name, "output.weight"))             return GGML_TYPE_COUNT;   // pxa_pxq_head_type()
-    if (name.find(".nextn.") != std::string::npos)      return GGML_TYPE_COUNT;   // MTP companion
-    if (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight") ||
-        pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
+    // MTP companion (eh_proj etc., non-expert): draft-path only, but a contaminated draft costs
+    // acceptance rate, and these are a handful of small tensors. Q8_0 instead of the old flat
+    // MXFP4 (zero-MXFP4 rule, 2026-07-28). The nextn _exps stacks are caught above.
+    if (name.find(".nextn.") != std::string::npos)      return GGML_TYPE_Q8_0;
+    // DeltaNet per-head decay/gate projections: 32 rows < the 64-row PXQ panel — geometrically
+    // impossible for the slab codecs, and their error acts multiplicatively on the recurrent
+    // state. Q8_0 (+0.011% file size on the 35B) instead of the old flat-MXFP4 landing
+    // (zero-MXFP4 rule, 2026-07-28).
+    if (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight")) {
+        return GGML_TYPE_Q8_0;
+    }
+    // ssm_out (DeltaNet output projection, geometry-eligible): measured on Fusion4-35B
+    // 2026-07-28 — see the measurement note at this table's header. Left on the legacy landing
+    // until that measurement says otherwise; use --custom-q '(ssm_out\.weight)=pxq4' to build
+    // the native arm.
+    if (pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
 
     // token embeddings: a row GATHER, never a GEMM, so the P100 "k-quants are slow" rule does
     // not apply. Q6_K kills 0.121 relative RMS + the MXFP4 gain bias for ~+0.08 GiB on Laguna.
     if (pxa_name_is(name, "token_embd.weight")) {
         return t->ne[0] % QK_K == 0 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
     }
-    // K and V projections are already q8_0 in both our files and Q4_K_M's — parity, keep.
+    // K and V projections default to q8_0 (parity with our shipped files and Q4_K_M).
     // attn_v_b is MLA's V projection and was inheriting flat MXFP4; same role, same rule.
+    // PXA_PXQ_KV (documented in docs/LEVERS.md but never landed in source until 2026-07-28 —
+    // the docs row described three silent gates; all three clear here because the resolver
+    // returns an EXPLICIT type and the write loop's eligibility is geometry-only now):
+    // overrides the pin. Accepts q8_0|pxq4|pxq4hq|pxq6|mxfp4. NOTE the q8_0 "parity" premise is
+    // false against a flat-MXFP4 legacy file (its K/V are MXFP4) — `mxfp4` restores true byte
+    // parity for A/B work; the pxq tiers are the native option.
     if (pxa_name_is(name, "attn_k.weight") || pxa_name_is(name, "attn_v.weight") ||
         pxa_name_is(name, "attn_v_b.weight")) {
-        return GGML_TYPE_Q8_0;
+        static const ggml_type kv = [] {
+            const char * e = getenv("PXA_PXQ_KV");
+            if (!e || !*e) return GGML_TYPE_Q8_0;
+            std::string s(e);
+            for (auto & ch : s) ch = std::tolower(ch);
+            if (s == "q8_0")   return GGML_TYPE_Q8_0;
+            if (s == "pxq4")   return GGML_TYPE_PXQ4;
+            if (s == "pxq4hq") return GGML_TYPE_PXQ4HQ;
+            if (s == "pxq6")   return GGML_TYPE_PXQ6;
+            if (s == "mxfp4")  return GGML_TYPE_MXFP4;
+            LLAMA_LOG_WARN("PXA_PXQ_KV: unknown type '%s' — keeping q8_0\n", s.c_str());
+            return GGML_TYPE_Q8_0;
+        }();
+        return kv;
     }
     // THE Laguna killer: a per-HEAD attention gate is a handful of softplus scalars per layer
     // (Laguna: 72 rows, 0.03% of the file) whose error multiplies an ENTIRE head. Never
@@ -1351,6 +1391,12 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     // NEVER a silent MXFP4 demotion, which is the error class this whole revision removes.
     if (!pxq4_tensor_geometry_ok(t)) {
         return GGML_TYPE_Q8_0;
+    }
+    // CORE (2026-07-28, the sm_70 dense-decode recipe): the whole GEMM backbone at the
+    // byte-parity PXQ4 core tier — 4.2526 bpw vs MXFP4's 4.2500, MMVQ-eligible on every class.
+    // Previously only expressible via --custom-q (the PXQ4core arm in the sm_70 campaign).
+    if (cfg.core) {
+        return GGML_TYPE_PXQ4;
     }
     const ggml_type hi = cfg.hq ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ6;
     switch (tier) {
@@ -2412,25 +2458,43 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         new_size, 1, params);
 
                     name = extra.name;
-                } else if (!pxq4_tensor_eligible(name, tensor) &&
+                } else if (!pxq4_tensor_geometry_ok(tensor) &&
                            (new_type == GGML_TYPE_PXQ1 || new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
                             new_type == GGML_TYPE_PXQ4 || new_type == GGML_TYPE_PXQ4HQ ||
                             new_type == GGML_TYPE_PXQ6)) {
-                    // safety: a PXQ target on a non-eligible tensor (bad custom rule) — the
-                    // native codecs need _exps geometry and there is no CPU codec to fall to.
-                    // BACKBONE_REV 2 changed the landing type from mxfp4 to q8_0: this path
-                    // only ever fires on rare, small tensors, and MXFP4's two failure channels
-                    // (a 3.54-effective-bit codec at 4.25 bpw, plus a systematic gain bias) make
-                    // it the one type we never want to fall into silently. Legacy mode keeps
-                    // the old mxfp4 landing so it byte-reproduces pre-rev-2 recipes.
+                    // safety: a PXQ target on a geometry-ineligible tensor (bad custom rule) —
+                    // the slab codecs need 64-row panels / 32-wide blocks and there is no CPU
+                    // codec to fall to. BACKBONE_REV 2 changed the landing type from mxfp4 to
+                    // q8_0: this path only ever fires on rare, small tensors, and MXFP4's two
+                    // failure channels (a 3.54-effective-bit codec at 4.25 bpw, plus a
+                    // systematic gain bias) make it the one type we never want to fall into
+                    // silently. Legacy mode keeps the old mxfp4 landing so it byte-reproduces
+                    // pre-rev-2 recipes.
+                    // NOTE (2026-07-28): this gate used to be the full CLASS-based
+                    // pxq4_tensor_eligible(), which silently demoted an EXPLICIT --custom-q PXQ
+                    // target under PXA_PXQ_BACKBONE=legacy — the arm came out byte-identical to
+                    // its control. An explicit PXQ target is now honoured whenever the GEOMETRY
+                    // allows it, in every backbone mode.
                     const bool bb_legacy = pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY;
                     const ggml_type demoted = bb_legacy ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
-                    LLAMA_LOG_WARN("%s: %s is not PXQ-eligible — demoting %s -> %s\n",
-                                   __func__, name.c_str(), ggml_type_name(new_type), ggml_type_name(demoted));
+                    // LOUD-DEMOTE (2026-07-28, owner-requested): a silently demoted EXPLICIT
+                    // --custom-q target is how an A/B arm ends up byte-identical to its control
+                    // and "measures" nothing. Scream, count, and summarize at the end.
+                    if (pxa_custom_rule_matches(params, name)) {
+                        ++g_pxa_customq_demoted;
+                        LLAMA_LOG_ERROR("\n⚠⚠ CUSTOM-Q DEMOTED: %s — your --custom-q rule targeted %s but the tensor "
+                                        "fails PXQ slab geometry (ne0=%" PRId64 ", ne1=%" PRId64 "; needs rows%%64==0, K%%32==0). "
+                                        "Landing on %s instead. The output will NOT test your rule for this tensor.\n",
+                                        name.c_str(), ggml_type_name(new_type), tensor->ne[0], tensor->ne[1],
+                                        ggml_type_name(demoted));
+                    }
+                    LLAMA_LOG_WARN("%s: %s fails PXQ slab geometry (ne0=%" PRId64 ", ne1=%" PRId64 ") — demoting %s -> %s\n",
+                                   __func__, name.c_str(), tensor->ne[0], tensor->ne[1],
+                                   ggml_type_name(new_type), ggml_type_name(demoted));
                     new_type = demoted;
                     do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
                             new_size, chunk_size_multiplier, params);
-                } else if (pxq4_tensor_eligible(name, tensor) &&
+                } else if (pxq4_tensor_geometry_ok(tensor) &&
                            (new_type == GGML_TYPE_PXQ1 || new_type == GGML_TYPE_PXQ2 || new_type == GGML_TYPE_PXQ3 ||
                             new_type == GGML_TYPE_PXQ4 || new_type == GGML_TYPE_PXQ4HQ ||
                             new_type == GGML_TYPE_PXQ6 ||
@@ -2527,6 +2591,11 @@ QuantizationDone:;
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
+    if (g_pxa_customq_demoted > 0) {
+        LLAMA_LOG_ERROR("\n⚠⚠ %d tensor(s) targeted by --custom-q were DEMOTED off their requested PXQ type "
+                        "(slab-geometry failures — see the CUSTOM-Q DEMOTED lines above). "
+                        "Dump and diff the tier table before benching this artifact.\n", g_pxa_customq_demoted);
+    }
 
     // ------------------------------------------------------------------------------------------
     // PXQ-P5 composition summary + assertion (2026-07-27). Motivation: a dense (no-expert)
