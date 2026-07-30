@@ -521,6 +521,145 @@ static bool pxa_argv_has(int argc, char ** argv, std::initializer_list<const cha
     return false;
 }
 
+// ── PXA_CONTAINER_AWARE_v1 (2026-07-30) ─────────────────────────────────────────────────
+// Detect whether this process runs under a container supervisor (Docker/Podman/containerd/
+// k8s/LXC). The wedge monitor's exit-and-let-the-orchestrator-restart contract is only
+// valid when an orchestrator exists; bare metal gets an in-process recovery attempt and a
+// distinct exit code instead (see the PXA_WEDGE_EXIT_v1 block in main). Multi-signal, and
+// the verdict is logged once at startup so it is auditable.
+// Precedence: PXA_IN_CONTAINER=0|1 (operator override) > filesystem/cgroup/env evidence.
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <sstream>
+
+static bool pxa_file_exists(const char * p) {
+    struct stat st;
+    return ::stat(p, &st) == 0;
+}
+
+static bool pxa_file_contains(const char * path, std::initializer_list<const char *> needles, std::string & hit) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        for (const char * n : needles) {
+            if (line.find(n) != std::string::npos) { hit = n; return true; }
+        }
+    }
+    return false;
+}
+
+// Container-internal mountinfo signature: /etc/hostname, /etc/hosts or /etc/resolv.conf
+// bind-mounted from a container-manager path. Checking the MOUNT POINT (field 5) is what
+// keeps a docker HOST honest — a host's mountinfo also lists /var/lib/docker/containers/...
+// mounts of its running containers, so a bare substring test would misclassify every
+// docker-running bare-metal box as "in a container".
+static bool pxa_mountinfo_container_root(std::string & hit) {
+    std::ifstream f("/proc/self/mountinfo");
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream is(line);
+        std::string f1, f2, f3, f4, mp;
+        if (!(is >> f1 >> f2 >> f3 >> f4 >> mp)) continue;
+        if (mp != "/etc/hostname" && mp != "/etc/hosts" && mp != "/etc/resolv.conf") continue;
+        for (const char * n : {"/docker/containers/", "/containers/storage/", "/kubelet/pods/", "/lxc/"}) {
+            if (line.find(n) != std::string::npos) {
+                hit = std::string(n) + " -> " + mp;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool pxa_pid1_env_has_container(std::string & kv_out) {
+    std::ifstream f("/proc/1/environ", std::ios::binary);
+    if (!f) return false; // unreadable (not root in a shared pid ns) — other signals decide
+    std::string blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t pos = 0;
+    while (pos < blob.size()) {
+        size_t end = blob.find('\0', pos);
+        if (end == std::string::npos) end = blob.size();
+        if (blob.compare(pos, 10, "container=") == 0) {
+            kv_out = blob.substr(pos, end - pos);
+            return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+#endif // !_WIN32
+
+static bool pxa_detect_container(std::string & why) {
+    const char * ov = getenv("PXA_IN_CONTAINER");
+    if (ov && *ov) {
+        why = std::string("PXA_IN_CONTAINER=") + ov + " (operator override)";
+        return atoi(ov) != 0;
+    }
+#ifdef _WIN32
+    why = "windows: no container detection implemented, assuming bare metal";
+    return false;
+#else
+    std::string hit;
+    if (pxa_file_exists("/.dockerenv"))        { why = "/.dockerenv present (docker)";           return true; }
+    if (pxa_file_exists("/run/.containerenv")) { why = "/run/.containerenv present (podman)";    return true; }
+    std::string cenv;
+    if (pxa_pid1_env_has_container(cenv))      { why = cenv + " in /proc/1/environ (lxc/nspawn/podman)"; return true; }
+    if (pxa_file_contains("/proc/1/cgroup", {"docker", "containerd", "kubepods", "libpod", "lxc", "buildkit"}, hit)) {
+        why = std::string("'") + hit + "' in /proc/1/cgroup"; return true;
+    }
+    if (pxa_mountinfo_container_root(hit)) {
+        why = std::string("'") + hit + "' in /proc/self/mountinfo"; return true;
+    }
+    why = "no container markers (checked /.dockerenv, /run/.containerenv, /proc/1/environ, /proc/1/cgroup, /proc/self/mountinfo)";
+    return false;
+#endif
+}
+
+// ── PXA_PORT_GUARD_v1 (2026-07-30) ──────────────────────────────────────────────────────
+// Refuse to start when another LIVE process already answers on the target port. bind()
+// alone is not enough of a story: when a fork-orphan (see PXA_BT_NOFORK_v1 in ggml.c) or a
+// forgotten sibling holds the socket, the stock failure is a one-line bind error that says
+// nothing about WHO holds the port — and with SO_REUSEPORT-style setups two servers can
+// silently share one. This probe makes the refusal loud and actionable. PXA_PORT_GUARD=0
+// disables it.
+#ifndef _WIN32
+static bool pxa_port_has_live_listener(const std::string & host, int port) {
+    const std::string probe_host = (host.empty() || host == "0.0.0.0") ? "127.0.0.1" : host;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo * res = nullptr;
+    if (getaddrinfo(probe_host.c_str(), portstr, &hints, &res) != 0 || !res) {
+        return false; // cannot probe — let bind_to_port decide
+    }
+    bool live = false;
+    for (struct addrinfo * ai = res; ai; ai = ai->ai_next) {
+        int fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        struct timeval tv = {1, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (::connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen) == 0) {
+            live = true;
+            ::close(fd);
+            break;
+        }
+        ::close(fd);
+    }
+    freeaddrinfo(res);
+    return live;
+}
+#endif // !_WIN32
+
 // true only if EVERY visible CUDA device is cc 610 (sm_61: P40/GTX 10-series class). That
 // arch is fp16-starved (1:64 rate vs sm_60/P100's full-rate fp16, sm_70+'s tensor cores) and
 // the MLA flash-attention path leans on fp16 — community P40 measurement: fa-on decode is
@@ -607,6 +746,15 @@ int main(int argc, char ** argv) {
     // TODO: not great to use extern vars
     server_log_json = params.log_json;
     server_verbose = params.verbosity > 0;
+
+    // PXA_CONTAINER_AWARE_v1: detect the runtime once, loudly — the wedge monitor's restart
+    // contract depends on it (see the PXA_WEDGE_EXIT_v1 block below). Always printed, even
+    // with logging disabled, so post-mortems can tell which contract was in force.
+    std::string pxa_container_why;
+    const bool pxa_in_container = pxa_detect_container(pxa_container_why);
+    fprintf(stderr, "PXA_CONTAINER_AWARE_v1: runtime=%s (%s)\n",
+            pxa_in_container ? "container" : "bare-metal", pxa_container_why.c_str());
+    fflush(stderr);
 
 
     // struct that contains llama context and inference
@@ -854,6 +1002,24 @@ int main(int argc, char ** argv) {
     // set timeouts and change hostname and port
     svr->set_read_timeout (params.timeout_read);
     svr->set_write_timeout(params.timeout_write);
+
+#ifndef _WIN32
+    // PXA_PORT_GUARD_v1: never let a second server silently coexist with a live sibling on
+    // the same port (the failure mode behind the 2026-07-30 bare-metal duplicate-server
+    // incident). Probe BEFORE bind so the refusal is fast and names the actual cause.
+    {
+        const char * pg = getenv("PXA_PORT_GUARD");
+        if (!(pg && atoi(pg) == 0) && pxa_port_has_live_listener(params.hostname, params.port)) {
+            fprintf(stderr,
+                "\nPXA_PORT_GUARD_v1: a LIVE listener already answers on %s:%d — refusing to start a second server on the same port.\n"
+                "Find and stop the sibling first: ss -ltnp 'sport = :%d'\n"
+                "(If it is a deadlocked fork-orphan, kill the CHILD before the parent — killing the parent first orphans the child and it keeps the port.)\n"
+                "Set PXA_PORT_GUARD=0 to bypass this check.\n\n",
+                params.hostname.c_str(), params.port, params.port);
+            return 1;
+        }
+    }
+#endif
 
     if (!svr->bind_to_port(params.hostname, params.port)) {
         fprintf(stderr, "\ncouldn't bind to server socket: hostname=%s port=%d\n\n", params.hostname.c_str(), params.port);
@@ -2519,36 +2685,72 @@ int main(int argc, char ** argv) {
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
 
-    // PXA_WEDGE_EXIT_v1: honest self-exit on a genuinely hung forward pass (a driver/CUDA wedge no
-    // in-process logic can recover — post-Xid the context is poisoned on these cards). A single
-    // llama_decode call stuck in flight for > PXA_WEDGE_EXIT_MS (default 180000; 0 = off) across 3
-    // consecutive 5s checks => _exit(42); Docker --restart (+ the container belt) reloads the server
-    // fresh. A legitimate decode call is one ub chunk (seconds even at deep context), so 180s
+    // PXA_WEDGE_EXIT_v1 (container-aware since 2026-07-30): honest self-exit on a genuinely
+    // hung forward pass (a driver/CUDA wedge no in-process logic can recover — post-Xid the
+    // context is poisoned on these cards). A single llama_decode call stuck in flight for
+    // > PXA_WEDGE_EXIT_MS (default 180000; 0 = off) across 3 consecutive 5s checks, then:
+    //   * container:   _exit(42) — the orchestrator (--restart / the belt) reloads fresh.
+    //   * bare metal:  no supervisor exists, so exit-and-hope would just leave the port dead.
+    //                  First try in-process recovery: llama_decode_stop() aborts a SOFT wedge
+    //                  at the next abort-callback poll (the scoped ret=-3 unwind releases the
+    //                  slots honestly and errors the clients — nobody hangs). If the decode is
+    //                  STILL in flight 3 checks later it is a hard driver wedge: _exit(41)
+    //                  with a LOUD "no supervisor detected, restart me" banner. 41 != 42 so
+    //                  logs can tell the two contracts apart.
+    // In NEITHER mode does this monitor fork, re-exec, or spawn anything: the process only
+    // ever goes away; an EXTERNAL actor brings it back. (The 2026-07-30 duplicate-server
+    // incident was the abort-path fork in ggml_print_backtrace — fixed as PXA_BT_NOFORK_v1 —
+    // not this monitor; this monitor must never grow such a path.)
+    // A legitimate decode call is one ub chunk (seconds even at deep context), so 180s
     // in-flight is unambiguous. Detached: you cannot join a thread that is stuck in the driver.
     {
         const char * pxa_we_env = getenv("PXA_WEDGE_EXIT_MS");
         const int64_t pxa_wedge_exit_ms = pxa_we_env ? atoll(pxa_we_env) : 180000LL;
         if (pxa_wedge_exit_ms > 0) {
-            std::thread([&ctx_server, pxa_wedge_exit_ms]() {
-                int strikes = 0;
+            std::thread([&ctx_server, pxa_wedge_exit_ms, pxa_in_container]() {
+                const int strikes_max = pxa_in_container ? 3 : 6;
+                int  strikes = 0;
+                bool recovery_tried = false;
                 for (;;) {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     if (ctx_server.pxa_decode_wedged(pxa_wedge_exit_ms)) {
                         ++strikes;
-                        fprintf(stderr, "PXA_WEDGE_EXIT_v1: llama_decode in flight > %lld ms (strike %d/3)\n",
-                                (long long) pxa_wedge_exit_ms, strikes);
+                        fprintf(stderr, "PXA_WEDGE_EXIT_v1: llama_decode in flight > %lld ms (strike %d/%d)\n",
+                                (long long) pxa_wedge_exit_ms, strikes, strikes_max);
                         fflush(stderr);
-                        if (strikes >= 3) {
-                            fprintf(stderr, "PXA_WEDGE_EXIT_v1: confirmed hung forward pass — self-exit(42) for a fresh restart\n");
-                            fflush(stderr);
-                            _exit(42);
+                        if (pxa_in_container) {
+                            if (strikes >= strikes_max) {
+                                fprintf(stderr, "PXA_WEDGE_EXIT_v1: confirmed hung forward pass — self-exit(42) for a fresh restart by the container supervisor\n");
+                                fflush(stderr);
+                                _exit(42);
+                            }
+                        } else {
+                            if (strikes == 3 && !recovery_tried) {
+                                recovery_tried = true;
+                                fprintf(stderr, "PXA_WEDGE_EXIT_v1: BARE-METAL, no container supervisor — attempting in-process recovery via llama_decode_stop() (soft-wedge abort)\n");
+                                fflush(stderr);
+                                llama_decode_stop();
+                            } else if (strikes >= strikes_max) {
+                                fprintf(stderr,
+                                    "PXA_WEDGE_EXIT_v1: =============================================================\n"
+                                    "PXA_WEDGE_EXIT_v1: HARD WEDGE — in-process recovery failed, the forward pass is\n"
+                                    "PXA_WEDGE_EXIT_v1: stuck in the driver. NO CONTAINER SUPERVISOR WAS DETECTED, so\n"
+                                    "PXA_WEDGE_EXIT_v1: NOTHING will restart this server automatically.\n"
+                                    "PXA_WEDGE_EXIT_v1: Exiting with code 41 — the OPERATOR must restart it manually.\n"
+                                    "PXA_WEDGE_EXIT_v1: (Set PXA_IN_CONTAINER=1 to force the container contract, or\n"
+                                    "PXA_WEDGE_EXIT_v1:  PXA_WEDGE_EXIT_MS=0 to disable this monitor entirely.)\n"
+                                    "PXA_WEDGE_EXIT_v1: =============================================================\n");
+                                fflush(stderr);
+                                _exit(41);
+                            }
                         }
                     } else {
                         strikes = 0;
+                        recovery_tried = false;
                     }
                 }
             }).detach();
-            LOG_INFO("PXA_WEDGE_EXIT_v1 armed", {{"stall_ms", pxa_wedge_exit_ms}});
+            LOG_INFO("PXA_WEDGE_EXIT_v1 armed", {{"stall_ms", pxa_wedge_exit_ms}, {"runtime", pxa_in_container ? "container" : "bare-metal"}});
         }
     }
 
