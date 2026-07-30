@@ -180,3 +180,4 @@ a.out.*
 # (GGUFs, fixtures) stay out of the repo.
 pxa-bench/pxq-universal/**/*.gguf
 pxa-bench/pxq-universal/*.gguf
+.ccache-docker/
