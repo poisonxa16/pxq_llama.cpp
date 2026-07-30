@@ -1570,8 +1570,10 @@ llm_expert_gating_func_type   gating_op,
 // construction. Mirror of pxa_fa_prefill_split_ne11() in ggml/src/ggml-cuda/pxa-enhance.cuh
 // (this is a non-CUDA TU) — KEEP THE TWO IN LOCKSTEP, including the level/mode defaults:
 // env wins (0 = off; 1..8 clamped to 9 for decode/MTP-verify safety); PXA_REFERENCE -> 0;
-// PXA_MODE=max -> 0 (fa is off in MAX, the split is inert); BALANCE (default) -> 64 (the
-// 2026-07-22 posture directive — SPLIT is the BALANCE prefill carrier).
+// PXA_MODE=max -> 0 (fa is off in MAX, the split is inert); otherwise 0 — EXPERIMENTAL
+// OPT-IN ONLY since 2026-07-24 (the non-FA prefill chain inflates the compute buffer ~2.35x
+// and OOMs 16 GB cards at ub2048). The old "BALANCE -> 64" default is DEAD; this comment
+// previously still claimed it (doc/comment drift caught by the 2026-07-29 A6 audit).
 static int pxa_fa_prefill_split_ne11_mirror() {
     static const int v = [](){
         const char * e = getenv("PXA_FA_PREFILL_SPLIT");

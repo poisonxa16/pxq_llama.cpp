@@ -4309,6 +4309,43 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 
         llm_load_print_meta(ml, model);
 
+        // PXA model profile (2026-07-29): register the loaded model's identity with ggml so
+        // backend-side PXA_ENHANCE decisions key on (device x MODEL), not device alone. This
+        // runs BEFORE llm_load_tensors (before any graph exists) — the CUDA side re-resolves
+        // model-dependent levers against the profile generation, so init order cannot race it.
+        {
+            struct ggml_pxa_model_profile prof;
+            memset(&prof, 0, sizeof(prof));
+            const auto & hp = model.hparams;
+            int cls = GGML_PXA_MODEL_DENSE;
+            if (hp.n_expert > 0) {
+                switch (model.arch) {
+                    case LLM_ARCH_QWEN35MOE:
+                    case LLM_ARCH_QWEN3NEXT:  cls = GGML_PXA_MODEL_MOE_HYBRID_RECURRENT; break;
+                    case LLM_ARCH_LAGUNA:
+                    case LLM_ARCH_OPENAI_MOE: cls = GGML_PXA_MODEL_MOE_HYBRID_SWA;       break;
+                    default:                  cls = GGML_PXA_MODEL_MOE;                  break;
+                }
+            }
+            prof.model_class   = cls;
+            prof.n_expert      = (int) hp.n_expert;
+            prof.n_expert_used = (int) hp.n_expert_used;
+            prof.n_vocab       = (int) hp.n_vocab;
+            prof.has_mtp_head  = (hp.nextn_predict_layers > 0 ||
+                                  model.arch == LLM_ARCH_GEMMA4_MTP) ? 1 : 0;
+            prof.mtp_active    = model.mtp ? 1 : 0;
+            int n_pxq = 0;
+            for (const auto & w : ml.weights) {
+                if (w.tensor && (w.tensor->type == GGML_TYPE_PXQ4 ||
+                                 w.tensor->type == GGML_TYPE_PXQ4HQ)) {
+                    n_pxq++;
+                }
+            }
+            prof.n_pxq_mmvq_tensors = n_pxq;
+            snprintf(prof.arch_name, sizeof(prof.arch_name), "%s", llama_model_arch_string(&model));
+            ggml_pxa_set_model_profile(&prof);
+        }
+
         if (model.vocab.get_type() != LLAMA_VOCAB_TYPE_NONE &&
             model.hparams.n_vocab != model.vocab.n_tokens()) {
             throw std::runtime_error("vocab size mismatch");
@@ -5149,7 +5186,22 @@ static bool llama_context_has_mtp_outputs(const llama_context & lctx) {
 // the MTP feature row is recurrent-state wide, and the all-token D2H extraction was the dominant
 // 35B prefill cost.
 static bool pxa_mtp_lazy_warmup_enabled() {
-    static const bool on = getenv("PXA_MTP_LAZY_WARMUP") && atoi(getenv("PXA_MTP_LAZY_WARMUP")) == 1;
+    // Level default (2026-07-29): PXA_ENHANCE=1 -> ON (temp-0 output BIT-IDENTICAL, measured
+    // 35B prefill +12% [lazy warmup] then +47% [lazy prompt flags] 2026-07-15; inert on
+    // non-MTP runs — every consumer is behind an MTP-active check). Explicit env always
+    // wins (=0 rolls back); PXA_REFERENCE=1 -> off. Mirrors: examples/server/server-context.cpp
+    // pxa_mtp_lazy_prompt_flags() + the slot resolver — keep the three in lockstep.
+    static const bool on = [](){
+        const char * e = getenv("PXA_MTP_LAZY_WARMUP");
+        if (e) return atoi(e) == 1;
+        const char * r = getenv("PXA_REFERENCE");
+        if (r && atoi(r) != 0) return false;
+        const char * l = getenv("PXA_ENHANCE");
+        const bool v = l && atoi(l) != 0;
+        if (v) fprintf(stderr, "PXA_AUTO: MTP_LAZY_WARMUP=1 (ENHANCE default; bit-identical; "
+                               "override PXA_MTP_LAZY_WARMUP=0)\n");
+        return v;
+    }();
     return on;
 }
 
@@ -6407,6 +6459,23 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         // TODO: extract to a function
         // build worst-case graph
         int n_tokens = (int)std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch);
+        // PXA_MTP_DRAFT_RESERVE_CLAMP (port of upstream ik_llama.cpp #2181): an MTP draft-gen
+        // step consumes exactly one token + one hidden-state vector per decode, so when a
+        // deferred K-shift/s-copy/defrag lands mid-draft the worst-case re-reserve only needs
+        // a 1-token graph -- the full min(n_ctx, n_ubatch)-wide MTP graph is a pure transient
+        // compute-buffer spike. NOTE: in this tree the trigger state is structurally
+        // unreachable in the server (PXA_HYBRID_CTX_SHIFT_v3 never marks the MTP companion's
+        // KV flags: shift mirroring was replaced by seq_rm + rebuild), so this is
+        // defense-in-depth/upstream parity for paths that may re-mark companion flags
+        // (the imatrix MTP draft loop, future arch ports). Under-reserving is safe either
+        // way: the scheduler auto-reallocs when a later, larger graph arrives (ggml-alloc).
+        static const bool pxa_mtp_draft_reserve_clamp = [] {
+            const char * s = getenv("PXA_MTP_DRAFT_RESERVE_CLAMP");
+            return s != nullptr && atoi(s) != 0;
+        }();
+        if (pxa_mtp_draft_reserve_clamp && lctx.cparams.mtp_op_type == MTP_OP_DRAFT_GEN) {
+            n_tokens = 1;
+        }
         int n_past = lctx.cparams.n_ctx - n_tokens;
         llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
         ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, llama_batch_get_one(&token, n_tokens, n_past, 0), true, lctx.cparams.worst_graph_tokens);

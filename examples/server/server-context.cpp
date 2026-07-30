@@ -769,7 +769,16 @@ void server_slot::reset() {
 // Under lazy, prompt tokens are flagged exactly like a non-MTP slot; the prompt-done path still
 // flags the final token (sampling + the lazy self-seed hidden row). Eager mode is byte-unchanged.
 static bool pxa_mtp_lazy_prompt_flags() {
-    static const bool on = getenv("PXA_MTP_LAZY_WARMUP") && atoi(getenv("PXA_MTP_LAZY_WARMUP")) == 1;
+    // In lockstep with pxa_mtp_lazy_warmup_enabled() (src/llama.cpp) — keep the three in lockstep:
+    // explicit env wins; else ENHANCE -> on (bit-identical, measured), REFERENCE/DEFAULT -> off.
+    static const bool on = [](){
+        const char * e = getenv("PXA_MTP_LAZY_WARMUP");
+        if (e) return atoi(e) == 1;
+        const char * r = getenv("PXA_REFERENCE");
+        if (r && atoi(r) != 0) return false;
+        const char * l = getenv("PXA_ENHANCE");
+        return l && atoi(l) != 0;
+    }();
     return on;
 }
 
@@ -2691,6 +2700,24 @@ void server_context::send_partial_response(server_slot& slot, completion_token_o
 }
 
 void server_context::send_final_response(server_slot& slot) {
+    // PXA_UTF8_FINAL_v1 (2026-07-30): a generation cut mid-multibyte-codepoint (n_predict
+    // cap / ignore_eos runaway) leaves a trailing partial UTF-8 sequence in generated_text.
+    // nlohmann::json refuses to serialise it and the WHOLE response 500s
+    // ("incomplete UTF-8 string; last byte: 0x..") AFTER a successful generation — a
+    // content-dependent, seed-reproducible failure that masquerades as flaky infrastructure.
+    // The streaming path already holds back incomplete sequences per-chunk (process_token);
+    // apply the same discipline to the final payload: drop the unrenderable tail bytes.
+    {
+        const size_t utf8_ok = validate_utf8(slot.generated_text);
+        if (utf8_ok < slot.generated_text.size()) {
+            LOG_WARNING("final response: dropping incomplete trailing UTF-8 sequence", {
+                {"id_slot",       slot.id},
+                {"id_task",       slot.id_task},
+                {"dropped_bytes", slot.generated_text.size() - utf8_ok},
+            });
+            slot.generated_text.resize(utf8_ok);
+        }
+    }
     auto res = std::make_unique<server_task_result_cmpl_final>();
     res->final_result = true;
     res->id = slot.id_task;
@@ -4062,14 +4089,45 @@ void server_context::apply_checkpoint(server_slot & slot) {
     if (slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
         int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
 
-        if (pos_min >= pos_min_thold) {
-            SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min);
+        // PXA_CKPT_HYBRID_ROLLBACK_v1 (2026-07-28) — THE recurrent-checkpoint contamination fix.
+        //
+        // For HYBRID arches (qwen35moe / qwen3next Gated-DeltaNet) the unified cache is
+        // one-cell-per-token, so llama_kv_cache_seq_pos_min() returns the ATTENTION side's
+        // minimum (~0 with no SWA) and the old `pos_min >= pos_min_thold` gate NEVER fired —
+        // while the per-sequence recurrent state row (which llama_kv_cache_seq_rm cannot trim)
+        // silently stayed at the END of the previous generation. Any prefix-reuse admission
+        // (n_past < cache size: a repeated request, edited history, eval harness re-entry) then
+        // decoded new tokens against a recurrent state from the FUTURE of a different
+        // generation. One degenerate generation poisoned the slot's state for every later
+        // request — measured live: byte-identical greedy requests flipping from clean tool
+        // calls to 4000-token loops, `tool_choice:"required"` emitting "{ { { {" x740.
+        //
+        // The recurrent state's true position IS the newest cached token (seq_pos_max): the
+        // state was advanced by every decoded token. Roll back whenever it sits AHEAD of the
+        // re-entry point. The checkpoint search must then compare that same quantity —
+        // cur.pos_max, the position the SNAPSHOT's recurrent state is at — against the re-entry
+        // threshold; the old predicate compared cur.pos_min (== 0 on every hybrid checkpoint),
+        // which matched the NEWEST checkpoint unconditionally and restored recurrent state from
+        // the poisoned generation itself.
+        const bool      is_hybrid = llama_model_is_hybrid(llama_get_model(slot.ctx));
+        const llama_pos state_pos = is_hybrid ? llama_kv_cache_seq_pos_max(slot.ctx, slot.id) : -1;
+
+        const bool need_rewind = (pos_min >= pos_min_thold) || (is_hybrid && state_pos > pos_min_thold);
+
+        if (need_rewind) {
+            SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, state_pos = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min, (int)state_pos);
 
             // search for a context checkpoint
             const auto it = std::find_if(
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
                 [&](const auto & cur) {
+                    if (is_hybrid) {
+                        // the snapshot's recurrent state includes every token up to cur.pos_max;
+                        // it is usable only strictly BEFORE the re-entry point (>= 1 token left
+                        // to re-decode for logits, and never state from the divergent future).
+                        return cur.pos_max < pos_min_thold;
+                    }
                     return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                 }
             );
@@ -4090,6 +4148,17 @@ void server_context::apply_checkpoint(server_slot & slot) {
                     SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float)checkpoint_size / 1024 / 1024);
                     do_reset = true;
                     //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
+                } else if (is_hybrid) {
+                    // resume EXCLUSIVE of the snapshot position: the restored recurrent state
+                    // already contains the token at pos_max — re-decoding it would double-apply
+                    // it to the linear-attention state.
+                    pos_next = std::min(pos_next, it->pos_max + 1);
+                    slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
+
+                    pos_next = slot.prompt_tokens.pos_next(slot.n_past_prompt);
+                    pos_next = std::min(pos_next, it->pos_max_prompt + 1);
+                    slot.n_past_prompt = slot.prompt_tokens.size_up_to_pos(pos_next);
+                    SLT_WRN(slot, "restored HYBRID context checkpoint took %.2f ms (state_pos %d -> %d, n_past = %d, size = %.3f MiB)\n", (ggml_time_us() - t_start) / 1000.0, (int)state_pos, it->pos_max, slot.n_past, (float)checkpoint_size / 1024 / 1024);
                 } else {
                     pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                     slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
@@ -4398,6 +4467,15 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         slot.n_past--;
                         if (slot.ga_i > 0) {
                             slot.n_past_se--;
+                        }
+
+                        // PXA_CKPT_HYBRID_ROLLBACK_v1: on a hybrid arch the recurrent state
+                        // already contains the token we just un-counted — re-decoding it
+                        // without a rollback would double-apply it to the DeltaNet state.
+                        // Re-run the rollback against the decremented n_past (it restores a
+                        // strictly-older checkpoint or forces a clean full re-process).
+                        if (llama_model_is_hybrid(llama_get_model(slot.ctx))) {
+                            apply_checkpoint(slot);
                         }
                     }
                     slot.n_prompt_tokens_cache = slot.n_past_prompt;

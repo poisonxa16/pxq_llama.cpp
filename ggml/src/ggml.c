@@ -163,6 +163,8 @@ typedef pthread_t ggml_thread_t;
     (!defined(TARGET_OS_TV) && !defined(TARGET_OS_WATCH))
 
 #include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
 
 #if defined(__ANDROID__)
 #include <unwind.h>
@@ -222,9 +224,29 @@ static void ggml_print_backtrace_symbols(void) {
 #endif
 
 static void ggml_print_backtrace(void) {
+    // PXA_BT_NOFORK_v1 (2026-07-30): this helper fork()s to attach a debugger on abort.
+    // Two defects made it able to DUPLICATE a live server:
+    //   1. the child called exit() (not _exit()) when gdb/lldb were not found. exit() runs
+    //      atexit handlers / library destructors in a fork child of a heavily multithreaded
+    //      CUDA process whose driver mutexes were held by other threads at fork time — the
+    //      child deadlocks FOREVER, wearing the parent's argv in ps and holding dups of every
+    //      fd including the HTTP listening socket. Observed live (bare-metal DGX, 2026-07-30):
+    //      a second "llama-server" with PPID = the real server, port fights, dead /health.
+    //   2. the parent blocked in waitpid() with no deadline — the aborting thread never
+    //      reached abort(), so the half-dead parent kept serving alongside its stuck child.
+    // Fixes: honor GGML_NO_BACKTRACE (skip the fork entirely), child uses _exit(), parent
+    // waits with a 15 s deadline then SIGKILLs the child and falls back to symbols.
+    if (getenv("GGML_NO_BACKTRACE")) {
+        ggml_print_backtrace_symbols();
+        return;
+    }
     char attach[32];
     snprintf(attach, sizeof(attach), "attach %d", getpid());
     int pid = fork();
+    if (pid < 0) {
+        ggml_print_backtrace_symbols();
+        return;
+    }
     if (pid == 0) {
         // try gdb
         execlp("gdb", "gdb", "--batch",
@@ -240,10 +262,33 @@ static void ggml_print_backtrace(void) {
             "-o", "quit",
             "-p", attach,
             (char *) NULL);
-        exit(EXIT_FAILURE);
+        // NEVER exit() here: atexit/dtor handlers in a fork child of a multithreaded CUDA
+        // process deadlock on mutexes that were held at fork time, leaving an immortal
+        // duplicate of the server. _exit() bypasses all handlers.
+        _exit(EXIT_FAILURE);
     } else {
-        int wstatus;
-        waitpid(pid, &wstatus, 0);
+        int wstatus = 0;
+        int waited_ms = 0;
+        for (;;) {
+            pid_t r = waitpid(pid, &wstatus, WNOHANG);
+            if (r == pid) {
+                break;
+            }
+            if (r < 0) {
+                ggml_print_backtrace_symbols();
+                return;
+            }
+            if (waited_ms >= 15000) {
+                // debugger attached to a wedged CUDA process can itself hang — do not
+                // let the aborting thread block forever behind it
+                kill(pid, SIGKILL);
+                waitpid(pid, &wstatus, 0);
+                ggml_print_backtrace_symbols();
+                return;
+            }
+            usleep(100 * 1000);
+            waited_ms += 100;
+        }
         if (WIFEXITED(wstatus)) {
             if (WEXITSTATUS(wstatus) == EXIT_FAILURE) {
                 // gdb failed, fallback to backtrace_symbols
@@ -7996,8 +8041,11 @@ bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate)
     // PXQ-UNIVERSAL mixed tiers (CUDA-only slab types): the fused CUDA MoE kernels
     // handle mixed up/gate pairs over {PXQ2, PXQ3, PXQ4} with independent per-operand
     // policies (ggml-cuda/pxq6.cuh PXQ6_PICK_FMT_GU mixed-pair table).
-    const bool up_ok   = type_up   == GGML_TYPE_PXQ2 || type_up   == GGML_TYPE_PXQ3 || type_up   == GGML_TYPE_PXQ4;
-    const bool gate_ok = type_gate == GGML_TYPE_PXQ2 || type_gate == GGML_TYPE_PXQ3 || type_gate == GGML_TYPE_PXQ4;
+    // PXQ1 added 2026-07-29 alongside its decode dispatch. Without it a mixed P1 pair (e.g.
+    // 122B PXQU24 blk.38: gate=pxq1, up=pxq2) never becomes a fused node, so the CUDA mixed-pair
+    // arms are unreachable and those layers run two separate mul_mat_id ops + a standalone GLU.
+    const bool up_ok   = type_up   == GGML_TYPE_PXQ1 || type_up   == GGML_TYPE_PXQ2 || type_up   == GGML_TYPE_PXQ3 || type_up   == GGML_TYPE_PXQ4;
+    const bool gate_ok = type_gate == GGML_TYPE_PXQ1 || type_gate == GGML_TYPE_PXQ2 || type_gate == GGML_TYPE_PXQ3 || type_gate == GGML_TYPE_PXQ4;
     return up_ok && gate_ok;
 }
 
@@ -30410,3 +30458,41 @@ int ggml_cpu_has_matmul_int8(void) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////
+// PXA model profile (see ggml.h) — written once by the loader, read by backends.
+// The hook fires on registration in EITHER order: set-then-register (backend came
+// up late) or register-then-set (backend came up first). Last write wins.
+
+static struct ggml_pxa_model_profile g_pxa_model_profile;
+static int  g_pxa_model_profile_gen  = 0;
+static void (*g_pxa_model_profile_hook)(void) = NULL;
+
+void ggml_pxa_set_model_profile(const struct ggml_pxa_model_profile * profile) {
+    if (profile) {
+        g_pxa_model_profile = *profile;
+        g_pxa_model_profile.valid = 1;
+        g_pxa_model_profile.arch_name[sizeof(g_pxa_model_profile.arch_name) - 1] = 0;
+    } else {
+        memset(&g_pxa_model_profile, 0, sizeof(g_pxa_model_profile));
+    }
+    g_pxa_model_profile_gen++;
+    if (g_pxa_model_profile_hook) {
+        g_pxa_model_profile_hook();
+    }
+}
+
+const struct ggml_pxa_model_profile * ggml_pxa_get_model_profile(void) {
+    return &g_pxa_model_profile;
+}
+
+int ggml_pxa_model_profile_generation(void) {
+    return g_pxa_model_profile_gen;
+}
+
+void ggml_pxa_register_model_profile_hook(void (*hook)(void)) {
+    g_pxa_model_profile_hook = hook;
+    if (hook && g_pxa_model_profile.valid) {
+        hook();
+    }
+}

@@ -521,6 +521,145 @@ static bool pxa_argv_has(int argc, char ** argv, std::initializer_list<const cha
     return false;
 }
 
+// ── PXA_CONTAINER_AWARE_v1 (2026-07-30) ─────────────────────────────────────────────────
+// Detect whether this process runs under a container supervisor (Docker/Podman/containerd/
+// k8s/LXC). The wedge monitor's exit-and-let-the-orchestrator-restart contract is only
+// valid when an orchestrator exists; bare metal gets an in-process recovery attempt and a
+// distinct exit code instead (see the PXA_WEDGE_EXIT_v1 block in main). Multi-signal, and
+// the verdict is logged once at startup so it is auditable.
+// Precedence: PXA_IN_CONTAINER=0|1 (operator override) > filesystem/cgroup/env evidence.
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <sstream>
+
+static bool pxa_file_exists(const char * p) {
+    struct stat st;
+    return ::stat(p, &st) == 0;
+}
+
+static bool pxa_file_contains(const char * path, std::initializer_list<const char *> needles, std::string & hit) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        for (const char * n : needles) {
+            if (line.find(n) != std::string::npos) { hit = n; return true; }
+        }
+    }
+    return false;
+}
+
+// Container-internal mountinfo signature: /etc/hostname, /etc/hosts or /etc/resolv.conf
+// bind-mounted from a container-manager path. Checking the MOUNT POINT (field 5) is what
+// keeps a docker HOST honest — a host's mountinfo also lists /var/lib/docker/containers/...
+// mounts of its running containers, so a bare substring test would misclassify every
+// docker-running bare-metal box as "in a container".
+static bool pxa_mountinfo_container_root(std::string & hit) {
+    std::ifstream f("/proc/self/mountinfo");
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream is(line);
+        std::string f1, f2, f3, f4, mp;
+        if (!(is >> f1 >> f2 >> f3 >> f4 >> mp)) continue;
+        if (mp != "/etc/hostname" && mp != "/etc/hosts" && mp != "/etc/resolv.conf") continue;
+        for (const char * n : {"/docker/containers/", "/containers/storage/", "/kubelet/pods/", "/lxc/"}) {
+            if (line.find(n) != std::string::npos) {
+                hit = std::string(n) + " -> " + mp;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool pxa_pid1_env_has_container(std::string & kv_out) {
+    std::ifstream f("/proc/1/environ", std::ios::binary);
+    if (!f) return false; // unreadable (not root in a shared pid ns) — other signals decide
+    std::string blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t pos = 0;
+    while (pos < blob.size()) {
+        size_t end = blob.find('\0', pos);
+        if (end == std::string::npos) end = blob.size();
+        if (blob.compare(pos, 10, "container=") == 0) {
+            kv_out = blob.substr(pos, end - pos);
+            return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+#endif // !_WIN32
+
+static bool pxa_detect_container(std::string & why) {
+    const char * ov = getenv("PXA_IN_CONTAINER");
+    if (ov && *ov) {
+        why = std::string("PXA_IN_CONTAINER=") + ov + " (operator override)";
+        return atoi(ov) != 0;
+    }
+#ifdef _WIN32
+    why = "windows: no container detection implemented, assuming bare metal";
+    return false;
+#else
+    std::string hit;
+    if (pxa_file_exists("/.dockerenv"))        { why = "/.dockerenv present (docker)";           return true; }
+    if (pxa_file_exists("/run/.containerenv")) { why = "/run/.containerenv present (podman)";    return true; }
+    std::string cenv;
+    if (pxa_pid1_env_has_container(cenv))      { why = cenv + " in /proc/1/environ (lxc/nspawn/podman)"; return true; }
+    if (pxa_file_contains("/proc/1/cgroup", {"docker", "containerd", "kubepods", "libpod", "lxc", "buildkit"}, hit)) {
+        why = std::string("'") + hit + "' in /proc/1/cgroup"; return true;
+    }
+    if (pxa_mountinfo_container_root(hit)) {
+        why = std::string("'") + hit + "' in /proc/self/mountinfo"; return true;
+    }
+    why = "no container markers (checked /.dockerenv, /run/.containerenv, /proc/1/environ, /proc/1/cgroup, /proc/self/mountinfo)";
+    return false;
+#endif
+}
+
+// ── PXA_PORT_GUARD_v1 (2026-07-30) ──────────────────────────────────────────────────────
+// Refuse to start when another LIVE process already answers on the target port. bind()
+// alone is not enough of a story: when a fork-orphan (see PXA_BT_NOFORK_v1 in ggml.c) or a
+// forgotten sibling holds the socket, the stock failure is a one-line bind error that says
+// nothing about WHO holds the port — and with SO_REUSEPORT-style setups two servers can
+// silently share one. This probe makes the refusal loud and actionable. PXA_PORT_GUARD=0
+// disables it.
+#ifndef _WIN32
+static bool pxa_port_has_live_listener(const std::string & host, int port) {
+    const std::string probe_host = (host.empty() || host == "0.0.0.0") ? "127.0.0.1" : host;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo * res = nullptr;
+    if (getaddrinfo(probe_host.c_str(), portstr, &hints, &res) != 0 || !res) {
+        return false; // cannot probe — let bind_to_port decide
+    }
+    bool live = false;
+    for (struct addrinfo * ai = res; ai; ai = ai->ai_next) {
+        int fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        struct timeval tv = {1, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (::connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen) == 0) {
+            live = true;
+            ::close(fd);
+            break;
+        }
+        ::close(fd);
+    }
+    freeaddrinfo(res);
+    return live;
+}
+#endif // !_WIN32
+
 // true only if EVERY visible CUDA device is cc 610 (sm_61: P40/GTX 10-series class). That
 // arch is fp16-starved (1:64 rate vs sm_60/P100's full-rate fp16, sm_70+'s tensor cores) and
 // the MLA flash-attention path leans on fp16 — community P40 measurement: fa-on decode is
@@ -608,6 +747,15 @@ int main(int argc, char ** argv) {
     server_log_json = params.log_json;
     server_verbose = params.verbosity > 0;
 
+    // PXA_CONTAINER_AWARE_v1: detect the runtime once, loudly — the wedge monitor's restart
+    // contract depends on it (see the PXA_WEDGE_EXIT_v1 block below). Always printed, even
+    // with logging disabled, so post-mortems can tell which contract was in force.
+    std::string pxa_container_why;
+    const bool pxa_in_container = pxa_detect_container(pxa_container_why);
+    fprintf(stderr, "PXA_CONTAINER_AWARE_v1: runtime=%s (%s)\n",
+            pxa_in_container ? "container" : "bare-metal", pxa_container_why.c_str());
+    fflush(stderr);
+
 
     // struct that contains llama context and inference
     server_context ctx_server;
@@ -693,6 +841,107 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // PXA AUTO-TS (2026-07-29): fill -ts on the ONE measured mixed cell. T4 (ENHANCE
+    // topology tune, 2026-07-23) measured a V100-heavy -ts 1.4,0.6 as the DOMINANT mixed-rig
+    // lever: +9.78% decode (76.27 -> 83.73 t/s, PXQ4-35B split V100+P100, -sm layer, 588-tok
+    // prompt), where every kernel lever was neutral; 1.45 loses decode and 1.5+ OOMs the V100.
+    // Scope is deliberately NARROW: exactly 2 CUDA devices, one sm_70 + one sm_60, -ts unset,
+    // ENHANCE level — every other topology keeps the stock proportional-by-VRAM default (the
+    // measured basis does not generalize; a wrong -ts can OOM). CLI -ts always wins;
+    // PXA_AUTO_TS=0 forces off, =1 forces on at any level (never under PXA_REFERENCE=1).
+    {
+#if defined(GGML_USE_CUDA)
+        const char * at = getenv("PXA_AUTO_TS");
+        const char * rr2 = getenv("PXA_REFERENCE");
+        const bool  ref2 = rr2 && atoi(rr2) != 0;
+        const char * en2 = getenv("PXA_ENHANCE");
+        const bool  enh2 = !ref2 && en2 && atoi(en2) != 0;
+        const bool  active = at ? (atoi(at) != 0 && !ref2) : enh2;
+        const bool  ts_explicit = pxa_argv_has(argc, argv, {"-ts", "--tensor-split"});
+        bool ts_unset = true;
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            if (params.tensor_split[i] != 0.0f) { ts_unset = false; break; }
+        }
+        if (active && !ts_explicit && ts_unset && ggml_backend_cuda_get_device_count() == 2) {
+            const int cc0 = ggml_backend_cuda_get_device_cc(0);
+            const int cc1 = ggml_backend_cuda_get_device_cc(1);
+            const bool mixed_70_60 = (cc0 == 700 && cc1 == 600) || (cc0 == 600 && cc1 == 700);
+            if (mixed_70_60) {
+                const int hi = (cc0 == 700) ? 0 : 1;
+                params.tensor_split[hi]     = 1.4f;
+                params.tensor_split[1 - hi] = 0.6f;
+                fprintf(stderr, "PXA_AUTO: tensor_split dev%d(sm_70)=1.4 dev%d(sm_60)=0.6 "
+                                "(measured T4 cell: +9.78%% decode vs balanced, PXQ4-35B V100+P100 "
+                                "-sm layer; override -ts or PXA_AUTO_TS=0)\n", hi, 1 - hi);
+            }
+        }
+#endif
+    }
+
+    // PXA AUTO-SAMPLERS (2026-07-29): model-family sampler DEFAULTS, ENHANCE-level only.
+    // Fills only fields the CLI left unset (per-field --temp/--top-k/--top-p/--min-p
+    // explicitness check); per-request sampler params still override per request as always.
+    // Gate: PXA_AUTO_SAMPLERS=0 forces off, =1 forces on at any level; unset -> engages only
+    // under PXA_ENHANCE=1 (and never under PXA_REFERENCE=1), so DEFAULT-level behavior is
+    // byte-identical to before this layer existed. Every applied default logs value+reason.
+    // The one PERFORMANCE-critical rule (measured): top_k<=0 means a full-vocab CPU sort
+    // EVERY token — on a ~201k vocab that HALVED decode (31 vs 65 t/s, gpt-oss-120b,
+    // 6-card cell, 2026-07-04). The guard clamps an unset-or-0 top_k to 100.
+    {
+        const char * as = getenv("PXA_AUTO_SAMPLERS");
+        const char * rr = getenv("PXA_REFERENCE");
+        const bool  ref = rr && atoi(rr) != 0;
+        const char * en = getenv("PXA_ENHANCE");
+        const bool  enh = !ref && en && atoi(en) != 0;
+        const bool  active = as ? (atoi(as) != 0 && !ref) : enh;
+        if (active) {
+            const std::string arch = pxa_gguf_arch(params.model);
+            const bool t_exp = pxa_argv_has(argc, argv, {"--temp"});
+            const bool k_exp = pxa_argv_has(argc, argv, {"--top-k"});
+            const bool p_exp = pxa_argv_has(argc, argv, {"--top-p"});
+            const bool m_exp = pxa_argv_has(argc, argv, {"--min-p"});
+            struct pxa_sampler_row { const char * arch; float temp; int top_k; float top_p; float min_p; const char * why; };
+            static const pxa_sampler_row tab[] = {
+                // gpt-oss "official" is top_k=0 — measured to HALVE decode (full-vocab sort);
+                // top_k=100 is the measured-negligible-quality fix (2026-07-04).
+                { "gpt-oss",   1.0f, 100, 1.00f, 0.00f, "gpt-oss family defaults; top_k=100 not 0 (top_k=0 halves decode: full-201k-vocab CPU sort/token)" },
+                { "qwen35moe", 0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
+                { "qwen3next", 0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
+                { "qwen35",    0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
+                { "laguna",    0.7f,  20, 0.80f, 0.00f, "qwen-family hybrid — qwen no-think defaults (HEURISTIC: no per-model sampler sweep yet)" },
+            };
+            const pxa_sampler_row * row = nullptr;
+            for (const auto & r : tab) {
+                if (arch == r.arch) { row = &r; break; }
+            }
+            if (row) {
+                if (!t_exp) params.sparams.temp  = row->temp;
+                if (!k_exp) params.sparams.top_k = row->top_k;
+                if (!p_exp) params.sparams.top_p = row->top_p;
+                if (!m_exp) params.sparams.min_p = row->min_p;
+                fprintf(stderr, "PXA_AUTO: samplers arch=%s -> temp=%.2f%s top_k=%d%s top_p=%.2f%s min_p=%.2f%s (%s; "
+                                "override: the CLI flag or PXA_AUTO_SAMPLERS=0)\n",
+                        arch.c_str(),
+                        params.sparams.temp,  t_exp ? "(cli)" : "",
+                        params.sparams.top_k, k_exp ? "(cli)" : "",
+                        params.sparams.top_p, p_exp ? "(cli)" : "",
+                        params.sparams.min_p, m_exp ? "(cli)" : "",
+                        row->why);
+            } else {
+                fprintf(stderr, "PXA_AUTO: samplers arch=%s -> no family row, stock defaults kept "
+                                "(temp=%.2f top_k=%d top_p=%.2f min_p=%.2f)\n",
+                        arch.empty() ? "?" : arch.c_str(),
+                        params.sparams.temp, params.sparams.top_k, params.sparams.top_p, params.sparams.min_p);
+            }
+            // The generic performance guard, independent of the family table.
+            if (!k_exp && params.sparams.top_k <= 0) {
+                params.sparams.top_k = 100;
+                fprintf(stderr, "PXA_AUTO: top_k<=0 clamped to 100 (top_k=0 forces a full-vocab CPU sort "
+                                "every token — measured decode HALVED on a 201k vocab; override --top-k)\n");
+            }
+        }
+    }
+
     LOG_INFO("build info", {
         {"build",  LLAMA_BUILD_NUMBER},
         {"commit", LLAMA_COMMIT}
@@ -753,6 +1002,24 @@ int main(int argc, char ** argv) {
     // set timeouts and change hostname and port
     svr->set_read_timeout (params.timeout_read);
     svr->set_write_timeout(params.timeout_write);
+
+#ifndef _WIN32
+    // PXA_PORT_GUARD_v1: never let a second server silently coexist with a live sibling on
+    // the same port (the failure mode behind the 2026-07-30 bare-metal duplicate-server
+    // incident). Probe BEFORE bind so the refusal is fast and names the actual cause.
+    {
+        const char * pg = getenv("PXA_PORT_GUARD");
+        if (!(pg && atoi(pg) == 0) && pxa_port_has_live_listener(params.hostname, params.port)) {
+            fprintf(stderr,
+                "\nPXA_PORT_GUARD_v1: a LIVE listener already answers on %s:%d — refusing to start a second server on the same port.\n"
+                "Find and stop the sibling first: ss -ltnp 'sport = :%d'\n"
+                "(If it is a deadlocked fork-orphan, kill the CHILD before the parent — killing the parent first orphans the child and it keeps the port.)\n"
+                "Set PXA_PORT_GUARD=0 to bypass this check.\n\n",
+                params.hostname.c_str(), params.port, params.port);
+            return 1;
+        }
+    }
+#endif
 
     if (!svr->bind_to_port(params.hostname, params.port)) {
         fprintf(stderr, "\ncouldn't bind to server socket: hostname=%s port=%d\n\n", params.hostname.c_str(), params.port);
@@ -2418,36 +2685,72 @@ int main(int argc, char ** argv) {
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
 
-    // PXA_WEDGE_EXIT_v1: honest self-exit on a genuinely hung forward pass (a driver/CUDA wedge no
-    // in-process logic can recover — post-Xid the context is poisoned on these cards). A single
-    // llama_decode call stuck in flight for > PXA_WEDGE_EXIT_MS (default 180000; 0 = off) across 3
-    // consecutive 5s checks => _exit(42); Docker --restart (+ the container belt) reloads the server
-    // fresh. A legitimate decode call is one ub chunk (seconds even at deep context), so 180s
+    // PXA_WEDGE_EXIT_v1 (container-aware since 2026-07-30): honest self-exit on a genuinely
+    // hung forward pass (a driver/CUDA wedge no in-process logic can recover — post-Xid the
+    // context is poisoned on these cards). A single llama_decode call stuck in flight for
+    // > PXA_WEDGE_EXIT_MS (default 180000; 0 = off) across 3 consecutive 5s checks, then:
+    //   * container:   _exit(42) — the orchestrator (--restart / the belt) reloads fresh.
+    //   * bare metal:  no supervisor exists, so exit-and-hope would just leave the port dead.
+    //                  First try in-process recovery: llama_decode_stop() aborts a SOFT wedge
+    //                  at the next abort-callback poll (the scoped ret=-3 unwind releases the
+    //                  slots honestly and errors the clients — nobody hangs). If the decode is
+    //                  STILL in flight 3 checks later it is a hard driver wedge: _exit(41)
+    //                  with a LOUD "no supervisor detected, restart me" banner. 41 != 42 so
+    //                  logs can tell the two contracts apart.
+    // In NEITHER mode does this monitor fork, re-exec, or spawn anything: the process only
+    // ever goes away; an EXTERNAL actor brings it back. (The 2026-07-30 duplicate-server
+    // incident was the abort-path fork in ggml_print_backtrace — fixed as PXA_BT_NOFORK_v1 —
+    // not this monitor; this monitor must never grow such a path.)
+    // A legitimate decode call is one ub chunk (seconds even at deep context), so 180s
     // in-flight is unambiguous. Detached: you cannot join a thread that is stuck in the driver.
     {
         const char * pxa_we_env = getenv("PXA_WEDGE_EXIT_MS");
         const int64_t pxa_wedge_exit_ms = pxa_we_env ? atoll(pxa_we_env) : 180000LL;
         if (pxa_wedge_exit_ms > 0) {
-            std::thread([&ctx_server, pxa_wedge_exit_ms]() {
-                int strikes = 0;
+            std::thread([&ctx_server, pxa_wedge_exit_ms, pxa_in_container]() {
+                const int strikes_max = pxa_in_container ? 3 : 6;
+                int  strikes = 0;
+                bool recovery_tried = false;
                 for (;;) {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     if (ctx_server.pxa_decode_wedged(pxa_wedge_exit_ms)) {
                         ++strikes;
-                        fprintf(stderr, "PXA_WEDGE_EXIT_v1: llama_decode in flight > %lld ms (strike %d/3)\n",
-                                (long long) pxa_wedge_exit_ms, strikes);
+                        fprintf(stderr, "PXA_WEDGE_EXIT_v1: llama_decode in flight > %lld ms (strike %d/%d)\n",
+                                (long long) pxa_wedge_exit_ms, strikes, strikes_max);
                         fflush(stderr);
-                        if (strikes >= 3) {
-                            fprintf(stderr, "PXA_WEDGE_EXIT_v1: confirmed hung forward pass — self-exit(42) for a fresh restart\n");
-                            fflush(stderr);
-                            _exit(42);
+                        if (pxa_in_container) {
+                            if (strikes >= strikes_max) {
+                                fprintf(stderr, "PXA_WEDGE_EXIT_v1: confirmed hung forward pass — self-exit(42) for a fresh restart by the container supervisor\n");
+                                fflush(stderr);
+                                _exit(42);
+                            }
+                        } else {
+                            if (strikes == 3 && !recovery_tried) {
+                                recovery_tried = true;
+                                fprintf(stderr, "PXA_WEDGE_EXIT_v1: BARE-METAL, no container supervisor — attempting in-process recovery via llama_decode_stop() (soft-wedge abort)\n");
+                                fflush(stderr);
+                                llama_decode_stop();
+                            } else if (strikes >= strikes_max) {
+                                fprintf(stderr,
+                                    "PXA_WEDGE_EXIT_v1: =============================================================\n"
+                                    "PXA_WEDGE_EXIT_v1: HARD WEDGE — in-process recovery failed, the forward pass is\n"
+                                    "PXA_WEDGE_EXIT_v1: stuck in the driver. NO CONTAINER SUPERVISOR WAS DETECTED, so\n"
+                                    "PXA_WEDGE_EXIT_v1: NOTHING will restart this server automatically.\n"
+                                    "PXA_WEDGE_EXIT_v1: Exiting with code 41 — the OPERATOR must restart it manually.\n"
+                                    "PXA_WEDGE_EXIT_v1: (Set PXA_IN_CONTAINER=1 to force the container contract, or\n"
+                                    "PXA_WEDGE_EXIT_v1:  PXA_WEDGE_EXIT_MS=0 to disable this monitor entirely.)\n"
+                                    "PXA_WEDGE_EXIT_v1: =============================================================\n");
+                                fflush(stderr);
+                                _exit(41);
+                            }
                         }
                     } else {
                         strikes = 0;
+                        recovery_tried = false;
                     }
                 }
             }).detach();
-            LOG_INFO("PXA_WEDGE_EXIT_v1 armed", {{"stall_ms", pxa_wedge_exit_ms}});
+            LOG_INFO("PXA_WEDGE_EXIT_v1 armed", {{"stall_ms", pxa_wedge_exit_ms}, {"runtime", pxa_in_container ? "container" : "bare-metal"}});
         }
     }
 
