@@ -1,4 +1,4 @@
-== pxa-profile p100-pxq2  model=fusion2-35b-PXQ2.gguf  gpus=GPU-3ee56dcf-9b10-9395-e762-e90d8635d4c8  2026-07-21T15:01:02Z ==
+== pxa-profile p100-pxq2  model=fusion2-35b-PXQ2.gguf  gpus=<redacted>  2026-07-21T15:01:02Z ==
 ======== PROFILE p100-pxq2 / DECODE (approx 10 prompt toks, gen 400) ========
   Device 0: Tesla P100-PCIE-16GB, compute capability 6.0, VMM: yes, VRAM: 16269 MiB
 PXA_GRAPH dev=0 nodes=104 us=20634

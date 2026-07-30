@@ -1,4 +1,4 @@
-== pxa-profile v100-pxq4  model=della-reversed-v2-PXQ6.gguf  gpus=GPU-9af9aaf0-3f5a-cca5-b0c1-0a5b04971db6,GPU-55101e77-9558-d99c-0665-55d9b30ac9cb  2026-07-21T15:00:45Z ==
+== pxa-profile v100-pxq4  model=della-reversed-v2-PXQ6.gguf  gpus=<redacted>  2026-07-21T15:00:45Z ==
 ======== PROFILE v100-pxq4 / DECODE (approx 10 prompt toks, gen 400) ========
   Device 0: Tesla V100-PCIE-16GB, compute capability 7.0, VMM: yes, VRAM: 16144 MiB
   Device 1: Tesla V100-PCIE-16GB, compute capability 7.0, VMM: yes, VRAM: 16144 MiB

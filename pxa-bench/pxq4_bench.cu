@@ -5,7 +5,7 @@
 // ~64 tokens/expert at ub=2048):
 //   A) prod baseline: per-expert MXFP4->f16 dequant (the PXA_MXFP4_DEQ_V2 kernel) into a
 //      reused global f16 buffer + cublasGemmEx fp16 (CUBLAS_COMPUTE_16F) — the exact path
-//      the live brain runs on the P100s.
+//      a production MoE server takes on P100.
 //   B) PXQ4 fused: ONE grouped kernel over all experts reading 4.25bpw slabs straight into
 //      smem tiles (dequant never touches global memory), half2 HFMA2 accumulate.
 //   C) context: cublas with dequant excluded (pre-dequanted), to isolate the dequant share.
@@ -13,8 +13,8 @@
 // Correctness: PXQ4 in-kernel dequant is bit-checked against the prod dequant kernel; both
 // GEMM paths are compared against an fp64 CPU reference (max rel err).
 //
-// Memory budget deliberately small (~250 MB) so it runs on a P100 slice NEXT TO the resident
-// brain (no brain downtime).
+// Memory budget deliberately small (~250 MB) so it runs on a P100 slice alongside another
+// resident workload on the same card.
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cstdint>

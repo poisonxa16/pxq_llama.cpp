@@ -2530,7 +2530,7 @@ int32_t common_speculative_on_target_batch(
     // PXA port (upstream f5e5753c #1987): shift hidden rows right by one for recurrent-
     // conditioned MTP (qwen35/qwen35moe) so eager warmup conditions MTP position i on the
     // previous token's target hidden state, matching the drafter's h_last seeding. This whole
-    // path is skipped for the live 35B (PXA_MTP_LAZY_WARMUP=1 returns early at the caller), so
+    // path is skipped whenever PXA_MTP_LAZY_WARMUP=1 (returns early at the caller), so
     // it only affects an eager-warmup A/B; unshifted warmup had a one-token conditioning skew.
     const bool uses_shifted_hidden_rows = mtp_model_uses_recurrent_conditioning(*mtp_state);
     std::vector<float> previous_hidden_storage;

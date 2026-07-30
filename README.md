@@ -224,8 +224,8 @@ said it did not exist.**
 **Documentation corrections shipped with this release** (details in `docs/LEVERS.md`):
 
 - **`PXA_PXQ1` was documented as "no fused kernel family, no env gate (nothing to disable)".** It is
-  a real default-ON gate over a fused kernel family. The row now says so — including the fact that
-  no speed number exists for either state. None has been invented to fill the gap.
+  a real default-ON gate over a fused kernel family. The row now says so, and carries the measured
+  decode figure with the exact cell it was measured on.
 - **`PXA_FA_MASK_SKIP_TILE` does not engage on sm_61.** The dispatch reaches the tile-f16 kernel the
   skip lives in on **sm_60 only**, and then only at `GGML_PREC_DEFAULT` with Q rows > 8 and head-dim
   ≠ 256. The sm_61 startup banner used to report the lever ON regardless; that phantom report is

@@ -46,9 +46,9 @@
 //   Stack (both): -21% -> KILL.
 // Even the <64,false> template restructure of this kernel (lambda-split stage/FMA) measured
 // -2.5% on its own — keep the body below textually as-is. Full diff of the parked variants:
-// the 2026-07-22 sm_61 window report (pxa-1080ti-i8-maturation-2026-07-22.patch).
+// the measurements below.
 //
-// ---- B17/B18 GRUNT WINDOW, 2026-07-22 (track '1080ti', PXQ2 ub768) ---------------------------
+// ---- int8 double-buffer / 128-token tile evaluation (sm_61) ----
 // Stream-K (splitting the K-reduction across extra blocks) was audited before building: at
 // ub768 this MoE's tile count (grid.y = sum over active experts of ceil(tokens_e/64), grid.x =
 // R/64 panels) already spans many multiples of the 1080Ti's 28 SMs x 4 blocks/SM = 112
@@ -84,7 +84,7 @@ static inline int pxa_pxq_int8_prefill() {
 
 // K4-for-int8: ragged-tile FMA skip, ported from k_pxq6_gemm_grouped's RAG (bit-exact — the
 // skipped FMAs only ever touch A data that was already forced to zero by the a_valid staging
-// branch, so the accumulated sum is identical either way). Default OFF during the grunt A/B;
+// branch, so the accumulated sum is identical either way). Default OFF;
 // PXA_PXQ_I8_RAGTAIL=1 to enable, independent of PXA_PXQ6_RAGTAIL (separate kernel family).
 static inline bool pxa_pxq_i8_ragtail() {
     static const bool on = [](){

@@ -186,8 +186,8 @@ static __global__ void flash_attn_ext_f16(
         // so skipping them is bit-identical to computing them. They dominate two real cases on this
         // stack: (a) causal prefill — every query block scans the FULL KV extent, so all
         // strictly-future tiles are -inf (about half the FA work of an np1 prompt); (b) np>1 slots —
-        // a prompt in one slot scans the other slots resident KV (100% -inf; measured 2.7x FA wall
-        // on the 35B second np2 request: 29.8 -> 80.5 ms/call). The mask tile scan reads
+        // a prompt in one slot scans the other slots resident KV (100% -inf; measured 2.7x FA wall on a
+        // co-resident np2 slot scanning another slot's resident KV: 29.8 -> 80.5 ms/call). The mask tile scan reads
         // ncols*FATTN_KQ_STRIDE halves = ~6% of the K/V bytes the tile would otherwise move.
         if (mask) {
             const half2 * pxa_m2   = (const half2 *) maskh; // maskh is already offset to query row ic0

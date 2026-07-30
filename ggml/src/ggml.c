@@ -5468,7 +5468,7 @@ static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml
     if (cur_end + size_needed + GGML_OBJECT_SIZE > ctx->mem_size) {
         // PXA_ARENA_HARD_FAIL: the plain assert() below compiles out in release builds, so an
         // exhausted meta arena returned NULL and the caller segfaulted with zero context
-        // (np>=8 + MTP on the 122B died exactly here, 2026-06-12). Abort loudly with the
+        // (reproduced under np>=8 with MTP enabled). Abort loudly with the
         // numbers instead — a clean post-mortem beats silent memory corruption.
         GGML_PRINT("%s: not enough space in the context's memory pool (needed %zu, available %zu, no_alloc=%d)\n",
             __func__, cur_end + size_needed + GGML_OBJECT_SIZE, ctx->mem_size, ctx->no_alloc ? 1 : 0);

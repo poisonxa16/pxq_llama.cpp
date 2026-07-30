@@ -179,8 +179,8 @@ void server_queue::start_loop() {
                     // moment a slot can take work. notify_slot_changed() alone cannot revive
                     // tasks that were deferred while slots were already idle (no future
                     // release -> no notify -> permanent starvation: completion tasks parked
-                    // forever while /health stayed green, observed live on the 122B
-                    // 2026-06-12 — the residual "soak wave-4" HTTP-hang signature).
+                    // forever while /health stayed green, reproduced under a sustained
+                    // multi-slot soak — an HTTP-hang signature).
                     condition_tasks.wait_for(lock, std::chrono::milliseconds(500), [&] {
                         return (!queue_tasks.empty() || !running);
                         });
