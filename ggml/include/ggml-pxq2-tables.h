@@ -1,4 +1,4 @@
-// ggml-pxq2-tables.h -- PXQ2 frozen numeric tables (spec: PXQ-UNIVERSAL-2026-07-17.md).
+// ggml-pxq2-tables.h -- PXQ2 frozen numeric tables. Format spec: this header; conversion: docs/PXQU-CONVERT.md.
 //
 // PXQ2 = 2-bit codes into the co-fit LM4 4-entry book + the PROVEN PXQ6 E16-row two-level
 // scales, UNCHANGED:

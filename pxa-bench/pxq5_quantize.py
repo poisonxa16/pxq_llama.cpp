@@ -19,7 +19,7 @@
 #
 # This file is the BIT-PARITY REFERENCE for the C++ quantizer (llama-quantize PXQ5) and the
 # CUDA kernels (pxq5.cuh): same tables, same double-precision error accumulation, same
-# assignment rule. Design doc: PXQ5-PROPRIETARY-QUANT-DESIGN-2026-07-16.md.
+# assignment rule.
 #
 # Usage:
 #   pxq5_quantize.py --selftest

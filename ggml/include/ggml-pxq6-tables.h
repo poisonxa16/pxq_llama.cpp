@@ -1,4 +1,4 @@
-// ggml-pxq6-tables.h -- PXQ6 frozen numeric tables (spec: PXQ6-MEGA-OPTIMIZATION-2026-07-17.md).
+// ggml-pxq6-tables.h -- PXQ6 frozen numeric tables. Format spec: this header; conversion: docs/PXQU-CONVERT.md.
 //
 // PXQ6 = PXQ5 numerics (frozen PX16 16-entry book, UNCHANGED) + E16-row two-level scales:
 //   per-ROW fp16 anchor (128 B header per 64-row panel = 2 B/row via ggml row_meta_size)
@@ -10,9 +10,10 @@
 //   Measured (lab, 36-slice rng-42 protocol): wrel 0.068086 = -12.6% vs frozen PXQ5 0.077906
 //   at 4.2656 bpw. HQ tier (bs8 subs, PXQ6HQ type): wrel 0.058683 = -24.7% at 4.5156 bpw.
 //
-// SOURCES (sha256-locked; do NOT edit values by hand -- regenerate with gen_pxq6_tables.py):
+// SOURCES (sha256-locked; do NOT edit values by hand -- regenerate from the calibration sources):
 //   sublevels.json  d8847db66fafc90644526597a71907889e1cf1d06bf9290bc7277d5fb6e22cab
 //   books.json      047ef6431435339def7000571726e9a8fe8cd3e654448e70803c2bfa1fad3041
+//   (internal calibration lab artifacts; the sha256s pin the exact tables used)
 // All sublevels are fp16-snapped then emitted as exact fp32 hex literals. The book is the
 // The frozen PX16 book (inherited verbatim from the retired PXQ5 type — values byte-frozen).
 #pragma once

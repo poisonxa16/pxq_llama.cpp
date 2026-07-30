@@ -1,5 +1,5 @@
 // pxq2-quantize.inc.cpp — PXQ2 native quantizer (2-bit LM4 codes x E16-row scales;
-// spec PXQ-UNIVERSAL-2026-07-17.md). Cloned from pxq6-quantize.inc.cpp (core tier only).
+// spec: ggml/include/ggml-pxq2-tables.h). Cloned from pxq6-quantize.inc.cpp (core tier only).
 //
 // SELF-CONTAINED functions; spliced into src/llama-quantize.cpp next to the PXQ6 block, and
 // compiled standalone by pxa-bench/pxqu_ref.cpp (the correctness / wrel-reproduction tool).
@@ -15,7 +15,7 @@
 //            word h = elems 16h..16h+15, elem j at bits 2*(j&15) (4 codes/byte, low bits first)
 //            panel = 128 B anchor header + kslabs x 576 B slabs; panels row-major; experts outer.
 //
-// QUANTIZE ALGORITHM — identical to PXQ6 (= pxqu_lab.py quant_cands, E16 scheme):
+// QUANTIZE ALGORITHM — identical to PXQ6 (= the numpy reference quant_cands, E16 scheme):
 //   per row   : anchor = fp16_rn(row absmax)  [optional weighted-MSE anchor fit, env-gated]
 //   per block : FULL search over all 16 sub-levels; codes = RTN against the sorted book
 //               (midpoint rule = numpy searchsorted 'left'); keep argmin sum w_i (x_i - w_hat_i)^2
@@ -28,7 +28,7 @@
 //   bf16 expert weights (verified none on Ornith-35B), and pxa-bench/pxqu_wrel.py measures the
 //   gate with the same convention on both sides.
 //
-// GATES (Q-G1/Q-G2, see PXQ-UNIVERSAL-2026-07-17.md B1): byte-parity vs the numpy reference;
+// GATES (Q-G1/Q-G2): byte-parity vs the numpy reference;
 // wrel on the frozen 36-slice rng-42 protocol reproduces the lab number (0.3020488) per
 // pxa-bench/pxqu_wrel.py (±1e-4, snapped-SUB16-adjusted oracle).
 //

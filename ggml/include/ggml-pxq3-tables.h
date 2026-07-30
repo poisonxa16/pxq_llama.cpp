@@ -1,11 +1,11 @@
-// ggml-pxq3-tables.h -- PXQ3 frozen numeric tables (spec: PXQ-UNIVERSAL-2026-07-17.md).
+// ggml-pxq3-tables.h -- PXQ3 frozen numeric tables. Format spec: this header; conversion: docs/PXQU-CONVERT.md.
 //
 // PXQ3 = 3-bit codes into the co-fit LM8 8-entry book + the PROVEN PXQ6 E16-row two-level
 // scales, UNCHANGED (per-ROW fp16 anchor in the 128 B panel header + frozen PXQ6 SUB16
 // 4-bit sub-scale per 16-elem block; slab scale SoA stays 64 B; dequant contract identical
 // to PXQ6: eff = fp32(anchor)*SUB16[s4]; w = eff*fp32(book[c])).
 //
-// CODE PACKING -- BIT-PLANE (locked by the PXQ-UNIVERSAL doc so fp16-LUT and int8-LUT
+// CODE PACKING -- BIT-PLANE (locked by the format contract so fp16-LUT and int8-LUT
 // extraction both stay branch-free). Per 32-elem row-block, 12 code bytes laid out as
 // three LE uint32 words w0 w1 w2:
 //   w0 = LOW plane of elems  0..15 (2 bits/elem, elem j at bits 2j)

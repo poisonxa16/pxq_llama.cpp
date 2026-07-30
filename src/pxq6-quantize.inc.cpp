@@ -1,9 +1,9 @@
-// pxq6-quantize.inc.cpp — PXQ6 native quantizer (E16-row scales; spec PXQ6-MEGA-OPTIMIZATION-2026-07-17.md).
+// pxq6-quantize.inc.cpp — PXQ6 native quantizer (E16-row scales; spec: ggml/include/ggml-pxq6-tables.h).
 //
 // SELF-CONTAINED functions; spliced into src/llama-quantize.cpp next to the PXQ5 block, and
 // compiled standalone by pxa-bench/pxq6_ref.cpp (the correctness / wrel-reproduction tool).
 //
-// FORMAT (frozen, §2.6 of the spec):
+// FORMAT (frozen):
 //   values : 4-bit codes into the frozen PX16 book (identical to PXQ5; book[7]==0, absmax==1)
 //   scales : per-ROW fp16 anchor (64 anchors = 128 B header at the head of each 64-row panel)
 //            x one 4-bit sub-scale per 16-elem block through the frozen EW-Lloyd table SUB16
@@ -13,7 +13,7 @@
 //            panel = 128 B anchor header + kslabs x 1088 B slabs; panels row-major; experts outer.
 //   HQ tier (PXQ6HQ): 4-bit sub per 8-elem block via SUB8 -> 128 B scale SoA, slab 1152 B.
 //
-// QUANTIZE ALGORITHM (deterministic; = what the lab measurement ran, sweep2.py E16-row-4bit-EW):
+// QUANTIZE ALGORITHM (deterministic; = what the reference measurement ran, E16-row-4bit-EW):
 //   per row   : anchor = fp16_rn(row absmax)  [optional weighted-MSE anchor fit, env-gated]
 //   per block : FULL search over all 16 sub-levels; codes = RTN against the sorted book
 //               (midpoint rule = numpy searchsorted 'left'); keep argmin sum w_i (x_i - w_hat_i)^2
@@ -21,7 +21,7 @@
 //   zero blocks (amax==0) -> s4=0, codes=7 (book zero); zero rows (anchor snaps to 0) -> whole
 //   row s4=0/codes=7. Reconstruction of both == 0, matching the lab reference bit-exactly.
 //
-// MEASURED GATES (Q-G1/Q-G2, see PXQ6-BUILD-2026-07-17.md): byte-parity vs the numpy reference;
+// MEASURED GATES (Q-G1/Q-G2): byte-parity vs the numpy reference;
 // wrel on the frozen 36-slice rng-42 protocol reproduces the lab numbers.
 //
 // Env:

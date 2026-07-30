@@ -1,5 +1,5 @@
 // pxq3-quantize.inc.cpp — PXQ3 native quantizer (3-bit LM8 codes, BIT-PLANE packed, x
-// E16-row scales; spec PXQ-UNIVERSAL-2026-07-17.md). Cloned from pxq6-quantize.inc.cpp.
+// E16-row scales; spec: ggml/include/ggml-pxq3-tables.h). Cloned from pxq6-quantize.inc.cpp.
 //
 // SELF-CONTAINED functions; spliced into src/llama-quantize.cpp next to the PXQ2 block, and
 // compiled standalone by pxa-bench/pxqu_ref.cpp (the correctness / wrel-reproduction tool).
@@ -17,7 +17,7 @@
 //            stay branch-free; every word 4-aligned for every row.)
 //            panel = 128 B anchor header + kslabs x 832 B slabs; panels row-major; experts outer.
 //
-// QUANTIZE ALGORITHM — identical to PXQ6/PXQ2 (= pxqu_lab.py quant_cands, E16 scheme):
+// QUANTIZE ALGORITHM — identical to PXQ6/PXQ2 (= the numpy reference quant_cands, E16 scheme):
 //   anchor = fp16_rn(row absmax); FULL 16-cand sub search per block; RTN codes against the
 //   sorted book by the midpoint rule; double-accum imatrix-weighted SSE argmin.
 //   zero rows: s4=0 / codes=PXQ3_ZIDX -> recon exactly 0 (eff==0) == numpy oracle. Zero blocks
