@@ -3014,7 +3014,7 @@ static void mul_mat_1row(const ggml_tensor * src0, const ggml_tensor * src1, ggm
 // requires src1->ne[2]*ne[3] > 1 (a real batch dim). A plain F32 x F32, ne11==1 GEMV therefore
 // falls all the way through to the generic `ggml_cuda_op_mul_mat_cublas`, whose fp16-GEMM branch
 // also requires src0 to be F16/BF16/quantized — so an F32 src0 lands on a bare `cublasSgemm`
-// call. Measured (PXA_PROFILE, this session): ~450-480us/call on P100/V100 for what is a
+// call. Measured (PXA_PROFILE): ~450-480us/call on P100/V100 for what is a
 // ~1M-FLOP GEMV (256 rows x 2048 K) that should cost low single-digit us — the wall is cuBLAS's
 // per-call launch/workspace overhead for a GEMM shape it is not built for (N=1), paid on EVERY
 // decode token, per MoE layer. Fix: a dedicated warp-per-output-row GEMV kernel — sequential
