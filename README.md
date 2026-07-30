@@ -40,18 +40,74 @@ Best config for **both** sides — upstream at its own documented best (its best
 
 ## PXQ vs MXFP4 — every cell we measured, including the one we lose
 
-Same engine, same cards, same protocol, tier/codec the only variable. Dense = Qwable-27B,
+> **⚠ CORRECTION (2026-07-29): the MoE decode row has been withdrawn, and the rest of this
+> table is pending re-verification.** On re-measurement the published MoE-decode figure did not
+> reproduce, and the artifact behind it was found not to match its label. Details in
+> "Withdrawn: MoE decode" below. We would rather publish the correction than leave a number up
+> that we can no longer stand behind.
+
+Same engine, same cards, same protocol. Dense = Qwable-27B,
 MoE = Fusion4-35B, `llama-server /completion`, temp 0, coherence-gated, n=7, median reported.
 
 | cell | PXQ4 | MXFP4 | result |
 |---|---|---|---|
-| **MoE decode**, 2×V100 | 104.06 | 96.59 | **+7.7%** |
-| **MoE prefill**, 2×V100 | 1394.0 | 1172.8 | **+18.9%** |
-| **Dense prefill**, 2×V100 | 543.9 | 265.6 | **+104.8%** |
-| **Dense prefill**, 2×P100 | 128.0 | 107.4 | **+19.2%** |
-| **Dense decode**, 2×P100 | 15.18 | 14.32 | **+6.0%** |
-| **Dense decode**, 2×V100 *(default)* | 29.79 | 36.40 | **−18.2%** ← we lose this one |
-| **Dense decode**, 2×V100 *(with opt-in `PXA_PXQ_MMVQ=1`)* | 33.82 | 36.38 | **−7.0%** |
+| ~~**MoE decode**, 2×V100~~ | ~~104.06~~ | ~~96.59~~ | **WITHDRAWN — see below** |
+| **MoE prefill**, 2×V100 † | 1394.0 | 1172.8 | **+18.9%** |
+| **Dense prefill**, 2×V100 † | 543.9 | 265.6 | **+104.8%** |
+| **Dense prefill**, 2×P100 † | 128.0 | 107.4 | **+19.2%** |
+| **Dense decode**, 2×P100 † | 15.18 | 14.32 | **+6.0%** |
+| **Dense decode**, 2×V100 *(default)* † | 29.79 | 36.40 | **−18.2%** ← we lose this one |
+| **Dense decode**, 2×V100 *(with opt-in `PXA_PXQ_MMVQ=1`)* † | 33.82 | 36.38 | **−7.0%** |
+
+### Withdrawn: MoE decode (was 104.06 vs 96.59, "+7.7%")
+
+Re-running the exact published artifact in the exact published cell
+(`-c 8192 -b 512 -ub 512`, temp 0, `/completion`, 2×V100, n=7 median, prompt fill 6018):
+
+| binary | MMVQ off | MMVQ on |
+|---|---|---|
+| pre-canon | **93.19** | 92.82 |
+| current   | 91.39 | 90.84 |
+
+**93.19, not 104.06.** The MXFP4 side of the comparison reproduces across builds (96.59 → 94.54);
+the PXQ4 side does not. Two candidate explanations were tested and both failed: the bit-exactness
+rework costs only 1.9%, and `PXA_PXQ_MMVQ` is a no-op on this file (−0.4%).
+
+The cause turned out to be the artifact, not the kernel. Its tier table:
+
+```
+attn    : MXFP4:82
+shexp   : MXFP4:123
+exps    : MXFP4:3 / PXQ4:120
+ssm_out : MXFP4:30
+```
+
+Full census: `F32:308  MXFP4:300  PXQ4:120  Q8_0:23  F16:2` — 753 tensors, 443 quantized.
+**Only 120 of the 443 quantized tensors (27%) are PXQ4**, and attention and the shared expert
+carry none. So that row did not compare PXQ4 against MXFP4; it compared *MXFP4-with-PXQ4-experts*
+against *MXFP4*. It also explains the MMVQ null: only `PXQ4`/`PXQ4HQ` gain from that flag, and
+MXFP4 is already on the same kernel path.
+
+**† The dense rows: audited, and the artifacts are sound — but the comparison's identity is not
+recorded.**
+
+| artifact | quantized tensors | PXQ share |
+|---|---|---|
+| `Qwable-27B-PXQ4core` | 470 | 69% |
+| `Qwable-27B-MXFP4-lite` | 470 | 0% |
+| `Qwable-27B-MXFP4-legacy` | 506 | 0% |
+
+`PXQ4core` and `MXFP4-lite` are a properly matched pair: identical tensor counts and identical
+`Q8_0`/`Q6_K` promotions, with exactly 325 tensors differing and only in codec. `MXFP4-legacy` is
+**not** matched — it has 36 more quantized tensors and lacks those promotions.
+
+The published table does not say which of the two MXFP4 files the dense rows used. Against `lite`
+they are sound; against `legacy` they confound codec with backbone allocation. The rows stay
+daggered until re-run against a named file — not because they are known wrong, but because we
+cannot currently prove which comparison was made.
+
+Nothing here is a claim that PXQ regressed: the corrected MoE-decode figure matches the current
+build within measurement noise.
 
 **The loss is real and we are not going to hide it.** On Volta (sm_70), dense-model *decode* is
 ~7% slower on PXQ4 than MXFP4. The cause is understood: MXFP4's block layout maps onto DP4A with a
