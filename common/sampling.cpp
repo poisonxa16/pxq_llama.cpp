@@ -44,6 +44,21 @@ static void pxa_pxq1_apply_rep_guard(common_params_sampling & sp) {
         return;
     }
     if (mode == 0) {
+        // PXA_REP_GUARD_SCOPE fix (2026-07-30): the ENHANCE auto-arm is PXQ1-CONTENT-ONLY
+        // again. The 2026-07-24 broadening to any-PXQ was motivated by the Fusion4 prose
+        // attractor — which was subsequently root-caused to PXA_PXQ4_2D_SPLIT non-bit-
+        // exactness and FIXED by PXQ_CANON_v1 (H1 verified gone at defaults, 2026-07-28/30).
+        // Left broad, the guard MEASURABLY CORRUPTS exact answers on high-quality tiers:
+        // Laguna PXQ4-core, 4xP100+1080Ti, temp-0/top_k-1 chat probe "4183*391" — DEFAULT
+        // level answers 1,635,553 (correct, x3); ENHANCE answered 1,635,593 (x3): the filled
+        // repeat/DRY penalties suppress the legitimate repeated "5". Both-direction proof:
+        // ENHANCE + PXA_REP_GUARD=0 -> correct x3; DEFAULT + PXA_REP_GUARD=1 -> wrong x3.
+        // That flip was chased for a night as an "sm_61 numerics bug" — it was this lever.
+        // PXQ1-bearing files (incl. PXQU12/24 mixed maps) keep the guard: the 1-bit tier's
+        // looping is measured and real. PXA_REP_GUARD=1 still forces any-PXQ arming.
+        if (!llama_pxa_pxq1_content()) {
+            return;
+        }
         const char * r = std::getenv("PXA_REFERENCE");
         if (r && atoi(r) != 0) {
             return;   // REFERENCE wins if both are set
@@ -709,15 +724,22 @@ static llama_token_data_array llama_sampling_prepare_impl(
     const auto& penalty_tokens = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : prev;
     const int penalty_tokens_used_size = std::min((int)penalty_tokens.size(), penalty_last_n);
     if (penalty_tokens_used_size) {
-        const float nl_logit = logits[llama_token_nl(llama_get_model(ctx_main))];
+        // llama_token_nl() can legitimately return LLAMA_TOKEN_NULL (-1). Some vocabs (e.g. Falcon3's
+        // BPE tokenizer) tokenize "\n" to zero tokens, and the loader's fallback
+        // (llama-vocab.cpp, linefeed_id = special_pad_id) runs before LLM_KV_TOKENIZER_PAD_ID is read
+        // from the GGUF, so it copies the BPE default, which is itself LLAMA_TOKEN_NULL. Reading
+        // logits[-1] is then an out-of-bounds access one float before the current position's logit
+        // row, which segfaults when that address happens to be unmapped.
+        const llama_token nl_token = llama_token_nl(llama_get_model(ctx_main));
+        const float nl_logit = nl_token != LLAMA_TOKEN_NULL ? logits[nl_token] : 0.0f;
 
         llama_sample_repetition_penalties(ctx_main, &cur_p,
                 penalty_tokens.data() + penalty_tokens.size() - penalty_tokens_used_size,
                 penalty_tokens_used_size, penalty_repeat, penalty_freq, penalty_present);
 
-        if (!penalize_nl) {
+        if (!penalize_nl && nl_token != LLAMA_TOKEN_NULL) {
             for (size_t idx = 0; idx < cur_p.size; idx++) {
-                if (cur_p.data[idx].id == llama_token_nl(llama_get_model(ctx_main))) {
+                if (cur_p.data[idx].id == nl_token) {
                     cur_p.data[idx].logit = nl_logit;
                     break;
                 }

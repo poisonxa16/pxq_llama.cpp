@@ -5,6 +5,8 @@
 #include "iqk/iqk_cpu_ops.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <cstring>
 #include <ctime>
 #include <cfloat>
@@ -755,22 +757,49 @@ llama_token llama_sample_token_with_rng_impl(struct llama_sampling * smpl, llama
     auto p = sump * r / rng.max();
     auto iter = std::upper_bound(probs.begin(), probs.end(), p);
     if (iter == probs.end()) {
+        // PXA_SAMPLE_SOFTFAIL_v1 (2026-07-30): landing here means the cumulative-probability
+        // vector was unsampleable — in practice a NaN cascade from garbage logits (observed
+        // live on the DGX teacher: an hy_v3 checkpoint-restore/full-reprocess handed the
+        // sampler an invalid buffer and this site's GGML_ABORT killed the WHOLE np2 server —
+        // then the abort-path backtrace fork hung it as a zombie pair; see PXA_BT_NOFORK_v1).
+        // One poisoned slot killing every co-resident generation is the same blast-radius
+        // defect class as the old ret=-3 unwind. Keep the forensic dump (first occurrence
+        // only), but degrade to a deterministic fallback token — max finite logit, else the
+        // first candidate — so the REQUEST degenerates while the server survives.
+        // PXA_SAMPLE_ABORT=1 restores the old whole-process fatal for debugging.
         LLAMA_LOG_ERROR("=============================== Failed to sample token\n");
-        std::ofstream out("probabilities.txt");
-        out << "candidates->size: " << candidates->size << std::endl;
-        out << "max  = " << max << std::endl;
-        out << "sump = " << sump << std::endl;
-        out << "r    = " << r << std::endl;
-        out << "probabilities:\n";
-        for (int j = 0; j < candidates->size; ++j) {
-            out << j << "  " << candidates->data[j].id << "  " << candidates->data[j].logit << "  " << probs[j] << std::endl;
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            std::ofstream out("probabilities.txt");
+            out << "candidates->size: " << candidates->size << std::endl;
+            out << "max  = " << max << std::endl;
+            out << "sump = " << sump << std::endl;
+            out << "r    = " << r << std::endl;
+            out << "probabilities:\n";
+            for (int j = 0; j < candidates->size; ++j) {
+                out << j << "  " << candidates->data[j].id << "  " << candidates->data[j].logit << "  " << probs[j] << std::endl;
+            }
+            out.flush();
+            out.close();
+            LLAMA_LOG_ERROR("Data has been stored in probabilities.txt\n");
         }
-        out.flush();
-        out.close();
-        LLAMA_LOG_ERROR("Data has been stored in probabilities.txt\n");
-        LLAMA_LOG_ERROR("Create an issue with full log and attach probabilities.txt to the issue\n");
-        LLAMA_LOG_ERROR("\n\nCrashing now\n");
-        GGML_ABORT("Fatal error");
+        if (getenv("PXA_SAMPLE_ABORT") && atoi(getenv("PXA_SAMPLE_ABORT")) != 0) {
+            LLAMA_LOG_ERROR("\n\nCrashing now (PXA_SAMPLE_ABORT=1)\n");
+            GGML_ABORT("Fatal error");
+        }
+        int best = -1;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (int j = 0; j < (int) candidates->size; ++j) {
+            const float lg = candidates->data[j].logit;
+            if (std::isfinite(lg) && lg > best_logit) { best_logit = lg; best = j; }
+        }
+        const llama_token fallback_id = candidates->data[best >= 0 ? best : 0].id;
+        LLAMA_LOG_ERROR("PXA_SAMPLE_SOFTFAIL_v1: unsampleable distribution — falling back to token %d (finite-argmax=%s); this request may degenerate, the server survives (PXA_SAMPLE_ABORT=1 restores the old fatal)\n",
+                (int) fallback_id, best >= 0 ? "yes" : "no");
+        smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
+        smpl->n_sample++;
+        return fallback_id;
     }
     GGML_ASSERT(iter != probs.end());
     auto idx = std::distance(probs.begin(), iter);
