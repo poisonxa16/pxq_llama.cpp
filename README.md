@@ -40,11 +40,11 @@ Best config for **both** sides — upstream at its own documented best (its best
 
 ## PXQ vs MXFP4 — every cell we measured, including the one we lose
 
-> **⚠ CORRECTION (2026-07-29): the MoE decode row has been withdrawn, and the rest of this
-> table is pending re-verification.** On re-measurement the published MoE-decode figure did not
-> reproduce, and the artifact behind it was found not to match its label. Details in
-> "Withdrawn: MoE decode" below. We would rather publish the correction than leave a number up
-> that we can no longer stand behind.
+> **⚠ CORRECTION (2026-07-29): the MoE decode row has been withdrawn, the MoE prefill row has
+> been relabelled (‡), and the rest of this table is pending re-verification.** On
+> re-measurement the published MoE-decode figure did not reproduce, and the artifact behind both
+> MoE rows was found not to match its label. Details in "Withdrawn: MoE decode" below. We would
+> rather publish the correction than leave a number up that we can no longer stand behind.
 
 Same engine, same cards, same protocol. Dense = Qwable-27B,
 MoE = Fusion4-35B, `llama-server /completion`, temp 0, coherence-gated, n=7, median reported.
@@ -52,7 +52,7 @@ MoE = Fusion4-35B, `llama-server /completion`, temp 0, coherence-gated, n=7, med
 | cell | PXQ4 | MXFP4 | result |
 |---|---|---|---|
 | ~~**MoE decode**, 2×V100~~ | ~~104.06~~ | ~~96.59~~ | **WITHDRAWN — see below** |
-| **MoE prefill**, 2×V100 † | 1394.0 | 1172.8 | **+18.9%** |
+| **MoE prefill**, 2×V100 ‡ | 1394.0 | 1172.8 | **+18.9%** |
 | **Dense prefill**, 2×V100 † | 543.9 | 265.6 | **+104.8%** |
 | **Dense prefill**, 2×P100 † | 128.0 | 107.4 | **+19.2%** |
 | **Dense decode**, 2×P100 † | 15.18 | 14.32 | **+6.0%** |
@@ -88,6 +88,13 @@ carry none. So that row did not compare PXQ4 against MXFP4; it compared *MXFP4-w
 against *MXFP4*. It also explains the MMVQ null: only `PXQ4`/`PXQ4HQ` gain from that flag, and
 MXFP4 is already on the same kernel path.
 
+**‡ The MoE *prefill* row is measured on that same artifact.** The number reproduces — the label
+does not. With only 120 of its 443 quantized tensors PXQ4, and attention and the shared expert
+still MXFP4, **+18.9% is an expert-codec prefill delta — *MXFP4-with-PXQ4-experts* vs *MXFP4*,
+not whole-model PXQ4 vs MXFP4.** Read it as that narrower claim. It gets re-run against an MoE
+artifact that is PXQ4 throughout, at which point it either becomes a whole-model number or it
+doesn't.
+
 **† The dense rows: audited, and the artifacts are sound — but the comparison's identity is not
 recorded.**
 
@@ -113,9 +120,10 @@ build within measurement noise.
 ~7% slower on PXQ4 than MXFP4. The cause is understood: MXFP4's block layout maps onto DP4A with a
 single scale fixup per 32-value block, while PXQ4's sub-scale hierarchy costs a second fixup chain
 and a second cache sector for the scale. It has survived roughly eight distinct kernel-side attacks
-across three sessions — including a rewritten `vec_dot` that we built, measured, and **reverted**
-when it came in slightly worse (see the revert commit, which carries its own numbers). At equal bit
-width against a kernel already running at ~76% of HBM peak, the ceiling is a tie, not a win.
+across three separate optimization passes — including a rewritten `vec_dot` that we built, measured,
+and **reverted** when it came in slightly worse (see the revert commit, which carries its own
+numbers). At equal bit width against a kernel already running at ~76% of HBM peak, the ceiling is a
+tie, not a win.
 
 **What you get for those 7%:**
 
@@ -135,7 +143,7 @@ above exists.
 
 | your setup | honest answer |
 |---|---|
-| **MoE** (any size) | **PXQ4** — faster on both axes (fidelity vs MXFP4 measured on dense, not yet on MoE) |
+| **MoE** (any size) | **PXQ4** — prefill win measured, but as an expert-codec delta (‡ above). **No MoE decode comparison currently stands** — the published one is withdrawn. Fidelity vs MXFP4 measured on dense, not yet on MoE |
 | **Pascal** (P100/GP100) | **PXQ4** — faster on both axes; dense fidelity measured (below) |
 | **Dense, long prompts / agentic** | **PXQ4** — ~2× prefill, better quality |
 | **Dense, decode-bound, on Volta** | **MXFP4 is faster.** Take PXQ4 only if you want the fidelity |
@@ -154,6 +162,85 @@ PXQ — that comparison is the evidence for this claim.
 `op_params` precision-alias fix from this cycle is recorded in our own notes as leaving MXFP4
 **unchanged** — its guard is PXQ-scoped. A clean per-fix attribution for non-PXQ codecs has not
 been done.
+
+## Updates — 2026-07-30
+
+**A decode path for the 1-bit tier, model-adaptive lever selection, a round of robustness work —
+and a set of documentation corrections, including one lever that shipped default-ON while the docs
+said it did not exist.**
+
+- **PXQ1 (the 1-bit tier) now reaches a real decode dispatch path** instead of falling back to
+  dequant + cuBLAS every token. Measured on a 122B-A10B PXQU24 artifact: decode **11.8 → 36.0 t/s**.
+  Also fixes an out-of-bounds code-row read when `CODE_WORDS == 1` — which is exactly the PXQ1
+  geometry. Gated by **`PXA_PXQ1` (default ON)**; `=0` returns to the dequant/cuBLAS fallback, and
+  a one-shot sign-book self-check disables the fused path on its own if it ever fails.
+- **`PXA_ENHANCE=1` is now (device × model) adaptive, and prints a decision ledger.** Lever
+  selection reads the loaded model's tensor census as well as the device fleet, and every auto-set
+  decision is printed at startup with its reason — so the configuration actually in force is
+  auditable instead of inferred. Concretely: `PXA_PXQ_GEMM_2D` auto-arms only for sm_60 × dense ×
+  PXQ-bearing tensors rather than on device class alone, and `PXA_PXQ_MMVQ` auto-arms only on a
+  PXQ4/PXQ4HQ-bearing model with a DP4A-capable device.
+- **Env gates are value-tested, not presence-tested.** `PXA_FOO=0` now *disables* a lever instead
+  of enabling it by virtue of being set — which is what every operator already assumed it did.
+- **The server now survives things that used to take it down.** An unsampleable distribution (in
+  practice a NaN cascade from invalid logits) used to `GGML_ABORT` the whole process, killing every
+  co-resident generation over one poisoned slot; it now keeps the forensic dump, falls back to the
+  finite argmax and degrades only that request (`PXA_SAMPLE_ABORT=1` restores the fatal behaviour).
+  A generation cut mid-codepoint no longer 500s an otherwise successful request — the final
+  response holds back an incomplete trailing UTF-8 sequence, as the streaming path already did.
+  The abort-path backtrace no longer forks, which used to leave a deadlocked orphan holding the
+  listening socket. New: a **port guard** that refuses to start when a live listener already
+  answers on the target port, and names the cause (`PXA_PORT_GUARD=0` bypasses); and
+  **container-aware wedge handling** — exit-and-let-the-orchestrator-restart is only a valid
+  contract when an orchestrator exists, so bare metal gets an in-process recovery attempt and a
+  distinct exit code instead (`PXA_IN_CONTAINER=0|1` overrides the detection). Hybrid-recurrent
+  checkpoint rollback is fixed (`PXA_CKPT_HYBRID_ROLLBACK`).
+- **The PXQ repetition guard is now PXQ1-scoped.** Arming it on any PXQ artifact was the root cause
+  of the reported arithmetic flips on sm_61: a guard aimed at 1-bit degeneration was penalising
+  correct repeated digits in ordinary output.
+- **`llama-quantize` now fails loudly instead of quietly.** All twelve `--*-type` flags assigned the
+  parse-failure value unconditionally and the consumer guard then skipped the flag in silence —
+  exit 0, clean logs, and a different model than the one you asked for. Type names are now matched
+  case-insensitively and an unparseable one is a hard failure. `--custom-q` demotions are reported
+  per tensor and summarised at end of run (a silent demote is how a measurement arm ends up
+  measuring nothing). New selectors: **`PXA_PXQ_KV`** (`q8_0`|`pxq4`|`pxq4hq`|`pxq6`|`mxfp4`,
+  default `q8_0`) for `attn_k`/`attn_v`/`attn_v_b`, and a `core` token for **`PXA_PXQ_BACKBONE`** —
+  both were described in the lever docs before they existed in source; this lands them.
+- **Upstream ports, all default-off or fix-only** (ik_llama.cpp #2057/#2102, #1967/#1969, #1918,
+  #2181, #2188, #2018, #2129): opt-in parallel weight loading for `--no-mmap`
+  (**`PXA_PARALLEL_LOAD=N`** — unset/0 keeps the serial path, `1` selects the upstream default of 8
+  workers, `2..64` an explicit count; with mmap the upstream rewrite serializes every tensor behind
+  one mutex, so that path is kept serial and the loader warns once); stb_image_resize2 SIMD
+  resizers plus the reference bicubic Qwen-VL / Gemma4V preprocessing (**`PXA_MTMD_STBIR=1`** — one
+  switch, because the reference "bicubic" is a filtered Catmull-Rom that only the stbir path
+  provides); an MTP draft-gen KV-reserve clamp (**`PXA_MTP_DRAFT_RESERVE_CLAMP`**, default off); a
+  deepstack image-embedding stride OOB; and three `common/` correctness fixes — sampler
+  out-of-bounds on vocabularies with no newline token, a jinja for-loop scope leak
+  (`PXA_JINJA_LEGACY_LOOP_SCOPE` restores the old behaviour), and a boolean flag swallowing the
+  following argv entry.
+- **New (opt-in): `PXA_FA_MASK_SKIP_TILE_F32`** — skip fully-masked KV tiles in the tile-f32
+  flash-attention kernel. Fully-masked tiles contribute exactly zero, so the skip is bit-identical.
+
+**Documentation corrections shipped with this release** (details in `docs/LEVERS.md`):
+
+- **`PXA_PXQ1` was documented as "no fused kernel family, no env gate (nothing to disable)".** It is
+  a real default-ON gate over a fused kernel family. The row now says so — including the fact that
+  no speed number exists for either state. None has been invented to fill the gap.
+- **`PXA_FA_MASK_SKIP_TILE` does not engage on sm_61.** The dispatch reaches the tile-f16 kernel the
+  skip lives in on **sm_60 only**, and then only at `GGML_PREC_DEFAULT` with Q rows > 8 and head-dim
+  ≠ 256. The sm_61 startup banner used to report the lever ON regardless; that phantom report is
+  gone. On sm_61 and on the F32-precision path the equivalent is the opt-in
+  `PXA_FA_MASK_SKIP_TILE_F32` above.
+- **`PXA_FA_PREFILL_SPLIT` has no auto-default.** The resolver returns 0 at every level and posture
+  unless the env is set — the non-FA prefill chain inflates the compute buffer ~2.35× and OOMs
+  16 GB cards at ub2048 — so the earlier BALANCE/ENHANCE auto-default was withdrawn (2026-07-24)
+  and the docs now match the source. `PXA_MODE` no longer moves any kernel-lever default either;
+  its only consumers are the mode name and the startup report.
+- **The CUDA-graph knobs are inventoried per knob** (`PXA_CUDA_GRAPH_MOE`, `_LRU`, `_REARM`,
+  `_BATCH_MAX_NY`), along with `PXA_PXQ_DISPATCH_DBG` — each labelled *unmeasured* or
+  *diagnostic-only* rather than handed a number it does not have.
+- **The MoE codec comparison is corrected**: the decode figure is withdrawn and the prefill figure
+  is relabelled as an expert-codec delta. See the table and its ‡/† footnotes above.
 
 ## Updates — 2026-07-28
 
@@ -176,7 +263,8 @@ been done.
   notes record it leaving **MXFP4 unchanged** (its guard is PXQ-scoped), so it is a PXQ-side ratio
   win rather than a lift for every codec.
 
-- **New: `PXA_PXQ_MMVQ` (default OFF).** Routes PXQ4/PXQ4HQ decode to the stock q8_1 MMVQ kernel.
+- **New: `PXA_PXQ_MMVQ` (default OFF *without* `PXA_ENHANCE`).** Routes PXQ4/PXQ4HQ decode to the
+  stock q8_1 MMVQ kernel.
   **+13.7% dense decode** (29.787 → 33.861, 2×V100) and **+6.7% on MoE** when paired with PXQ4
   attention. Quality-neutral: paired perplexity **at `-b 8`** gives Δ +0.0036 dense (44× inside the
   error bar) and Δ −0.0031 MoE — opposite signs, i.e. noise. **G3-class**: token output changes, so
@@ -185,6 +273,11 @@ been done.
   prefill and the MMVQ dispatch gate is `ne11 <= 8`, so the kernel never fires and both arms return
   *identical* perplexity — a false pass from a run in which the feature was switched off. Applies to
   any decode-window lever.
+  **Update — since the 2026-07-29 model-adaptive auto-set, `PXA_ENHANCE=1` turns this ON by
+  itself** when the loaded model carries PXQ4/PXQ4HQ tensors and a DP4A-capable device is present:
+  mode 1 if any sm_70+ card is in the fleet, mode 2 on an all-sm_61 fleet; a pure sm_60 (P100)
+  fleet stays OFF, since its DP4A is emulated. An explicit `PXA_PXQ_MMVQ=…` always wins, and the
+  startup ledger prints which way it resolved and why (`docs/LEVERS.md` §0c).
 
 - **`PXA_PXQ_GEMM_2D=2` is now clamped to sm_60.** Its previous +2.30% sm_70 figure was measured
   against the pre-coalescing dequant; against the current one it is **−18.6%** on dense. sm_60 is
@@ -272,6 +365,7 @@ decode, gate/up fusion) tuned for Pascal/Volta.
 | PXQ4 (formerly PXQ6) | 4.27 bpw | 1.0× (−12.6% vs plain 4-bit float) | flagship 4-bit |
 | PXQ3 | 3.27 bpw | ~2.1× | 3-bit, bit-plane packed |
 | PXQ2 | 2.27 bpw | ~4.4× | 2-bit, LM4 codebook |
+| PXQ1 | 1.26 bpw | not measured | 1-bit sign codes × the same E16-row scales. A **stretch tier for `--pxq-universal` mixes**, not a general-purpose whole-model quant — PXQ1 content measurably loops on open-ended prompts, which `PXA_REP_GUARD` exists to damp |
 
 The backbone (attention / router / embeddings) is assigned per class by `BACKBONE_REV 2` (see `docs/LEVERS.md`); `ssm_*` and a few legacy classes stay MXFP4. Earlier releases flattened the whole backbone to MXFP4 — that is no longer the case. Numerics are
 imatrix-calibrated and gated byte-exact against a reference (Q-G1 byte-parity + Q-G2 wrel).

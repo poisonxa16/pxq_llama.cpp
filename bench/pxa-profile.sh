@@ -11,15 +11,18 @@
 #   2x16 GB (V100 pair):   MODEL=PXA-Fusion2-35B-PXQ4.gguf  (18.7 GB)  TS="1,1"  NGL=99
 #
 # Usage: GPUS=<uuid[,uuid]> MODEL=/path/to.gguf [TS=1,1] [BUILD=/path] ./pxa-profile.sh <tag>
+#   BUILD defaults to <repo>/build (the tree this script lives in); OUT defaults to ./profile-<tag>.txt.
 set -uo pipefail
 TAG="${1:-run}"
 GPUS="${GPUS:?set GPUS=GPU-uuid[,GPU-uuid]}"
 MODEL="${MODEL:?set MODEL=/abs/path/to/pxq.gguf}"
 TS="${TS:-}"
 NGL="${NGL:-99}"
-BUILD="${BUILD:-<local-path>}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || dirname "$HERE")"
+BUILD="${BUILD:-$REPO/build}"
 IMG="${IMG:-nvidia/cuda:12.8.1-devel-ubuntu24.04}"
-OUT="${OUT:-/root/squeeze-window/profile-$TAG.txt}"
+OUT="${OUT:-./profile-$TAG.txt}"
 mkdir -p "$(dirname "$OUT")"
 MDIR="$(dirname "$MODEL")"; MBASE="$(basename "$MODEL")"
 tsflag=""; [ -n "$TS" ] && tsflag="-ts $TS"
