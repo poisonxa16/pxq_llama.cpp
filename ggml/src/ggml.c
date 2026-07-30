@@ -230,8 +230,9 @@ static void ggml_print_backtrace(void) {
     //      atexit handlers / library destructors in a fork child of a heavily multithreaded
     //      CUDA process whose driver mutexes were held by other threads at fork time — the
     //      child deadlocks FOREVER, wearing the parent's argv in ps and holding dups of every
-    //      fd including the HTTP listening socket. Observed live (bare-metal DGX, 2026-07-30):
-    //      a second "llama-server" with PPID = the real server, port fights, dead /health.
+    //      fd including the HTTP listening socket. Observed live on a multi-GPU bare-metal
+    //      server (2026-07-30): a second "llama-server" with PPID = the real server, port
+    //      fights, dead /health.
     //   2. the parent blocked in waitpid() with no deadline — the aborting thread never
     //      reached abort(), so the half-dead parent kept serving alongside its stuck child.
     // Fixes: honor GGML_NO_BACKTRACE (skip the fork entirely), child uses _exit(), parent

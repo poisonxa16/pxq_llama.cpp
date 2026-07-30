@@ -171,8 +171,8 @@ static inline const char * pxa_model_class_name() {
 
 // PXA_PXQ_MMVQ ENHANCE auto-default (device x model). The ship recipe (A4m,
 // KERNEL-CANONICAL-2026-07-29) runs MMVQ ON: fidelity-neutral measured PAIRED at
-// matched batch (dppl +0.016%, inside +/-0.054 error bars; run's paired test
-// +0.053%, t=17 — detectable, irrelevant). Auto ON only when the model actually
+// matched batch (dppl +0.016%, inside +/-0.054 error bars; the independent paired test
+// measured +0.053%, t=17 — detectable, irrelevant). Auto ON only when the model actually
 // carries MMVQ-eligible tensors (PXQ4/PXQ4HQ census from the loader) AND a
 // DP4A-capable device exists:
 //   sm_70+ present            -> mode 1 (Volta+ devices only — the ship gate)
@@ -323,15 +323,16 @@ static inline bool pxa_p100_fp16_gemm() {
 // PXA_MODE=balance|max — the owner-facing POSTURE knob (2026-07-22). 0 = BALANCE (default),
 // 1 = MAX. The postures are the PRODUCT; the kernel levers are the means:
 //   BALANCE (the daily): -fa on, ub 2048-class. Best decode AND best-possible prefill IN the
-//     fa-on regime — FA_PREFILL_SPLIT (big batches ride the fa-off math) + FA_MASK_SKIP_TILE
-//     carry the prefill; decode stays the untouched fa-on path (byte-identical by construction).
+//     fa-on regime — FA_MASK_SKIP_TILE carries the prefill by default; FA_PREFILL_SPLIT (big
+//     batches ride the fa-off math) is available but opt-in, see its resolver below. Decode
+//     stays the untouched fa-on path (byte-identical by construction).
 //   MAX (bulk ingest): -fa off, largest-fitting ub. Absolute max prefill, decode secondary.
 // Both postures imply the full measured ENHANCE-class lever set; they differ only in fa +
 // which prefill carriers engage + the adaptive-ub target. PXA_REFERENCE=1 overrides both to
 // the pure reference path. The -fa/-ub DEFAULTING + adaptive-ub live server-side
 // (examples/server/server.cpp, an in-lockstep PXA_MODE mirror) and only fill flags the CLI
-// left unset — explicit -fa/-ub always win. Here the mode moves kernel-lever defaults
-// (FA_PREFILL_SPLIT below) and the startup report.
+// left unset — explicit -fa/-ub always win. Here the mode drives the startup report only; no
+// kernel-lever default currently keys off it (FA_PREFILL_SPLIT is opt-in at every posture).
 static inline int pxa_mode() {
     static const int v = [](){
         const char * e = getenv("PXA_MODE");
@@ -347,12 +348,18 @@ static inline const char * pxa_mode_name() {
 // PXA_FA_MASK_SKIP_TILE: fully-masked-KV-tile skip ported to the tile-f16 FA kernel (the
 // fattn-wmma-f16 skip is already shipped unconditional). A KV tile whose mask is entirely
 // -inf contributes exactly zero (exp(-inf-max)==0, running max unchanged, rescale==1), so
-// skipping it is bit-identical BY CONSTRUCTION. Engages on sm_60/sm_61 prefill under -fa on
-// (a BALANCE carrier; inert at fa-off). Default ON at DEFAULT/ENHANCE per the 2026-07-22
-// posture directive; REFERENCE -> off. Env wins (PXA_FA_MASK_SKIP_TILE=0 rolls back).
-// ⚠ HONESTY GATE: the B1 silicon A/B (sha-set + decode-guard, staged at
-// /root/squeeze-window/enh-p100/bcells.sh) has NOT yet run — compiled clean, equivalence
-// argued by construction, target pf>=900 fa-on ub2048 P100. Run B1 before quoting numbers.
+// skipping it is bit-identical BY CONSTRUCTION. SCOPE — this mirrors the fattn.cu dispatch,
+// do not widen it in prose: the tile-f16 kernel is reached on sm_60 only (fast_fp16_available()
+// excludes sm_61; fp16_mma_available() sends sm_70+ to the WMMA/MMA kernels), only at
+// GGML_PREC_DEFAULT, and only when Q->ne[1] > 8 with head-dim != 256 — i.e. batched/prefill
+// shapes under -fa on (a BALANCE carrier; inert at fa-off, and Q->ne[1] <= 8 decode shapes take
+// the vec kernels instead). At those same shapes sm_61 and the F32-precision path take the
+// tile-f32 kernel, which carries its own opt-in PXA_FA_MASK_SKIP_TILE_F32 (fattn-tile-f32.cu).
+// Default ON at DEFAULT/ENHANCE per the 2026-07-22 posture directive; REFERENCE -> off.
+// Env wins (PXA_FA_MASK_SKIP_TILE=0 rolls back).
+// ⚠ HONESTY GATE: the silicon A/B (sha-set + decode-guard) has NOT yet run — compiled clean,
+// equivalence argued by construction, target pf>=900 fa-on ub2048 P100. No speedup is measured
+// for this lever yet; do not quote numbers until that A/B has run.
 static inline bool pxa_fa_mask_skip_tile() {
     static const bool v = [](){
         const char * e = getenv("PXA_FA_MASK_SKIP_TILE");
@@ -362,24 +369,27 @@ static inline bool pxa_fa_mask_skip_tile() {
     return v;
 }
 
-// PXA_FA_PREFILL_SPLIT: per-ubatch FA regime dispatch — THE BALANCE prefill carrier. A graph
+// PXA_FA_PREFILL_SPLIT: per-ubatch FA regime dispatch — an OPT-IN prefill carrier. A graph
 // whose attention batch (n_tokens) >= this threshold builds the non-FA batched-cuBLAS
 // attention chain even under -fa on (prefill rides the fa-off math = the P100/1080Ti/V100
 // fast-prefill regime); below the threshold the FA branch is untouched, so decode/MTP-verify
-// are byte-identical by construction. Defaults (2026-07-22 posture directive):
-// BALANCE at DEFAULT/ENHANCE -> 64; MAX -> 0 (fa is off in MAX, the split is inert);
-// REFERENCE -> 0. Env wins (PXA_FA_PREFILL_SPLIT=0 rolls back; values 1..8 are clamped to 9
-// for decode/MTP-verify safety). The actual consumer is src/llama-build-context.cpp (a
-// non-CUDA TU) which keeps an in-sync mirror — keep the two in lockstep.
-// ⚠ HONESTY GATE: B2/B3 silicon A/B (staged, bcells.sh; target pf>=1100 fa-on ub2048 P100,
-// decode sha-identical) has NOT yet run — verified in-source only (non-FA branch handles the
-// FA v_trans==false layout; softmax accepts the FA F16 mask). Run B2/B3 before quoting numbers.
+// are byte-identical by construction. DEFAULT IS 0 (off) AT EVERY LEVEL AND EVERY POSTURE —
+// REFERENCE, DEFAULT and ENHANCE, BALANCE and MAX alike — because the non-FA prefill chain
+// inflates the compute buffer (see the resolver body). It has to be bought explicitly, e.g.
+// PXA_FA_PREFILL_SPLIT=64. (The 2026-07-22 posture directive originally auto-set 64 at
+// BALANCE/ENHANCE; that auto-default was withdrawn 2026-07-28 — notes quoting 64 as a default
+// are stale.) Env wins (values 1..8 are clamped to 9 for decode/MTP-verify safety). The actual
+// consumer is src/llama-build-context.cpp (a non-CUDA TU) which keeps an in-sync mirror —
+// keep the two in lockstep.
+// ⚠ HONESTY GATE: the fa-on silicon A/B (target pf>=1100 fa-on ub2048 P100, decode
+// sha-identical) has NOT yet run — verified in-source only (non-FA branch handles the FA
+// v_trans==false layout; softmax accepts the FA F16 mask). Do not quote numbers until it has.
 static inline int pxa_fa_prefill_split_ne11() {
     static const int v = [](){
         const char * e = getenv("PXA_FA_PREFILL_SPLIT");
         if (e) { int t = atoi(e); return t <= 0 ? 0 : (t < 9 ? 9 : t); }
         if (pxa_config_level() == 0) return 0;    // REFERENCE
-        // EXPERIMENTAL opt-in ONLY (merged from private 178a357, 2026-07-28): ENHANCE/BALANCE
+        // EXPERIMENTAL opt-in ONLY (2026-07-28): ENHANCE/BALANCE
         // no longer auto-enable FA_PREFILL_SPLIT — the non-FA prefill chain inflates the
         // compute buffer ~2.35x (1956 -> 4607 MiB measured) and OOMs 16 GB cards at ub2048.
         // The +45% P100 prefill is real but must be bought explicitly (PXA_FA_PREFILL_SPLIT=64)
