@@ -1876,12 +1876,13 @@ int32_t common_speculative_on_target_seq_batch(
     // self-seeds via common_speculative_ensure_sequence_hidden() before the first draft
     // (the server draft path already calls it) and the companion KV fills forward from
     // accepts. Trade: early-draft acceptance dips (PXA_MTP_ADAPTIVE_K shrinks depth
-    // automatically) in exchange for full-speed prefill. Env: PXA_MTP_LAZY_WARMUP=1
-    // (default off). Gates BOTH prompt-warmup callers (text prefill + media warmup); the
+    // automatically) in exchange for full-speed prefill. The level is resolved by
+    // llama_pxa_mtp_lazy_warmup() (include/llama.h) — an explicit PXA_MTP_LAZY_WARMUP wins,
+    // else PXA_ENHANCE=1 turns it on while PXA_REFERENCE=1 and the plain default leave it
+    // off — so this site cannot disagree with the decode-time output reserve or the graph
+    // out_ids row-slice. Gates BOTH prompt-warmup callers (text prefill + media warmup); the
     // checkpoint-restore resync uses is_prompt_warmup=false and is untouched.
-    static const bool pxa_mtp_lazy_warmup =
-        getenv("PXA_MTP_LAZY_WARMUP") && atoi(getenv("PXA_MTP_LAZY_WARMUP")) == 1;
-    if (pxa_mtp_lazy_warmup && is_prompt_warmup) {
+    if (llama_pxa_mtp_lazy_warmup() && is_prompt_warmup) {
         return 0;
     }
 

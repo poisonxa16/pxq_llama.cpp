@@ -5180,17 +5180,22 @@ static bool llama_context_has_mtp_outputs(const llama_context & lctx) {
         lctx.model.arch == LLM_ARCH_GEMMA4_MTP);
 }
 
-// PXA_MTP_LAZY_WARMUP_v1: env-gated (PXA_MTP_LAZY_WARMUP=1) skip of the prompt-time MTP companion
-// warmup (see common/speculative.cpp). With the warmup skipped, nothing consumes per-token MTP
+// PXA_MTP_LAZY_WARMUP_v1: level-gated (PXA_MTP_LAZY_WARMUP, else the PXA_ENHANCE/PXA_REFERENCE
+// level) skip of the prompt-time MTP companion warmup (see common/speculative.cpp). With the warmup skipped, nothing consumes per-token MTP
 // hidden rows on prompt-sized batches, so llama_decode also stops reserving + extracting them —
 // the MTP feature row is recurrent-state wide, and the all-token D2H extraction was the dominant
 // 35B prefill cost.
-static bool pxa_mtp_lazy_warmup_enabled() {
+bool llama_pxa_mtp_lazy_warmup(void) {
     // Level default (2026-07-29): PXA_ENHANCE=1 -> ON (temp-0 output BIT-IDENTICAL, measured
     // 35B prefill +12% [lazy warmup] then +47% [lazy prompt flags] 2026-07-15; inert on
     // non-MTP runs — every consumer is behind an MTP-active check). Explicit env always
-    // wins (=0 rolls back); PXA_REFERENCE=1 -> off. Mirrors: examples/server/server-context.cpp
-    // pxa_mtp_lazy_prompt_flags() + the slot resolver — keep the three in lockstep.
+    // wins (=0 rolls back); PXA_REFERENCE=1 -> off. Exported through include/llama.h because
+    // the other consumers of the contract live outside this translation unit (the qwen35
+    // graph builder's out_ids row-slice, common/speculative.cpp's prompt-warmup skip);
+    // routing them all through this one resolver is what keeps the level default from being
+    // honored at some sites and silently ignored at the rest. Still resolving the same level
+    // locally: examples/server/server-context.cpp pxa_mtp_lazy_prompt_flags() — keep the two
+    // in lockstep.
     static const bool on = [](){
         const char * e = getenv("PXA_MTP_LAZY_WARMUP");
         if (e) return atoi(e) == 1;
@@ -5440,7 +5445,7 @@ static int llama_decode_internal(
     // PXA_MTP_LAZY_WARMUP_v1: on prompt-sized batches the skipped companion warmup was the only
     // all-row consumer — reserve normal outputs only. Gen/verify batches (whose rows the accept
     // path consumes) sit far below the 64-token gate and keep full rows.
-    if (pxa_mtp_lazy_warmup_enabled() && n_outputs_embd > n_outputs && n_tokens_all > 64) {
+    if (llama_pxa_mtp_lazy_warmup() && n_outputs_embd > n_outputs && n_tokens_all > 64) {
         n_outputs_embd = n_outputs;
     }
     if (llama_output_reserve(lctx, std::max<size_t>(n_outputs, n_outputs_embd)) < std::max<size_t>(n_outputs, n_outputs_embd)) {

@@ -627,6 +627,15 @@ extern "C" {
     // (PXQ1/2/3/4/4HQ/6) — consumed by the common sampling layer's repetition guard.
     LLAMA_API bool llama_pxa_pxq_content(void);
 
+    // PXA_MTP_LAZY_WARMUP: the single resolver for the lazy-MTP-warmup level. Resolved once
+    // per process: an explicit PXA_MTP_LAZY_WARMUP wins (=1 on, anything else off), else
+    // PXA_REFERENCE=1 forces off, else PXA_ENHANCE!=0 turns it on. Every consumer of the
+    // contract — the decode-time MTP output reserve (src/llama.cpp), the graph builders'
+    // out_ids row-slice, the speculative prompt-warmup skip (common/speculative.cpp) and the
+    // server slot output flags — must read the level through this function, so the level
+    // default cannot be honored at one site and ignored at another.
+    LLAMA_API bool llama_pxa_mtp_lazy_warmup(void);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);
