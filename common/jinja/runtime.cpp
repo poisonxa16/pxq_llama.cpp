@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <cstdlib>
 
 #define FILENAME "jinja-runtime"
 
@@ -459,6 +460,18 @@ value if_statement::execute_impl(context & ctx) {
     return str;
 }
 
+// PXA_JINJA_LEGACY_LOOP_SCOPE=1 restores the pre-fix for-loop scoping, where ONE scope was
+// shared across every iteration of a {% for %} body, so a conditional {% set %} leaked its
+// value into later iterations. Rollback lever only: the default (unset or "0") is the fixed
+// per-iteration scoping that matches standard Jinja2 semantics. Value-tested ("=0" is OFF).
+static bool pxa_jinja_legacy_loop_scope() {
+    static const bool legacy = [] {
+        const char * e = std::getenv("PXA_JINJA_LEGACY_LOOP_SCOPE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return legacy;
+}
+
 value for_statement::execute_impl(context & ctx) {
     context scope(ctx); // new scope for loop variables
 
@@ -596,11 +609,21 @@ value for_statement::execute_impl(context & ctx) {
         loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
         loop_obj->insert("previtem", i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
         loop_obj->insert("nextitem", i < filtered_items.size() - 1 ? filtered_items[i + 1] : mk_val<value_undefined>("nextitem"));
-        scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
+        // Use a fresh scope for each iteration so that {% set %} variables
+        // (including ones assigned only conditionally inside the body) do not
+        // leak across iterations. This matches standard Jinja2 semantics, where
+        // each loop iteration starts with a clean scope. State that must
+        // accumulate across iterations has to use namespace(), whose mutations
+        // are applied to the shared object referenced from the enclosing scope.
+        // PXA_JINJA_LEGACY_LOOP_SCOPE=1 selects the enclosing shared scope instead
+        // (the old leaky behavior, kept only as a rollback lever).
+        context iter_scope_fresh(scope);
+        context & iter_scope = pxa_jinja_legacy_loop_scope() ? scope : iter_scope_fresh;
+        iter_scope.set_val("loop", loop_obj);
+        scope_update_fns[i](iter_scope);
         try {
             for (auto & stmt : body) {
-                value val = stmt->execute(scope);
+                value val = stmt->execute(iter_scope);
                 result->push_back(val);
             }
         } catch (const continue_statement::signal &) {
