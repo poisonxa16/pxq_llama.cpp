@@ -29,6 +29,11 @@ struct llama_file {
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
 
+    // PXA_PARALLEL_LOAD support (upstream ik_llama.cpp PR#2057): an independent handle to the
+    // same file (own FILE* / own offset) so worker threads can seek/read concurrently.
+    // Only valid for read-only, non-truncating modes.
+    std::unique_ptr<llama_file> clone() const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

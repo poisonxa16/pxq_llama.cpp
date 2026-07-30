@@ -188,6 +188,17 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    // PXA_PARALLEL_LOAD (port of upstream ik_llama.cpp PR#2057 + PR#2102): multi-threaded
+    // tensor loading for non-mmap loads. Dispatched from load_all_data only when the
+    // PXA_PARALLEL_LOAD env gate is set AND use_mmap is false; never called directly.
+    // Returns false if cancelled by progress_callback.
+    bool load_all_data_parallel(
+            struct ggml_context * ctx,
+            llama_buf_map & bufs_mmap,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data,
+            int n_workers);
 };
 
 void llm_load_arch(llama_model_loader & ml, llama_model & model);
