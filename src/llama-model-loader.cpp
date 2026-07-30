@@ -24,6 +24,12 @@
 #include <future>
 #include <regex>
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
@@ -487,7 +493,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
 
             if (llama_pxa_type_is_pxq(type) && !g_llama_pxa_pxq_content) {
                 g_llama_pxa_pxq_content = true;
-                LLAMA_LOG_INFO("%s: PXQ content detected (%s) — repetition guard eligible (arms at ENHANCE; PXA_REP_GUARD overrides)\n", __func__, ggml_type_name(type));
+                LLAMA_LOG_INFO("%s: PXQ content detected (%s) — repetition guard eligible (auto-arms at ENHANCE only for PXQ1-bearing files since 2026-07-30; PXA_REP_GUARD=1 forces any-PXQ, =0 disables)\n", __func__, ggml_type_name(type));
             }
 
             if (n_type_max < n_type[type]) {
@@ -1093,6 +1099,25 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+// PXA_PARALLEL_LOAD=N -> worker count for the multi-threaded tensor loader (upstream ik PR#2057 port).
+//   unset / 0 / non-numeric : OFF (default) - the legacy serial path below runs unchanged
+//   1                       : ON with 8 workers (the upstream PR#2057 default)
+//   2..64                   : ON with exactly N workers
+static int pxa_parallel_load_workers() {
+    const char * s = getenv("PXA_PARALLEL_LOAD");
+    if (s == nullptr || *s == 0) {
+        return 0;
+    }
+    const int v = atoi(s);
+    if (v <= 0) {
+        return 0;
+    }
+    if (v == 1) {
+        return 8;
+    }
+    return std::min(v, 64);
+}
+
 // Returns false if cancelled by progress_callback
 bool llama_model_loader::load_all_data(
             struct ggml_context * ctx,
@@ -1101,6 +1126,22 @@ bool llama_model_loader::load_all_data(
             llama_progress_callback progress_callback,
             void * progress_callback_user_data) {
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+
+    // PXA_PARALLEL_LOAD: opt-in multi-threaded loader (port of upstream ik PR#2057 + PR#2102).
+    // Parallelism only exists for non-mmap loads: the upstream rewrite serializes every tensor
+    // behind one mutex when mmap is in use (identical work, extra thread overhead), so with mmap
+    // we keep the proven serial path below and say why.
+    if (const int n_workers = pxa_parallel_load_workers(); n_workers > 0) {
+        if (use_mmap) {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("%s: PXA_PARALLEL_LOAD is set but mmap is in use - no effect; add --no-mmap to parallelize weight loading\n", __func__);
+                warned = true;
+            }
+        } else {
+            return load_all_data_parallel(ctx, bufs_mmap, progress_callback, progress_callback_user_data, n_workers);
+        }
+    }
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
@@ -1276,6 +1317,278 @@ bool llama_model_loader::load_all_data(
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.
+            return progress_callback(1.0f, progress_callback_user_data);
+        }
+    }
+
+    return true;
+}
+
+// PXA_PARALLEL_LOAD: multi-threaded tensor loading for non-mmap loads.
+// Port of upstream ik_llama.cpp PR#2057 (parallel weight loading) + PR#2102 (bound memory during
+// non-staged GPU loading: mmap the file lazily and MADV_DONTNEED each consumed range instead of
+// buffering whole tensors in RAM). Deliberate PXA deviations from upstream, all narrowing scope:
+//   * only reachable with !use_mmap (upstream also threads the mmap path but serializes every
+//     tensor behind one mutex there - identical work for pure overhead - so the serial path stays
+//     authoritative for mmap and the mmap/mlock/unmap-fragment machinery is not duplicated here);
+//   * llama_file::clone() happens per branch that actually reads via FILE* (upstream cloned once
+//     per tensor even for branches that never use it);
+//   * staging buffers/events are freed after the pool joins even on cancel/exception (upstream
+//     leaked them on those paths);
+//   * worker count comes from the PXA_PARALLEL_LOAD env instead of a hardcoded 8.
+bool llama_model_loader::load_all_data_parallel(
+            struct ggml_context * ctx,
+            llama_buf_map & bufs_mmap,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data,
+            int n_workers) {
+    GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+    GGML_ASSERT(!use_mmap && "parallel loader is only dispatched for non-mmap loads");
+    GGML_ASSERT(n_workers > 0);
+
+    {
+        static bool logged = false;
+        if (!logged) {
+            LLAMA_LOG_INFO("%s: PXA_PARALLEL_LOAD active: %d workers\n", __func__, n_workers);
+            logged = true;
+        }
+    }
+
+    std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+
+    // per-worker scratch read buffers for the serialized fallback branch
+    std::vector<std::vector<no_init<uint8_t>>> read_bufs(n_workers);
+
+    // PR#2102: per-file lazy mmaps used by the non-staged GPU branch; pages are dropped with
+    // dontneed_fragment right after each tensor is consumed, so memory use stays bounded.
+    std::vector<std::unique_ptr<llama_mmap>> split_mappings(files.size());
+
+#if defined(GGML_USE_CUDA)
+    // one pinned staging buffer per worker for async uploads (upstream PR#2057 size)
+    constexpr size_t buffer_size = 16 * 1024 * 1024; // 16MB
+
+    std::vector<ggml_backend_buffer_t> host_buffers;
+    std::vector<void*> host_ptrs;
+    std::vector<ggml_backend_event_t> events;
+
+    ggml_backend_t cuda_backend = nullptr;
+    if (!check_tensors) {
+        // Use async uploads from pinned memory to GPU memory.
+        // First determine if the CUDA backend is active, and if so, determine the device ID.
+        ggml_backend_buffer_t buf = bufs_mmap.count(0) ? bufs_mmap.at(0) : nullptr;
+        if (buf) {
+            ggml_backend_buffer_type_t buffer_type = ggml_backend_buffer_get_type(buf);
+            for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+                auto * cuda_buffer_type = ggml_backend_cuda_buffer_type(i);
+                if (buffer_type == cuda_buffer_type) {
+                    cuda_backend = ggml_backend_cuda_init(i, nullptr);
+                    break;
+                }
+            }
+        }
+
+        // If the cuda backend is active create pinned memory buffers and events for synchronisation.
+        if (cuda_backend) {
+            for (int idx = 0; idx < n_workers; ++idx) {
+                host_buffers.emplace_back(ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), buffer_size));
+                host_ptrs.emplace_back(ggml_backend_buffer_get_base(host_buffers[idx]));
+                events.emplace_back(ggml_backend_event_new(cuda_backend));
+            }
+            // force creation of the upload stream now, not lazily from a worker thread
+            ggml_backend_event_record(events[0]);
+            ggml_backend_event_synchronize(events[0]);
+        }
+    }
+#endif
+
+    // most per-tensor ops are not thread-safe; this mutex serializes them
+    std::mutex load_mutex;
+
+    // Load one tensor into its backing buffer:
+    // * host buffer:           parallel read into place
+    // * cuda (async staging):  parallel chunked read -> per-worker pinned buffer -> async upload
+    // * other CUDA-named buf:  parallel mmap-backed tensor_set + MADV_DONTNEED (PR#2102)
+    // * rest:                  serialized read + tensor_set
+    auto load_tensor = [&](ggml_tensor * cur, int thread_idx) -> size_t {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        GGML_ASSERT(weight != nullptr);
+        GGML_ASSERT(weight->idx < files.size());
+        const size_t n_size = ggml_nbytes(cur);
+
+        // host. parallel.
+        if (ggml_backend_buffer_is_host(cur->buffer)) {
+            const auto file = files.at(weight->idx)->clone();
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(cur->data, n_size);
+            if (check_tensors) {
+                std::lock_guard<std::mutex> lock(load_mutex);
+                validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                            return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                            }));
+            }
+            return n_size;
+        }
+
+#if defined(GGML_USE_CUDA)
+        // cuda with async staging. parallel: reads are concurrent, uploads share one stream.
+        if (cuda_backend) {
+            const auto file = files.at(weight->idx)->clone();
+            file->seek(weight->offs, SEEK_SET);
+
+            size_t bytes_read = 0;
+
+            while (bytes_read < n_size) {
+                size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
+
+                ggml_backend_event_synchronize(events[thread_idx]);
+                file->read_raw(host_ptrs[thread_idx], read_iteration);
+                ggml_backend_tensor_set_async(cuda_backend, cur, host_ptrs[thread_idx], bytes_read, read_iteration);
+                ggml_backend_event_record(events[thread_idx]);
+
+                bytes_read += read_iteration;
+            }
+            return n_size;
+        }
+
+        // remaining CUDA-named buffers (split buffers; or check_tensors runs, where the staging
+        // backend is disabled). parallel, memory-bounded via mmap + DONTNEED (PR#2102).
+        const char * buffer_name = ggml_backend_buffer_name(cur->buffer);
+        if (std::strncmp(buffer_name, GGML_CUDA_NAME, strlen(GGML_CUDA_NAME)) == 0) {
+            llama_mmap * mapping;
+            {
+                std::lock_guard<std::mutex> lock(load_mutex);
+                auto & m = split_mappings[weight->idx];
+                if (!m) {
+                    // mmap-ing the original file does not touch its FILE* offset, so this is
+                    // safe against the cloned handles the other branches read through
+                    m.reset(new llama_mmap(files.at(weight->idx).get(), /*prefetch =*/ 0, ggml_is_numa()));
+                }
+                mapping = m.get();
+            }
+            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+            ggml_backend_tensor_set(cur, data, 0, n_size);
+            if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            mapping->dontneed_fragment(weight->offs, weight->offs + n_size);
+            return n_size;
+        }
+#endif
+
+        // rest. serialized.
+        {
+            std::lock_guard<std::mutex> lock(load_mutex);
+            const auto file = files.at(weight->idx)->clone();
+            auto & read_buf = read_bufs[thread_idx];
+            read_buf.resize(n_size);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(read_buf.data(), n_size);
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            return n_size;
+        }
+    };
+
+    // shared work iterator: each worker CASes the cursor forward to claim the next tensor
+    auto cursor = std::make_shared<std::atomic<ggml_tensor *>>(ggml_get_first_tensor(ctx));
+    auto next_tensor = [this, ctx, cursor]() -> ggml_tensor * {
+        while (true) {
+            ggml_tensor * cur = cursor->load();
+            if (!cur) {
+                return nullptr;
+            }
+            if (!cursor->compare_exchange_weak(cur, ggml_get_next_tensor(ctx, cur))) {
+                continue;
+            }
+            // with split-experts models get_weight can return nullptr - skip, same as the serial path
+            if (get_weight(ggml_get_name(cur))) {
+                return cur;
+            }
+        }
+    };
+
+    std::atomic<size_t> loaded{size_done}; // bytes loaded so far (across calls), for the progress bar
+    std::atomic<bool>   cancelled{false};
+    std::atomic<bool>   failed{false};
+    std::exception_ptr  first_exception;
+
+    auto worker = [&](int thread_idx) {
+        try {
+            while (!cancelled.load() && !failed.load()) {
+                if (progress_callback) {
+                    const size_t done = loaded.load(std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lock(load_mutex);
+                    if (!progress_callback((float) done / size_data, progress_callback_user_data)) {
+                        cancelled.store(true);
+                        break;
+                    }
+                }
+                ggml_tensor * cur = next_tensor();
+                if (!cur) {
+                    break;
+                }
+                const size_t n_size = load_tensor(cur, thread_idx);
+                loaded.fetch_add(n_size, std::memory_order_relaxed);
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(load_mutex);
+            if (!failed.exchange(true)) {
+                first_exception = std::current_exception();
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(n_workers);
+    for (int thread_idx = 0; thread_idx < n_workers; ++thread_idx) {
+        pool.emplace_back(worker, thread_idx);
+    }
+    for (auto & t : pool) {
+        t.join();
+    }
+
+    size_done = loaded.load();
+
+#if defined(GGML_USE_CUDA)
+    // free temporary resources used for async cuda uploads; all workers have joined, so this is
+    // safe on the failure/cancel paths too (an event that was never recorded syncs immediately)
+    if (cuda_backend) {
+        for (size_t idx = 0; idx < events.size(); ++idx) {
+            ggml_backend_event_synchronize(events[idx]);
+            ggml_backend_event_free(events[idx]);
+            ggml_backend_buffer_free(host_buffers[idx]);
+        }
+        ggml_backend_free(cuda_backend);
+    }
+#endif
+
+    if (first_exception) {
+        std::rethrow_exception(first_exception);
+    }
+    if (cancelled.load()) {
+        return false;
+    }
+
+    // check validation results
+    bool validation_failed = false;
+    for (auto & future : validation_result) {
+        auto result = future.get();
+        if (!result.second) {
+            LLAMA_LOG_ERROR("%s: tensor '%s' has invalid data\n", __func__, ggml_get_name(result.first));
+            validation_failed = true;
+        }
+    }
+    if (validation_failed) {
+        throw std::runtime_error("found tensors with invalid data");
+    }
+
+    // last call: report completion (no mmap fragments to unmap - this path never runs with mmap)
+    if (size_done >= size_data) {
+        if (progress_callback) {
+            // even though the model is done loading, we still honor cancellation
+            // since the caller needs to free allocations
             return progress_callback(1.0f, progress_callback_user_data);
         }
     }
