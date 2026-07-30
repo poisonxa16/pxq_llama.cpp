@@ -487,7 +487,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
 
             if (llama_pxa_type_is_pxq(type) && !g_llama_pxa_pxq_content) {
                 g_llama_pxa_pxq_content = true;
-                LLAMA_LOG_INFO("%s: PXQ content detected (%s) — repetition guard eligible (arms at ENHANCE; PXA_REP_GUARD overrides)\n", __func__, ggml_type_name(type));
+                LLAMA_LOG_INFO("%s: PXQ content detected (%s) — repetition guard eligible (auto-arms at ENHANCE only for PXQ1-bearing files since 2026-07-30; PXA_REP_GUARD=1 forces any-PXQ, =0 disables)\n", __func__, ggml_type_name(type));
             }
 
             if (n_type_max < n_type[type]) {

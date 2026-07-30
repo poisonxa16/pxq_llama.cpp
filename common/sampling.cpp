@@ -44,6 +44,21 @@ static void pxa_pxq1_apply_rep_guard(common_params_sampling & sp) {
         return;
     }
     if (mode == 0) {
+        // PXA_REP_GUARD_SCOPE fix (2026-07-30): the ENHANCE auto-arm is PXQ1-CONTENT-ONLY
+        // again. The 2026-07-24 broadening to any-PXQ was motivated by the Fusion4 prose
+        // attractor — which was subsequently root-caused to PXA_PXQ4_2D_SPLIT non-bit-
+        // exactness and FIXED by PXQ_CANON_v1 (H1 verified gone at defaults, 2026-07-28/30).
+        // Left broad, the guard MEASURABLY CORRUPTS exact answers on high-quality tiers:
+        // Laguna PXQ4-core, 4xP100+1080Ti, temp-0/top_k-1 chat probe "4183*391" — DEFAULT
+        // level answers 1,635,553 (correct, x3); ENHANCE answered 1,635,593 (x3): the filled
+        // repeat/DRY penalties suppress the legitimate repeated "5". Both-direction proof:
+        // ENHANCE + PXA_REP_GUARD=0 -> correct x3; DEFAULT + PXA_REP_GUARD=1 -> wrong x3.
+        // That flip was chased for a night as an "sm_61 numerics bug" — it was this lever.
+        // PXQ1-bearing files (incl. PXQU12/24 mixed maps) keep the guard: the 1-bit tier's
+        // looping is measured and real. PXA_REP_GUARD=1 still forces any-PXQ arming.
+        if (!llama_pxa_pxq1_content()) {
+            return;
+        }
         const char * r = std::getenv("PXA_REFERENCE");
         if (r && atoi(r) != 0) {
             return;   // REFERENCE wins if both are set

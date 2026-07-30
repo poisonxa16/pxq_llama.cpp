@@ -166,7 +166,7 @@ happens second.
 | `PXA_PXQ3` | **on** | the 3-bit (LM8 bit-plane) kernel family; `=0` disables | |
 | `PXA_PXQ6R` | **on** | the 5-bit PXQ6 (LM32 x E16-row) kernel family; `=0` drops to dequant→cuBLAS | the quality tier (env name keeps the internal working name) |
 | — (PXQ1, type id 248) | always on | the sub-2-bit tier: 1-bit sign codes × the shared E16-row scales (per-row fp16 anchor + frozen SUB16 4-bit subs), 2-level book {−1,+1}, type_size 5 (1 scale byte + 4 code bytes / 32 elems), ~1.26 bpw. **Served dequant→cuBLAS GEMM in v1** — no fused kernel family, no env gate (nothing to disable). Built for `--pxq-universal` mixed maps: the 24/32 GB stretch tiers put low-importance experts at 1-bit (`pxq1` lines in the tier map, e.g. a knapsack mix like 126×pxq1/18×pxq2 for a ≤24 GB 122B-A5B) | quantize: `llama-quantize … PXQ1` (uniform) or `pxq1` rules in a `--pxq-universal` map; fixed compiled-in book, no provenance KVs |
-| `PXA_PXQ1_REP_GUARD` | auto (arms at ENHANCE) | **PXQ1 repetition guard** (2026-07-23): the 1-bit tier measurably loops on open-ended prompts (coding answers stay clean — measured on a 122B PXQU24 mixed file). When the loaded gguf contains ANY PXQ1 tensor AND the config level is **ENHANCE**, sampler init fills repetition defenses as DEFAULTS: `repeat_penalty` 1.0→1.15, `repeat_last_n` 64→256, DRY `dry_multiplier` 0→0.8 (base/allowed-length untouched). **User-set values always win — only knobs still at their defaults are filled.** `=0` forces off, `=1` forces on at any level. Visible as `PXQ1 content detected: repetition guard ON […]` at sampler init (the loader also logs detection at model load) | REFERENCE/DEFAULT levels leave sampling untouched; models with no PXQ1 tensors never trigger it |
+| `PXA_PXQ1_REP_GUARD` | auto (arms at ENHANCE) | **PXQ1 repetition guard** (2026-07-23): the 1-bit tier measurably loops on open-ended prompts (coding answers stay clean — measured on a 122B PXQU24 mixed file). When the loaded gguf contains ANY PXQ1 tensor AND the config level is **ENHANCE**, sampler init fills repetition defenses as DEFAULTS: `repeat_penalty` 1.0→1.15, `repeat_last_n` 64→256, DRY `dry_multiplier` 0→0.8 (base/allowed-length untouched). **User-set values always win — only knobs still at their defaults are filled.** `=0` forces off, `=1` forces on at any level. Visible as `PXQ1 content detected: repetition guard ON […]` at sampler init (the loader also logs detection at model load) | REFERENCE/DEFAULT levels leave sampling untouched; models with no PXQ1 tensors never trigger it. ⚠ **2026-07-30 — code/doc drift found, measured, and fixed:** on 2026-07-24 the code silently broadened the auto-arm to ANY PXQ tier (this row still said PXQ1-only). Measured harm on a high-quality tier (Laguna-S-2.1 PXQ4-core, 4×P100+1080Ti `-ts 8,8,8,8,3`, ctx 8192, `/v1/chat` temp 0 top_k 1, fresh server per arm, ×3 reps): DEFAULT answers 4183×391 = **1,635,553 (correct ×3)**; ENHANCE answered **1,635,593 (wrong ×3)** — the filled repeat/DRY penalties suppress the legitimate repeated digit. Both-direction conviction: ENHANCE+`PXA_REP_GUARD=0` → correct ×3; DEFAULT+`PXA_REP_GUARD=1` → wrong ×3. This flip was chased for a night as an "sm_61/1080Ti numerics bug" (INT8_PREFILL, MMVQ, graphs-off, and the 7-card topology were each A/B-exonerated — all null arms). The auto-arm is now PXQ1-content-only again (matching this row); the broadening's original motive (the Fusion4 prose attractor, H1) was separately root-caused to `PXA_PXQ4_2D_SPLIT` non-bit-exactness and fixed by `PXQ_CANON_v1`. `=1` still forces any-PXQ arming; fixed-binary verification: ENHANCE→correct ×3 + guard not applied, forced→wrong ×3 + `[FORCED]` log. ⚠ COROLLARY for past numbers: every gauntlet/eval served with `PXA_ENHANCE=1` on a PXQ file between 2026-07-24 and 2026-07-30 ran with repeat_penalty 1.15 / last_n 256 / DRY 0.8 silently filled for requests that did not set them |
 
 All master gates are ON out of the box (they were mis-documented as "off" before 2026-07-21) —
 zero-env users get the fused kernels on every PXQ / PXQ-UNIVERSAL file.
@@ -576,7 +576,7 @@ Documented so the sm_70 dead ends are reproducible instead of folklore:
 | `PXA_MOE_GROUPED_VERIFY` | off | `grouped_moe_verify.cuh` | shadow-verify for the A1 grouped MoE path: grouped writes a private scratch, per-token path stays authoritative, mismatches print. ⚠ **Fixed 2026-07-30: this was PRESENCE-tested (`=0` still enabled it — the only PXA lever where `=0` meant ON); it is now value-tested like every other lever** |
 | `PXA_MTP_ADAPTIVE_K` | 0 | `common/speculative.cpp` | acceptance-EMA adaptive draft depth (companion to `PXA_MTP_ADAPTIVE`) |
 | `PXA_SPEC_RELAXED_PMIN` | 0.05 | `common/sampling.cpp` | p_min floor for the `PXA_SPEC_RELAXED` experiment (G3-class; not recommended) |
-| `PXA_REP_GUARD` | level default | `common/sampling.cpp` | repetition-attractor guard; supersedes `PXA_PXQ1_REP_GUARD` (which remains as a back-compat alias) |
+| `PXA_REP_GUARD` | level default | `common/sampling.cpp` | repetition-attractor guard; supersedes `PXA_PXQ1_REP_GUARD` (back-compat alias). ⚠ 2026-07-30: ENHANCE auto-arm narrowed back to PXQ1-bearing files only — the any-PXQ broadening measurably flipped a temp-0 exact answer on PXQ4 (see the §1 row for the full measurement); `=1` forces any-PXQ, `=0` disables |
 | `PXA_ENHANCE_DBG` | off | `pxa-enhance.cuh` | prints the detected topology + every chosen ENHANCE config (diagnostic; use it to audit what the adaptive layer decided) |
 | `PXA_CUDA_GRAPH_MOE` / `_LRU` / `_REARM` / `_BATCH_MAX_NY` | — | `ggml-cuda.cu` | CUDA-graph capture family for the MoE decode path (graphs measured null ×3 on the sm_70 dense cell — see §G of the action register — but the knobs are live for other cells) |
 | `PXA_PXQ6R_ANCHOR_FIT` / `PXA_PXQ6R_SUB` | — | `pxq6.cuh` | PXQ6R tier lab knobs (anchor-fit strategy / sub-scale LUT override) |
@@ -590,3 +590,32 @@ Documented so the sm_70 dead ends are reproducible instead of folklore:
 | `--ctx-checkpoints-interval N` | 512 | min tokens between checkpoints |
 | `--ctx-checkpoints-tolerance N` | 5 | tokens-before-full-prompt at which a checkpoint is created |
 | `--ctx-checkpoints-eviction NAME` | variance | eviction strategy: `fifo`, `variance`, `auto`(=variance); variance keeps uniform positional coverage |
+
+### 2026-07-30 latest — the "sm_61 arith flip" was the PXQ repetition guard (dead-end + fix, fully measured)
+
+Verification class: **root-caused with both-direction A/B; fix verified on the shipped binary.**
+Cell for every arm: Laguna-S-2.1 **PXQ4-core**, 4×P100 + 1080 Ti, `-ts 8,8,8,8,3`, `-c 8192
+-np 1 -b 2048 -ub 2048 -fa on` f16 KV `--jinja`, `/v1/chat/completions` temp 0 / top_k 1 /
+`cache_prompt:false`, fresh server per arm, 3 reps per arm (all arms ×3 identical).
+
+| arm | env | 4183×391 | verdict |
+|---|---|---|---|
+| B | none (DEFAULT) | **1,635,553 ✓** | control |
+| C | `PXA_ENHANCE=1` +MMVQ+graphs-off | 1,635,593 ✗ | repro of the "flip" |
+| D | C + `PXA_PXQ_INT8_PREFILL=0` | 1,635,593 ✗ | **INT8_PREFILL exonerated** |
+| E1 | `PXA_ENHANCE=1` alone | 1,635,593 ✗ | ENHANCE is the carrier |
+| E2 | `GGML_CUDA_DISABLE_GRAPHS=1` alone | 1,635,553 ✓ | null |
+| E3 | `PXA_PXQ_MMVQ=1` alone | 1,635,553 ✓ | null |
+| F1 | ENHANCE + `PXA_SPEC_RELAXED=0` | 1,635,593 ✗ | exonerated |
+| F2 | ENHANCE + `PXA_AUTO_SAMPLERS=0` | 1,635,593 ✗ | exonerated |
+| G1 | ENHANCE + `PXA_REP_GUARD=0` | **1,635,553 ✓** | **conviction (direction 1)** |
+| G2 | DEFAULT + `PXA_REP_GUARD=1` | 1,635,593 ✗ | **conviction (direction 2)** |
+| H1 | fixed binary, ENHANCE | **1,635,553 ✓** | fix verified |
+| H2 | fixed binary, `PXA_REP_GUARD=1` | 1,635,593 ✗ + `[FORCED]` log | force path intact |
+
+Also measured: the ORIGINAL failing 7-card cell (2×V100+4×P100+1080Ti, `-ts 1,1,8,8,8,8,3`,
+same file/env as the incident incl. graphs-off) answered **correct ×3** when served standalone
+— the incident's 4/5 ran co-resident with a second brain on the V100s; with the guard armed
+the flip is near-tie/cell-fragile, which is exactly why it masqueraded as a numerics bug.
+**Dead ends recorded so nobody re-chases:** sm_61/1080Ti DP4A numerics, INT8_PREFILL,
+MMVQ, CUDA-graphs-off, and 7-card topology are ALL exonerated for this symptom.
