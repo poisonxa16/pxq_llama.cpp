@@ -620,3 +620,9 @@ same file/env as the incident incl. graphs-off) answered **correct ×3** when se
 the flip is near-tie/cell-fragile, which is exactly why it masqueraded as a numerics bug.
 **Dead ends recorded so nobody re-chases:** sm_61/1080Ti DP4A numerics, INT8_PREFILL,
 MMVQ, CUDA-graphs-off, and 7-card topology are ALL exonerated for this symptom.
+
+### 2026-07-30 — MTP draft-gen worst-case reserve clamp (upstream #2181 port, gated)
+
+| var | default | where | what it does |
+|---|---|---|---|
+| `PXA_MTP_DRAFT_RESERVE_CLAMP` | **0 (off)** | `src/llama.cpp` (`llama_kv_cache_update_internal`) | `=1`: when a deferred K-shift/s-copy/defrag fires during an MTP **draft-gen** decode (`mtp_op_type == MTP_OP_DRAFT_GEN`), the post-update worst-case graph re-reserve is clamped from `min(n_ctx, n_ubatch)` tokens to **1** — a draft-gen step consumes exactly one token + one hidden-state vector, so the full-width MTP-graph reserve is a pure transient compute-buffer spike. Port of upstream ik_llama.cpp #2181 (`de55d9e2`). **Verification class: code-audited no-op in the current server, either state** — the trigger is structurally unreachable here: `PXA_HYBRID_CTX_SHIFT_v3` never marks the MTP companion's KV flags (companion shift mirroring was replaced by `seq_rm` + rebuild), the server only defrags the target ctx, and nothing `seq_cp`s the companion. **[EST] no measurable effect in the live config**; landed as defense-in-depth/upstream parity for paths that re-mark companion flags (the imatrix MTP draft loop, future arch ports, any revival of companion shift mirroring). Safe by construction: an under-reserve auto-reallocs on the next larger graph (ggml-alloc), and reservation size never touches computed values — no output-path effect. Not in ENHANCE. TU compile-verified on the canonical tree; no runtime A/B exists because no reachable cell exercises it |

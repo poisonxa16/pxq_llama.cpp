@@ -6459,6 +6459,23 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         // TODO: extract to a function
         // build worst-case graph
         int n_tokens = (int)std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch);
+        // PXA_MTP_DRAFT_RESERVE_CLAMP (port of upstream ik_llama.cpp #2181): an MTP draft-gen
+        // step consumes exactly one token + one hidden-state vector per decode, so when a
+        // deferred K-shift/s-copy/defrag lands mid-draft the worst-case re-reserve only needs
+        // a 1-token graph -- the full min(n_ctx, n_ubatch)-wide MTP graph is a pure transient
+        // compute-buffer spike. NOTE: in this tree the trigger state is structurally
+        // unreachable in the server (PXA_HYBRID_CTX_SHIFT_v3 never marks the MTP companion's
+        // KV flags: shift mirroring was replaced by seq_rm + rebuild), so this is
+        // defense-in-depth/upstream parity for paths that may re-mark companion flags
+        // (the imatrix MTP draft loop, future arch ports). Under-reserving is safe either
+        // way: the scheduler auto-reallocs when a later, larger graph arrives (ggml-alloc).
+        static const bool pxa_mtp_draft_reserve_clamp = [] {
+            const char * s = getenv("PXA_MTP_DRAFT_RESERVE_CLAMP");
+            return s != nullptr && atoi(s) != 0;
+        }();
+        if (pxa_mtp_draft_reserve_clamp && lctx.cparams.mtp_op_type == MTP_OP_DRAFT_GEN) {
+            n_tokens = 1;
+        }
         int n_past = lctx.cparams.n_ctx - n_tokens;
         llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
         ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, llama_batch_get_one(&token, n_tokens, n_past, 0), true, lctx.cparams.worst_graph_tokens);
