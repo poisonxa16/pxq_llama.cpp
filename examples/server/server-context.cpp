@@ -2700,6 +2700,24 @@ void server_context::send_partial_response(server_slot& slot, completion_token_o
 }
 
 void server_context::send_final_response(server_slot& slot) {
+    // PXA_UTF8_FINAL_v1 (2026-07-30): a generation cut mid-multibyte-codepoint (n_predict
+    // cap / ignore_eos runaway) leaves a trailing partial UTF-8 sequence in generated_text.
+    // nlohmann::json refuses to serialise it and the WHOLE response 500s
+    // ("incomplete UTF-8 string; last byte: 0x..") AFTER a successful generation — a
+    // content-dependent, seed-reproducible failure that masquerades as flaky infrastructure.
+    // The streaming path already holds back incomplete sequences per-chunk (process_token);
+    // apply the same discipline to the final payload: drop the unrenderable tail bytes.
+    {
+        const size_t utf8_ok = validate_utf8(slot.generated_text);
+        if (utf8_ok < slot.generated_text.size()) {
+            LOG_WARNING("final response: dropping incomplete trailing UTF-8 sequence", {
+                {"id_slot",       slot.id},
+                {"id_task",       slot.id_task},
+                {"dropped_bytes", slot.generated_text.size() - utf8_ok},
+            });
+            slot.generated_text.resize(utf8_ok);
+        }
+    }
     auto res = std::make_unique<server_task_result_cmpl_final>();
     res->final_result = true;
     res->id = slot.id_task;
