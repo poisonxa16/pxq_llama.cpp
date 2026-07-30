@@ -6405,7 +6405,9 @@ static bool pxa_cuda_graph_batch_enabled() {
         // The E2 union probe (PXA_MOE_DEBUG) does a cudaMemcpy D2H + stream sync INSIDE the MoE op,
         // and the A1 shadow-verify (PXA_MOE_GROUPED_VERIFY) relies on device-printf flushing at
         // stream syncs -- both are incompatible with (or defeated by) graph capture/replay.
-        if (getenv("PXA_MOE_DEBUG") || getenv("PXA_MOE_GROUPED_VERIFY")) return false;
+        // (PXA_MOE_GROUPED_VERIFY goes through its value-tested resolver since 2026-07-30 —
+        // a presence test here would disable graphs on an explicit =0.)
+        if (getenv("PXA_MOE_DEBUG") || pxa_moe_grouped_shadow()) return false;
         return true;
     }();
     return on;

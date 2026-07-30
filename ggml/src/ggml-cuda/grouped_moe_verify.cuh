@@ -59,7 +59,14 @@ static inline int pxa_moe_grouped_flags() {
     return f;
 }
 static inline bool pxa_moe_grouped_shadow() {
-    static const bool v = getenv("PXA_MOE_GROUPED_VERIFY") != nullptr;
+    // PXA_TYPEARG_STRICT_v1-adjacent fix (2026-07-30): this was PRESENCE-tested, so
+    // PXA_MOE_GROUPED_VERIFY=0 still ENABLED shadow-verify — the only PXA_* lever whose
+    // =0 meant ON (flagged by the 2026-07-29 A14 lever inventory). Value-test like every
+    // other lever: unset or =0 -> off, any nonzero -> on.
+    static const bool v = [](){
+        const char * e = getenv("PXA_MOE_GROUPED_VERIFY");
+        return e && atoi(e) != 0;
+    }();
     return v;
 }
 
