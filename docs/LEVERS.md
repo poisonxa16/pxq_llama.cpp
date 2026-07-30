@@ -81,7 +81,7 @@ The kernel levers below are the MEANS; these two named postures are the PRODUCT.
 
 | posture | how to select | fa / ub it fills | goal |
 |---|---|---|---|
-| **BALANCE** (default, the daily) | no env, or `PXA_MODE=balance` | `-fa on`, adaptive ub (2048-class on 16 GB cards) | best **decode** AND best-possible prefill **in the fa-on regime** — carried by `PXA_FA_PREFILL_SPLIT=64` (big batches build the non-FA/fa-off math even under `-fa on`) + `PXA_FA_MASK_SKIP_TILE` (bit-identical fully-masked-tile skip in the Pascal tile FA kernel). fa-on **decode is byte-untouched by construction** (decode-sized graphs never cross the split threshold; skipped tiles contribute exactly zero) — a prefill lever that costs decode is a MAX-only lever, never BALANCE. |
+| **BALANCE** (default, the daily) | no env, or `PXA_MODE=balance` | `-fa on`, adaptive ub (2048-class on 16 GB cards) | best **decode** AND best-possible prefill **in the fa-on regime** — carried by `PXA_FA_MASK_SKIP_TILE` (bit-identical fully-masked-tile skip in the Pascal tile FA kernel). ⚠ corrected 2026-07-30: `PXA_FA_PREFILL_SPLIT` is **no longer a BALANCE carrier** — it has been experimental OPT-IN (default 0) since 2026-07-24 because its non-FA prefill chain inflates the compute buffer ~2.35× and OOMs 16 GB cards at ub2048; opt in with `PXA_FA_PREFILL_SPLIT=64` when VRAM headroom allows (see its §4 row). fa-on **decode is byte-untouched by construction** — a prefill lever that costs decode is a MAX-only lever, never BALANCE. |
 | **MAX** (bulk ingest) | `PXA_MODE=max` | `-fa off`, largest-fitting ub {2048→1024→768→512} | absolute max prefill; decode secondary. SPLIT/MASK_SKIP are inert at fa-off; all fa-off prefill levers (fp16-GEMM sm_60, CUBLAS64 sm_70, INT8_PREFILL sm_61 under ENHANCE) engage. |
 
 Rules of engagement:
@@ -107,14 +107,15 @@ PXQU-16+q8head on P100/V100, PXQ2 on the 1080 Ti — 2026-07-22 windows):
 | card | BALANCE (fa-on) | MAX (fa-off, largest-fitting ub) |
 |---|---|---|
 | **V100 16 GB** (sm_70) | prefill **1627.7** / decode **91.0–92.8** @ ub512 (+6.0% prefill from CUBLAS64; fa-on ub2048 blows up at request time until SPLIT is silicon-verified — adaptive-ub or explicit `-ub 512` is the working fa-on ceiling on a near-full single card). **Decode headline with MTP: 108.3** @ ub1024 fa-on (mtp n1 + lazy, steady-state; base 91.6 same session — see the MTP section; ub2048 + the MTP gguf OOMs single-card, ub1024 is the ceiling) | prefill **2358.2** / decode 77.3–78.3 @ ub2048 (**canonical close 2026-07-22**: WMMA v2 `=3` on the merged canonical build, +5.0% flag-attributable; clean confirm set 2383.5. Canonical flag-off base is now **2245.3** — the old 2149.6 row moved +4.5% from canonical churn (CUBLAS64-era), drift resolved. CUBLAS64 +9.6% banked inside; threshold 64 proven the true optimum: 48 ties, 32 loses, 96 forfeits the +5% [64,96) window) |
-| **P100 16 GB** (sm_60) | **BALANCE (fa-on ub2048): prefill 1206 / decode 56.7** -- `PXA_FA_PREFILL_SPLIT` lifts fa-on prefill +45% (834->1206) with decode held (measured, median of 3) | **MAX (fa-off ub2048): prefill 1170 / decode 41.5** (fp16-GEMM on, banked) |
+| **P100 16 GB** (sm_60) | **BALANCE (fa-on ub2048): prefill 1206 / decode 56.7** -- measured WITH `PXA_FA_PREFILL_SPLIT=64` explicitly set (+45% fa-on prefill, 834->1206, decode held; median of 3). ⚠ SPLIT is opt-in since 2026-07-24, so out-of-the-box BALANCE prefill is the 834-class number unless you set it | **MAX (fa-off ub2048): prefill 1170 / decode 41.5** (fp16-GEMM on, banked) |
 | **1080 Ti 11 GB** (sm_61) | prefill 678 / decode **65.6** @ ub768 adaptive (ub2048/1024 physically OOM; SPLIT is the staged carrier toward the ~950–1001 fa-off class) | prefill **985** / decode 64.7 @ ub768 (reproduces published 1001 within 1.6%; ENHANCE INT8_PREFILL +830% is the carrier; I8-DBUF/BN128 maturation REFUTED — see §5) |
 
-⚠ **HONESTY GATE (2026-07-22)**: the two BALANCE carriers (`PXA_FA_PREFILL_SPLIT`,
-`PXA_FA_MASK_SKIP_TILE`) are compiled clean and equivalence-argued by construction, but their
-staged silicon A/B (B1/B2/B3 sha-set + decode-guard cells) has **not yet run** — they were
-defaulted ON per the posture directive. Roll back instantly with `PXA_FA_PREFILL_SPLIT=0` /
-`PXA_FA_MASK_SKIP_TILE=0`; run the staged cells before quoting BALANCE prefill numbers.
+⚠ **HONESTY GATE (2026-07-22; amended 2026-07-30)**: `PXA_FA_MASK_SKIP_TILE` is compiled clean
+and equivalence-argued by construction, but its staged silicon A/B (B1/B2/B3 sha-set +
+decode-guard cells) has **not yet run** — it was defaulted ON per the posture directive; roll
+back instantly with `PXA_FA_MASK_SKIP_TILE=0`. `PXA_FA_PREFILL_SPLIT` was demoted to opt-in
+(default 0) on 2026-07-24 — see its §4 row — so it is no longer a shipped default awaiting
+silicon; its A/B remains un-run and is owed when someone opts in.
 Determinism note (new stack fact): temp-0 output has run-to-run sha flutter even on unmodified
 binaries in cuBLAS-engaged configs — determinism gates must compare **sha sets / short-gen
 exactness**, not single-run sha equality.
@@ -239,7 +240,7 @@ The published per-card numbers in `bench/README.md` were measured with section-2
 | `PXA_VOLTA_CUBLAS_ID_NE11` | 0 | same idea for the routed (mul_mat_id) expert GEMMs on sm_70 | measured a LOSS on the configs tried — MXFP4 experts already ride fast MMQ | leave unset |
 | `PXA_P100_FP16_GEMM` | on | sm_60 dense-GEMM prefill path: fp16 dequant + GemmEx-16F (GP100 has full-rate fp16) | `=0` rolls back to fp32 SGEMM (the old, slower path). Its gain is already banked in the published P100 1213/1169 fa-off numbers. **0a hygiene 2026-07-22: now level-aware — `PXA_REFERENCE=1` really turns it OFF on sm_60** (it used to stay silently ON and contaminate reference floors); explicit env still wins | G3-class; ON is the shipped default |
 | `PXA_FA_MASK_SKIP_TILE` | **on** | skips fully-`-inf`-masked 64-wide KV tiles in the Pascal tile-f16 FA kernel (port of the shipped wmma MASK_SKIP; the nb31 mask-stride lesson applied). A BALANCE carrier: engages sm_60/sm_61 under `-fa on`; inert at fa-off | bit-identical BY CONSTRUCTION (skipped tiles contribute exactly zero); **⚠ staged B1 silicon A/B (sha-set + decode-guard, target P100 fa-on ub2048 pf ≥900) has NOT yet run** — defaulted ON per the 2026-07-22 posture directive; `=0` rolls back | bit-exact (by construction; silicon gate pending) |
-| `PXA_FA_PREFILL_SPLIT` | **64** (BALANCE) / 0 (MAX, REFERENCE) | per-ubatch FA regime dispatch (`src/llama-build-context.cpp` + resolver): graphs with `n_tokens ≥ N` build the non-FA batched-cuBLAS attention chain even under `-fa on` — prefill rides the fa-off math (the pre-Turing fast-prefill regime), decode/MTP-verify (< N) keep the byte-untouched FA branch. Values 1–8 clamp to 9 (decode/MTP-verify safety) | decode byte-identical by construction; **⚠ staged B2/B3 silicon A/B (target P100 fa-on ub2048 pf ≥1100, decode sha-identical) has NOT yet run** — defaulted 64-under-BALANCE per the posture directive; `=0` rolls back | prefill G3-class (regime swap), decode bit-exact |
+| `PXA_FA_PREFILL_SPLIT` | **0 — EXPERIMENTAL OPT-IN ONLY** (⚠ row corrected 2026-07-30: it previously claimed "64 under BALANCE" while both resolvers have returned 0 since 2026-07-24/merged 07-28 — doc/code drift caught by the A6 audit) | per-ubatch FA regime dispatch (`src/llama-build-context.cpp` + resolver): graphs with `n_tokens ≥ N` build the non-FA batched-cuBLAS attention chain even under `-fa on` — prefill rides the fa-off math (the pre-Turing fast-prefill regime), decode/MTP-verify (< N) keep the byte-untouched FA branch. Values 1–8 clamp to 9 (decode/MTP-verify safety). **Why no longer a default:** the non-FA prefill chain inflates the compute buffer ~2.35× (1956 → 4607 MiB measured) and OOMs 16 GB cards at ub2048. The +45% P100 fa-on prefill (834→1206) is real but must be bought explicitly (`PXA_FA_PREFILL_SPLIT=64`) with the VRAM headroom to pay for it | decode byte-identical by construction; the staged B2/B3 silicon A/B has still not run | prefill G3-class (regime swap), decode bit-exact |
 | `PXA_MXFP4_DEQ_V2` | on | fast coalesced smem-table MXFP4→f16 dequant kernel | 150→397 GB/s dequant, bit-identical output; `=0` rolls back | bit-exact |
 | `PXA_PXQ6_PRMT` | off | K2c: prmt/byte-perm **register-LUT** book decode (4-bit tiers) — 16-entry book in 8 uniform registers, `__byte_perm` nibble→fp16, zero smem. Bit-exact (memcmp all-pass, all 4 tiers) | **−11% decode on V100** (re-screened −17% n=2 in the 2026-07-26 KSG4 ship config — same verdict, dead). ⚠ **CAUSE CORRECTED 2026-07-27: the original reading "Tesla decode is bandwidth-bound so it loses" is DISPROVEN by the ncu roofline** (`ncu-pxq4-mmv.log`, V100 decode instances of the mmv family): `dram__throughput` **5.96–35.62% of peak** — nowhere near a memory ceiling — with achieved occupancy **19.8–38.6%, Block Limit = Registers (6 blocks/SM)**. The kernel is **register-limited and latency-bound**; PRMT loses because its extra uniform-register book + integer ops worsen exactly the register/issue pressure that is the real constraint. This misreading aimed four sm_70 attacks at a bottleneck that was not there (`CUDA_GRAPH_V2` −2..−4%, `INT8_PREFILL` −6.6% prefill, PRMT −11%, `FUSERED` −1.6%). KEEP default-OFF: it is the correctness-proven **sm_80 Marlin-tier prerequisite**, not a Pascal/Volta lever | bit-exact |
 | `PXA_PXQ6_LDCS` | off | K7: `ld.global.cs` (evict-first) on the decode weight code stream | **+0.5% V100 decode = noise** (below the <1% kill line); bit-exact + harmless, left OFF. May pay on tighter-L2 cards (P100 A/B pending) | bit-exact |
@@ -391,10 +392,13 @@ the same-worktree drift-free A/B build (2 target files only) ran on `build-spec1
 | `PXA_SPEC_RELAXED` (+`_PMIN`) | off | relaxed draft-acceptance experiment (G3-class; not recommended) |
 | `PXA_SHARED_MTP_BATCH_COMMIT` | on | batches MTP commit work across slots; `=0` restores fully-serial behavior (rollback knob) |
 | `PXA_MOE_FASTTG_MAX_NY` | 8 | max verify-batch Ny that stays on the per-token fast-TG path; `=1` routes Ny>1 MTP verify batches to the expert-grouped batched path (weights read once per traversal) |
-| `PXA_MOE_GROUPED` / `_VERIFY` / `PXA_MOE_BATCHED_VERIFY` | off | A1 expert-grouped batched-MoE verify kernels + shadow-verify harness (G3-class; incompatible with graph capture) |
+| `PXA_MOE_GROUPED` / `_VERIFY` / `PXA_MOE_BATCHED_VERIFY` | off | A1 expert-grouped batched-MoE verify kernels + shadow-verify harness (G3-class; incompatible with graph capture). ⚠ fixed 2026-07-30: `PXA_MOE_GROUPED_VERIFY` was presence-tested (`=0` still enabled shadow-verify); it is now value-tested like every other lever |
 | `PXA_PROMPT_INTERLEAVE` | on | co-decodes resident slots while another slot prefills; `=0` reverts to serialize-behind-decode (ops kill-switch) |
 | `PXA_HEALTH_STALL_MS` | 60000 | `/health` reports stalled if a queued probe can't be served within the deadline (`0` = off) — keeps health honest instead of parking an HTTP worker |
-| `PXA_WEDGE_EXIT_MS` | 0 | in-server watchdog: one `llama_decode` stuck longer than this (×3 checks) → process exit so a supervisor can restart (`0` = off) |
+| `PXA_WEDGE_EXIT_MS` | **180000** (⚠ doc previously said 0 — the code has always defaulted to 180000/ON) | in-server stall watchdog: one `llama_decode` stuck longer than this across 3 consecutive 5 s checks triggers the runtime-appropriate action (`0` = off). **Container-aware since 2026-07-30:** in a container → `_exit(42)` (the orchestrator restarts); bare metal → an in-process recovery attempt first (`llama_decode_stop()` soft-wedge abort at strike 3), then `_exit(41)` at strike 6 with a loud "no supervisor detected — restart manually" banner. Exit codes are distinct (41 bare / 42 container) so logs can tell the contracts apart. The monitor never forks or re-execs in either mode. |
+| `PXA_IN_CONTAINER` | unset (auto-detect) | forces the container verdict used by `PXA_WEDGE_EXIT_v1`: `=1` container contract, `=0` bare-metal contract. Precedence: this override > auto-detection (`/.dockerenv`, `/run/.containerenv`, `container=` in `/proc/1/environ`, docker/containerd/kubepods/libpod/lxc in `/proc/1/cgroup`, container paths in `/proc/self/mountinfo`). The verdict + evidence is printed once at startup (`PXA_CONTAINER_AWARE_v1: runtime=...`) |
+| `PXA_PORT_GUARD` | on | pre-bind probe: if a LIVE listener already answers on the target host:port the server refuses to start with an actionable error instead of silently coexisting/fighting (the 2026-07-30 bare-metal duplicate-server incident); `=0` bypasses |
+| `GGML_NO_BACKTRACE` | unset | `=1`: on abort, skip the fork-a-debugger backtrace entirely (symbols-only). The fork path is now safe (`PXA_BT_NOFORK_v1`: child `_exit`s instead of `exit`ing — the old `exit()` could deadlock a fork child of the multithreaded CUDA process into an immortal duplicate server; parent waits max 15 s then SIGKILLs), but production servers may still prefer to skip the debugger attach, which stops the process while gdb runs |
 
 ## 7. Multi-GPU / partition levers
 
@@ -408,6 +412,7 @@ the same-worktree drift-free A/B build (2 target files only) ran on `build-spec1
 
 | var | what it does |
 |---|---|
+| `PXA_PXQ_COMPOSITION_OVERRIDE` (env) / `--pxq-composition-override` (CLI) | **SAFETY GATE, not a performance knob — read before ever setting it.** After every PXQ-target quantize the writer sums output bytes by type and asserts (a) PXQ-family bytes ≥ 50% of the file and (b) a uniform PXQ target actually produced bytes of its named tier. On failure it **deletes the mislabelled output** and aborts with `PXQ composition assertion: target <FTYPE> produced <X>% PXQ-family bytes…`. This assertion exists because exactly such a file shipped once: an artifact labelled "PXQ4" that was 27% PXQ / 68% MXFP4 with attention and the shared expert carrying none, which entered a public README as *"tier/codec the only variable"* and stood for weeks (the retracted 104.06). **If you trip this assertion and reach for the override, you are about to ship the same mislabel — rename the output honestly instead.** (Documented 2026-07-30; the guard itself shipped 2026-07-28, `src/llama-quantize.cpp`.) |
 | `PXA_PXQ6_BOOK` / `PXA_PXQ2_BOOK` / `PXA_PXQ3_BOOK` / `PXA_PXQ6R_BOOK` | override the frozen codebook — for lab experiments; shipped books are compiled in and sha-pinned |
 | `PXA_PXQ6_SUB` / `_SUB_HQ` / `PXA_PXQ2_SUB` / `PXA_PXQ3_SUB` | override the sub-scale LUTs (lab) |
 | `PXA_PXQ6_ANCHOR_FIT` / `PXA_PXQ2_ANCHOR_FIT` / `PXA_PXQ3_ANCHOR_FIT` | anchor-fit strategy toggles in the native quantizers (lab; defaults are the shipped, gate-proven settings) |
@@ -539,3 +544,39 @@ release notes.*
   and killed; the 104.06 figure it was anchored to was retracted as an artifact-composition error).
   Bit-exactness costs 1.9% and is worth it: it retires the entire config-dependent greedy-flip class
   (S, target, device SM count, lever toggles).
+
+## Updates — 2026-07-30 — container-aware wedge exit + fork root cause + strict quantize type args
+
+- **`PXA_BT_NOFORK_v1` (ggml.c):** root cause of the bare-metal duplicate-server incident
+  (DGX-1, 2026-07-30). `ggml_abort` → `ggml_print_backtrace()` forks to attach gdb; with no
+  debugger on PATH the child called `exit()` — atexit/dtor handlers in a fork child of a
+  multithreaded CUDA process deadlock on mutexes held at fork time, leaving an immortal
+  duplicate of the server (parent's argv, PPID = parent, holding a dup of the listening
+  socket) while the parent blocked forever in `waitpid`. Fixes: child `_exit`s, parent waits
+  ≤15 s then SIGKILLs, `GGML_NO_BACKTRACE` honored, `fork()` failure falls back to symbols.
+- **`PXA_CONTAINER_AWARE_v1` + `PXA_IN_CONTAINER` + exit codes 41/42:** see the section-6 rows.
+- **`PXA_PORT_GUARD_v1`:** see the section-6 row.
+- **`PXA_UTF8_FINAL_v1` (server):** final responses no longer 500 when a generation stops
+  mid-multibyte-codepoint (`n_predict` cap / `ignore_eos`) — the incomplete trailing UTF-8
+  bytes are dropped from the final payload exactly as the streaming path already did
+  per-chunk. Closes the "incomplete UTF-8 string; last byte: 0x.." open bug (2026-07-29).
+- **`PXA_TYPEARG_STRICT_v1` (`llama-quantize`):** all 12 `--*-type` flags now HARD-FAIL on an
+  unparseable type name instead of silently ignoring the flag (exit 0, wrong artifact — the
+  2026-07-29 open bug), and type names match case-insensitively (`q6_k` == `q6_K`).
+
+### 2026-07-30 — previously UNDOCUMENTED levers (the A14 inventory closed out)
+
+Every row here existed in source with no doc row (flagged by the 2026-07-29 A14 audit).
+Documented so the sm_70 dead ends are reproducible instead of folklore:
+
+| var | default | where | what it does |
+|---|---|---|---|
+| `PXA_PXQ_MMVQ_ROWS` | **4** (accepts 1\|2\|4\|8\|16) | `pxq-mmvq.cuh` | rows-per-block for the PXQ MMVQ decode kernel. ⚠ ROWS≥8 is a MEASURED DEAD END on sm_70 (register-bound: ROWS=1 62 reg/0 B spill → ROWS=16 183 reg/256 B spill; the "37.89 t/s ROWS=8 beats MXFP4" figure was FABRICATED — no on-disk log). This knob is how those dead ends were expressed |
+| `PXA_PXQ_MMVQ_VDR` | **2** (accepts 2\|4) | `pxq-mmvq.cuh` | values-per-dot-iteration for the same kernel. VDR=4 measured −4 to −6% — dead end, kept for reproducibility |
+| `PXA_MOE_GROUPED_VERIFY` | off | `grouped_moe_verify.cuh` | shadow-verify for the A1 grouped MoE path: grouped writes a private scratch, per-token path stays authoritative, mismatches print. ⚠ **Fixed 2026-07-30: this was PRESENCE-tested (`=0` still enabled it — the only PXA lever where `=0` meant ON); it is now value-tested like every other lever** |
+| `PXA_MTP_ADAPTIVE_K` | 0 | `common/speculative.cpp` | acceptance-EMA adaptive draft depth (companion to `PXA_MTP_ADAPTIVE`) |
+| `PXA_SPEC_RELAXED_PMIN` | 0.05 | `common/sampling.cpp` | p_min floor for the `PXA_SPEC_RELAXED` experiment (G3-class; not recommended) |
+| `PXA_REP_GUARD` | level default | `common/sampling.cpp` | repetition-attractor guard; supersedes `PXA_PXQ1_REP_GUARD` (which remains as a back-compat alias) |
+| `PXA_ENHANCE_DBG` | off | `pxa-enhance.cuh` | prints the detected topology + every chosen ENHANCE config (diagnostic; use it to audit what the adaptive layer decided) |
+| `PXA_CUDA_GRAPH_MOE` / `_LRU` / `_REARM` / `_BATCH_MAX_NY` | — | `ggml-cuda.cu` | CUDA-graph capture family for the MoE decode path (graphs measured null ×3 on the sm_70 dense cell — see §G of the action register — but the knobs are live for other cells) |
+| `PXA_PXQ6R_ANCHOR_FIT` / `PXA_PXQ6R_SUB` | — | `pxq6.cuh` | PXQ6R tier lab knobs (anchor-fit strategy / sub-scale LUT override) |
