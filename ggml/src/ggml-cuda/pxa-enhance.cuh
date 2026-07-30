@@ -456,7 +456,10 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
                 fprintf(stderr, " INT8_PREFILL ON [TEST all-arch]");
             }
         } else if (cc == 610 && (i8 == 1 || i8 == 2)) {
-            fprintf(stderr, " INT8_PREFILL ON [+182%% pf, G3]%s", pxa_fa_mask_skip_tile() ? " MASK_SKIP_TILE ON" : "");
+            // No MASK_SKIP_TILE here: fast_fp16_available() excludes cc 610, so sm_61 never
+            // dispatches the tile-f16 kernel the lever lives in — reporting it ON would be a
+            // phantom lever. sm_61 takes tile-f32, whose skip is PXA_FA_MASK_SKIP_TILE_F32.
+            fprintf(stderr, " INT8_PREFILL ON [+182%% pf, G3]");
             if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [TEST all-arch]");
         } else if (cc == 600) {
             fprintf(stderr, " FP16_GEMM %s [2:1 hgemm] MASK_SKIP_TILE %s [bit-exact]",
