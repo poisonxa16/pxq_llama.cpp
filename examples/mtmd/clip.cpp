@@ -36,6 +36,8 @@
 #include <functional>
 #include <cfloat>
 
+#include "stb/stb_image_resize2.h"
+
 #define DEFAULT_INTERPOLATION_MODE ((int)GGML_SCALE_MODE_BILINEAR | (int)GGML_SCALE_FLAG_ALIGN_CORNERS)
 
 // TODO: allow to pass callback from user code
@@ -4098,6 +4100,28 @@ static void normalize_image_u8_to_f32(const clip_image_u8 & src, clip_image_f32 
 
 // set of tools to manupulate images
 // in the future, we can have HW acceleration by allowing this struct to access 3rd party lib like imagick or opencv
+// PXA_MTMD_STBIR_v1 (2026-07-30): port of upstream ik_llama.cpp #1967 (574f22b3,
+// stb_image_resize2 SIMD resizers) + #1969 (19f08160, bicubic for the Qwen-VL family).
+// PXA_MTMD_STBIR=1 (value-tested, default OFF) switches the handwritten point-sampling
+// resizers in img_tool to the vendored stb_image_resize2 implementations (bilinear ->
+// STBIR_FILTER_TRIANGLE, bicubic -> STBIR_FILTER_CATMULLROM, both properly filtered on
+// downscale) AND applies the upstream Qwen2/2.5/3-VL + Gemma4V preprocessing correction
+// (bilinear -> bicubic, matching the HF reference processors). The two halves are
+// deliberately one switch: the reference "bicubic" is a filtered Catmull-Rom, which only
+// the stbir path provides -- the legacy point-sampled bicubic would alias on downscale.
+// Default OFF: with the gate off every legacy path is byte-identical to before.
+static bool pxa_mtmd_stbir_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("PXA_MTMD_STBIR");
+        const bool v = e != nullptr && atoi(e) != 0;
+        if (v) {
+            LOG_INF("clip: PXA_MTMD_STBIR_v1 ON -- stb_image_resize2 resizers + bicubic Qwen-VL preprocessing\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 struct img_tool {
     enum resize_algo {
         RESIZE_ALGO_BILINEAR,
@@ -4262,6 +4286,18 @@ struct img_tool {
 private:
     // Bilinear resize function
     static void resize_bilinear(const clip_image_u8 & src, clip_image_u8 & dst, int target_width, int target_height) {
+        if (pxa_mtmd_stbir_enabled()) {
+            // upstream 574f22b3 (#1967): filtered SIMD triangle resize
+            dst.nx = target_width;
+            dst.ny = target_height;
+            dst.buf.resize(3 * (size_t) target_width * (size_t) target_height);
+
+            stbir_resize(
+                src.buf.data(), src.nx, src.ny, src.nx * 3,
+                dst.buf.data(), target_width, target_height, target_width * 3,
+                STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_TRIANGLE);
+            return;
+        }
         dst.nx = target_width;
         dst.ny = target_height;
         dst.buf.resize(3 * target_width * target_height);
@@ -4298,6 +4334,18 @@ private:
     // Bicubic resize function
     // part of image will be cropped if the aspect ratio is different
     static bool resize_bicubic(const clip_image_u8 & img, clip_image_u8 & dst, int target_width, int target_height) {
+        if (pxa_mtmd_stbir_enabled()) {
+            // upstream 574f22b3 (#1967): filtered Catmull-Rom == the HF/PIL "bicubic"
+            dst.nx = target_width;
+            dst.ny = target_height;
+            dst.buf.resize(3 * (size_t) target_width * (size_t) target_height);
+
+            stbir_resize(
+                img.buf.data(), img.nx, img.ny, img.nx * 3,
+                dst.buf.data(), target_width, target_height, target_width * 3,
+                STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_CATMULLROM);
+            return true;
+        }
         const int nx = img.nx;
         const int ny = img.ny;
 
@@ -4708,7 +4756,13 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                     params.patch_size * cur_merge,
                     params.image_min_pixels,
                     params.image_max_pixels);
-                img_tool::resize(*img, resized, new_size, img_tool::RESIZE_ALGO_BILINEAR, false);
+                // PXA_MTMD_STBIR_v1: upstream 19f08160 (#1969) -- the HF reference processors
+                // resample the Qwen-VL family + Gemma4V with bicubic; applied only when the
+                // stbir resizers are ON (upstream "bicubic" = filtered Catmull-Rom; the legacy
+                // point-sampled bicubic would alias on downscale instead of fixing it).
+                img_tool::resize(*img, resized, new_size,
+                        pxa_mtmd_stbir_enabled() ? img_tool::RESIZE_ALGO_BICUBIC
+                                                 : img_tool::RESIZE_ALGO_BILINEAR, false);
                 // clip_image_save_to_bmp(resized, "preproc.bmp");
                 clip_image_f32_ptr img_f32(clip_image_f32_init());
                 // clip_image_f32_ptr res(clip_image_f32_init());
