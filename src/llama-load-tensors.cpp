@@ -120,6 +120,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_glm_dsa_tensors(const LLM_TN & tn);
 
+    bool create_deepseek4_tensors(const LLM_TN & tn);
+
     bool create_glm4_tensors(const LLM_TN & tn);
 
     bool create_glm4_moe_tensors(const LLM_TN & tn);
@@ -2952,6 +2954,115 @@ bool create_tensors_helper::create_glm_dsa_tensors(const LLM_TN & tn) {
     return use_mmap_buffer;
 }
 
+// Adapted from llama.cpp src/models/deepseek4.cpp
+// (llama_model_deepseek4::load_arch_tensors, lines 62-148) @ upstream commit
+// 82dbc4f01, PR #24162 and follow-ups.
+// Copyright (c) 2023-2026 The ggml authors. MIT.
+//
+// DS4 is NOT an MLA architecture: attn_kv is a plain MQA projection (1 KV head of
+// n_embd_head_k) and the output projection is a LoRA pair (attn_output_a/_b). There is
+// no attn_k_b / attn_v_b, so nothing here feeds llm_prepare_mla / is_mla_model().
+bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const int64_t q_lora_rank     = hparams.n_lora_q;
+    const int64_t n_ff_exp        = hparams.n_ff_exp;
+    const int64_t n_expert_shared = hparams.n_expert_shared;
+
+    const int64_t o_groups    = hparams.dsv4_o_group_count;
+    const int64_t o_lora_rank = hparams.dsv4_o_lora_rank;
+    const int64_t hc_mult     = hparams.dsv4_hc_mult;
+    const int64_t hc_dim      = hc_mult * n_embd;
+    const int64_t hc_mix_dim  = (2 + hc_mult) * hc_mult;
+
+    if (o_groups <= 0 || o_lora_rank <= 0 || hc_mult <= 0) {
+        throw std::runtime_error("DeepSeek-V4: o_groups / o_lora_rank / hc_mult must all be > 0");
+    }
+    if ((n_head * n_embd_head_k) % o_groups != 0) {
+        throw std::runtime_error("DeepSeek-V4: n_head*n_embd_head_k is not divisible by o_groups");
+    }
+
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+    model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+
+    model.hc_head_fn    = create_tensor(ctx_output_split, tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult});
+    model.hc_head_base  = create_tensor(ctx_output,       tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult});
+    model.hc_head_scale = create_tensor(ctx_output,       tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1});
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+
+        layer.attn_norm     = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd});
+        layer.attn_sinks    = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head});
+        layer.wq_a          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_A,       "weight", i), {n_embd, q_lora_rank});
+        layer.attn_q_a_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank});
+        layer.wq_b          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_B,       "weight", i), {q_lora_rank, n_head * n_embd_head_k});
+        layer.wkv           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV,        "weight", i), {n_embd, n_embd_head_k});
+        layer.attn_kv_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k});
+        layer.wo_a          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_A,     "weight", i), {n_head * n_embd_head_k / o_groups, o_lora_rank * o_groups});
+        layer.wo_b          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_B,     "weight", i), {o_groups * o_lora_rank, n_embd});
+
+        layer.hc_attn_fn    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim});
+        layer.hc_attn_base  = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim});
+        layer.hc_attn_scale = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3});
+        layer.hc_ffn_fn     = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix_dim});
+        layer.hc_ffn_base   = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim});
+        layer.hc_ffn_scale  = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3});
+
+        const int64_t ratio = hparams.dsv4_compress_ratios[i];
+        if (ratio != 0) {
+            // ratio 4 (CSA + lightning indexer) carries a doubled compressor width;
+            // ratio 128 (hyper-compressed attention) does not.
+            const int64_t coff = ratio == 4 ? 2 : 1;
+
+            layer.attn_comp_wkv   = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head_k});
+            layer.attn_comp_wgate = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * n_embd_head_k});
+            layer.attn_comp_ape   = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_COMPRESSOR_APE,   "weight", i), {coff * n_embd_head_k, ratio});
+            layer.attn_comp_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i), {n_embd_head_k});
+
+            if (ratio == 4) {
+                const int64_t n_embd_indexer = hparams.indexer_head_size;
+
+                layer.indexer_proj     = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, (int64_t) hparams.indexer_n_head});
+                layer.indexer_attn_q_b = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, (int64_t) hparams.indexer_n_head * n_embd_indexer});
+
+                layer.indexer_comp_wkv   = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   "weight", i), {n_embd, 2 * n_embd_indexer});
+                layer.indexer_comp_wgate = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, 2 * n_embd_indexer});
+                layer.indexer_comp_ape   = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,   "weight", i), {2 * n_embd_indexer, ratio});
+                layer.indexer_comp_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_INDEXER_COMPRESSOR_NORM,  "weight", i), {n_embd_indexer});
+            }
+            // ratio values other than 0/4/128 are rejected in llm_load_hparams().
+        }
+
+        layer.ffn_gate_inp = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
+        if ((uint32_t) i < hparams.dsv4_hash_layer_count) {
+            // I32 token-id -> expert-id hash routing table. Must never be quantized.
+            layer.ffn_gate_tid2eid = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab});
+        } else {
+            layer.ffn_exp_probs_b = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert});
+        }
+        layer.ffn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+
+        GGML_ASSERT(n_expert      > 0);
+        GGML_ASSERT(n_expert_used > 0);
+
+        layer.ffn_gate_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert});
+        layer.ffn_down_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert});
+        layer.ffn_up_exps   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert});
+
+        layer.ffn_gate_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared});
+        layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    });
+        layer.ffn_up_shexp   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared});
+    }
+
+    return use_mmap_buffer;
+}
+
 bool create_tensors_helper::create_glm4_moe_tensors(const LLM_TN & tn) {
     LOADING_PRELUDE
 
@@ -4620,6 +4731,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_deepseek2_tensors(tn); break;
         case LLM_ARCH_GLM_DSA:
             use_mmap_buffer = create_glm_dsa_tensors(tn); break;
+        case LLM_ARCH_DEEPSEEK4:
+            use_mmap_buffer = create_deepseek4_tensors(tn); break;
         case LLM_ARCH_GLM4_MOE:
             use_mmap_buffer = create_glm4_moe_tensors(tn); break;
         case LLM_ARCH_BITNET:

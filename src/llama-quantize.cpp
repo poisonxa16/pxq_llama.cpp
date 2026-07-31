@@ -1135,7 +1135,13 @@ static bool pxq4_legacy_native_class(const std::string & name) {
         return true;
     }
     if ((m & 2u) && (pxa_name_is(name, "attn_q.weight")   || pxa_name_is(name, "attn_qkv.weight") ||
-                     pxa_name_is(name, "attn_output.weight") || pxa_name_is(name, "attn_gate.weight"))) {
+                     pxa_name_is(name, "attn_output.weight") || pxa_name_is(name, "attn_gate.weight") ||
+                     // DeepSeek-V4 splits the output projection into a LoRA down/up pair
+                     // (attn_output_a {n_head*n_embd_head/o_groups, o_lora_rank*o_groups},
+                     //  attn_output_b {o_groups*o_lora_rank, n_embd}). Same role as attn_output,
+                     // and neither name matches pxa_name_is(..., "attn_output.weight"), so without
+                     // this PXA_PXQ_NATIVE=attn was a silent no-op on DS4.
+                     pxa_name_is(name, "attn_output_a.weight") || pxa_name_is(name, "attn_output_b.weight"))) {
         return true;
     }
     // NOTE: this used pxa_name_ends(), whose strict-suffix test can never match the top-level
@@ -1265,6 +1271,14 @@ static bool pxa_pxq_backbone_native_class(const std::string & name, const ggml_t
     if (pxa_name_is(name, "attn_q_a.weight") || pxa_name_is(name, "attn_q_b.weight")) {
         return true;
     }
+    // DeepSeek-V4 splits the OUTPUT projection into a LoRA down/up pair
+    // (attn_output_a {n_embd, o_groups*o_lora_rank} + attn_output_b). Same role and
+    // same error class as attn_output.weight -- which this table's own notes record
+    // as the worst-measured class (3.2x) -- and pxa_name_is("attn_output.weight")
+    // does NOT match either of them.
+    if (pxa_name_is(name, "attn_output_a.weight") || pxa_name_is(name, "attn_output_b.weight")) {
+        return true;
+    }
     if (pxa_name_is(name, "attn_gate.weight")) {
         return t->ne[1] > 256;                               // per-CHANNEL only; per-head -> F16
     }
@@ -1368,6 +1382,45 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     if (pxa_name_is(name, "attn_gate.weight") && t->ne[1] <= 256) {
         return GGML_TYPE_F16;
     }
+    // ---------------- DeepSeek-V4 classes the stock rules do not know ----------------
+    // Every branch here returns an EXPLICIT type. Without them these tensors fall
+    // through to flat MXFP4, which violates this tree's zero-MXFP4 rule and, for the
+    // indexer, quantizes the thing that CHOOSES which tokens are attended to.
+    //
+    // attn_kv is DS4's K and V fused into one projection (1 KV head of 512). The
+    // legacy rule only catches it because "attn_kv" happens to contain "attn_k";
+    // pin it explicitly so it cannot drift.
+    if (pxa_name_is(name, "attn_kv.weight")) {
+        return GGML_TYPE_Q8_0;
+    }
+    // The APE tables are absolute-position embeddings, not GEMM weights, and they
+    // are tiny (ratio x coff*head_dim per layer; ~11 MB across all 43 layers).
+    // Keep them F32 -- the converter writes F32, so this resolves to a verbatim copy.
+    if (pxa_name_ends(name, "attn_compressor_ape.weight") ||
+        pxa_name_ends(name, "indexer_compressor_ape.weight")) {
+        return GGML_TYPE_F32;
+    }
+    // Per-layer KV compressors + the lightning indexer. The indexer's output is a
+    // top-k SELECTION, so its error is not a small numeric perturbation -- it is the
+    // wrong tokens attended to, with no loud signal. q8_0; they are a small share of
+    // the file (only compress_ratios[il] != 0 layers carry them).
+    if (pxa_name_ends(name, "attn_compressor_kv.weight")   || pxa_name_ends(name, "attn_compressor_gate.weight") ||
+        pxa_name_ends(name, "attn_compressor_norm.weight") ||
+        name.find(".indexer.") != std::string::npos        || name.find("indexer_compressor_") != std::string::npos) {
+        return GGML_TYPE_Q8_0;
+    }
+    // Hyper-connection mixers: {hc_dim, 24}, {24}, {3} per layer plus the {hc_dim, 4}
+    // head. 24 and 4 rows are far below the 64-row PXQ panel, and each one rescales an
+    // ENTIRE residual stream -- the same error class as Laguna's per-head attn_gate.
+    if (name.find("hc_attn_") != std::string::npos || name.find("hc_ffn_") != std::string::npos ||
+        name.find("output_hc_") != std::string::npos) {
+        return GGML_TYPE_F16;
+    }
+    // The hash routing table is not quantized at all (see the skip in the write loop).
+    if (pxa_name_ends(name, "ffn_gate_tid2eid.weight")) {
+        return GGML_TYPE_COUNT;
+    }
+
     if (!pxa_pxq_backbone_native_class(name, t)) {
         return GGML_TYPE_COUNT;
     }
@@ -1403,7 +1456,10 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
         case PXA_TIER_PXQ1:                                       // only via PXA_PXQ_BACKBONE=universal
         case PXA_TIER_PXQ2:
             // attn_output is the worst-measured class (3.2x) — give it the HQ 4-bit tier.
-            return pxa_name_is(name, "attn_output.weight") ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ4;
+            // DeepSeek-V4's o-LoRA pair is the same class (see above).
+            return (pxa_name_is(name, "attn_output.weight")   ||
+                    pxa_name_is(name, "attn_output_a.weight") ||
+                    pxa_name_is(name, "attn_output_b.weight")) ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ4;
         case PXA_TIER_PXQ3:
         case PXA_TIER_PXQU:
             return GGML_TYPE_PXQ4HQ;
@@ -2141,6 +2197,13 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
         //quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
 
+        // do not quantize the DeepSeek-V4 hash routing table. It is an I32
+        // token-id -> expert-id map: 2-D, and its name ends in "weight", so every
+        // generic rule above marks it quantizable. Quantizing it is a textbook
+        // "loads and emits fluent garbage" failure. Upstream added the same line
+        // in src/llama-quant.cpp (PR #25787).
+        quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
+
         // do not quantize positional embeddings and token types (BERT)
         quantize &= name != LLM_TN(model.arch)(LLM_TENSOR_POS_EMBD,    "weight");
         quantize &= name != LLM_TN(model.arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
@@ -2287,7 +2350,36 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             // If we've decided to quantize to the same type the tensor is already
             // in then there's nothing to do.
             if (tensor != output_tensor) {
-                quantize &= tensor->type != new_type;
+                // ...EXCEPT for a PXQ tier reading an MXFP4 source. The PXQ ftypes are
+                // FLATTENED to MOSTLY_MXFP4 above (see pxq2_out/pxq3_out/... at the top
+                // of this function), so default_type is MXFP4 and this equality holds for
+                // every expert tensor of a GGUF whose converter wrote raw MXFP4 blocks
+                // (DeepSeek-V4 upstream-style). quantize would go false, the verbatim-copy
+                // branch would run, and the native-PXQ upgrade further down would NEVER
+                // fire -- producing a file NAMED PXQ2 that is actually 4.25 bpw. That is a
+                // 137 GiB artifact where a 73 GiB one was asked for, printed as a bland
+                // "size = ... MB" line with no warning.
+                //
+                // NOTE this is the FALLBACK, not the plan: MXFP4 -> f32 -> PXQ2 is doubly
+                // lossy and makes an imatrix measure the wrong function. Prefer converting
+                // from a high-precision source (for DS4 that is the default converter mode,
+                // which dequantizes the experts). This exists so the upstream-shaped file
+                // cannot silently lie about its own tier. Needs --allow-requantize.
+                const bool pxq_upgrade = pxq_tier != PXA_TIER_NONE
+                                      && new_type    == GGML_TYPE_MXFP4
+                                      && tensor->type == GGML_TYPE_MXFP4
+                                      && pxq4_legacy_native_class(name)
+                                      && pxq4_tensor_geometry_ok(tensor);
+                if (pxq_upgrade) {
+                    LLAMA_LOG_INFO("\nPXQ: %s is MXFP4 in the source; requantizing to the "
+                                   "%s tier instead of copying it verbatim ", name.c_str(),
+                                   ggml_type_name(pxq_tier == PXA_TIER_PXQ1 ? GGML_TYPE_PXQ1 :
+                                                  pxq_tier == PXA_TIER_PXQ2 ? GGML_TYPE_PXQ2 :
+                                                  pxq_tier == PXA_TIER_PXQ3 ? GGML_TYPE_PXQ3 :
+                                                                              GGML_TYPE_PXQ4));
+                } else {
+                    quantize &= tensor->type != new_type;
+                }
             }
         }
 

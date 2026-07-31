@@ -406,6 +406,7 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
         case LLM_EXPERT_GATING_FUNC_SOFTMAX: return "softmax";
         case LLM_EXPERT_GATING_FUNC_SIGMOID: return "sigmoid";
         case LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "softmax_weight";
+        case LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS: return "sqrtsoftplus";
         default:                             return "unknown";
     }
 }
@@ -811,6 +812,19 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
     const uint32_t n_slots = llama_kv_qnext_state_slots(cache);
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
 }
+
+// ---------------------------------------------------------------------------
+// DeepSeek-V4 memory module hooks.
+//
+// These three symbols are DECLARED in src/llama-kv-cache-dsv4.h and DEFINED in
+// src/llama-kv-cache-dsv4.cpp, both owned by chunk C. They are forward-declared
+// here rather than #include-d so that this translation unit still compiles before
+// that header lands; the signatures are fixed by the port spec and must match.
+// ---------------------------------------------------------------------------
+bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type type_v,
+                            uint32_t kv_size, bool offload);
+void llama_dsv4_set_inputs (llama_context & lctx, const llama_batch & batch);
+void llama_dsv4_memory_free(llama_context & lctx);
 
 static bool llama_kv_cache_init(
              struct llama_kv_cache & cache,
@@ -2336,6 +2350,38 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
         LLAMA_LOG_INFO("%s: expert_weights_norm  = %d\n",     __func__, hparams.expert_weights_norm);
         LLAMA_LOG_INFO("%s: expert_gating_func   = %s\n",     __func__, llama_expert_gating_func_name((llm_expert_gating_func_type) hparams.expert_gating_func));
         LLAMA_LOG_INFO("%s: nextn_predict_layers = %d\n",     __func__, hparams.nextn_predict_layers);
+    }
+
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_INFO("%s: n_lora_q             = %d\n",     __func__, hparams.n_lora_q);
+        LLAMA_LOG_INFO("%s: n_ff_exp             = %d\n",     __func__, hparams.n_ff_exp);
+        LLAMA_LOG_INFO("%s: n_expert_shared      = %d\n",     __func__, hparams.n_expert_shared);
+        LLAMA_LOG_INFO("%s: expert_weights_scale = %.3f\n",   __func__, hparams.expert_weights_scale);
+        LLAMA_LOG_INFO("%s: expert_weights_norm  = %d\n",     __func__, hparams.expert_weights_norm);
+        LLAMA_LOG_INFO("%s: expert_gating_func   = %s\n",     __func__, llama_expert_gating_func_name((llm_expert_gating_func_type) hparams.expert_gating_func));
+        LLAMA_LOG_INFO("%s: indexer_n_head       = %d\n",     __func__, hparams.indexer_n_head);
+        LLAMA_LOG_INFO("%s: indexer_head_size    = %d\n",     __func__, hparams.indexer_head_size);
+        LLAMA_LOG_INFO("%s: indexer_top_k        = %d\n",     __func__, hparams.indexer_top_k);
+        LLAMA_LOG_INFO("%s: o_groups             = %d\n",     __func__, hparams.dsv4_o_group_count);
+        LLAMA_LOG_INFO("%s: o_lora_rank          = %d\n",     __func__, hparams.dsv4_o_lora_rank);
+        LLAMA_LOG_INFO("%s: hc_mult              = %d\n",     __func__, hparams.dsv4_hc_mult);
+        LLAMA_LOG_INFO("%s: hc_sinkhorn_iters    = %d\n",     __func__, hparams.dsv4_hc_sinkhorn_iters);
+        LLAMA_LOG_INFO("%s: hc_eps               = %g\n",     __func__, hparams.dsv4_hc_eps);
+        LLAMA_LOG_INFO("%s: hash_layer_count     = %d\n",     __func__, hparams.dsv4_hash_layer_count);
+        LLAMA_LOG_INFO("%s: compress_rope_base   = %.1f\n",   __func__, hparams.dsv4_compress_rope_base);
+        {
+            uint32_t n_raw = 0, n_csa = 0, n_hca = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                switch (hparams.dsv4_compress_ratios[il]) {
+                    case 0:   n_raw++; break;
+                    case 4:   n_csa++; break;
+                    case 128: n_hca++; break;
+                    default:  break;
+                }
+            }
+            LLAMA_LOG_INFO("%s: compress_ratios      = %u x raw(swa %u) / %u x csa(4) / %u x hca(128)\n",
+                    __func__, n_raw, hparams.n_swa, n_csa, n_hca);
+        }
     }
 
     vocab.print_info();
@@ -5165,6 +5211,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
         }
     }
+
+    // DeepSeek-V4: fill the per-ubatch compression plans (csa / hca / lid) into the
+    // graph input tensors that chunk D registered in lctx's llama_dsv4_inputs.
+    if (lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
+        llama_dsv4_set_inputs(lctx, batch);
+    }
 }
 
 // Make sure enough space is available for outputs.
@@ -7396,6 +7448,16 @@ struct llama_context * llama_init_from_model(
         type_v = GGML_TYPE_F32; // required by ggml_ssm_scan for Mamba's ssm_states
     }
 
+    // DS4 stores K and V of the same compressed row, so the two cache types must be
+    // identical (upstream llama-context.cpp:3556, PR #25871). A quantized V additionally
+    // requires flash attention there; this tree leaves that to the usual FA handling.
+    if (model->arch == LLM_ARCH_DEEPSEEK4 && type_k != type_v) {
+        LLAMA_LOG_ERROR("%s: deepseek4 does not support different K (%s) and V (%s) cache types\n",
+                __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+        llama_free(ctx);
+        return nullptr;
+    }
+
     GGML_ASSERT(hparams.n_embd_head_k(0) % ggml_blck_size(type_k) == 0);
     GGML_ASSERT(hparams.n_embd_head_v(0) % ggml_blck_size(type_v) == 0);
     if (!hparams.vocab_only) {
@@ -7580,6 +7642,18 @@ struct llama_context * llama_init_from_model(
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
+        }
+
+        // DeepSeek-V4 keeps FOUR stores: the raw SWA(128) token ring - which is what the
+        // standard llama_kv_cache above provides (cells/head) - plus three append-only
+        // compressed block streams (csa / hca / lid) with their compressor ring state.
+        // Chunk C owns the module; this is the only place it is created.
+        if (model->arch == LLM_ARCH_DEEPSEEK4) {
+            if (!llama_dsv4_memory_init(*ctx, type_k, type_v, kv_size, cparams.offload_kqv)) {
+                LLAMA_LOG_ERROR("%s: llama_dsv4_memory_init() failed\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
         }
 
         {
@@ -7791,6 +7865,9 @@ struct llama_context * llama_init_from_model(
 }
 
 void llama_free(struct llama_context * ctx) {
+    if (ctx && ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
+        llama_dsv4_memory_free(*ctx);
+    }
     delete ctx;
 }
 
@@ -7872,6 +7949,9 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_MISTRAL4:
+        // DS4 is NORM-rope, same group as deepseek2 (upstream llama-model.cpp:2530).
+        // Omitting this silently gives the wrong rope layout.
+        case LLM_ARCH_DEEPSEEK4:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
