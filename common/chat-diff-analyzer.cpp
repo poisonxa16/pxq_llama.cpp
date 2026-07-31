@@ -829,6 +829,21 @@ void analyze_tools::analyze_tool_call_format_non_json(const std::string & clean_
     format.per_call_end = result_end.tags["call_end"];
     format.section_start = result.tags["sec_start"];
     format.section_end = result_end.tags["sec_end"];
+
+    // The template's EOS is a TURN terminator, not a tool-call marker. When the tool section
+    // closer is followed immediately by EOS with nothing in between (Hunyuan HY3 renders
+    // "</tool_call>\n</tool_calls><eos>"), the two-closer scan above pairs
+    // (</tool_calls>, <eos>) instead of (</tool_call>, </tool_calls>) and every closing marker
+    // ends up shifted one level out. Taking EOS as section_end then puts it in the grammar as
+    // required literal TEXT and in preserved_tokens, so the model spells the EOS string out to
+    // satisfy the grammar and the real EOS token is rendered into the served text after it -
+    // a duplicated EOS that the parser's end() rejects, losing the whole tool call.
+    // Shift the closers back by one; function.close is derived later from whichever of
+    // per_call_end / section_end is set, so it is unaffected.
+    if (tmpl != nullptr && !format.section_end.empty() && format.section_end == tmpl->eos_token()) {
+        format.section_end = format.per_call_end;
+        format.per_call_end.clear();
+    }
 }
 
 void analyze_tools::check_per_call_markers() {
@@ -942,13 +957,52 @@ void analyze_tools::extract_function_markers() {
                 function.name_suffix += suf_result.tags["ext"];
             }
         } else {
-            // For tagged: name_suffix extends to the first marker (arg marker)
-            auto suffix_parser = build_tagged_peg_parser([&](common_peg_parser_builder &p) {
-                return p.tag("ext", p.zero_or_more(p.negate(p.marker()) + p.any()));
-            });
-            auto suf_result = suffix_parser.parse_and_extract(diff.suffix);
-            if (suf_result.result.success()) {
-                function.name_suffix += suf_result.tags["ext"];
+            // For tagged: name_suffix extends to the marker that OPENS the first argument.
+            //
+            // The plain "stop at the first marker" scan (kept below as the fallback) is wrong
+            // whenever a separator marker sits between the function name and the argument
+            // opening marker, e.g. Hunyuan HY3:
+            //     <tool_call>NAME<tool_sep>\n<arg_key>ARG</arg_key>\n<arg_value>VAL</arg_value>\n
+            // There the first marker is <tool_sep>, not the argument opener, so the scan
+            // returned "" and the separator was silently dropped from the parser, from the
+            // generated GBNF and from preserved_tokens. A control-token separator missing
+            // from preserved_tokens is stripped out of the served text AND rejected during
+            // constrained generation, which derails the model in the middle of a tool call.
+            //
+            // The argument opener is the LAST marker starting at or before the first argument
+            // name (the same rule extract_argument_name_markers() applies to diff.prefix; it
+            // also covers openers that embed the name, e.g. <parameter=ARG>). Everything
+            // before that marker belongs to name_suffix.
+            //
+            // This strictly generalises the old scan: when at most one marker precedes the
+            // argument name the two agree, so only separator-marker templates change.
+            size_t boundary = std::string::npos;
+            size_t arg_pos  = diff.suffix.find(ARG_FIRST);
+            if (arg_pos != std::string::npos) {
+                // Marker syntax matches common_peg_parser_builder::marker(): '<'..'>' or '['..']'.
+                for (size_t i = 0; i <= arg_pos && i < diff.suffix.size(); ) {
+                    const char c      = diff.suffix[i];
+                    const char closer = c == '<' ? '>' : (c == '[' ? ']' : '\0');
+                    size_t     end    = closer == '\0' ? std::string::npos : diff.suffix.find(closer, i + 1);
+                    if (end == std::string::npos) {
+                        i++;
+                        continue;
+                    }
+                    boundary = i;
+                    i        = end + 1;
+                }
+            }
+            if (boundary != std::string::npos) {
+                function.name_suffix += diff.suffix.substr(0, boundary);
+            } else {
+                // No argument marker to anchor on: keep the historical behaviour.
+                auto suffix_parser = build_tagged_peg_parser([&](common_peg_parser_builder &p) {
+                    return p.tag("ext", p.zero_or_more(p.negate(p.marker()) + p.any()));
+                });
+                auto suf_result = suffix_parser.parse_and_extract(diff.suffix);
+                if (suf_result.result.success()) {
+                    function.name_suffix += suf_result.tags["ext"];
+                }
             }
         }
 

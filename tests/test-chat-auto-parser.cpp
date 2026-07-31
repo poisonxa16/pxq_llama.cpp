@@ -5,6 +5,7 @@
 #include "peg-parser.h"
 #include "testing.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -84,6 +85,16 @@ static void test_normalize_quotes_with_embedded_quotes(testing & t);
 // TAG_WITH_TAGGED argument parsing tests
 static void test_tagged_args_with_embedded_quotes(testing & t);
 
+// Hunyuan V3: TAG_WITH_TAGGED with a separator marker between the function name and
+// the first argument (<tool_sep...>), plus the string-value scanner over-run it exposed.
+static void test_hunyuan_v3_tagged_args(testing & t);
+
+// The string-value scanner must key on the value's closing MARKER, not marker + the
+// whitespace the template happened to render after it. Checked on Qwen3-Coder, whose
+// derivation is otherwise unaffected, so this isolates the scanner from the Hunyuan
+// separator-derivation defect.
+static void test_tagged_value_scanner_stops_at_close_marker(testing & t);
+
 int main(int argc, char * argv[]) {
     testing t(std::cout);
     t.verbose = true;
@@ -107,6 +118,8 @@ int main(int argc, char * argv[]) {
     t.test("standard_json_tools", test_standard_json_tools_formats);
     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
+    t.test("hunyuan_v3_tagged_args", test_hunyuan_v3_tagged_args);
+    t.test("tagged_value_scanner", test_tagged_value_scanner_stops_at_close_marker);
 
     return t.summary();
 }
@@ -2124,4 +2137,221 @@ static void test_cohere2moe_parser(testing & t) {
         t.assert_equal("parallel : tool 1 name", std::string("python"),           parallel_msg.tool_calls[1].name);
         t.assert_equal("parallel : tool 1 id",   std::string("1"),                parallel_msg.tool_calls[1].id);
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Hunyuan V3 (arch hy_v3) tagged tool calls.
+//
+// The template renders a call as
+//     <tool_calls:opensource>\n
+//     <tool_call:opensource>NAME<tool_sep:opensource>\n
+//     <arg_key:opensource>K</arg_key:opensource>\n
+//     <arg_value:opensource>V</arg_value:opensource>\n
+//     ...
+//     </tool_call:opensource>\n
+//     </tool_calls:opensource>
+//
+// Two defects met here and produced silently corrupted tool arguments:
+//
+//  1. extract_function_markers() stopped its name_suffix scan at the FIRST marker after
+//     the function name. That marker is the separator <tool_sep:opensource>, not the
+//     argument opener, so name_suffix derived as "" and the separator vanished from the
+//     parser, from the generated GBNF and from preserved_tokens. Being a control token
+//     absent from preserved_tokens, it was both stripped from the served text and
+//     rejected during constrained generation, which derailed the model mid tool call.
+//
+//  2. The string-argument scanner used until(arguments.value_suffix), and value_suffix
+//     carries the template's trailing newline ("</arg_value:opensource>\n"). A close tag
+//     not followed by exactly that whitespace does not match, so the scan ran on to the
+//     next argument's close and the FIRST argument's value swallowed the intervening
+//     markup while the later arguments still parsed correctly - wrong data, no error.
+// ---------------------------------------------------------------------------
+static void test_hunyuan_v3_tagged_args(testing & t) {
+    std::ifstream fin("models/templates/tencent-Hunyuan-V3.jinja", std::ios::binary);
+    std::ostringstream buf; buf << fin.rdbuf();
+    std::string src = buf.str();
+    if (!t.assert_true("Hunyuan V3 template loaded", !src.empty())) {
+        return;
+    }
+
+    const std::string SEP       = "<tool_sep:opensource>";
+    const std::string K_OPEN    = "<arg_key:opensource>";
+    const std::string K_CLOSE   = "</arg_key:opensource>";
+    const std::string V_OPEN    = "<arg_value:opensource>";
+    const std::string V_CLOSE   = "</arg_value:opensource>";
+    const std::string CALL_OPEN = "<tool_call:opensource>";
+    const std::string CALLS_OPEN  = "<tool_calls:opensource>";
+    const std::string CALL_CLOSE  = "</tool_call:opensource>";
+    const std::string CALLS_CLOSE = "</tool_calls:opensource>";
+
+    // (1) the separator must survive derivation, or the model is fought by its own grammar
+    t.test("separator is derived", [&](testing & t) {
+        autoparser::autoparser ap;
+        common_chat_template raw_tmpl(src, "<s>", "</s>");
+        ap.analyze_template(raw_tmpl);
+        t.assert_equal("function.name_suffix carries <tool_sep...>",
+                       SEP + "\n", ap.tools.function.name_suffix);
+        bool preserved = std::find(ap.preserved_tokens.begin(), ap.preserved_tokens.end(), SEP) !=
+                         ap.preserved_tokens.end();
+        t.assert_true("<tool_sep...> is a preserved token", preserved);
+    });
+
+    common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, src));
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "Weather?";
+
+    auto arg = [&](const std::string & k, const std::string & v) {
+        return K_OPEN + k + K_CLOSE + "\n" + V_OPEN + v + V_CLOSE + "\n";
+    };
+    auto wrap = [&](const std::string & args) {
+        return CALLS_OPEN + "\n" + CALL_OPEN + "get_weather" + SEP + "\n" + args + CALL_CLOSE + "\n" + CALLS_CLOSE;
+    };
+
+    auto parse_call = [&](testing & t, const std::string & params, const std::string & emission,
+                          const std::string & expected_args) {
+        common_chat_tool weather{
+            /* .name        = */ "get_weather",
+            /* .description = */ "Get current weather",
+            /* .parameters  = */ params,
+        };
+        common_chat_templates_inputs inputs;
+        inputs.messages = { user };
+        inputs.tools    = { weather };
+
+        auto params_out = common_chat_templates_apply(tmpls.get(), inputs);
+
+        common_peg_arena arena;
+        arena.load(params_out.parser);
+        common_chat_parser_params pp(params_out);
+
+        common_chat_msg msg;
+        try {
+            msg = common_chat_peg_parse(arena, emission, /* is_partial = */ false, pp);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("parse did not throw: ") + e.what(), false);
+            return;
+        }
+        if (!t.assert_equal("one tool call", (size_t) 1, msg.tool_calls.size())) {
+            return;
+        }
+        t.assert_equal("tool name", std::string("get_weather"), msg.tool_calls[0].name);
+        t.assert_equal("arguments", expected_args, msg.tool_calls[0].arguments);
+    };
+
+    const std::string P_1STR =
+        R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})";
+    const std::string P_2STR =
+        R"({"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string","enum":["celsius","fahrenheit"]}},"required":["city","unit"]})";
+    const std::string P_3STR =
+        R"({"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string","enum":["celsius","fahrenheit"]},"lang":{"type":"string"}},"required":["city","unit","lang"]})";
+    const std::string P_INT_FIRST =
+        R"({"type":"object","properties":{"days":{"type":"integer"},"unit":{"type":"string","enum":["celsius","fahrenheit"]}},"required":["days","unit"]})";
+
+    // (2) the reported trigger matrix: only the multi-string shapes were corrupted, but
+    //     every shape failed to parse at all once the separator was restored, so all four
+    //     are pinned here.
+    t.test("1 string arg", [&](testing & t) {
+        parse_call(t, P_1STR, wrap(arg("city", "Atlanta")), R"({"city":"Atlanta"})");
+    });
+    t.test("2 args, string first", [&](testing & t) {
+        parse_call(t, P_2STR, wrap(arg("city", "Atlanta") + arg("unit", "fahrenheit")),
+                   R"({"city":"Atlanta","unit":"fahrenheit"})");
+    });
+    t.test("2 args, integer first", [&](testing & t) {
+        parse_call(t, P_INT_FIRST, wrap(arg("days", "3") + arg("unit", "fahrenheit")),
+                   R"({"days":3,"unit":"fahrenheit"})");
+    });
+    t.test("3 args, string first", [&](testing & t) {
+        parse_call(t, P_3STR,
+                   wrap(arg("city", "Atlanta") + arg("unit", "fahrenheit") + arg("lang", "en")),
+                   R"({"city":"Atlanta","unit":"fahrenheit","lang":"en"})");
+    });
+
+    // (3) the scanner must key on the value's CLOSING MARKER, not on marker + trailing
+    //     whitespace. Without the trailing newline after the first </arg_value...> the old
+    //     scanner ran to the NEXT close and produced
+    //       {"city":"Atlanta</arg_value:opensource>...fahrenheit","unit":"fahrenheit"}
+    t.test("close marker without its trailing newline does not merge arguments", [&](testing & t) {
+        std::string emission = CALLS_OPEN + "\n" + CALL_OPEN + "get_weather" + SEP + "\n" +
+                               K_OPEN + "city" + K_CLOSE + "\n" + V_OPEN + "Atlanta" + V_CLOSE +
+                               K_OPEN + "unit" + K_CLOSE + "\n" + V_OPEN + "fahrenheit" + V_CLOSE + "\n" +
+                               CALL_CLOSE + "\n" + CALLS_CLOSE;
+        parse_call(t, P_2STR, emission, R"({"city":"Atlanta","unit":"fahrenheit"})");
+    });
+}
+
+
+// ---------------------------------------------------------------------------
+// Qwen3-Coder renders arguments as
+//     <parameter=NAME>\nVALUE\n</parameter>\n
+// so arguments.value_suffix is "</parameter>\n". Scanning the value with
+// until("</parameter>\n") makes the stop condition depend on what FOLLOWS the close
+// tag: drop the newline after one close tag and the scan runs on to the next argument's
+// close, so the first value swallows the intervening markup while the later arguments
+// still parse - a silent wrong-data result, not a parse error. The scanner must stop at
+// "</parameter>" and let the close parser absorb the whitespace.
+// ---------------------------------------------------------------------------
+static void test_tagged_value_scanner_stops_at_close_marker(testing & t) {
+    std::ifstream fin("models/templates/Qwen3-Coder.jinja", std::ios::binary);
+    std::ostringstream buf; buf << fin.rdbuf();
+    std::string src = buf.str();
+    if (!t.assert_true("Qwen3-Coder template loaded", !src.empty())) {
+        return;
+    }
+
+    common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, src));
+
+    common_chat_tool weather{
+        /* .name        = */ "get_weather",
+        /* .description = */ "Get current weather",
+        /* .parameters  = */ R"({"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string"}},"required":["city","unit"]})",
+    };
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "Weather?";
+
+    common_chat_templates_inputs inputs;
+    inputs.messages = { user };
+    inputs.tools    = { weather };
+
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+
+    common_peg_arena arena;
+    arena.load(params.parser);
+    common_chat_parser_params pp(params);
+
+    auto check = [&](testing & t, const std::string & emission) {
+        common_chat_msg msg;
+        try {
+            msg = common_chat_peg_parse(arena, emission, /* is_partial = */ false, pp);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("parse did not throw: ") + e.what(), false);
+            return;
+        }
+        if (!t.assert_equal("one tool call", (size_t) 1, msg.tool_calls.size())) {
+            return;
+        }
+        t.assert_equal("arguments", std::string(R"({"city":"Atlanta","unit":"fahrenheit"})"),
+                       msg.tool_calls[0].arguments);
+    };
+
+    t.test("well formed", [&](testing & t) {
+        check(t,
+              "<tool_call>\n<function=get_weather>\n"
+              "<parameter=city>\nAtlanta\n</parameter>\n"
+              "<parameter=unit>\nfahrenheit\n</parameter>\n"
+              "</function>\n</tool_call>");
+    });
+
+    t.test("close marker without its trailing newline does not merge arguments", [&](testing & t) {
+        check(t,
+              "<tool_call>\n<function=get_weather>\n"
+              "<parameter=city>\nAtlanta\n</parameter>"
+              "<parameter=unit>\nfahrenheit\n</parameter>\n"
+              "</function>\n</tool_call>");
+    });
 }
