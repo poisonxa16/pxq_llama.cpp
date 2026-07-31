@@ -1628,7 +1628,44 @@ void llm_load_hparams(
                 // error otherwise; a scalar would broadcast, which the validation below
                 // still accepts only if it is one of the three legal ratios.
                 std::fill(hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.end(), 0u);
-                ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer, true);
+                {
+                    // DS4 ships MORE ratios than blocks: the 0731 Flash release carries 46 for
+                    // 43 layers. Upstream accepts >= n_layer and uses the first n_layer; our
+                    // shared get_key_or_arr() demands an exact match and would reject the model
+                    // outright. Relaxing the shared guard is not an option -- for every other
+                    // arch a short array must stay an error, not a silent broadcast of zeros --
+                    // so read the raw array here and take the prefix.
+                    //
+                    // The surplus is the hash layers, appended at the tail and all zero:
+                    //     idx  0  1  2   3  4   5 ...  42 | 43 44 45
+                    //     val  0, 0, 4, 128, 4, 128 ...  4 |  0,  0,  0
+                    // The per-layer regime pattern occupies exactly indices [0, n_layer).
+                    // Assert that relationship rather than assume it: a different future layout
+                    // must fail loudly here, because silently taking the wrong prefix would
+                    // assign the wrong attention regime to every layer and produce plausible
+                    // garbage instead of an error.
+                    std::vector<uint32_t> ratios;
+                    ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios, true);
+                    if (ratios.size() < hparams.n_layer) {
+                        throw std::runtime_error(format(
+                                    "DeepSeek-V4: attention.compress_ratios has %u entries, need at least n_layer=%u",
+                                    (uint32_t) ratios.size(), hparams.n_layer));
+                    }
+                    const uint32_t surplus = (uint32_t) ratios.size() - hparams.n_layer;
+                    if (surplus != 0 && surplus != hparams.dsv4_hash_layer_count) {
+                        throw std::runtime_error(format(
+                                    "DeepSeek-V4: attention.compress_ratios has %u entries for n_layer=%u; the %u "
+                                    "surplus entries match neither 0 nor hash_layer_count=%u, so which entries are "
+                                    "the per-layer regimes is undetermined",
+                                    (uint32_t) ratios.size(), hparams.n_layer, surplus, hparams.dsv4_hash_layer_count));
+                    }
+                    if (hparams.n_layer > hparams.dsv4_compress_ratios.size()) {
+                        throw std::runtime_error(format("DeepSeek-V4: n_layer=%u exceeds LLAMA_MAX_LAYERS", hparams.n_layer));
+                    }
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        hparams.dsv4_compress_ratios[il] = ratios[il];
+                    }
+                }
                 for (uint32_t il = 0; il < hparams.n_layer; ++il) {
                     const uint32_t r = hparams.dsv4_compress_ratios[il];
                     if (r != 0 && r != 4 && r != 128) {
