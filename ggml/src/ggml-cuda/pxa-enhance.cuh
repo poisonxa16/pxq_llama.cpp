@@ -181,7 +181,11 @@ static inline const char * pxa_model_class_name() {
 // The pxq-mmvq.cuh resolver keeps its own loud print + the BOOK/SUB-override
 // decline; explicit PXA_PXQ_MMVQ always wins.
 static inline int pxa_pxq_mmvq_auto_default() {
-    if (pxa_config_level() != 2) return 0;
+    // Armed at DEFAULT as well as ENHANCE as of 2026-07-31. It used to require level 2,
+    // so every user running the binary as shipped got the non-MMVQ path and none of the
+    // sm_70 backbone benefit -- the lever existed, self-armed on paper, and never fired.
+    // REFERENCE (0) still opts out, and PXA_PXQ_MMVQ=0 remains an explicit override.
+    if (pxa_config_level() == 0) return 0;
     if (!pxa_model_known() || pxa_model().n_pxq_mmvq_tensors <= 0) return 0;
     const pxa_topology_t & t = g_pxa_topology;
     if (!t.valid) return 0;
