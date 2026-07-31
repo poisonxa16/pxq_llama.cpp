@@ -1210,6 +1210,7 @@ struct pxa_pxq_bb_cfg {
     bool univ = false;   // also cover PXQ_UNIVERSAL / PXQ1
     bool lite = false;   // only the promotions that cost nothing at decode
     bool core = false;   // GEMM backbone at the byte-parity PXQ4 core tier (MMVQ-eligible)
+    bool pxq6 = false;   // restore the pre-2026-07-31 PXQ6 backbone on the 4-/5-bit tiers
 };
 
 static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
@@ -1224,18 +1225,23 @@ static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
             if (has("hq"))                               c.hq   = true;
             if (has("lite"))                             c.lite = true;
             if (has("core"))                             c.core = true;
+            if (has("pxq6"))                             c.pxq6 = true;
             if (has("universal") || has("all"))          c.univ = true;
         }
         if (c.mode == PXA_BB_LEGACY) {
             LLAMA_LOG_INFO("PXQ backbone rules: LEGACY (flat MXFP4 for every non-expert tensor) "
                            "— PXA_PXQ_BACKBONE=legacy\n");
         } else {
-            LLAMA_LOG_INFO("PXQ backbone rules: REV 2 (per-class promotion%s%s%s) — "
-                           "PXA_PXQ_BACKBONE=legacy restores the old flat-MXFP4 backbone\n",
-                           c.lite ? ", LITE (decode-free classes only)"
-                                  : (c.core ? ", CORE (byte-parity PXQ4 GEMM backbone)"
-                                            : (c.hq ? ", PXQ4HQ backbone" : "")),
-                           c.univ ? ", incl. PXQ_UNIVERSAL/PXQ1" : "", "");
+            LLAMA_LOG_INFO("PXQ backbone rules: REV 2 (per-class promotion%s%s) — "
+                           "4-/5-bit tiers take a %s GEMM backbone; "
+                           "PXA_PXQ_BACKBONE=pxq6 restores the pre-2026-07-31 PXQ6 backbone, "
+                           "=legacy the old flat-MXFP4 one\n",
+                           c.lite ? ", LITE (decode-free classes only)" : "",
+                           c.univ ? ", incl. PXQ_UNIVERSAL/PXQ1" : "",
+                           c.lite ? "MXFP4 (lite)"
+                                  : (c.hq   ? "PXQ4HQ"
+                                  : (c.pxq6 ? "PXQ6"
+                                            : "PXQ4 (byte-parity, MMVQ-eligible)")));
         }
         return c;
     }();
@@ -1319,7 +1325,8 @@ static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, 
 static int g_pxa_customq_demoted = 0;
 
 // The resolver. Returns GGML_TYPE_COUNT for "not mine — leave to the legacy pipeline".
-static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier) {
+static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier,
+                                       bool model_has_experts) {
     const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
     if (cfg.mode == PXA_BB_LEGACY || tier == PXA_TIER_NONE) {
         return GGML_TYPE_COUNT;
@@ -1448,10 +1455,53 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     // CORE (2026-07-28, the sm_70 dense-decode recipe): the whole GEMM backbone at the
     // byte-parity PXQ4 core tier — 4.2526 bpw vs MXFP4's 4.2500, MMVQ-eligible on every class.
     // Previously only expressible via --custom-q (the PXQ4core arm in the sm_70 campaign).
+    //
+    // CORE applies to EVERY tier: one uniform PXQ4 GEMM backbone across the whole ladder.
+    // Being MMVQ-eligible is not the same as being equally fast on it -- the sm_70 campaign
+    // separated the two eligible types on the same path (PXQ4core 33.861 t/s vs PXQ4HQ
+    // 30.969), so core is ~9% on PXQ3's all-PXQ4HQ backbone and on PXQ2's attn_output, and
+    // it is SMALLER besides (4.2526 bpw vs 4.52). The trade it makes is fidelity on
+    // attn_output, the worst-measured class -- deliberate, and the reason core is a token
+    // rather than the default for those tiers.
+    const bool core_tier = tier == PXA_TIER_PXQ4 || tier == PXA_TIER_PXQ4HQ || tier == PXA_TIER_PXQ6;
+
+    // DENSE MODELS: the named tier governs the backbone.
+    //
+    // The promotion below is defined as "one notch above the EXPERT tier". A model with no
+    // routed experts has no expert tier -- the backbone is the entire model -- so promoting
+    // (or, since 2026-07-31, demoting) it relative to nothing produces a file whose contents
+    // do not match its name. Measured on Qwen3-0.6B: the PXQ6 tier emitted 140 tensors /
+    // 193.92 MiB of PXQ4 and ZERO bytes of pxq6, identical to the PXQ4 arm, and the
+    // composition assertion refused to write it -- i.e. PXQ6 could not quantize a dense model
+    // at all. Default only: an explicit PXA_PXQ_BACKBONE=core/hq/pxq6 still wins below, and
+    // the assertion remains the backstop if that override mislabels the output.
+    if (!model_has_experts && core_tier && !cfg.core && !cfg.hq && !cfg.pxq6) {
+        return tier == PXA_TIER_PXQ6   ? GGML_TYPE_PXQ6
+             : tier == PXA_TIER_PXQ4HQ ? GGML_TYPE_PXQ4HQ
+                                       : GGML_TYPE_PXQ4;
+    }
+
     if (cfg.core) {
         return GGML_TYPE_PXQ4;
     }
-    const ggml_type hi = cfg.hq ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ6;
+    // Backbone for the 4-/5-bit tiers. PXQ4 is the DEFAULT as of 2026-07-31 (was PXQ6).
+    //
+    // PXQ6 is not MMVQ-registered -- pxa_pxq_mmvq_type() admits PXQ4 and PXQ4HQ only -- so a
+    // PXQ6 backbone drops the dense and shared-expert FFN off the fused single-kernel decode
+    // path onto the per-operand divert. Measured against the PXQ6 backbone it replaces,
+    // n=8/arm interleaved, fresh server per arm, one binary:
+    //     sm_60 (P100)  +8-10% decode        sm_70 (V100)  +30-35% decode
+    // and the file is ~1% smaller: PXQ4 is 4.2526 bpw at K=6144 vs PXQ6's 5.2526, i.e. byte
+    // parity with MXFP4's 4.2500 rather than +1.00.
+    //
+    // Against an MXFP4 backbone it is a wash on Pascal (-2% decode / +2% prefill) and parity
+    // on Volta PROVIDED MMVQ IS ARMED. See pxa_pxq_mmvq_auto_default(): arming it at DEFAULT
+    // level is what makes the sm_70 number reachable without PXA_ENHANCE.
+    //
+    // PXA_PXQ_BACKBONE=pxq6 restores the pre-2026-07-31 PXQ6 backbone; =hq gives PXQ4HQ.
+    const ggml_type hi = cfg.hq   ? GGML_TYPE_PXQ4HQ
+                       : cfg.pxq6 ? GGML_TYPE_PXQ6
+                                  : GGML_TYPE_PXQ4;
     switch (tier) {
         case PXA_TIER_PXQ1:                                       // only via PXA_PXQ_BACKBONE=universal
         case PXA_TIER_PXQ2:
@@ -1782,7 +1832,19 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         pxq3_out   ? PXA_TIER_PXQ3   : pxq1_out   ? PXA_TIER_PXQ1   :
         pxqu_out   ? PXA_TIER_PXQU   : PXA_TIER_NONE;
     if (pxq_tier != PXA_TIER_NONE) {
-        (void) pxa_pxq_backbone_cfg();   // resolve + log the mode once, before the write loop
+        const pxa_pxq_bb_cfg & bbcfg = pxa_pxq_backbone_cfg();   // resolve + log once, before the write loop
+        // PXQ1 and PXQ_UNIVERSAL sit behind the `universal` opt-in, so `core` ALONE is a silent
+        // no-op on them: the table never runs and the backbone falls all the way back to flat
+        // MXFP4 (measured: PXQ1+core on a dense model gave mxfp4 64.7%, vs pxq4 51.7% once
+        // `universal` was added). Say so rather than shipping a file the operator believes is a
+        // core build. Not auto-enabled: the opt-in is deliberate -- a PXQU tier map is authored
+        // per-tensor and neither tier has measured backbone evidence.
+        if (bbcfg.core && !bbcfg.univ &&
+            (pxq_tier == PXA_TIER_PXQ1 || pxq_tier == PXA_TIER_PXQU)) {
+            LLAMA_LOG_WARN("PXQ backbone: PXA_PXQ_BACKBONE=core has NO EFFECT on this tier — "
+                           "PXQ1/PXQ_UNIVERSAL need the `universal` opt-in too. "
+                           "Use PXA_PXQ_BACKBONE=core,universal for a core backbone here.\n");
+        }
     }
 
     int nthread = params->nthread;
@@ -2290,7 +2352,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 // and the explicit --attn-q-type/--token-embedding-type/... overrides below
                 // still win over all of it. --pure stands down entirely (it means "no rules").
                 if (pxq_tier != PXA_TIER_NONE) {
-                    const ggml_type bb = pxa_pxq_backbone_type(name, tensor, pxq_tier);
+                    const ggml_type bb = pxa_pxq_backbone_type(name, tensor, pxq_tier,
+                                                               qs.model.hparams.n_expert > 1);
                     // the regex scan is the expensive half, so only pay it for a tensor the
                     // table actually wants to move
                     if (bb < GGML_TYPE_COUNT && bb != new_type && !pxa_custom_rule_matches(params, name)) {
