@@ -371,7 +371,6 @@ struct llama_layer {
     // unchanged. Copyright (c) 2023-2026 The ggml authors. MIT.
     // (`wq_a`/`wq_b`/`attn_q_a_norm`/`attn_sinks`/`wkv` above are reused as-is;
     //  `wkv` had no other user in this tree.)
-    struct ggml_tensor * attn_kv_norm        = nullptr; // "blk.N.attn_kv_a_norm"
     struct ggml_tensor * wo_a                = nullptr;
     struct ggml_tensor * wo_b                = nullptr;
     struct ggml_tensor * hc_attn_fn          = nullptr;

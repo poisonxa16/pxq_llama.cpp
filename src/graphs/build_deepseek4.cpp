@@ -128,7 +128,7 @@
 //             indexer_proj, indexer_attn_q_b, ffn_norm, ffn_gate_inp,
 //             ffn_exp_probs_b, ffn_*_exps, ffn_*_shexp already exist here)
 //   NOTE: this tree calls the compressed-KV norm `attn_kv_a_norm`, upstream calls
-//   it `attn_kv_norm`. We use the local name.
+//   it `attn_kv_norm`. We use the local name -- in BOTH the graph and the loader.
 //
 
 #include "../llama-build-context.h"

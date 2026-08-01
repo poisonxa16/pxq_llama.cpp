@@ -3003,7 +3003,10 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
         layer.attn_q_a_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank});
         layer.wq_b          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_B,       "weight", i), {q_lora_rank, n_head * n_embd_head_k});
         layer.wkv           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV,        "weight", i), {n_embd, n_embd_head_k});
-        layer.attn_kv_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k});
+        // NB: attn_kv_a_norm, NOT a new attn_kv_norm field -- build_deepseek4 reads
+        // attn_kv_a_norm, and llm_build_norm() SILENTLY skips the weight multiply when
+        // the tensor is null, so a mismatch here loads the weight and then never uses it.
+        layer.attn_kv_a_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k});
         layer.wo_a          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_A,     "weight", i), {n_head * n_embd_head_k / o_groups, o_lora_rank * o_groups});
         layer.wo_b          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_B,     "weight", i), {o_groups * o_lora_rank, n_embd});
 
