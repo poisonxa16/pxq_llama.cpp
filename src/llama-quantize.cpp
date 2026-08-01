@@ -1938,6 +1938,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             if (o.key[0] == 0) break;
             if (o.tag == LLAMA_KV_OVERRIDE_TYPE_FLOAT) {
                 gguf_set_val_f32(ctx_out, o.key, o.val_f64);
+            } else if (o.tag == LLAMA_KV_OVERRIDE_TYPE_UINT) {
+                gguf_set_val_u32(ctx_out, o.key, (uint32_t) o.val_i64);
             } else if (o.tag == LLAMA_KV_OVERRIDE_TYPE_INT) {
                 gguf_set_val_i32(ctx_out, o.key, o.val_i64);
             } else if (o.tag == LLAMA_KV_OVERRIDE_TYPE_BOOL) {

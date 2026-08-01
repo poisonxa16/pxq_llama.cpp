@@ -62,6 +62,7 @@ struct llama_dsv4_comp_inputs {
 struct llama_dsv4_inputs {
     ggml_tensor * raw_k_idxs  = nullptr;            // I64 [n_tokens]
     ggml_tensor * raw_kq_mask = nullptr;            // F32 [n_kv_raw, n_tokens, 1, 1]
+    ggml_tensor * raw_win_idxs = nullptr;           // I32 [n_swa+n_tokens] (window mode only)
     ggml_tensor * raw_k_rot   = nullptr;            // F32 [nrot, nrot] or null
     llama_dsv4_comp_inputs comp[3];                 // indexed by llama_dsv4_stream
 };
@@ -87,10 +88,23 @@ void llama_dsv4_memory_free(llama_context & lctx);
 llama_dsv4_inputs &          llama_dsv4_get_inputs   (llama_context & lctx);
 const llama_dsv4_comp_plan & llama_dsv4_get_plan     (const llama_context & lctx, llama_dsv4_stream s);
 uint32_t                     llama_dsv4_get_raw_n_kv (const llama_context & lctx);
+uint32_t                     llama_dsv4_get_raw_swa  (const llama_context & lctx);
+// PXA_DSV4_RAW_WINDOW_KV (default ON, =0 rolls back): raw attention spans
+// [prior-window gather | in-batch keys] = n_swa + n_tokens rows instead of the whole
+// ring. Same visible key set, far fewer rows (decode: 129 vs ring 768 at ub=512).
+bool                         llama_dsv4_raw_window_enabled();
+// 0 = ring, 1 = window lever, 2 = identity-gather bisect (ring maths, window plumbing)
+int                          llama_dsv4_raw_window_mode();
+// window K width, padded so the attention kernel never sees a partial trailing tile
+uint32_t                     llama_dsv4_raw_window_width(const llama_context & lctx, int64_t n_tokens);
 int64_t                      llama_dsv4_get_raw_nrot (const llama_context & lctx);  // 0 => no raw k_rot
 int64_t                      llama_dsv4_get_comp_nrot(const llama_context & lctx, llama_dsv4_stream s);
 
 ggml_tensor * llama_dsv4_get_raw_k(const llama_context & lctx, ggml_context * ctx, int32_t il);
+// `ring_w` MUST be the tensor llama_dsv4_cpy_raw_k() returned for this layer, not the
+// ring leaf: the gather has to depend on the scatter or the scheduler may run it first.
+ggml_tensor * llama_dsv4_get_raw_win_k(const llama_context & lctx, ggml_context * ctx,
+                                       ggml_tensor * ring_w, ggml_tensor * win_idxs, int32_t il);
 ggml_tensor * llama_dsv4_cpy_raw_k(const llama_context & lctx, ggml_context * ctx,
                                    ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il);
 ggml_tensor * llama_dsv4_get_comp_k(const llama_context & lctx, ggml_context * ctx,

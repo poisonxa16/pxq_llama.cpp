@@ -271,10 +271,16 @@ void llm_build_context::build_dsv4_inputs() {
 
     inp = llama_dsv4_inputs();
 
-    const int64_t n_kv_raw = (int64_t) llama_dsv4_get_raw_n_kv(lctx);
+    const bool    raw_win  = llama_dsv4_raw_window_enabled();
+    const int64_t n_kv_raw = llama_dsv4_raw_window_mode() == 1
+                                     ? (int64_t) llama_dsv4_raw_window_width(lctx, n_tokens)
+                                     : (int64_t) llama_dsv4_get_raw_n_kv(lctx);
 
     inp.raw_k_idxs  = dsv4_build_input_1d(ctx0, GGML_TYPE_I64, n_tokens, "dsv4_raw_k_idxs");
     inp.raw_kq_mask = dsv4_build_input_mask(ctx0, n_kv_raw, n_tokens, "dsv4_raw_kq_mask");
+    if (raw_win) {
+        inp.raw_win_idxs = dsv4_build_input_1d(ctx0, GGML_TYPE_I32, n_kv_raw, "dsv4_raw_win_idxs");
+    }
     inp.raw_k_rot   = dsv4_build_input_rot(ctx0, llama_dsv4_get_raw_nrot(lctx), "dsv4_raw_k_rot");
 
     static const char * const s_name[3] = { "csa", "hca", "lid" };
@@ -803,9 +809,12 @@ ggml_tensor * llm_build_context::build_dsv4_csa_lid_attention(
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, kv);
 
-    ggml_build_forward_expand(gf, llama_dsv4_cpy_raw_k(lctx, ctx0, kv, inp.raw_k_idxs, il));
+    ggml_tensor * raw_ring_w = llama_dsv4_cpy_raw_k(lctx, ctx0, kv, inp.raw_k_idxs, il);
+    ggml_build_forward_expand(gf, raw_ring_w);
 
-    ggml_tensor * raw_k = llama_dsv4_get_raw_k(lctx, ctx0, il);
+    ggml_tensor * raw_k = llama_dsv4_raw_window_enabled()
+        ? llama_dsv4_get_raw_win_k(lctx, ctx0, raw_ring_w, inp.raw_win_idxs, il)
+        : llama_dsv4_get_raw_k(lctx, ctx0, il);
     cb(raw_k, "csa_raw_k", il);
 
     ggml_tensor * csa_k = llama_dsv4_get_comp_k(lctx, ctx0, LLAMA_DSV4_CSA, il);
@@ -860,9 +869,12 @@ ggml_tensor * llm_build_context::build_dsv4_hca_attention(
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, kv);
 
-    ggml_build_forward_expand(gf, llama_dsv4_cpy_raw_k(lctx, ctx0, kv, inp.raw_k_idxs, il));
+    ggml_tensor * raw_ring_w = llama_dsv4_cpy_raw_k(lctx, ctx0, kv, inp.raw_k_idxs, il);
+    ggml_build_forward_expand(gf, raw_ring_w);
 
-    ggml_tensor * raw_k = llama_dsv4_get_raw_k(lctx, ctx0, il);
+    ggml_tensor * raw_k = llama_dsv4_raw_window_enabled()
+        ? llama_dsv4_get_raw_win_k(lctx, ctx0, raw_ring_w, inp.raw_win_idxs, il)
+        : llama_dsv4_get_raw_k(lctx, ctx0, il);
     cb(raw_k, "hca_raw_k", il);
 
     ggml_tensor * hca_k = llama_dsv4_get_comp_k(lctx, ctx0, LLAMA_DSV4_HCA, il);
@@ -910,9 +922,12 @@ ggml_tensor * llm_build_context::build_dsv4_raw_attention(
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, kv);
 
-    ggml_build_forward_expand(gf, llama_dsv4_cpy_raw_k(lctx, ctx0, kv, inp.raw_k_idxs, il));
+    ggml_tensor * raw_ring_w = llama_dsv4_cpy_raw_k(lctx, ctx0, kv, inp.raw_k_idxs, il);
+    ggml_build_forward_expand(gf, raw_ring_w);
 
-    ggml_tensor * k = llama_dsv4_get_raw_k(lctx, ctx0, il);
+    ggml_tensor * k = llama_dsv4_raw_window_enabled()
+        ? llama_dsv4_get_raw_win_k(lctx, ctx0, raw_ring_w, inp.raw_win_idxs, il)
+        : llama_dsv4_get_raw_k(lctx, ctx0, il);
 
     ggml_tensor * kq_mask = dsv4_finalize_kq_mask(ctx0, inp.raw_kq_mask, cparams.flash_attn);
 

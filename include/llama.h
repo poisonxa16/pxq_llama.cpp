@@ -353,6 +353,7 @@ extern "C" {
         LLAMA_KV_OVERRIDE_TYPE_FLOAT,
         LLAMA_KV_OVERRIDE_TYPE_BOOL,
         LLAMA_KV_OVERRIDE_TYPE_STR,
+        LLAMA_KV_OVERRIDE_TYPE_UINT,   // writes GGUF UINT32 (see val_i64)
     };
 
     struct llama_model_kv_override {

@@ -76,6 +76,7 @@ struct dsv4_stream_state {
 struct llama_dsv4_memory {
     // raw SWA(128) token cache — the one true ring
     uint32_t raw_size = 0;
+    uint32_t n_swa    = 128;
     std::unordered_map<int32_t, size_t> raw_map_il;
     std::vector<ggml_tensor *> raw_k;             // [n_embd_k_raw, raw_size]
 
@@ -431,6 +432,7 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
     const uint32_t n_swa = hparams.n_swa > 0 ? hparams.n_swa : 128u;
     const uint32_t n_ub  = lctx.cparams.n_ubatch > 0 ? lctx.cparams.n_ubatch : 512u;
     mem->raw_size = GGML_PAD(n_ub + n_swa + 1, 256u);
+    mem->n_swa    = n_swa;
 
     const uint32_t n_embd_head_k = hparams.n_embd_head_k(0);   // method here, field upstream
 
@@ -547,7 +549,70 @@ void llama_dsv4_set_inputs(llama_context & lctx, const llama_batch & batch) {
     }
     dsv4_fill(inp.raw_k_idxs, mem.raw_k_idxs_host);
 
-    if (inp.raw_kq_mask) {
+    if (inp.raw_win_idxs && llama_dsv4_raw_window_mode() == 2) {
+        // bisect: the FULL ring through the window plumbing, so the maths is the ring's
+        std::vector<int32_t> ident((size_t) mem.raw_size);
+        for (uint32_t j = 0; j < mem.raw_size; ++j) {
+            ident[j] = (int32_t) j;
+        }
+        ggml_backend_tensor_set(inp.raw_win_idxs, ident.data(), 0, ident.size()*sizeof(int32_t));
+    }
+
+    if (inp.raw_kq_mask && llama_dsv4_raw_window_mode() == 1) {
+        // window mode: K = [prior n_swa rows from the ring | the nt in-batch keys]
+        const llama_pos n_swa    = (llama_pos) mem.n_swa;
+        const int64_t   n_kv_raw = inp.raw_kq_mask->ne[0];
+        GGML_ASSERT(n_kv_raw >= (int64_t) n_swa + nt && "raw window mask narrower than the window");
+
+        llama_pos P = 0;
+        bool have_p = false;
+        for (int32_t i = 0; i < nt; ++i) {
+            const llama_pos p = dsv4_batch_pos(batch, i);
+            if (p >= 0 && (!have_p || p < P)) { P = p; have_p = true; }
+        }
+
+        // [prior window | this ubatch's own rows]. Row (P-n_swa+j) cannot have been
+        // clobbered: raw_size >= n_ubatch + n_swa + 1, so the positions this pass writes
+        // ([P, P+nt)) and the prior window ([P-n_swa, P)) never share a ring row.
+        // safe filler row: a row this pass definitely wrote, so no gathered row is ever
+        // uninitialised. The mask leaves every filler column -inf, so it contributes zero.
+        // ORDER: [in-batch | prior]. Every query's own key lands in column < nt, so the
+        // leading tile is never fully masked (see v6 header). The visible key SET is
+        // identical either way.
+        const int32_t safe = nt > 0 ? (int32_t) mem.raw_k_idxs_host[0] : 0;
+        std::vector<int32_t> win((size_t) n_kv_raw, safe);
+        for (int32_t k = 0; k < nt; ++k) {
+            win[(size_t) k] = (int32_t) mem.raw_k_idxs_host[k];
+        }
+        for (llama_pos j = 0; j < n_swa; ++j) {
+            const llama_pos pos_j = P - n_swa + j;
+            win[(size_t) nt + (size_t) j] = pos_j >= 0 ? (int32_t) (pos_j % (llama_pos) mem.raw_size) : safe;
+        }
+        if (inp.raw_win_idxs) {
+            ggml_backend_tensor_set(inp.raw_win_idxs, win.data(), 0, win.size()*sizeof(int32_t));
+        }
+
+        std::vector<float> mask((size_t) n_kv_raw*nt, -INFINITY);
+        for (int32_t i = 0; i < nt; ++i) {
+            const llama_pos p = dsv4_batch_pos(batch, i);
+            if (p < 0) {
+                continue;
+            }
+            for (int32_t k = 0; k < nt; ++k) {
+                const llama_pos pk = dsv4_batch_pos(batch, k);
+                if (pk >= 0 && pk <= p && p - pk < n_swa) {
+                    mask[(size_t) i*n_kv_raw + (size_t) k] = 0.0f;
+                }
+            }
+            for (llama_pos j = 0; j < n_swa; ++j) {
+                const llama_pos pos_j = P - n_swa + j;
+                if (pos_j >= 0 && pos_j <= p && p - pos_j < n_swa) {
+                    mask[(size_t) i*n_kv_raw + (size_t) nt + (size_t) j] = 0.0f;
+                }
+            }
+        }
+        ggml_backend_tensor_set(inp.raw_kq_mask, mask.data(), 0, mask.size()*sizeof(float));
+    } else if (inp.raw_kq_mask) {
         const int64_t n_kv_raw = inp.raw_kq_mask->ne[0];
         const llama_pos n_swa  = (llama_pos) (hparams.n_swa > 0 ? hparams.n_swa : 128u);
 
@@ -629,6 +694,39 @@ uint32_t llama_dsv4_get_raw_n_kv(const llama_context & /*lctx*/) {
     return dsv4_mem().raw_size;
 }
 
+uint32_t llama_dsv4_get_raw_swa(const llama_context & /*lctx*/) {
+    return dsv4_mem().n_swa;
+}
+
+int llama_dsv4_raw_window_mode() {
+    static const int mode = []() {
+        // DEFAULT OFF: the window path is an unfinished experiment that NaNs (see
+        // DS4-QUANT-LADDER checkpoint 12). The shipping behaviour is the full ring.
+        const char * e = getenv("PXA_DSV4_RAW_WINDOW_KV");
+        return e ? atoi(e) : 0;
+    }();
+    return mode;
+}
+
+bool llama_dsv4_raw_window_enabled() {
+    return llama_dsv4_raw_window_mode() != 0;
+}
+
+static uint32_t dsv4_raw_window_align() {
+    static const uint32_t a = []() {
+        const char * e = getenv("PXA_DSV4_RAW_WINDOW_ALIGN");
+        const int v = e ? atoi(e) : 64;
+        return (uint32_t) (v > 0 ? v : 1);
+    }();
+    return a;
+}
+
+uint32_t llama_dsv4_raw_window_width(const llama_context & /*lctx*/, int64_t n_tokens) {
+    const uint32_t w = GGML_PAD((uint32_t) (dsv4_mem().n_swa + (uint32_t) n_tokens),
+                                dsv4_raw_window_align());
+    return w < dsv4_mem().raw_size ? w : dsv4_mem().raw_size;
+}
+
 int64_t llama_dsv4_get_raw_nrot(const llama_context & /*lctx*/) {
     return 0;   // raw stream carries no k_rot in this cut
 }
@@ -657,6 +755,32 @@ ggml_tensor * llama_dsv4_get_raw_k(const llama_context & lctx, ggml_context * ct
     ggml_tensor * k = mem.raw_k[mem.raw_map_il.at(il)];
     const llama_hparams & hp = lctx.model.hparams;
     return dsv4_k_attn_view(ctx, k, hp.n_embd_head_k(il), hp.n_head_kv(il));
+}
+
+ggml_tensor * llama_dsv4_get_raw_win_k(const llama_context & lctx, ggml_context * ctx,
+                                       ggml_tensor * ring_w, ggml_tensor * win_idxs, int32_t il) {
+    // ONE gather over the ring: [prior window | this ubatch's rows].
+    //
+    // Gather from `ring_w` -- what llama_dsv4_cpy_raw_k() RETURNED -- not from the ring
+    // leaf. The set_rows that writes this ubatch's keys returns its own handle, so reading
+    // the leaf leaves the gather with NO dependency on the scatter, and the multi-backend
+    // scheduler is then free to run the gather first and read unwritten rows (NaN). The
+    // full-ring path is immune only because its K is a view aliasing the ring in place.
+    //
+    // ggml_get_rows() on an F16 source yields F32; cast straight back to the ring's type
+    // so flash-attn takes K/V as F16 without build_dsv4_attn_mha casting the SAME tensor
+    // twice (it is passed as both k and v). F16 -> F32 -> F16 is exact, so the window
+    // path is bit-identical to the ring path, not merely close.
+    llama_dsv4_memory & mem = dsv4_mem();
+    ggml_tensor * ring = mem.raw_k[mem.raw_map_il.at(il)];        // [w, raw_size]
+    GGML_ASSERT(ring_w != nullptr && "raw window gather needs the set_rows result");
+    GGML_ASSERT(ring_w->ne[0] == ring->ne[0] && ring_w->ne[1] == ring->ne[1]);
+    ggml_tensor * win = ggml_get_rows(ctx, ring_w, win_idxs);     // [w, n_swa+nt] F32
+    if (win->type != ring->type) {
+        win = ggml_cast(ctx, win, ring->type);
+    }
+    const llama_hparams & hp = lctx.model.hparams;
+    return dsv4_k_attn_view(ctx, win, hp.n_embd_head_k(il), hp.n_head_kv(il));
 }
 
 ggml_tensor * llama_dsv4_cpy_raw_k(const llama_context & /*lctx*/, ggml_context * ctx,
