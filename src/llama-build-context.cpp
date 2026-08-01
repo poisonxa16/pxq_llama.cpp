@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <atomic>
 #include <stdexcept>
 #include "llama-build-context.h"
@@ -56,6 +57,7 @@ llm_build_context::llm_build_context(
         n_embd_v_gqa     (hparams.n_embd_v_gqa()),
         n_expert         (hparams.n_expert),
         n_expert_used    (warmup ? hparams.n_expert : hparams.n_expert_used),
+        is_warmup        (warmup),
         freq_base        (cparams.rope_freq_base),
         freq_scale       (cparams.rope_freq_scale),
         ext_factor       (cparams.yarn_ext_factor),
@@ -2337,11 +2339,17 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     llm.init();
 
     {
-        // PXA_BUILDGRAPH_DBG: first-N graph builds print the workspace identity — hunting the
-        // np>=8+MTP init segfault where build #8 dies inside ggml_new_object with the bounds
+        // PXA_BUILDGRAPH_DBG: first-N graph builds print the workspace identity — used to hunt
+        // the np>=8+MTP init segfault where build #8 died inside ggml_new_object with the bounds
         // check NOT firing (ctx/buffer garbage -> use-after-free suspect, not arena overflow).
+        // Env-gated (PXA_BUILDGRAPH_DBG=1): it was unconditional, so every run wrote 64 lines to
+        // stderr, which corrupts any log a harness parses and buries real output.
+        static const bool pxa_dbg_on = [] {
+            const char * e = getenv("PXA_BUILDGRAPH_DBG");
+            return e && atoi(e) > 0;
+        }();
         static std::atomic<int> pxa_dbg_n{0};
-        const int pxa_n = pxa_dbg_n.fetch_add(1);
+        const int pxa_n = pxa_dbg_on ? pxa_dbg_n.fetch_add(1) : 64;
         if (pxa_n < 64) {
             fprintf(stderr, "PXA_BUILD_DBG #%d lctx=%p meta=%p metasz=%zu ntok=%d worst=%d nodes_budget=%zu\n",
                 pxa_n, (void *) &lctx, (void *) lctx.buf_compute_meta.data(), lctx.buf_compute_meta.size(),

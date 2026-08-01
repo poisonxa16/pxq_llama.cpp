@@ -58,6 +58,12 @@ struct llm_build_context {
     const int64_t n_expert;
     const int64_t n_expert_used;
 
+    // true while building the warm-up graph. The warm-up run deliberately routes
+    // to EVERY expert (see n_expert_used above), so any arch that supplies its own
+    // expert selection must fall back to the router for this build or the two
+    // disagree on the selection width.
+    const bool is_warmup;
+
     const float freq_base;
     const float freq_scale;
     const float ext_factor;

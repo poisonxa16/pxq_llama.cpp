@@ -128,7 +128,7 @@
 //             indexer_proj, indexer_attn_q_b, ffn_norm, ffn_gate_inp,
 //             ffn_exp_probs_b, ffn_*_exps, ffn_*_shexp already exist here)
 //   NOTE: this tree calls the compressed-KV norm `attn_kv_a_norm`, upstream calls
-//   it `attn_kv_norm`. We use the local name.
+//   it `attn_kv_norm`. We use the local name -- in BOTH the graph and the loader.
 //
 
 #include "../llama-build-context.h"
@@ -275,6 +275,10 @@ static ggml_tensor * dsv4_build_input_rot(ggml_context * ctx, int64_t nrot, cons
 //
 
 void llm_build_context::build_dsv4_inputs() {
+    // Derive this batch's compression plans FIRST: every plan-sized tensor below must be
+    // built from the same plan llama_dsv4_set_inputs() will fill it from.
+    llama_dsv4_build_plans(lctx, batch);
+
     llama_dsv4_inputs & inp = llama_dsv4_get_inputs(lctx);
 
     inp = llama_dsv4_inputs();
@@ -1381,9 +1385,12 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
         // The first dsv4_hash_layer_count blocks route by a token-id -> expert-id hash
         // table instead of by the router top-k. exp_probs_b does not exist there.
+        // Skipped on the warm-up graph: that build forces n_expert_used = n_expert so
+        // every expert tensor is touched, and the hash table is only n_expert_used wide
+        // (upstream guards this the same way, with !cparams.warmup).
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b      = layer.ffn_exp_probs_b;
-        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+        if ((uint32_t) il < hparams.dsv4_hash_layer_count && !is_warmup) {
             GGML_ASSERT(layer.ffn_gate_tid2eid);
             GGML_ASSERT(inp_tokens && "DSV4 hash-routed layers need token ids (embedding input is unsupported)");
             // NOTE: ffn_gate_tid2eid is I32; this tree's CUDA get_rows has no I32

@@ -1618,3 +1618,9 @@ template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum ll
 
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(enum llm_kv, unsigned int&, bool);
 
+// DeepSeek-V4 reads attention.compress_ratios as a raw array whose length may EXCEED
+// n_layer (the 0731 Flash release ships 46 for 43 blocks), which get_key_or_arr() rejects
+// by design. Both overloads are needed: the llm_kv one forwards to the string one.
+template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::vector<uint32_t> &, bool);
+template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv, std::vector<uint32_t> &, bool);
+
