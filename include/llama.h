@@ -608,6 +608,12 @@ extern "C" {
 
     LLAMA_API void llama_free_model(struct llama_model * model);
 
+    // Bind a loaded DSpark support model (arch deepseek4-dspark) to its DS4 target.
+    // Copies the scalars the support file does not carry and runs the donor-match
+    // assertions. Returns false (and logs which check failed) on a mismatch.
+    LLAMA_API bool llama_dspark_bind_target(struct llama_model * drafter,
+                                      const struct llama_model * target);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);

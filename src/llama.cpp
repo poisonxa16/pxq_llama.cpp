@@ -3956,6 +3956,17 @@ static bool llm_load_tensors(
         } else {
             model.buft_output = llama_default_buffer_type_cpu(true);
         }
+    } else if (model.devices.empty()) {
+        // Every branch below indexes model.devices[...]; on a CPU-only run of a CUDA build
+        // (no GPU, CUDA_VISIBLE_DEVICES="", or -ngl 0 with no devices) that vector is EMPTY
+        // and the read segfaults. device_count comes from model.splits (always >= 1), so the
+        // existing `device_count > 0` guard on the fit block does NOT cover this. Same class
+        // of bug, same fix: with no devices there is nothing to offload to, so place
+        // everything on the CPU.
+        model.buft_output = llama_default_buffer_type_cpu(true);
+        for (int i = i_gpu_start; i < n_layer; ++i) {
+            model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+        }
     } else {
         ggml_backend_buffer_type_t split_buft;
         if ((split_mode == LLAMA_SPLIT_MODE_GRAPH || split_mode == LLAMA_SPLIT_MODE_ATTN) && model.splits.size() > 1) {
@@ -7864,6 +7875,105 @@ struct llama_context * llama_init_from_model(
     return ctx;
 }
 
+
+// ---------------------------------------------------------------------------
+// DSpark: bind a loaded support model to its target.
+//
+// The support GGUF has nine metadata keys. llm_load_hparams_dspark() derives every
+// hparam that is implied by a tensor SHAPE; this copies the ones that are not
+// implied by any shape, and then runs the assertions that separate "the right donor"
+// from "a donor that loads cleanly and drafts garbage".
+//
+// Deliberately NOT a change to llama_model_load's signature: no public API churn,
+// no load-order dependency. Call it once, after both models are loaded, before any
+// drafter graph is built.
+// ---------------------------------------------------------------------------
+bool llama_dspark_bind_target(struct llama_model * drafter, const struct llama_model * target) {
+    if (!drafter || !target) {
+        LLAMA_LOG_ERROR("%s: null model\n", __func__);
+        return false;
+    }
+    if (drafter->arch != LLM_ARCH_DEEPSEEK4_DSPARK) {
+        LLAMA_LOG_ERROR("%s: drafter arch is %s, expected deepseek4-dspark\n",
+                __func__, llama_model_arch_string(drafter));
+        return false;
+    }
+    if (target->arch != LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_ERROR("%s: target arch is %s, expected deepseek4\n",
+                __func__, llama_model_arch_string(target));
+        return false;
+    }
+
+    auto &       dh = drafter->hparams;
+    const auto & th = target->hparams;
+
+    // --- scalars that no drafter tensor shape implies ---
+    dh.n_expert_used            = th.n_expert_used;
+    dh.expert_weights_scale     = th.expert_weights_scale;
+    dh.expert_weights_norm      = th.expert_weights_norm;
+    dh.expert_gating_func       = th.expert_gating_func;
+    dh.f_norm_rms_eps           = th.f_norm_rms_eps;
+    dh.n_swa                    = th.n_swa;
+    dh.n_rot                    = th.n_rot;
+    dh.rope_freq_base_train     = th.rope_freq_base_train;
+    dh.rope_freq_scale_train    = th.rope_freq_scale_train;
+    dh.n_ctx_orig_yarn          = th.n_ctx_orig_yarn;
+    dh.n_ctx_train              = th.n_ctx_train;
+    dh.rope_scaling_type_train  = th.rope_scaling_type_train;
+    dh.dsv4_hc_sinkhorn_iters   = th.dsv4_hc_sinkhorn_iters;
+    dh.dsv4_hc_eps              = th.dsv4_hc_eps;
+    dh.dsv4_compress_rope_base  = th.dsv4_compress_rope_base;
+    dh.swiglu_limits            = th.swiglu_limits;
+    dh.swiglu_limits_shared     = th.swiglu_limits_shared;
+
+    // --- assertions: twelve of them, and they are the whole safety net ---
+    struct chk { bool ok; const char * what; };
+    const uint32_t last = dh.n_layer ? dh.n_layer - 1 : 0;
+    const ggml_tensor * main_proj = dh.n_layer ? drafter->layers[0].dspark_main_proj    : nullptr;
+    const ggml_tensor * w1        = dh.n_layer ? drafter->layers[last].dspark_markov_w1 : nullptr;
+    const ggml_tensor * conf      = dh.n_layer ? drafter->layers[last].dspark_conf_proj : nullptr;
+
+    int32_t max_cap = -1;
+    for (uint32_t i = 0; i < dh.dspark_n_target_layers; ++i) {
+        max_cap = std::max(max_cap, dh.dspark_target_layer_ids[i]);
+    }
+
+    const chk checks[] = {
+        { dh.n_embd == th.n_embd,                                          "drafter n_embd == target n_embd" },
+        { main_proj && main_proj->ne[0] == (int64_t) dh.dspark_n_target_layers * (int64_t) dh.n_embd,
+                                                                           "main_proj input == n_capture*n_embd" },
+        { dh.n_vocab == th.n_vocab,                                        "drafter n_vocab == target n_vocab" },
+        { w1 && w1->ne[1] == (int64_t) dh.n_vocab,                         "markov_w1 covers the vocab" },
+        { conf && conf->ne[0] == (int64_t) dh.n_embd + (int64_t) dh.dspark_markov_rank,
+                                                                           "conf_proj input == n_embd + markov_rank" },
+        { max_cap >= 0 && (uint32_t) max_cap < th.n_layer,                 "capture layer ids inside the target" },
+        { dh.dspark_stage_count == dh.n_layer,                             "stage_count == n_layers" },
+        { dh.dspark_noise_token >= 0 && (uint32_t) dh.dspark_noise_token < dh.n_vocab,
+                                                                           "noise_token_id inside the vocab" },
+        { target->tok_embd != nullptr,                                     "target carries token_embd" },
+        { target->output   != nullptr,                                     "target carries output.weight" },
+        { dh.dspark_markov_rank % 32 == 0,                                 "markov_rank % 32 == 0 (Q8_0 gemv)" },
+        { dh.n_expert_used > 0 && dh.n_expert > 0,                         "MoE routing constants are set" },
+    };
+
+    bool ok = true;
+    for (const auto & c : checks) {
+        if (!c.ok) { LLAMA_LOG_ERROR("%s: FAILED: %s\n", __func__, c.what); ok = false; }
+    }
+    if (!ok) return false;
+
+    drafter->dspark_target = target;
+
+    LLAMA_LOG_INFO("%s: DSpark bound: block_size=%u stages=%u capture_layers=[",
+            __func__, dh.dspark_block_size, dh.n_layer);
+    for (uint32_t i = 0; i < dh.dspark_n_target_layers; ++i) {
+        LLAMA_LOG_INFO("%s%d", i ? "," : "", dh.dspark_target_layer_ids[i]);
+    }
+    LLAMA_LOG_INFO("] n_expert_used=%u sinkhorn_iters=%u rms_eps=%g\n",
+            dh.n_expert_used, dh.dsv4_hc_sinkhorn_iters, (double) dh.f_norm_rms_eps);
+    return true;
+}
+
 void llama_free(struct llama_context * ctx) {
     if (ctx && ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
         llama_dsv4_memory_free(*ctx);
@@ -7952,6 +8062,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         // DS4 is NORM-rope, same group as deepseek2 (upstream llama-model.cpp:2530).
         // Omitting this silently gives the wrong rope layout.
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK4_DSPARK:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2

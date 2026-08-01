@@ -38,6 +38,150 @@ static inline const char * llm_expert_gating_func_name(llm_expert_gating_func_ty
 }
 
 
+
+// ---------------------------------------------------------------------------
+// DSpark support-file hparams.
+//
+// The DSpark support GGUF carries NINE metadata keys and NO geometry: no
+// block_count, no context_length, no embedding_length, no vocab, no tokenizer.
+// llm_load_hparams' mandatory prologue reads all three of those unconditionally
+// and throws before the arch switch is ever reached, so this arch gets an early
+// return and derives its geometry from its OWN tensor shapes instead.
+//
+// Everything genuinely NOT derivable from a shape (n_expert_used, sinkhorn
+// iteration count, rms eps, rope base/scaling, o_group_count, ...) is copied
+// later from the bound target model - see llama_dspark_bind_target(). A
+// mismatched donor loads cleanly and drafts garbage; the assertions there are
+// the only thing standing between us and that.
+// ---------------------------------------------------------------------------
+static int64_t dspark_tensor_ne(llama_model_loader & ml, const char * name, int dim) {
+    const ggml_tensor * t = ml.get_tensor_meta(name);
+    if (!t) {
+        throw std::runtime_error(format("DSpark support file is missing tensor '%s'", name));
+    }
+    return t->ne[dim];
+}
+
+static void llm_load_hparams_dspark(llama_model_loader & ml, llama_model & model) {
+    auto & hparams = model.hparams;
+
+    ml.get_key(LLM_KV_GENERAL_NAME, model.name, false);
+
+    ml.get_key(LLM_KV_DSPARK_BLOCK_SIZE,  hparams.dspark_block_size);
+    ml.get_key(LLM_KV_DSPARK_STAGE_COUNT, hparams.dspark_stage_count);
+    ml.get_key(LLM_KV_DSPARK_N_LAYERS,    hparams.n_layer);
+    ml.get_key(LLM_KV_DSPARK_MARKOV_RANK, hparams.dspark_markov_rank);
+    {
+        uint32_t noise = 0;
+        ml.get_key(LLM_KV_DSPARK_NOISE_TOKEN_ID, noise);
+        hparams.dspark_noise_token = (int32_t) noise;
+    }
+    {
+        // only get_arr<std::vector<uint32_t>>(llm_kv, ...) is explicitly instantiated in
+        // this tree (llama-model-loader.cpp:1635); the layer ids are small non-negative
+        // ints, so read them as uint32 and narrow.
+        std::vector<uint32_t> ids;
+        ml.get_arr(LLM_KV_DSPARK_TARGET_LAYER_IDS, ids, true);
+        if (ids.empty() || ids.size() > hparams.dspark_target_layer_ids.size()) {
+            throw std::runtime_error(format("DSpark: dspark.target_layer_ids has %zu entries", ids.size()));
+        }
+        for (size_t i = 0; i < ids.size(); ++i) hparams.dspark_target_layer_ids[i] = (int32_t) ids[i];
+        hparams.dspark_n_target_layers = (uint32_t) ids.size();
+    }
+
+    // stage_count IS n_layers - settled by ds4.c metal_graph_eval_dspark_stage_chain,
+    // not by the paper's 4-phase pipeline framing.
+    if (hparams.dspark_stage_count != hparams.n_layer) {
+        throw std::runtime_error(format("DSpark: stage_count=%u != n_layers=%u",
+                    hparams.dspark_stage_count, hparams.n_layer));
+    }
+    const uint32_t last = hparams.n_layer - 1;
+
+    // ---- geometry, derived from the support file's own tensor shapes ----
+    const int64_t main_proj_in = dspark_tensor_ne(ml, "mtp.0.main_proj.weight", 0);   // 3*n_embd
+    hparams.n_embd = (uint32_t) (main_proj_in / (int64_t) hparams.dspark_n_target_layers);
+    if ((int64_t) hparams.n_embd * (int64_t) hparams.dspark_n_target_layers != main_proj_in) {
+        throw std::runtime_error("DSpark: main_proj input width is not a multiple of the capture-layer count");
+    }
+    if (dspark_tensor_ne(ml, "mtp.0.main_norm.weight", 0) != (int64_t) hparams.n_embd) {
+        throw std::runtime_error("DSpark: main_norm width disagrees with the derived n_embd");
+    }
+
+    const std::string w1 = format("mtp.%u.markov_head.markov_w1.weight", last);
+    hparams.n_vocab = (uint32_t) dspark_tensor_ne(ml, w1.c_str(), 1);
+    if ((uint32_t) dspark_tensor_ne(ml, w1.c_str(), 0) != hparams.dspark_markov_rank) {
+        throw std::runtime_error("DSpark: markov_w1 rank disagrees with dspark.markov_rank");
+    }
+
+    hparams.n_head_arr.fill(0);
+    hparams.n_head_kv_arr.fill(0);
+    const uint32_t n_head = (uint32_t) dspark_tensor_ne(ml, "mtp.0.attn_sinks.weight", 0);
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        hparams.n_head_arr[il]    = n_head;
+        hparams.n_head_kv_arr[il] = 1;             // MLA: one shared latent
+    }
+    // n_embd_head_{k,v} are accessors over the _full/_swa pair in this tree, not fields.
+    // The drafter has no SWA-vs-full split (swa_layers stays all-zero), so both slots
+    // get the same value and every accessor path lands on it.
+    hparams.n_embd_head_k_full = (uint32_t) dspark_tensor_ne(ml, "mtp.0.attn_kv.weight", 1);
+    hparams.n_embd_head_k_swa  = hparams.n_embd_head_k_full;
+    hparams.n_embd_head_v_full = hparams.n_embd_head_k_full;
+    hparams.n_embd_head_v_swa  = hparams.n_embd_head_k_full;
+    hparams.swa_layers.fill(0);
+    hparams.n_lora_q      = (uint32_t) dspark_tensor_ne(ml, "mtp.0.attn_q_a.weight", 1);
+    hparams.n_expert      = (uint32_t) dspark_tensor_ne(ml, "mtp.0.ffn_gate_exps.weight", 2);
+    hparams.n_ff_exp      = (uint32_t) dspark_tensor_ne(ml, "mtp.0.ffn_gate_exps.weight", 1);
+    hparams.n_ff_arr.fill(hparams.n_ff_exp);
+    hparams.dsv4_hc_mult  = (uint32_t) (dspark_tensor_ne(ml, "mtp.0.hc_attn_fn.weight", 0) / (int64_t) hparams.n_embd);
+
+    // attn_output is the DS4 grouped LoRA pair:
+    //   a : {n_head*n_embd_head_k / o_groups , o_lora_rank * o_groups}
+    //   b : {o_groups * o_lora_rank          , n_embd}
+    // Both scalars fall out of a.ne[] given n_head and n_embd_head_k, so the drafter
+    // does NOT need the target for them. (Reading a.ne[1] as o_lora_rank directly is
+    // wrong by a factor of o_groups - it is o_lora_rank*o_groups.)
+    {
+        const int64_t a0 = dspark_tensor_ne(ml, "mtp.0.attn_output_a.weight", 0);
+        const int64_t a1 = dspark_tensor_ne(ml, "mtp.0.attn_output_a.weight", 1);
+        const int64_t qtot = (int64_t) n_head * (int64_t) hparams.n_embd_head_k_full;
+        if (a0 <= 0 || qtot % a0 != 0) {
+            throw std::runtime_error("DSpark: attn_output_a width does not divide n_head*n_embd_head_k");
+        }
+        hparams.dsv4_o_group_count = (uint32_t) (qtot / a0);
+        if (hparams.dsv4_o_group_count == 0 || a1 % (int64_t) hparams.dsv4_o_group_count != 0) {
+            throw std::runtime_error("DSpark: attn_output_a rank is not a multiple of o_groups");
+        }
+        hparams.dsv4_o_lora_rank = (uint32_t) (a1 / (int64_t) hparams.dsv4_o_group_count);
+    }
+
+    // one shared expert of n_ff_exp columns
+    hparams.n_expert_shared = (uint32_t) (dspark_tensor_ne(ml, "mtp.0.ffn_gate_shexp.weight", 1)
+                                          / (int64_t) hparams.n_ff_exp);
+
+    // The drafter has NO hash-routing table (no mtp.N.ffn_gate_tid2eid) and no
+    // compressor/indexer tensors: all three stages are plain raw-SWA blocks.
+    hparams.dsv4_hash_layer_count = 0;
+    std::fill(hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.end(), 0u);
+
+    // Placeholders; llama_dspark_bind_target() overwrites them from the target.
+    hparams.n_ctx_train   = 4096;
+    // Provisional. Not implied by any drafter tensor shape and not used by any tensor
+    // shape either - it only reaches the graph. llama_dspark_bind_target() overwrites it
+    // with the target's value before any drafter graph is built. A non-zero value is
+    // required here only because the shared LOADING_PRELUDE rejects n_expert>0 with
+    // n_expert_used==0.
+    hparams.n_expert_used = 6;
+
+    model.type = e_model::MODEL_UNKNOWN;
+
+    LLAMA_LOG_INFO("%s: DSpark support: stages=%u block_size=%u markov_rank=%u noise_id=%d "
+                   "n_embd=%u n_vocab=%u n_head=%u kv_lora=%u q_lora=%u n_expert=%u n_ff_exp=%u hc=%u\n",
+                   __func__, hparams.n_layer, hparams.dspark_block_size, hparams.dspark_markov_rank,
+                   hparams.dspark_noise_token, hparams.n_embd, hparams.n_vocab, n_head,
+                   hparams.n_embd_head_k_full, hparams.n_lora_q, hparams.n_expert, hparams.n_ff_exp,
+                   hparams.dsv4_hc_mult);
+}
+
 void llm_load_hparams(
         llama_model_loader & ml,
         llama_model & model, bool ignore_vocab) {
@@ -53,6 +197,14 @@ void llm_load_hparams(
         const char * name = gguf_get_key(ctx, i);
         const std::string value = gguf_kv_to_str(ctx, i);
         model.gguf_kv.emplace(name, value);
+    }
+
+    // DSpark: the support file has NO geometry keys. Its hparams come from its own
+    // tensor shapes; the required-key prologue below would throw before the arch
+    // switch is ever reached. Must stay ABOVE the LLM_KV_BLOCK_COUNT read.
+    if (model.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+        llm_load_hparams_dspark(ml, model);
+        return;
     }
 
     ml.get_key(LLM_KV_BLOCK_COUNT,       hparams.n_layer);
