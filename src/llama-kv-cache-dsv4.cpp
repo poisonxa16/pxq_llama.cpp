@@ -499,6 +499,20 @@ void llama_dsv4_set_inputs(llama_context & /*lctx*/, const llama_batch & batch) 
 // graph-side accessors
 //
 
+// ggml_set_rows() wants a 2D source: it asserts src->ne[1] == idxs->ne[0] and
+// src->ne[2] == dst->ne[2]. The DSV4 graph hands us 3D tensors ([n_embd, 1, n_tokens]
+// for raw K), so flatten to [dst_row_width, n_rows] first. Flattened against the
+// DESTINATION width, not an assumed source layout, because the four stores have
+// different widths (n_embd_k_gqa / n_embd_state / indexer_head_size).
+static ggml_tensor * dsv4_rows_src(ggml_context * ctx, ggml_tensor * dst, ggml_tensor * src) {
+    const int64_t w = dst->ne[0];
+    GGML_ASSERT(w > 0 && ggml_nelements(src) % w == 0);
+    if (src->ne[0] == w && ggml_n_dims(src) <= 2) {
+        return src;
+    }
+    return ggml_reshape_2d(ctx, src, w, ggml_nelements(src)/w);
+}
+
 llama_dsv4_inputs & llama_dsv4_get_inputs(llama_context & /*lctx*/) {
     return dsv4_mem().inputs;
 }
@@ -526,7 +540,8 @@ ggml_tensor * llama_dsv4_get_raw_k(const llama_context & /*lctx*/, ggml_context 
 
 ggml_tensor * llama_dsv4_cpy_raw_k(const llama_context & lctx, ggml_context * ctx,
                                    ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) {
-    return ggml_set_rows(ctx, llama_dsv4_get_raw_k(lctx, ctx, il), k_cur, k_idxs);
+    ggml_tensor * dst = llama_dsv4_get_raw_k(lctx, ctx, il);
+    return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, k_cur), k_idxs);
 }
 
 ggml_tensor * llama_dsv4_get_comp_k(const llama_context & /*lctx*/, ggml_context * /*ctx*/,
@@ -538,7 +553,8 @@ ggml_tensor * llama_dsv4_get_comp_k(const llama_context & /*lctx*/, ggml_context
 ggml_tensor * llama_dsv4_cpy_comp_k(const llama_context & lctx, ggml_context * ctx,
                                     llama_dsv4_stream s, ggml_tensor * k_cur,
                                     ggml_tensor * k_idxs, int32_t il) {
-    return ggml_set_rows(ctx, llama_dsv4_get_comp_k(lctx, ctx, s, il), k_cur, k_idxs);
+    ggml_tensor * dst = llama_dsv4_get_comp_k(lctx, ctx, s, il);
+    return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, k_cur), k_idxs);
 }
 
 ggml_tensor * llama_dsv4_get_state_kv(const llama_context & /*lctx*/, ggml_context * /*ctx*/,
@@ -556,11 +572,13 @@ ggml_tensor * llama_dsv4_get_state_score(const llama_context & /*lctx*/, ggml_co
 ggml_tensor * llama_dsv4_cpy_state_kv(const llama_context & lctx, ggml_context * ctx,
                                       llama_dsv4_stream s, ggml_tensor * cur,
                                       ggml_tensor * idxs, int32_t il) {
-    return ggml_set_rows(ctx, llama_dsv4_get_state_kv(lctx, ctx, s, il), cur, idxs);
+    ggml_tensor * dst = llama_dsv4_get_state_kv(lctx, ctx, s, il);
+    return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, cur), idxs);
 }
 
 ggml_tensor * llama_dsv4_cpy_state_score(const llama_context & lctx, ggml_context * ctx,
                                          llama_dsv4_stream s, ggml_tensor * cur,
                                          ggml_tensor * idxs, int32_t il) {
-    return ggml_set_rows(ctx, llama_dsv4_get_state_score(lctx, ctx, s, il), cur, idxs);
+    ggml_tensor * dst = llama_dsv4_get_state_score(lctx, ctx, s, il);
+    return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, cur), idxs);
 }
