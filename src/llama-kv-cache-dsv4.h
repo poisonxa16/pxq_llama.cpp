@@ -72,6 +72,11 @@ struct llama_dsv4_inputs {
 
 bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type type_v,
                             uint32_t kv_size, bool offload);
+// Derive the three compression plans for this batch. MUST run before the graph for the
+// same batch is built: build_dsv4_inputs() sizes every plan-derived graph input from the
+// stored plans, and llama_dsv4_set_inputs() then fills those tensors from the same plans.
+// Building the graph against a stale plan and filling from a fresh one is a size mismatch.
+void llama_dsv4_build_plans(llama_context & lctx, const llama_batch & batch);
 void llama_dsv4_set_inputs (llama_context & lctx, const llama_batch & batch);
 void llama_dsv4_memory_free(llama_context & lctx);
 

@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -113,6 +114,14 @@ static int32_t dsv4_batch_n_seq_id(const llama_batch & batch, int32_t i) {
     return batch.n_seq_id ? batch.n_seq_id[i] : 1;
 }
 
+// The reserve/worst-case graph is built straight from llama_batch_get_one(), whose pos
+// array is NULL and whose positions are implied by all_pos_0/all_pos_1. llama_decode
+// normalises that before its own graph build, but llama_build_graph() for the reserve
+// pass does not -- so every read of a position here must go through this.
+static llama_pos dsv4_batch_pos(const llama_batch & batch, int32_t i) {
+    return batch.pos ? batch.pos[i] : batch.all_pos_0 + (llama_pos) i*batch.all_pos_1;
+}
+
 static llama_dsv4_comp_plan dsv4_build_comp_plan(
         const llama_batch & batch,
         uint32_t ratio,
@@ -144,7 +153,7 @@ static llama_dsv4_comp_plan dsv4_build_comp_plan(
 
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         for (int32_t s = 0; s < dsv4_batch_n_seq_id(batch, i); ++s) {
-            curr_token_idx_map[std::make_pair(dsv4_batch_seq(batch, i, s), batch.pos[i])] = i;
+            curr_token_idx_map[std::make_pair(dsv4_batch_seq(batch, i, s), dsv4_batch_pos(batch, i))] = i;
         }
     }
 
@@ -164,7 +173,7 @@ static llama_dsv4_comp_plan dsv4_build_comp_plan(
     };
 
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        const llama_pos pos = batch.pos[i];
+        const llama_pos pos = dsv4_batch_pos(batch, i);
 
         if (pos < 0) {
             continue;
@@ -223,12 +232,12 @@ static llama_dsv4_comp_plan dsv4_build_comp_plan(
         assert(kv_size > 0);
 
         int32_t i = 0;
-        while (i < batch.n_tokens && batch.pos[i] < 0) {
+        while (i < batch.n_tokens && dsv4_batch_pos(batch, i) < 0) {
             ++i;
         }
         assert(i < batch.n_tokens);
 
-        const llama_pos    pos    = batch.pos[i];
+        const llama_pos    pos    = dsv4_batch_pos(batch, i);
         const llama_seq_id seq_id = dsv4_batch_seq(batch, i, 0);
         const int32_t source_idx  = state_source_idx(seq_id, pos);
 
@@ -480,18 +489,104 @@ void llama_dsv4_memory_free(llama_context & /*lctx*/) {
     g_dsv4 = nullptr;
 }
 
-void llama_dsv4_set_inputs(llama_context & /*lctx*/, const llama_batch & batch) {
+// write a host vector into a graph input tensor, checking the element count matches the
+// size the graph derived from the same plan (a mismatch means plan and graph disagree,
+// which must be loud -- a short write leaves the tail uninitialised)
+template <typename T>
+static void dsv4_fill(ggml_tensor * t, const std::vector<T> & v) {
+    if (!t) {
+        return;
+    }
+    GGML_ASSERT((int64_t) v.size() == ggml_nelements(t) &&
+                "DSV4 plan/graph input size disagreement");
+    if (!v.empty()) {
+        ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(T));
+    }
+}
+
+void llama_dsv4_build_plans(llama_context & /*lctx*/, const llama_batch & batch) {
     llama_dsv4_memory & mem = dsv4_mem();
 
     for (int si = 0; si < 3; ++si) {
         dsv4_stream_state & st = mem.s[si];
         st.plan = dsv4_build_comp_plan(batch, st.ratio, st.overlap, st.state_size, st.cache_size);
     }
+}
 
-    // raw ring row for each token: pos % raw_size
-    mem.raw_k_idxs_host.resize(batch.n_tokens);
-    for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        mem.raw_k_idxs_host[i] = (int64_t) (batch.pos[i] % (llama_pos) mem.raw_size);
+void llama_dsv4_set_inputs(llama_context & lctx, const llama_batch & batch) {
+    llama_dsv4_memory & mem = dsv4_mem();
+    const llama_hparams & hparams = lctx.model.hparams;
+
+    // The plans were built by llama_dsv4_build_plans() from THIS batch, before the graph
+    // that owns these input tensors. Re-deriving them here would be harmless (the builder
+    // is a pure function of the batch) but wasted; asserting instead catches a build/fill
+    // ordering regression loudly rather than as a short write into an ill-sized tensor.
+    for (int si = 0; si < 3; ++si) {
+        GGML_ASSERT((int32_t) mem.s[si].plan.n_visible.size() == batch.n_tokens &&
+                    "DSV4 plans were not built for this batch (llama_dsv4_build_plans must run first)");
+    }
+
+    llama_dsv4_inputs & inp = mem.inputs;
+    const int32_t nt = batch.n_tokens;
+
+    // ---- raw stream ----
+
+    // ring row for each token
+    mem.raw_k_idxs_host.resize(nt);
+    for (int32_t i = 0; i < nt; ++i) {
+        mem.raw_k_idxs_host[i] = (int64_t) (dsv4_batch_pos(batch, i) % (llama_pos) mem.raw_size);
+    }
+    dsv4_fill(inp.raw_k_idxs, mem.raw_k_idxs_host);
+
+    if (inp.raw_kq_mask) {
+        const int64_t n_kv_raw = inp.raw_kq_mask->ne[0];
+        const llama_pos n_swa  = (llama_pos) (hparams.n_swa > 0 ? hparams.n_swa : 128u);
+
+        std::vector<float> mask((size_t) n_kv_raw*nt, -INFINITY);
+        for (int32_t i = 0; i < nt; ++i) {
+            const llama_pos p = dsv4_batch_pos(batch, i);
+            if (p < 0) {
+                continue;
+            }
+            for (int64_t j = 0; j < n_kv_raw; ++j) {
+                // most recent position stored in ring row j, at or before p
+                const llama_pos back = (llama_pos) (((int64_t) p - j) % (int64_t) mem.raw_size);
+                const llama_pos q    = p - (back < 0 ? back + (llama_pos) mem.raw_size : back);
+                const llama_pos d    = p - q;
+                if (q >= 0 && d >= 0 && d < n_swa) {
+                    mask[(size_t) i*n_kv_raw + j] = 0.0f;
+                }
+            }
+        }
+        ggml_backend_tensor_set(inp.raw_kq_mask, mask.data(), 0, mask.size()*sizeof(float));
+    }
+
+    // ---- the three compressed streams ----
+
+    for (int si = 0; si < 3; ++si) {
+        const llama_dsv4_comp_plan & pl = mem.s[si].plan;
+        llama_dsv4_comp_inputs     & ci = inp.comp[si];
+
+        dsv4_fill(ci.state_pos,              pl.state_pos);
+        dsv4_fill(ci.state_persist_src_idxs, pl.state_persist_src_idxs);
+        dsv4_fill(ci.state_persist_dst_idxs, pl.state_persist_dst_idxs);
+        dsv4_fill(ci.state_read_idxs,        pl.state_read_idxs);
+        dsv4_fill(ci.state_write_idxs,       pl.state_write_idxs);
+        dsv4_fill(ci.state_write_pos,        pl.state_write_pos);
+
+        if (ci.kq_mask) {
+            const int64_t n_kv = ci.kq_mask->ne[0];
+            std::vector<float> mask((size_t) n_kv*nt, -INFINITY);
+            for (int32_t i = 0; i < nt; ++i) {
+                // n_visible[i] completed compressed rows are addressable by token i;
+                // everything above (including the graph-width padding) stays masked
+                const int64_t vis = std::min<int64_t>(pl.n_visible[i], n_kv);
+                for (int64_t j = 0; j < vis; ++j) {
+                    mask[(size_t) i*n_kv + j] = 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(ci.kq_mask, mask.data(), 0, mask.size()*sizeof(float));
+        }
     }
 }
 
