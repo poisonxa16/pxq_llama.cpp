@@ -341,8 +341,6 @@ struct llm_build_context {
     void build_dsv4_inputs();
 
     // hyper-connections
-    ggml_tensor * build_dsv4_hc_mix(ggml_tensor * x, ggml_tensor * weights, int il) const;
-    ggml_tensor * build_dsv4_hc_sinkhorn(ggml_tensor * comb, int il) const;
     ggml_tensor * build_dsv4_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
             ggml_tensor * hc_base, ggml_tensor ** post, ggml_tensor ** comb, int il) const;
     ggml_tensor * build_dsv4_hc_post(ggml_tensor * x, ggml_tensor * residual,

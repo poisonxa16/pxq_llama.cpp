@@ -152,18 +152,6 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
-static size_t dsv4_elem_offset(const ggml_tensor * t, int64_t i) {
-    return ggml_row_size(t->type, i);
-}
-
-static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t ne0, int64_t i0) {
-    return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
-}
-
-static ggml_tensor * dsv4_view_2d(ggml_context * ctx, ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t i0) {
-    return ggml_view_2d(ctx, t, ne0, ne1, t->nb[1], dsv4_elem_offset(t, i0));
-}
-
 // upstream: dsv4_append_zero_row(). Adds one synthetic trailing row that
 // state_read_idxs may address for the first block's "previous" half.
 static ggml_tensor * dsv4_append_zero_row(ggml_context * ctx, ggml_tensor * t, bool neg_inf) {
@@ -330,64 +318,13 @@ void llm_build_context::build_dsv4_inputs() {
 // hyper-connections
 //
 
-// upstream: build_hc_pre(x, weights, il) - the mixing half. Collapses the
-// [n_embd, hc, n_tokens] residual stream to [n_embd, n_tokens] with per-branch
-// weights. Fused path (ggml_dsv4_hc_pre) deliberately not ported.
-ggml_tensor * llm_build_context::build_dsv4_hc_mix(ggml_tensor * x, ggml_tensor * weights, int il) const {
-    GGML_ASSERT(x->ne[0] == n_embd);
-    GGML_ASSERT(x->ne[1] == (int64_t) hparams.dsv4_hc_mult);
-
-    const int64_t hc = hparams.dsv4_hc_mult;
-    const int64_t nt = x->ne[2];
-
-    ggml_tensor * result = nullptr;
-    for (int64_t ih = 0; ih < hc; ++ih) {
-        ggml_tensor * xh  = ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], ih*x->nb[1]);
-        ggml_tensor * wh  = ggml_view_2d(ctx0, weights, 1, nt, weights->nb[1], ih*weights->nb[0]);
-        ggml_tensor * cur = ggml_mul(ctx0, xh, wh);
-        result = result ? ggml_add(ctx0, result, cur) : cur;
-    }
-
-    GGML_UNUSED(il);
-
-    return result;
-}
-
-// upstream: build_hc_sinkhorn(). Row softmax over dst, one column
-// normalization, then (iters-1) alternating row/column normalizations.
-ggml_tensor * llm_build_context::build_dsv4_hc_sinkhorn(ggml_tensor * comb, int il) const {
-    GGML_UNUSED(il);
-
-    // comb is [dst_hc, src_hc, n_tokens]
-    comb = ggml_soft_max(ctx0, comb);
-
-    ggml_tensor * eps = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-    eps = ggml_fill(ctx0, eps, hparams.dsv4_hc_eps);
-
-    comb = ggml_add(ctx0, comb, eps);
-
-    auto norm_cols = [&]() {
-        ggml_tensor * comb_src_dst = ggml_cont(ctx0, ggml_permute(ctx0, comb, 1, 0, 2, 3));
-        ggml_tensor * col_sum = ggml_sum_rows(ctx0, comb_src_dst);
-        col_sum = ggml_add(ctx0, col_sum, eps);
-        col_sum = ggml_permute(ctx0, col_sum, 1, 0, 2, 3);
-        comb = ggml_div(ctx0, comb, col_sum);
-    };
-
-    auto norm_rows = [&]() {
-        ggml_tensor * row_sum = ggml_sum_rows(ctx0, comb);
-        row_sum = ggml_add(ctx0, row_sum, eps);
-        comb = ggml_div(ctx0, comb, row_sum);
-    };
-
-    norm_cols();
-    for (uint32_t i = 1; i < hparams.dsv4_hc_sinkhorn_iters; ++i) {
-        norm_rows();
-        norm_cols();
-    }
-
-    return comb;
-}
+// The primitive-op decompositions that used to live here (build_dsv4_hc_mix,
+// build_dsv4_hc_sinkhorn, and the per-branch loops in hc_pre/hc_post) are
+// replaced by the fused ops GGML_OP_DSV4_HC_{SPLIT_SINKHORN,WEIGHTED_SUM,EXPAND},
+// mirroring upstream @ 44c7b01de. The decomposition was ~19,000 of our 32,077
+// graph nodes per forward (43 layers x 2 hc passes x 20 Sinkhorn iterations of
+// permute/sum_rows/add/div on a 4x4) and was pure launch overhead at bs=1 --
+// prefill was at parity while decode ran 2.3-2.6x behind upstream.
 
 // upstream: build_hc_pre(x, hc_fn, hc_scale, hc_base, &post, &comb, il).
 // Produces the layer input, plus the post weights and the Sinkhorn-normalised
@@ -413,36 +350,27 @@ ggml_tensor * llm_build_context::build_dsv4_hc_pre(
     ggml_tensor * mixes     = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_mixes", il);
 
-    ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
-    ggml_tensor * scale_post = dsv4_view_1d(ctx0, hc_scale, 1, 1);
+    // One fused node computes the pre/post affine+sigmoid AND the 20-iteration
+    // Sinkhorn on the comb block (upstream: ggml_dsv4_hc_split_sinkhorn).
+    ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx0, mixes, hc_scale, hc_base,
+            (int) hc, (int) hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps);
+    cb(split, "hc_split", il);
 
-    ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
-    ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
-
-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
-    pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
-    pre = ggml_sigmoid(ctx0, pre);
-    pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
+    ggml_tensor * pre = ggml_view_2d(ctx0, split, hc, nt, split->nb[1], 0);
+    *post = ggml_view_2d(ctx0, split, hc, nt, split->nb[1], hc*split->nb[0]);
+    ggml_tensor * comb_flat = ggml_view_2d(ctx0, split, hc*hc, nt, split->nb[1], 2*hc*split->nb[0]);
+    if (nt != 1) {
+        pre       = ggml_cont(ctx0, pre);
+        *post     = ggml_cont(ctx0, *post);
+        comb_flat = ggml_cont(ctx0, comb_flat);
+    }
     cb(pre, "hc_pre", il);
-
-    *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
-    *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
-    *post = ggml_sigmoid(ctx0, *post);
-    *post = ggml_scale(ctx0, *post, 2.0f);
     cb(*post, "hc_post", il);
 
-    {
-        ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
-        ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
-
-        *comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
-        *comb = dsv4_hc_affine(ctx0, *comb, scale_comb, base_comb);
-        *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
-        *comb = build_dsv4_hc_sinkhorn(*comb, il);
-    }
+    *comb = ggml_reshape_3d(ctx0, comb_flat, hc, hc, nt);
     cb(*comb, "hc_comb", il);
 
-    return build_dsv4_hc_mix(x, pre, il);
+    return ggml_dsv4_hc_weighted_sum(ctx0, x, pre);
 }
 
 // upstream: build_hc_post(). Scatters the sublayer output back across the hc
@@ -456,28 +384,9 @@ ggml_tensor * llm_build_context::build_dsv4_hc_post(
     GGML_ASSERT(x->ne[0] == n_embd);
     GGML_ASSERT(residual->ne[1] == (int64_t) hparams.dsv4_hc_mult);
 
-    const int64_t hc = hparams.dsv4_hc_mult;
-    const int64_t nt = x->ne[1];
-
-    ggml_tensor * out = nullptr;
-    for (int64_t dst = 0; dst < hc; ++dst) {
-        ggml_tensor * post_dst = ggml_view_2d(ctx0, post, 1, nt, post->nb[1], dst*post->nb[0]);
-        ggml_tensor * cur = ggml_mul(ctx0, x, post_dst);
-
-        for (int64_t src = 0; src < hc; ++src) {
-            ggml_tensor * res_src = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
-            ggml_tensor * comb_src_dst = ggml_view_2d(ctx0, comb, 1, nt, comb->nb[2],
-                    dst*comb->nb[0] + src*comb->nb[1]);
-            cur = ggml_add(ctx0, cur, ggml_mul(ctx0, res_src, comb_src_dst));
-        }
-
-        cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, nt);
-        out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
-    }
-
     GGML_UNUSED(il);
 
-    return out;
+    return ggml_dsv4_hc_expand(ctx0, x, residual, post, comb);
 }
 
 // upstream: build_hc_head(). Final collapse of the hc-wide stream to n_embd.
@@ -500,7 +409,7 @@ ggml_tensor * llm_build_context::build_dsv4_hc_head(
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_head_pre", -1);
 
-    return build_dsv4_hc_mix(x, pre, -1);
+    return ggml_dsv4_hc_weighted_sum(ctx0, x, pre);
 }
 
 //

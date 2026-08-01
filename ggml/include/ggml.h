@@ -747,6 +747,10 @@ extern "C" {
         GGML_OP_FUSED_NORM,
         GGML_OP_FUSED_RMS_RMS_ADD,
 
+        GGML_OP_DSV4_HC_SPLIT_SINKHORN,
+        GGML_OP_DSV4_HC_WEIGHTED_SUM,
+        GGML_OP_DSV4_HC_EXPAND,
+
         GGML_OP_COUNT,
     };
 
@@ -2608,6 +2612,39 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * saved_steps);
+
+    // DeepSeek-V4 fused hyper-connection ops (used by src/graphs/build_deepseek4.cpp;
+    // semantics transcribed from upstream llama.cpp @ 44c7b01de).
+    //
+    // split_sinkhorn: mixes is [(2+n_hc)*n_hc, n_tokens]; output has the same shape:
+    // rows [0,n_hc) = sigmoid(mix*scale[0]+base)+eps (pre weights), rows [n_hc,2*n_hc)
+    // = 2*sigmoid(mix*scale[1]+base) (post weights), rows [2*n_hc, ...) = the
+    // Sinkhorn-normalized n_hc x n_hc combination matrix.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            int                   n_hc,
+            int                   sinkhorn_iters,
+            float                 eps);
+
+    // x is [n_embd, n_hc, n_tokens], weights is [n_hc, n_tokens];
+    // result is [n_embd, n_tokens] = sum_h x[:,h,:] * weights[h,:].
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    // block_out is [n_embd, n_tokens], residual is [n_embd, n_hc, n_tokens],
+    // post is [n_hc, n_tokens], comb is [n_hc, n_hc, n_tokens]; result is
+    // [n_embd, n_hc, n_tokens] = block_out*post[dst] + sum_src comb[dst,src]*residual[:,src,:].
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
 
     // custom operators
 
