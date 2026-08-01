@@ -419,9 +419,18 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
 
     llama_dsv4_memory * mem = new llama_dsv4_memory();
 
-    // raw SWA ring: window 128, padded. Upstream sizes it from the SWA window, not kv_size.
+    // raw SWA ring. ⚠ NOT sized from the window alone: unlike upstream (whose prefill
+    // attends in-batch keys directly and only rings the residual window), THIS port reads
+    // every raw key THROUGH the ring — set_rows(pos % raw_size) then attend over the ring.
+    // A ring of GGML_PAD(n_swa+1) rows self-collides on any ubatch spanning more than
+    // raw_size positions: rows written by position p are overwritten by p + raw_size in
+    // the SAME pass while earlier queries' masks still address the original keys.
+    // Measured: temp-0 divergence vs the reference onset at exactly prompt_n > 256,
+    // position-dependent, text-independent (DS4-QUANT-LADDER-2026-08-01.md checkpoint 2).
+    // Collision-free condition: raw_size >= n_ubatch + n_swa (+1 self row).
     const uint32_t n_swa = hparams.n_swa > 0 ? hparams.n_swa : 128u;
-    mem->raw_size = GGML_PAD(n_swa + 1, 256u);
+    const uint32_t n_ub  = lctx.cparams.n_ubatch > 0 ? lctx.cparams.n_ubatch : 512u;
+    mem->raw_size = GGML_PAD(n_ub + n_swa + 1, 256u);
 
     const uint32_t n_embd_head_k = hparams.n_embd_head_k(0);   // method here, field upstream
 
