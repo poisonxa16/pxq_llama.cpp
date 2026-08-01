@@ -533,27 +533,51 @@ int64_t llama_dsv4_get_comp_nrot(const llama_context & /*lctx*/, llama_dsv4_stre
     return 0;   // compressed streams carry no k_rot in this cut
 }
 
-ggml_tensor * llama_dsv4_get_raw_k(const llama_context & /*lctx*/, ggml_context * /*ctx*/, int32_t il) {
-    llama_dsv4_memory & mem = dsv4_mem();
-    return mem.raw_k[mem.raw_map_il.at(il)];
+// The cache is STORED flat as [n_embd_k_gqa, n_rows] because ggml_set_rows() wants a
+// row-major destination, but attention wants [n_embd_head_k, n_head_kv, n_kv]: MHA does
+// ggml_permute(k, 0, 2, 1, 3) and then mul_mat, and ggml_can_mul_mat needs
+// q->ne[2] % k->ne[2] == 0. Flat, k permutes to ne[2] = n_kv (256 here) and 64 heads
+// % 256 fails; viewed, it permutes to ne[2] = n_head_kv = 1 and the check passes.
+// n_embd_head_k*n_head_kv == n_embd_k_gqa, so this reinterprets the same rows — the
+// write path (flat) and the read path (viewed) address identical memory.
+static ggml_tensor * dsv4_k_attn_view(ggml_context * ctx, ggml_tensor * k,
+                                      int64_t n_embd_head_k, int64_t n_head_kv) {
+    GGML_ASSERT(k->ne[0] == n_embd_head_k*n_head_kv);
+    return ggml_view_3d(ctx, k, n_embd_head_k, n_head_kv, k->ne[1],
+                        ggml_row_size(k->type, n_embd_head_k),
+                        k->nb[1], 0);
 }
 
-ggml_tensor * llama_dsv4_cpy_raw_k(const llama_context & lctx, ggml_context * ctx,
+ggml_tensor * llama_dsv4_get_raw_k(const llama_context & lctx, ggml_context * ctx, int32_t il) {
+    llama_dsv4_memory & mem = dsv4_mem();
+    ggml_tensor * k = mem.raw_k[mem.raw_map_il.at(il)];
+    const llama_hparams & hp = lctx.model.hparams;
+    return dsv4_k_attn_view(ctx, k, hp.n_embd_head_k(il), hp.n_head_kv(il));
+}
+
+ggml_tensor * llama_dsv4_cpy_raw_k(const llama_context & /*lctx*/, ggml_context * ctx,
                                    ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) {
-    ggml_tensor * dst = llama_dsv4_get_raw_k(lctx, ctx, il);
+    // write through the FLAT store, not the attention view: set_rows needs a row-major
+    // [width, n_rows] destination
+    llama_dsv4_memory & mem = dsv4_mem();
+    ggml_tensor * dst = mem.raw_k[mem.raw_map_il.at(il)];
     return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, k_cur), k_idxs);
 }
 
-ggml_tensor * llama_dsv4_get_comp_k(const llama_context & /*lctx*/, ggml_context * /*ctx*/,
+ggml_tensor * llama_dsv4_get_comp_k(const llama_context & lctx, ggml_context * ctx,
                                     llama_dsv4_stream s, int32_t il) {
     dsv4_stream_state & st = dsv4_mem().s[s];
-    return st.k[st.map_il.at(il)];
+    ggml_tensor * k = st.k[st.map_il.at(il)];
+    // LID carries indexer_head_size per head, the other two carry n_embd_head_k; both
+    // are single-KV-head here, so the view is [width, 1, n_rows] either way.
+    return dsv4_k_attn_view(ctx, k, st.n_embd_k, 1);
 }
 
-ggml_tensor * llama_dsv4_cpy_comp_k(const llama_context & lctx, ggml_context * ctx,
+ggml_tensor * llama_dsv4_cpy_comp_k(const llama_context & /*lctx*/, ggml_context * ctx,
                                     llama_dsv4_stream s, ggml_tensor * k_cur,
                                     ggml_tensor * k_idxs, int32_t il) {
-    ggml_tensor * dst = llama_dsv4_get_comp_k(lctx, ctx, s, il);
+    dsv4_stream_state & st = dsv4_mem().s[s];
+    ggml_tensor * dst = st.k[st.map_il.at(il)];   // flat store, see cpy_raw_k
     return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, k_cur), k_idxs);
 }
 
