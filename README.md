@@ -143,7 +143,7 @@ above exists.
 
 | your setup | honest answer |
 |---|---|
-| **MoE** (any size) | **PXQ4** — prefill win measured, but as an expert-codec delta (‡ above). **No MoE decode comparison currently stands** — the published one is withdrawn. Fidelity vs MXFP4 measured on dense, not yet on MoE |
+| **MoE** (any size) | **PXQ4** — prefill win measured, but as an expert-codec delta (‡ above). **No MoE decode comparison between expert CODECS currently stands** — that one is withdrawn. A separate MoE decode result does stand: the GEMM **backbone** comparison (PXQ6 vs PXQ4, same expert codec) at +25.2% on a 299B MoE, see `docs/LEVERS.md` PXA_PXQ_BACKBONE. Fidelity vs MXFP4 measured on dense, not yet on MoE |
 | **Pascal** (P100/GP100) | **PXQ4** — faster on both axes; dense fidelity measured (below) |
 | **Dense, long prompts / agentic** | **PXQ4** — ~2× prefill, better quality |
 | **Dense, decode-bound, on Volta** | **MXFP4 is faster.** Take PXQ4 only if you want the fidelity |
@@ -179,7 +179,8 @@ said it did not exist.**
   decision is printed at startup with its reason — so the configuration actually in force is
   auditable instead of inferred. Concretely: `PXA_PXQ_GEMM_2D` auto-arms only for sm_60 × dense ×
   PXQ-bearing tensors rather than on device class alone, and `PXA_PXQ_MMVQ` auto-arms only on a
-  PXQ4/PXQ4HQ-bearing model with a DP4A-capable device.
+  PXQ4/PXQ4HQ-bearing model with a DP4A-capable device — and since 2026-07-31 it does so at
+  **DEFAULT** level too, not only under `PXA_ENHANCE=1`.
 - **Env gates are value-tested, not presence-tested.** `PXA_FOO=0` now *disables* a lever instead
   of enabling it by virtue of being set — which is what every operator already assumed it did.
 - **The server now survives things that used to take it down.** An unsampleable distribution (in
@@ -263,7 +264,7 @@ said it did not exist.**
   notes record it leaving **MXFP4 unchanged** (its guard is PXQ-scoped), so it is a PXQ-side ratio
   win rather than a lift for every codec.
 
-- **New: `PXA_PXQ_MMVQ` (default OFF *without* `PXA_ENHANCE`).** Routes PXQ4/PXQ4HQ decode to the
+- **`PXA_PXQ_MMVQ` — auto-arms at DEFAULT since 2026-07-31** (previously ENHANCE-only; `PXA_REFERENCE=1` opts out, and `PXA_PXQ_MMVQ=0` remains an explicit override). Routes PXQ4/PXQ4HQ decode to the
   stock q8_1 MMVQ kernel.
   **+13.7% dense decode** (29.787 → 33.861, 2×V100) and **+6.7% on MoE** when paired with PXQ4
   attention. Quality-neutral: paired perplexity **at `-b 8`** gives Δ +0.0036 dense (44× inside the

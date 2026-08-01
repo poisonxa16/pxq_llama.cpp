@@ -184,7 +184,7 @@ static inline int pxa_pxq_mmvq_mode() {
     if (m) {
         fprintf(stderr, "PXA_PXQ_MMVQ: mode %d%s (PXQ4/PXQ4HQ decode via the q8_1 MMVQ kernel, "
                         "s8 book snap — NOT bit-exact vs the fused fp16 mmv, fidelity-gated)\n",
-                m, e ? "" : " [AUTO: ENHANCE x PXQ4-bearing model x DP4A device; override PXA_PXQ_MMVQ=0]");
+                m, e ? "" : " [AUTO: DEFAULT/ENHANCE x PXQ4-bearing model x DP4A device; override PXA_PXQ_MMVQ=0]");
     }
     cached = m;
     cached_gen = gen;

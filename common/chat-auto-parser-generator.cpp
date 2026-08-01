@@ -345,7 +345,25 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
 
-    auto until_suffix = p.rule("until-suffix", p.until(arguments.value_suffix));
+    // The scanner that captures a string argument's value must stop at the value's CLOSING
+    // MARKER, not at "closing marker + whatever whitespace the template happened to render
+    // after it". arguments.value_suffix carries that trailing whitespace (HY3 derives
+    // "</arg_value:opensource>\n"), and using it verbatim as the until() delimiter makes the
+    // stop condition depend on what follows the close tag: if any close tag is not followed by
+    // exactly that whitespace, the scan silently runs past it to the next one and the first
+    // argument's value swallows the intervening arguments' markup. That is a silent
+    // wrong-data failure, not a parse failure, so nothing downstream can detect it.
+    //
+    // Only the trailing whitespace is dropped, and only when the remainder is a markup close
+    // marker ('>' or ']'); separators whose trailing whitespace is load-bearing (e.g. ",\n")
+    // keep the exact old delimiter. The trailing whitespace is consumed by tool_arg_close's
+    // p.space() instead, so well-formed output parses byte-identically to before.
+    std::string value_close = trim_trailing_whitespace(arguments.value_suffix);
+    if (value_close.empty() || (value_close.back() != '>' && value_close.back() != ']')) {
+        value_close = arguments.value_suffix;
+    }
+
+    auto until_suffix = p.rule("until-suffix", p.until(value_close));
 
     common_peg_parser tool_choice = p.choice();
 
@@ -378,7 +396,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
                                 p.tool_arg_json_value(p.schema(
                                     p.json(), "tool-" + name + "-arg-" + param_name + "-schema", param_schema, false)) +
                                     p.space()) +
-                           p.tool_arg_close(p.literal(arguments.value_suffix)));
+                           p.tool_arg_close(p.literal(value_close) + p.space()));
 
             auto named_arg = p.rule("tool-" + name + "-arg-" + param_name, arg);
             if (is_required) {

@@ -181,7 +181,11 @@ static inline const char * pxa_model_class_name() {
 // The pxq-mmvq.cuh resolver keeps its own loud print + the BOOK/SUB-override
 // decline; explicit PXA_PXQ_MMVQ always wins.
 static inline int pxa_pxq_mmvq_auto_default() {
-    if (pxa_config_level() != 2) return 0;
+    // Armed at DEFAULT as well as ENHANCE as of 2026-07-31. It used to require level 2,
+    // so every user running the binary as shipped got the non-MMVQ path and none of the
+    // sm_70 backbone benefit -- the lever existed, self-armed on paper, and never fired.
+    // REFERENCE (0) still opts out, and PXA_PXQ_MMVQ=0 remains an explicit override.
+    if (pxa_config_level() == 0) return 0;
     if (!pxa_model_known() || pxa_model().n_pxq_mmvq_tensors <= 0) return 0;
     const pxa_topology_t & t = g_pxa_topology;
     if (!t.valid) return 0;
@@ -500,9 +504,14 @@ static inline void pxa_enhance_log_model_decisions() {
             m.n_expert, m.n_expert_used, m.n_vocab,
             m.has_mtp_head ? "yes" : "no", m.mtp_active ? "yes" : "no",
             m.n_pxq_mmvq_tensors, pxa_topology_name(), pxa_config_level_name());
-    if (pxa_config_level() != 2) {
-        fprintf(stderr, "PXA_AUTO: level=%s — model-adaptive auto-set engages only under "
-                        "PXA_ENHANCE=1 (per-lever envs still win at any level)\n",
+    // REFERENCE opts out of every auto-set, so there is nothing to report there. DEFAULT
+    // is NOT silent any more: since 2026-07-31 PXQ_MMVQ (and FUSE_DELTANET) arm at DEFAULT,
+    // so early-returning here would print "auto-set engages only under PXA_ENHANCE=1" while
+    // the binary had in fact armed them -- the ledger is what an operator reads to find out
+    // what is active, so a false line here is worse than a stale doc.
+    if (pxa_config_level() == 0) {
+        fprintf(stderr, "PXA_AUTO: level=%s — every model-adaptive auto-set is OFF "
+                        "(per-lever envs still win at any level)\n",
                 pxa_config_level_name());
         return;
     }
@@ -531,8 +540,8 @@ static inline void pxa_enhance_log_model_decisions() {
         const int auto_mode = pxa_pxq_mmvq_auto_default();
         const char * why =
             e                                ? "explicit env override" :
-            auto_mode == 1                   ? "ENHANCE x PXQ4/PXQ4HQ-bearing model x sm_70+ present (ship recipe A4m; fidelity-neutral paired dppl +0.016%)" :
-            auto_mode == 2                   ? "ENHANCE x PXQ4/PXQ4HQ-bearing model x all-sm_61 fleet (real DP4A)" :
+            auto_mode == 1                   ? "auto (DEFAULT/ENHANCE) x PXQ4/PXQ4HQ-bearing model x sm_70+ present (ship recipe A4m; fidelity-neutral paired dppl +0.016%)" :
+            auto_mode == 2                   ? "auto (DEFAULT/ENHANCE) x PXQ4/PXQ4HQ-bearing model x all-sm_61 fleet (real DP4A)" :
             (m.n_pxq_mmvq_tensors <= 0)      ? "OFF: model carries no MMVQ-eligible PXQ4/PXQ4HQ tensors" :
             (t.has_sm60 && !t.has_sm70)      ? "OFF: sm_60-only fleet — P100 has no DP4A, the emulation path is not a win" :
                                                "OFF";
