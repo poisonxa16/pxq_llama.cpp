@@ -712,11 +712,19 @@ bool llama_dsv4_raw_window_enabled() {
     return llama_dsv4_raw_window_mode() != 0;
 }
 
+// The CUDA flash-attention launcher asserts K->ne[1] % FATTN_KQ_STRIDE == 0 with
+// FATTN_KQ_STRIDE = 256 (ggml-cuda/fattn-common.cuh). A window width that is not a
+// multiple of 256 is OUTSIDE the kernel contract -- that is what the 132- and 192-wide
+// experiments were, and they produced NaN rather than a clean abort. Never emit one.
 static uint32_t dsv4_raw_window_align() {
     static const uint32_t a = []() {
         const char * e = getenv("PXA_DSV4_RAW_WINDOW_ALIGN");
-        const int v = e ? atoi(e) : 64;
-        return (uint32_t) (v > 0 ? v : 1);
+        const int v = e ? atoi(e) : 256;
+        uint32_t r = (uint32_t) (v > 0 ? v : 256);
+        if (r % 256u != 0u) {                 // round UP to the contract, never below it
+            r = ((r / 256u) + 1u) * 256u;
+        }
+        return r;
     }();
     return a;
 }
@@ -724,7 +732,10 @@ static uint32_t dsv4_raw_window_align() {
 uint32_t llama_dsv4_raw_window_width(const llama_context & /*lctx*/, int64_t n_tokens) {
     const uint32_t w = GGML_PAD((uint32_t) (dsv4_mem().n_swa + (uint32_t) n_tokens),
                                 dsv4_raw_window_align());
-    return w < dsv4_mem().raw_size ? w : dsv4_mem().raw_size;
+    const uint32_t r = w < dsv4_mem().raw_size ? w : dsv4_mem().raw_size;
+    // raw_size is itself GGML_PAD(...,256), so both branches stay contract-legal.
+    GGML_ASSERT(r % 256u == 0u && "raw window width must satisfy the FA KQ-stride contract");
+    return r;
 }
 
 int64_t llama_dsv4_get_raw_nrot(const llama_context & /*lctx*/) {
