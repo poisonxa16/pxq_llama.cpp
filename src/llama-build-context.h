@@ -336,6 +336,7 @@ struct llm_build_context {
     // (adapted from llama.cpp src/models/deepseek4.cpp @ upstream 82dbc4f01, MIT).
     //
     ggml_cgraph * build_deepseek4();
+    ggml_cgraph * build_dspark();
 
     // creates the DSV4 graph input tensors and publishes them via llama_dsv4_get_inputs()
     void build_dsv4_inputs();

@@ -320,6 +320,8 @@ struct llama_context {
     struct ggml_tensor * inp_pos;         // I32 [n_batch]
     struct ggml_tensor * inp_out_ids;     // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
+    struct ggml_tensor * inp_dspark_cap = nullptr; // F32 [n_capture*n_embd, 1]
+    std::vector<float>   dspark_cap_host;          // host side of the above
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]

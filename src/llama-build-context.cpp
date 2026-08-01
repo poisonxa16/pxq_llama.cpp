@@ -2659,6 +2659,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_deepseek4();
             } break;
+        case LLM_ARCH_DEEPSEEK4_DSPARK:
+            {
+                result = llm.build_dspark();
+            } break;
         default:
             GGML_ABORT("fatal error");
     }

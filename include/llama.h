@@ -614,6 +614,12 @@ extern "C" {
     LLAMA_API bool llama_dspark_bind_target(struct llama_model * drafter,
                                       const struct llama_model * target);
 
+    // Hand the drafter the target's captured hidden states for the next proposal:
+    // n_capture*n_embd floats, the concatenation of the per-capture-layer means.
+    // Must be called before every drafter llama_decode().
+    LLAMA_API bool llama_dspark_set_capture(struct llama_context * ctx,
+                                            const float * data, size_t n);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);

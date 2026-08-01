@@ -4624,6 +4624,66 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         "causal attention is not supported by this model"
     );
 
+    // ---- DSpark: the block mask is NON-CAUSAL, and that is load-bearing ----
+    // Property 2 of the algorithm (ds4_cuda.cu:13466-13530): every draft row attends to
+    // every other row of the block INCLUDING later ones. Without it block drafting does
+    // not work at all - and it fails silently, as low acceptance rather than an error.
+    // The standard fill below is driven by cparams.causal_attn and would hide row 3 from
+    // row 1, so DSpark gets its own fill and returns before reaching it.
+    //
+    // Window rows keep ordinary causality against the block's BASE position (the target
+    // row's position, which rows 0 and 1 share): a draft position must not conjure
+    // history that does not exist yet.
+    if (lctx.model.arch == LLM_ARCH_DEEPSEEK4_DSPARK && lctx.inp_KQ_mask) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
+        const int64_t n_kv     = kv_self.n;
+        const int64_t n_rows   = batch.n_tokens;
+        const int64_t n_padded = GGML_PAD(n_rows, GGML_KQ_MASK_PAD);
+        const int64_t n_block  = (int64_t) lctx.model.hparams.dspark_block_size;
+        GGML_ASSERT(n_rows == n_block + 1);
+
+        // the block occupies the last n_rows cells written by this ubatch
+        const int64_t block_first = (int64_t) kv_self.head;
+        llama_pos base_pos = batch.pos[0];
+
+        float     * d32 = cparams.flash_attn ? nullptr : (float *)     lctx.inp_KQ_mask->data;
+        ggml_half * d16 = cparams.flash_attn ? (ggml_half *) lctx.inp_KQ_mask->data : nullptr;
+
+        for (int64_t i = 0; i < n_padded; ++i) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                float v = -INFINITY;
+                if (i < n_rows) {
+                    const bool in_block = (j >= block_first && j < block_first + n_rows);
+                    if (in_block) {
+                        // NON-CAUSAL: the whole block square is open, both directions.
+                        v = 0.0f;
+                    } else if (!kv_self.cells[j].is_empty() &&
+                                kv_self.cells[j].has_seq_id(batch.seq_id[0][0]) &&
+                                kv_self.cells[j].pos <= base_pos) {
+                        // window history, causal against the block's base position, and
+                        // clipped to the sliding window when the model has one.
+                        const uint32_t swa = lctx.model.hparams.n_swa;
+                        if (swa == 0 || (base_pos - kv_self.cells[j].pos) < (llama_pos) swa) {
+                            v = 0.0f;
+                        }
+                    }
+                }
+                if (d32) d32[i*n_kv + j] = v;
+                else     d16[i*n_kv + j] = ggml_fp32_to_fp16(v);
+            }
+        }
+
+        // the captured target hidden states, written by the speculative loop
+        if (lctx.inp_dspark_cap) {
+            const size_t need = ggml_nelements(lctx.inp_dspark_cap);
+            GGML_ASSERT(lctx.dspark_cap_host.size() == need &&
+                    "llama_dspark_set_capture() must be called before the drafter forward");
+            ggml_backend_tensor_set(lctx.inp_dspark_cap, lctx.dspark_cap_host.data(),
+                    0, need*sizeof(float));
+        }
+        return;
+    }
+
     if (lctx.inp_KQ_mask || lctx.inp_KQ_mask_swa) {
 #if IK_PRINT_TIMING == 2
         auto tim1 = ggml_time_us();
@@ -7971,6 +8031,23 @@ bool llama_dspark_bind_target(struct llama_model * drafter, const struct llama_m
     }
     LLAMA_LOG_INFO("] n_expert_used=%u sinkhorn_iters=%u rms_eps=%g\n",
             dh.n_expert_used, dh.dsv4_hc_sinkhorn_iters, (double) dh.f_norm_rms_eps);
+    return true;
+}
+
+
+bool llama_dspark_set_capture(struct llama_context * ctx, const float * data, size_t n) {
+    if (!ctx || !data) return false;
+    if (ctx->model.arch != LLM_ARCH_DEEPSEEK4_DSPARK) {
+        LLAMA_LOG_ERROR("%s: context is not a DSpark drafter\n", __func__);
+        return false;
+    }
+    const auto & hp = ctx->model.hparams;
+    const size_t need = (size_t) hp.dspark_n_target_layers * (size_t) hp.n_embd;
+    if (n != need) {
+        LLAMA_LOG_ERROR("%s: expected %zu floats (n_capture*n_embd), got %zu\n", __func__, need, n);
+        return false;
+    }
+    ctx->dspark_cap_host.assign(data, data + n);
     return true;
 }
 
