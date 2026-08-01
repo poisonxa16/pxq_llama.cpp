@@ -7458,6 +7458,14 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
+                if (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_I32) {
+                    // Same-type integer copy -- a strided byte copy, nothing to convert.
+                    // The implementation in cpy.cu must agree with this gate: DeepSeek-V4's
+                    // hash-routed blocks produce an I32 expert selection whose get_rows has no
+                    // CUDA path, the scheduler splits there, and the resulting I32 move aborted
+                    // the backend at ~3.8k prompt tokens.
+                    return true;
+                }
                 if (ggml_is_quantized(src0_type) && (src1_type == GGML_TYPE_F16 || src1_type == GGML_TYPE_F32)) {
                     return true;
                 }
