@@ -32,6 +32,7 @@
 #include "dsa_attn.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #define DSA_ATTN_MAX_ROWS       32
@@ -229,8 +230,36 @@ static void soft_max_f16_cuda_simple(half * x, const half * mask, const float * 
     }
 }
 
+// PXA_DSA_ATTN=0 disables the sparse path entirely, so the same binary can be A/B'd
+// with one variable. Both the dispatcher and the scheduler gate go through this
+// predicate, so the switch cannot half-apply.
+static bool pxa_dsa_attn_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("PXA_DSA_ATTN");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+
+// Minimum n_kv : index-width ratio before the sparse path is taken at prefill.
+// ik hardcodes 4, measured on an RTX 3090; it is a throughput trade (gather cost vs
+// GEMM saved), not a correctness bound, and the crossover is hardware-specific. Left
+// tunable so it can be measured on sm_70 rather than inherited.
+// NOTE: mirrored in build_dsv4_attn_mha() so the graph does not emit an index list the
+// kernel would then decline. This gate is the authoritative one.
+static int pxa_dsa_min_ratio() {
+    static const int ratio = [] {
+        const char * v = getenv("PXA_DSA_MIN_RATIO");
+        const int r = v ? atoi(v) : 4;
+        return r > 0 ? r : 4;
+    }();
+    return ratio;
+}
+
 bool ggml_cuda_dsa_attn_supported(const ggml_tensor * dst, int cc) {
     if (!dst || dst->op != GGML_OP_FLASH_ATTN_EXT) return false;
+
+    if (!pxa_dsa_attn_enabled()) return false;
 
     // Untestable here; do not claim it.
     if (cc >= CC_OFFSET_AMD) return false;
@@ -292,7 +321,7 @@ bool ggml_cuda_dsa_attn_supported(const ggml_tensor * dst, int cc) {
     if (Q->ne[1] <= 16) {
         if (indexer->ne[0] >= K->ne[1]) return false;
     } else {
-        if (K->ne[1] < 4*indexer->ne[0]) return false;
+        if (K->ne[1] < pxa_dsa_min_ratio()*indexer->ne[0]) return false;
     }
 
     // --- launchability -------------------------------------------------------

@@ -138,6 +138,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 // compression ratios that select the three per-layer attention regimes
 static constexpr int64_t DSV4_CSA_RATIO = 4;    // compressed sparse attn + lightning indexer
@@ -485,8 +486,14 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
             // Mirror of the "worth it?" block in ggml_cuda_dsa_attn_supported(). The
             // gather costs n_sel rows per query, so a barely-narrower list is a loss.
             // Applying the same rule here means we never spend a mask_to_idx node
-            // building a list the kernel would then decline to use.
-            const bool worth_it = nt <= 16 ? n_sel < n_kv : n_kv >= 4*n_sel;
+            // building a list the kernel would then decline to use. The kernel's copy
+            // is authoritative; disagreeing here only wastes a node, never miscomputes.
+            const int64_t min_ratio = [] {
+                const char * v = getenv("PXA_DSA_MIN_RATIO");
+                const int r = v ? atoi(v) : 4;
+                return (int64_t) (r > 0 ? r : 4);
+            }();
+            const bool worth_it = nt <= 16 ? n_sel < n_kv : n_kv >= min_ratio*n_sel;
 
             if (worth_it) {
                 selected = ggml_mask_to_index(ctx0, kq_mask, n_sel);
