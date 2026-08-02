@@ -5504,6 +5504,65 @@ static bool prepare_mtp_graph_inputs(
 // The cost is instrumented (t_dspark_read_us) because it is the ONLY justification for the
 // fused GGML_OP_DSPARK_MARKOV_HEAD in plan 7.2, whose single F32 [2, block_size] dst makes
 // this one read. Do not add that op on a hunch; add it on this number.
+// M5. Pull the target's dspark_cap_%d nodes off the graph so the drafter can be fed
+// without a file. The nodes are LAST-ROW only: the drafter is seeded from the token the
+// target just committed, and a multi-row verify batch's capture rows for the speculative
+// positions describe tokens that may be about to be thrown away.
+//
+// The capture is [n_embd, hc, nt] with hc already collapsed by hc_weighted_sum, so the
+// row stride is n_embd and the row wanted is nt-1.
+static void llama_dspark_extract_capture(llama_context & lctx, ggml_cgraph * gf) {
+    const auto & hp = lctx.model.hparams;
+    lctx.dspark_cap_out_ok = false;
+
+    // The capture count comes from the GRAPH, not from hparams: dspark_n_target_layers is
+    // a DRAFTER hparam and is 0 on the target, which would make this a silent no-op.
+    const int64_t n_embd = hp.n_embd;
+    int n_cap = 0;
+    for (int slot = 0; slot < 16; ++slot) {
+        char probe[32];
+        snprintf(probe, sizeof(probe), "dspark_cap_%d", slot);
+        bool any = false;
+        for (int i = gf->n_nodes - 1; i >= 0 && !any; --i) {
+            any = strcmp(gf->nodes[i]->name, probe) == 0;
+        }
+        if (!any) break;
+        ++n_cap;
+    }
+    if (n_cap <= 0) {
+        return;                       // PXA_DSPARK_CAPTURE is off: not an error
+    }
+    lctx.dspark_cap_out.assign((size_t) n_cap*(size_t) n_embd, 0.0f);
+
+    int found = 0;
+    for (int slot = 0; slot < n_cap; ++slot) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "dspark_cap_%d", slot);
+        ggml_tensor * t = nullptr;
+        for (int i = gf->n_nodes - 1; i >= 0; --i) {
+            if (strcmp(gf->nodes[i]->name, nm) == 0) { t = gf->nodes[i]; break; }
+        }
+        if (!t) {
+            continue;
+        }
+        GGML_ASSERT(t->ne[0] == n_embd && "dspark capture row width != n_embd");
+        const int64_t nt  = t->ne[1] > 0 ? t->ne[1] : 1;
+        const size_t  off = (size_t)(nt - 1)*t->nb[1];
+        ggml_backend_t b  = ggml_backend_sched_get_tensor_backend(lctx.sched, t);
+        if (!b) {
+            continue;
+        }
+        ggml_backend_tensor_get_async(b, t, lctx.dspark_cap_out.data() + (size_t) slot*n_embd,
+                                      off, (size_t) n_embd*sizeof(float));
+        ++found;
+    }
+    if (found == 0) {
+        return;                       // PXA_DSPARK_CAPTURE is off: not an error
+    }
+    ggml_backend_sched_synchronize(lctx.sched);
+    lctx.dspark_cap_out_ok = (found == n_cap);
+}
+
 static void llama_dspark_extract_draft(llama_context & lctx, ggml_cgraph * gf) {
     const auto & hp = lctx.model.hparams;
     const int    nb = (int) hp.dspark_block_size;
@@ -6076,6 +6135,11 @@ static int llama_decode_internal(
         // extract the DSpark M4 draft (ids + confidence logits)
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
             llama_dspark_extract_draft(lctx, gf);
+        }
+
+        // M5: extract the TARGET-side capture the drafter consumes
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
+            llama_dspark_extract_capture(lctx, gf);
         }
 
         // extract embeddings
@@ -8161,6 +8225,17 @@ bool llama_dspark_bind_target(struct llama_model * drafter, const struct llama_m
     return true;
 }
 
+
+int llama_dspark_get_capture(const struct llama_context * ctx, float * out, size_t max_n) {
+    if (!ctx || !ctx->dspark_cap_out_ok) {
+        return -1;
+    }
+    const size_t n = ctx->dspark_cap_out.size();
+    if (out && max_n >= n) {
+        memcpy(out, ctx->dspark_cap_out.data(), n*sizeof(float));
+    }
+    return (int) n;
+}
 
 bool llama_dspark_set_capture(struct llama_context * ctx, const float * data, size_t n) {
     if (!ctx || !data) return false;

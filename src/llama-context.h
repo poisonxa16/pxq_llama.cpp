@@ -340,6 +340,13 @@ struct llama_context {
     bool                     dspark_draft_ok  = false;
     int64_t                  t_dspark_read_us = 0;   // cost of the per-cycle D2H readbacks
     int64_t                  n_dspark_read    = 0;
+
+    // M5 - the TARGET side of the capture. build_deepseek4() emits dspark_cap_%d nodes
+    // under PXA_DSPARK_CAPTURE; this is where they land so a caller can hand them to the
+    // drafter without a file. Without it the loop can only ever run on a synthetic
+    // capture, which says nothing about acceptance.
+    std::vector<float>       dspark_cap_out;
+    bool                     dspark_cap_out_ok = false;
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]

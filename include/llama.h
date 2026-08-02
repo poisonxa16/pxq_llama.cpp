@@ -620,6 +620,14 @@ extern "C" {
     LLAMA_API bool llama_dspark_set_capture(struct llama_context * ctx,
                                             const float * data, size_t n);
 
+    // M5. Read the TARGET's captured hidden states back after its decode: the
+    // n_capture*n_embd floats produced by the dspark_cap_%d nodes (PXA_DSPARK_CAPTURE=1),
+    // taken from the LAST row of the batch. Returns the float count, or -1 if the last
+    // decode produced no capture. Feed the result straight to llama_dspark_set_capture()
+    // on the drafter context.
+    LLAMA_API int llama_dspark_get_capture(const struct llama_context * ctx,
+                                           float * out, size_t max_n);
+
     // M4. Seed the rank-256 Markov chain with the token the TARGET just committed
     // (ds4.c:59232). Must be called before every drafter llama_decode().
     LLAMA_API bool llama_dspark_set_prev(struct llama_context * ctx, llama_token prev);
@@ -652,6 +660,108 @@ extern "C" {
     // the markov tensors to sit in a WRITABLE buffer (offloaded, or loaded with
     // use_mmap=false); a read-only mmap will fault.
     LLAMA_API bool llama_dspark_install_selftest_weights(struct llama_model * drafter);
+
+    //
+    // M5 - the verify/accept loop
+    //
+
+    // Components of the DSV4 memory module, as restore selectors. They are separate so a
+    // probe can ATTRIBUTE a self-healing failure to a stream instead of reporting a
+    // single yes/no that names nothing.
+    enum llama_dsv4_spec_component {
+        LLAMA_DSV4_SPEC_RAW = 1 << 0,   // raw SWA(128) ring
+        LLAMA_DSV4_SPEC_CSA = 1 << 1,   // compress ratio 4, overlapped
+        LLAMA_DSV4_SPEC_HCA = 1 << 2,   // compress ratio 128, plain
+        LLAMA_DSV4_SPEC_LID = 1 << 3,   // lightning-indexer key stream, ratio 4, overlapped
+        LLAMA_DSV4_SPEC_COMPRESSED = (1 << 1) | (1 << 2) | (1 << 3),
+        LLAMA_DSV4_SPEC_ALL = 0xF,
+    };
+
+    // Save every DSV4 row the given batch is about to overwrite. MUST be called before
+    // llama_decode() of that batch. The compression plans are a pure function of the
+    // batch, so this does not disturb any plan already in flight.
+    //
+    // This exists because the DSV4 compressor ring CANNOT self-heal: state_size is
+    // 2*ratio for the overlapped streams and the overlap compressor reads exactly 2*ratio
+    // positions of history, so any speculative row overwrites history a later boundary
+    // still needs. Re-decoding the correct token at the same position does not repair it.
+    LLAMA_API bool llama_dspark_kv_snapshot(struct llama_context * ctx, struct llama_batch batch);
+
+    // Put the saved rows back. `components` is a mask of llama_dsv4_spec_component.
+    // Returns false if no snapshot is held.
+    LLAMA_API bool llama_dspark_kv_restore(struct llama_context * ctx, uint32_t components);
+
+    LLAMA_API void   llama_dspark_kv_discard(struct llama_context * ctx);
+    LLAMA_API size_t llama_dspark_kv_snapshot_bytes(struct llama_context * ctx);
+
+    // DEBUG. FNV-1a over a component's tensors (-1 = all). A digest cannot saturate the
+    // way a logit can, so a model whose forward pass has collapsed still gives a decisive
+    // answer about whether the STATE differs.
+    // component: 0 raw, 1 CSA, 2 HCA, 3 LID, -1 all, -2 -> count of NON-FINITE floats
+    // (a digest cannot separate "differs" from "NaN"; -2 is the guard against that).
+    LLAMA_API uint64_t llama_dspark_kv_digest(struct llama_context * ctx, int component);
+
+    // TEST HOOK - DESTRUCTIVE. Perturb the rows the last snapshot covers (i.e. exactly
+    // the rows a speculative batch overwrites) by +/- `amount`. This is the negative
+    // control for the M5 identity gate: a gate whose failure mode has never been
+    // demonstrated is decoration.
+    LLAMA_API bool llama_dspark_kv_scramble(struct llama_context * ctx, float amount);
+
+    // Copy a component's F32 state out, so a probe can measure HOW MUCH two states
+    // differ. Pass out=NULL to size the buffer. A digest says only whether the bytes
+    // match; it cannot tell a last-ulp reordering from a structurally wrong read, and
+    // those two have opposite consequences.
+    LLAMA_API size_t llama_dspark_kv_export(struct llama_context * ctx, int component,
+                                            float * out, size_t max_n);
+
+    // The exact-greedy-argmax prefix accept rule (ds4.c:61096-61118). row_tops[i] is the
+    // target's argmax for the row that PRECEDES draft token i, so the returned count is
+    // the number of draft tokens the target would itself have emitted. There is no
+    // probabilistic acceptance in DSpark; adding one would break its identity guarantee.
+    LLAMA_API int llama_dspark_accept_prefix(const llama_token * draft,
+                                             int                 n_draft,
+                                             const llama_token * row_tops,
+                                             int                 n_rows);
+
+    // The speculation governor, transcribed from ds4.c:47792-48013.
+    struct llama_dspark_sched;
+
+    struct llama_dspark_sched_state {
+        uint32_t skip_remaining;
+        uint32_t cycles;
+        uint32_t accepted;
+        uint32_t no_draft;
+        double   extra_ms;
+        double   saved_ms;
+        uint32_t lifetime_accepted;
+        bool     long_accept_seen;
+        uint32_t n_sched_skips;
+        uint32_t n_tail_skips;
+        bool     enabled;
+    };
+
+    LLAMA_API struct llama_dspark_sched * llama_dspark_sched_init(void);
+    LLAMA_API void llama_dspark_sched_free(struct llama_dspark_sched * s);
+
+    // Call once per decode cycle BEFORE preparing a proposal. True => propose nothing.
+    LLAMA_API bool llama_dspark_sched_should_skip(struct llama_dspark_sched * s);
+
+    // Hard skip near the end of a generation. ds4 checks this in the caller, before the
+    // proposal is prepared, and NOT inside note() - a tail skip must not be charged to the
+    // governor's window statistics. n_remaining < 0 means "budget unknown": never skip.
+    LLAMA_API bool llama_dspark_sched_tail_skip(struct llama_dspark_sched * s, int n_remaining);
+
+    // Call once per non-skipped cycle AFTER the accept count is known.
+    LLAMA_API void llama_dspark_sched_note(struct llama_dspark_sched * s,
+                                           uint32_t accepted_drafts,
+                                           bool     no_draft,
+                                           double   extra_ms,
+                                           double   last_target_eval_ms,
+                                           bool     conf0_valid,
+                                           float    conf0);
+
+    LLAMA_API void llama_dspark_sched_get(const struct llama_dspark_sched * s,
+                                          struct llama_dspark_sched_state * out);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

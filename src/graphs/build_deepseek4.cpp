@@ -1450,6 +1450,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
             ggml_tensor * capr = ggml_dsv4_hc_weighted_sum(ctx0, src, w);
             ggml_format_name(capr, "dspark_cap_%d", dspark_slot);
+            // M5: these nodes have NO consumer, so ggml-alloc is free to hand their
+            // storage to the next allocation the instant they are computed
+            // (ggml-alloc.c:500,547). Without the OUTPUT flag the host read back float
+            // bit patterns of whatever landed there next - the same trap M4 hit twice.
+            capr->flags |= GGML_TENSOR_FLAG_OUTPUT;
             ggml_build_forward_expand(gf, capr);
         }
     }
