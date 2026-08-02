@@ -1132,6 +1132,62 @@ uint64_t llama_dsv4_debug_digest(const llama_context & /*lctx*/, int component) 
     return 0;
 }
 
+// Digest a stream's compressed K cache EXCLUDING each tensor's final row.
+// The final row (cache_size-1) is the by-design masked dummy-write slot: ub=1
+// non-boundary steps park a masked scratch write there while a batch containing a
+// boundary does not, so the two submission styles leave different bytes in a row
+// attention never reads. Hashing it makes state-equivalence gates fail on a slot
+// with no consequences (measured 2026-08-02: the ENTIRE batched-vs-sequential
+// FULL/CTRL difference on the CPU path is this slot -- 21 layers x 64 floats per
+// stream, nothing else). The "live" digest answers the question those gates
+// actually ask: is the ATTENDED state equivalent?
+static uint64_t dsv4_digest_tensors_skip_last_row(const std::vector<ggml_tensor *> & ts, uint64_t h) {
+    std::vector<uint8_t> buf;
+    for (ggml_tensor * t : ts) {
+        if (!t) {
+            continue;
+        }
+        const size_t row_bytes = (size_t) t->nb[1];
+        const size_t n_full    = (size_t) ggml_nbytes(t);
+        const size_t n         = t->ne[1] > 1 ? n_full - row_bytes : n_full;
+        buf.resize(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, n);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= (uint64_t) buf[i];
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+uint64_t llama_dsv4_debug_digest_live(const llama_context & /*lctx*/, int component) {
+    if (!g_dsv4) {
+        return 0;
+    }
+    llama_dsv4_memory & mem = *g_dsv4;
+    uint64_t h = 1469598103934665603ull;
+    if (component < 0) {
+        h = dsv4_digest_tensors(mem.raw_k, h);
+        for (int si = 0; si < 3; ++si) {
+            h = dsv4_digest_tensors_skip_last_row(mem.s[si].k, h);
+            h = dsv4_digest_tensors(mem.s[si].st_kv,    h);
+            h = dsv4_digest_tensors(mem.s[si].st_score, h);
+        }
+        return h;
+    }
+    if (component == 0) {
+        return dsv4_digest_tensors(mem.raw_k, h);
+    }
+    if (component >= 1 && component <= 3) {
+        dsv4_stream_state & st = mem.s[component - 1];
+        h = dsv4_digest_tensors_skip_last_row(st.k, h);
+        h = dsv4_digest_tensors(st.st_kv,    h);
+        h = dsv4_digest_tensors(st.st_score, h);
+        return h;
+    }
+    return 0;
+}
+
 // Export a component's F32 state so a probe can measure HOW MUCH two states differ, not
 // just THAT they differ. A digest answers "are these the same bytes"; it cannot tell a
 // last-ulp reordering from a structurally wrong read, and those two have opposite
@@ -1214,6 +1270,13 @@ uint64_t llama_dspark_kv_digest(struct llama_context * ctx, int component) {
         return 0;
     }
     return llama_dsv4_debug_digest(*ctx, component);
+}
+
+uint64_t llama_dspark_kv_digest_live(struct llama_context * ctx, int component) {
+    if (!ctx) {
+        return 0;
+    }
+    return llama_dsv4_debug_digest_live(*ctx, component);
 }
 
 // NEGATIVE CONTROL for the M5 identity gate. Perturbs exactly the rows the last snapshot

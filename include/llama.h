@@ -700,6 +700,10 @@ extern "C" {
     // component: 0 raw, 1 CSA, 2 HCA, 3 LID, -1 all, -2 -> count of NON-FINITE floats
     // (a digest cannot separate "differs" from "NaN"; -2 is the guard against that).
     LLAMA_API uint64_t llama_dspark_kv_digest(struct llama_context * ctx, int component);
+    // As llama_dspark_kv_digest, but for the compressed streams it skips each K cache
+    // tensor's final row -- the masked dummy-write slot whose bytes legitimately differ
+    // between batched and sequential submission while never being read by attention.
+    LLAMA_API uint64_t llama_dspark_kv_digest_live(struct llama_context * ctx, int component);
 
     // TEST HOOK - DESTRUCTIVE. Perturb the rows the last snapshot covers (i.e. exactly
     // the rows a speculative batch overwrites) by +/- `amount`. This is the negative
