@@ -675,3 +675,53 @@ loses to `-fa off`, the correct outcome is to keep `-fa off` and say so.
 | *(no env — always on)* nl-token OOB guard | — | `common/sampling.cpp` (`llama_sampling_prepare_impl`) | Port of upstream ik #2188 (`8be93884`). The repetition-penalty block read `logits[llama_token_nl(...)]` unconditionally; on a vocab whose tokenizer maps `"\n"` to zero tokens the loader's fallback chain (`src/llama-vocab.cpp`: `linefeed_id = special_pad_id`, itself `LLAMA_TOKEN_NULL` on Falcon3-class BPE) yields id −1, making that `logits[-1]` — an OOB read one float before the logit row, a configuration-dependent segfault. Reachable from every token sampled through `common_sampler_sample` → `llama_sampling_prepare` (the read fires whenever any prev tokens exist, even with all penalties at 1.0, and `PXA_REP_GUARD`/ENHANCE arms real penalties on PXQ1 content). Now the token is fetched once and both the read and the `penalize_nl` restore are skipped at `LLAMA_TOKEN_NULL`. **Cannot change output on a vocab with a real newline token** (byte-identical block; upstream additionally measured 26 greedy comparisons across 8 models unchanged, and reproduced segfault→HTTP-200 on 4×P100 `-ngl 99` — our hardware class). Ungated: the old path is UB, there is no legacy behavior worth keeping. Relevance here: PXQ-UNIVERSAL quantizes arbitrary community models — exactly the odd-vocab traffic that trips this. No local crash repro was re-run (no nl-less-vocab model staged on the box); verification class: **structural + suite-identical + upstream repro on our hardware class** |
 | `PXA_JINJA_LEGACY_LOOP_SCOPE` | **0 (fix active)** | `common/jinja/runtime.cpp` (`for_statement::execute_impl`) | Port of upstream ik #2018 (`997b289d`). Each `{% for %}` iteration now executes in a fresh child scope, so a conditionally-skipped `{% set %}` no longer leaks the previous iteration's value forward (upstream's field case: a tool-call turn with reasoning followed by one without duplicated the stale reasoning into the second turn — wrong prompt, degraded output; goes straight at the tool-calling-reliability hard requirement). Matches standard Jinja2; cross-iteration accumulation still works via `namespace()` (mutations ride the shared object, which is why correctly-authored Qwen-family templates are unaffected). `=1` restores the old shared-scope behavior (value-tested; unset or `=0` = fixed). **Verified 2026-07-30 (CPU-only Release, `pxq-build:tools` container, worktree @ `9d564d7`):** ported upstream unit test passes (test-jinja 306 tests / 1427 assertions / 0 failures); with `=1` exactly that one test fails, rendering `[a][a][c]` — the leak, byte-for-byte the legacy semantics — and the other 305 tests are byte-identical; with `=0` output is byte-identical to unset (value-test proven). `test-chat-template` and `test-chat-auto-parser` outputs are **byte-identical before/after the port** (their pre-existing failures at `9d564d7` — the GLM whitespace-trim assert, 12/57 auto-parser cases — are unchanged, i.e. not loop-scope-related). No perf claim: cost is one flat scope copy per loop iteration, template-render only |
 | *(no env — always on)* `--skip-chat-parsing` / `--no-prefill-assistant` argv fix | — | `common/common.cpp` (`gpt_params_find_arg`) | Port of upstream ik #2129 (`3e76852b`). Both boolean flags carried a stray `CHECK_ARG`, silently consuming the NEXT command-line argument (`--skip-chat-parsing --version` ate `--version` and fell through to loading the default model) and dying as `invalid parameter` when the flag was last on the line. Removed; the usage strings were already boolean-style so no help change. **Verified:** `--skip-chat-parsing --version` / `--no-prefill-assistant --version` now print the version and exit 0 (before: rc=1 default-model-load failure); each flag as the last argument is accepted (before: usage dump). Ungated: pure argv correctness |
+
+### 2026-08-02 — DeepSeek-V4 flipped in-place RoPE (`PXA_ROPE_FLIPPED_v1`, upstream ik #2198 port)
+
+DS4 stores every roped row as `[nope | pe]` and the classic ggml shape for that is
+`nope = view(x,0)`, `pe = view(x,off)`, `pe = rope(pe)`, `x = concat(nope, pe, 0)`. The
+concat reads a **non-contiguous** source and writes a full-width destination. At the
+checkpoint's real geometry (`attention.key_length` 512, `rope.dimension_count` 64,
+`n_head` 64, `nt` 383) the q and attn-derope concats are about **50 MB per layer each**,
+against roughly **1.1 MB** for the compressed-KV ring concat.
+
+⚠ **This corrects a claim in our own notes.** `brain-notes/DS4-QUANT-LADDER-2026-08-01.md`
+attributes the profiled `concat_f32_non_cont` cost (3.8% of prefill over 9295 calls) to
+"raw-ring ⊕ compressed-K assembly". By tensor bytes that is off by roughly 45x — the
+partial-RoPE concats dominate, not the ring.
+
+Flipped RoPE removes the triple outright: rotate the **trailing** `n_dims` channels where
+they already are. No view, no concat, no destination allocation. The rotation itself is
+untouched — theta is still derived from the index *within* the rotated block, so only the
+memory index moves.
+
+⚠ **NO MEASURED EFFECT YET. Do not quote a speedup.** Upstream's author reports +2-3%
+prefill / 0 decode for this change on his hardware; that is **his** number, not ours, not
+reproduced here. Verification so far is correctness only.
+
+| var | default | where | what it does |
+|---|---|---|---|
+| `PXA_DS4_ROPE_INPLACE` | **1 (on)** | `src/graphs/build_deepseek4.cpp` (`dsv4_rope_inplace_enabled`) | Master switch for the six DS4 partial-RoPE sites: HCA compressed-KV, CSA/LID compressed-KV, indexer-q, attention q, attention kv, and the attention de-rope. On, each becomes one in-place flipped `GGML_OP_ROPE` (the de-rope retyped to `GGML_OP_ROPE_BACK`). `=0` rebuilds the **pre-port graph exactly** — the view/rope/concat triples come back — so a same-binary A/B is possible and a rollback needs no rebuild. Verification class: **bit-exact.** This is a pure representation change, so temp-0 output must be byte-identical between `=1` and `=0` at both `-fa` settings; if it is not, the port is wrong. **Effect: UNMEASURED.** |
+| *(no env — always on)* `op_params[15]` flipped flag | — | `ggml/src/ggml.c`, `ggml/src/ggml-cuda/rope.cu` | The ggml-level mechanism. `op_params[15] == 1` on a ROPE/ROPE_BACK node means "rotate `[ne0-n_dims, ne0)` instead of `[0, n_dims)`". Implemented for f32 on CPU and f32+f16 on CUDA. Nothing sets it except the DS4 builder, so on every other arch the flag is 0 and the code path is byte-unchanged. Both rope constructors now write slot 15 explicitly rather than relying on the tensor allocator's zero-init. |
+
+**Guards that ship with it — each is a place where a wrong answer would otherwise be silent:**
+
+- `ggml_cuda_op_rope_rope_impl` declines a flipped pair. This one is **live, not
+  defensive**: DS4 emits adjacent `GGML_OP_ROPE` nodes for q and kv, the CUDA dispatcher
+  fuses adjacent ROPE nodes, and the fused path's own eligibility check is
+  `memcmp(dst1->op_params, dst2->op_params, 15*sizeof(int))` — which stops one int short
+  of the flipped flag. Without the guard the fused kernel would accept the pair and rotate
+  the leading channels.
+- `ggml_cuda_op_rope_cache_impl`, `ggml_cuda_op_rope_fast`, `ggml_cuda_op_fused_rope_fast`
+  and `ggml_cuda_op_fused_rms_rope_fast` reject or decline flipped nodes.
+- mrope and vision layouts **assert** rather than silently ignoring the flag (upstream
+  ignores it); those layouts address the tail channels themselves, so a flipped request
+  there is a caller bug.
+- f16 on the CPU backend asserts (not implemented there; DS4 is f32).
+
+**One upstream defect was not ported.** ik's non-in-place flipped *neox* kernel derives the
+pair index as `i0/2 + rope_offset`, which walks past the end of the row for any
+`ne0 > n_dims` (e.g. `ne0=192, n_dims=64` addresses element 223 of a 192-wide row). It is
+unreachable in their build because DS4 always takes the in-place path, but it is wrong.
+Ours derives the index from the thread's position within the rotated block, and
+`tests/test-rope-flipped.cpp` exercises that path explicitly rather than trusting it.
