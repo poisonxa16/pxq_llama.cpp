@@ -34,39 +34,47 @@ static __global__ void k_mask_to_idx(
     const int i2 = blockIdx.y;
     const int i3 = blockIdx.z;
 
-    __shared__ int counts[WARP_SIZE];
+    const int lane = threadIdx.x;
 
     const mask_t * mask_r = (const mask_t *)((const char *) mask + i1*nb01 + i2*nb02 + i3*nb03);
     int          * idx_r  = (int          *)((      char *) idx  + i1*nb1  + i2*nb2  + i3*nb3);
 
-    for (int j = threadIdx.x; j < ne0; j += WARP_SIZE) {
+    for (int j = lane; j < ne0; j += WARP_SIZE) {
         idx_r[j] = -1;
     }
 
-    // Keep everything the mask does not hard-exclude. Written as !(v <= -inf) so that
-    // NaN (which fails every ordered compare) is KEPT: a superset stays correct, a
-    // subset silently drops KV.
-    int n_on = 0;
-    for (int j = threadIdx.x; j < ne00; j += WARP_SIZE) {
-        const float v = mask_to_idx_f32(mask_r[j]);
-        n_on += !(v <= -INFINITY) ? 1 : 0;
-    }
-    counts[threadIdx.x] = n_on;
-    __syncthreads();
+    // Walk the row in contiguous 32-wide chunks and place hits with a ballot prefix sum,
+    // so the output is in ASCENDING column order.
+    //
+    // The upstream kernel instead gives each lane a strided subset (j = lane, lane+32,
+    // ...) and concatenates the lanes' hits, which emits a thread-grouped permutation
+    // rather than a sorted list. Attention itself does not care -- softmax over the
+    // gathered columns is permutation-invariant as long as K, V and the mask are gathered
+    // with the same list -- but it makes the op's result backend-dependent, and when the
+    // list is shorter than the visible set the two orders TRUNCATE TO DIFFERENT SUBSETS.
+    // Measured: with 400 visible into a 256-wide list, CPU and CUDA disagreed on
+    // 4079/4096 slots. Ordering it costs nothing and makes CPU and CUDA identical.
+    //
+    // The predicate is !(v <= -inf), not v == 0, so NaN (which fails every ordered
+    // compare) is KEPT: a superset stays correct, a subset silently drops KV.
+    int base = 0;
+    for (int c = 0; c < ne00; c += WARP_SIZE) {
+        const int j = c + lane;
 
-    int start = 0;
-    for (int i = 0; i < threadIdx.x; ++i) {
-        start += counts[i];
-    }
-
-    for (int j = threadIdx.x; j < ne00; j += WARP_SIZE) {
-        const float v = mask_to_idx_f32(mask_r[j]);
-        if (!(v <= -INFINITY)) {
-            if (start < ne0) {
-                idx_r[start] = j;
-            }
-            ++start;
+        bool hit = false;
+        if (j < ne00) {
+            const float v = mask_to_idx_f32(mask_r[j]);
+            hit = !(v <= -INFINITY);
         }
+
+        const unsigned int ballot = __ballot_sync(0xffffffffu, hit);
+        if (hit) {
+            const int slot = base + __popc(ballot & ((1u << lane) - 1u));
+            if (slot < ne0) {
+                idx_r[slot] = j;
+            }
+        }
+        base += __popc(ballot);
     }
 }
 
