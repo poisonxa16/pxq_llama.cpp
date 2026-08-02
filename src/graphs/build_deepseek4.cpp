@@ -153,31 +153,54 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
-// PXA_DS4_ROPE_INPLACE (default on; set to 0 to restore the pre-port graph).
+// PXA_DS4_ROPE_FLIPPED (default on; set to 0 to restore the pre-port graph).
 //
 // DS4 stores every roped row as [nope | pe]. The classic shape is
 //   nope = view(x, 0)            pe = view(x, off)
 //   pe   = rope(pe)              x  = concat(nope, pe, 0)
-// which allocates a full-width destination and runs concat over a
-// non-contiguous source. At n_embd_head=512 / n_head=64 / nt=383 the q and
-// attn-derope concats are ~50 MB per layer each.
+// The concat reads a NON-contiguous source and writes a full-width destination.
+// At n_embd_head=512 / n_head=64 / nt=383 the q and attn-derope concats are
+// ~50 MB per layer each -- that is the cost this removes.
 //
-// Flipped in-place RoPE removes the whole triple: rotate the trailing n_dims
-// channels of the row where they already sit. No view, no concat, no
-// destination. Only the memory index moves; the rotation is identical, so the
-// numerical result is unchanged.
-static bool dsv4_rope_inplace_enabled() {
+// Flipped RoPE collapses the triple to one node: rotate the TRAILING n_dims
+// channels where they already sit and pass the nope half through in the same
+// kernel. Two views and the non-contiguous concat disappear. The rotation
+// itself is untouched -- only the memory index moves.
+//
+// ⚠ NOT in-place, deliberately, and this is a DEVIATION from upstream.
+//
+// Upstream uses ggml_rope_ext_inplace here, which also drops the destination
+// allocation. That is unsafe on this hardware, and it was measured, not
+// reasoned about: with in-place ropes, `-fa on` + a ~2600-token prompt aborts
+// inside cublasSgemm with "the function failed to launch" (a sticky fault
+// raised by an earlier kernel), while the same binary with the switch off, and
+// the same binary at `-fa off`, both complete.
+//
+// Cause: on sm_70 head dim 512 has no CUDA flash-attention kernel, so at
+// `-fa on` every DS4 attention node is placed on the CPU backend and the
+// attention output lives in host memory. An in-place rope is a VIEW of that
+// tensor, and ggml_backend_cuda_supports_op returns true unconditionally for
+// ROPE/ROPE_BACK, so the scheduler is free to assign the view to CUDA. A view
+// cannot be satisfied by inserting a copy -- it must write into its view_src's
+// actual buffer -- so the kernel writes to a host pointer. Upstream does not
+// hit this because their DS4 attention runs on the GPU (Ampere+).
+//
+// The concat -- the part that actually showed up in the profile -- is removed
+// either way. What in-place would additionally save is one destination
+// allocation and the nope-half copy, and the classic path was copying that
+// same data through the concat anyway.
+static bool dsv4_rope_flipped_enabled() {
     static const bool v = [] {
-        const char * e = getenv("PXA_DS4_ROPE_INPLACE");
+        const char * e = getenv("PXA_DS4_ROPE_FLIPPED");
         return !(e && e[0] == '0');
     }();
     return v;
 }
 
-// Rotate the trailing n_dims channels of `cur` in place.
-// `cur` must be contiguous, f32, and have no consumer that needs the pre-rope
-// values - the write lands in its parent's buffer.
-static ggml_tensor * dsv4_rope_flipped_inplace(
+// Rotate the trailing n_dims channels of `cur`, passing the leading channels
+// through. Fresh destination: no aliasing, so this is safe under any backend
+// split.
+static ggml_tensor * dsv4_rope_flipped(
         ggml_context * ctx, ggml_tensor * cur, ggml_tensor * pos, int n_dims, int rope_type,
         int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow) {
@@ -185,25 +208,42 @@ static ggml_tensor * dsv4_rope_flipped_inplace(
     GGML_ASSERT(cur->type == GGML_TYPE_F32);
     GGML_ASSERT(n_dims <= cur->ne[0]);
 
-    ggml_tensor * out = ggml_rope_ext_inplace(ctx, cur, pos, nullptr, n_dims, rope_type, n_ctx_orig,
+    ggml_tensor * out = ggml_rope_ext(ctx, cur, pos, nullptr, n_dims, rope_type, n_ctx_orig,
             freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     out->op_params[15] = 1; // PXA_ROPE_FLIPPED_v1
+
+    // Structural guard, not decoration: an in-place rope here is a VIEW, and a
+    // view must write into its view_src's buffer, which the scheduler is free to
+    // put on another backend. That is exactly the sm_70 `-fa on` abort
+    // (ROPE_BACK -> illegal memory access). If anyone switches these back to the
+    // _inplace constructors, fail at graph build rather than at a random kernel.
+    GGML_ASSERT(out->view_src == nullptr &&
+            "DS4 flipped rope must own its destination");
 
     return out;
 }
 
-// Inverse rotation, in place. ggml has no ggml_rope_ext_back_inplace(): ROPE and
-// ROPE_BACK share one op_params layout and one forward implementation
-// parameterised by a template bool, so retyping an in-place ROPE node is exactly
-// the inverse rotation and nothing else. (Same construction as upstream
-// ik_llama 6647db9c.)
-static ggml_tensor * dsv4_rope_back_flipped_inplace(
+// Inverse rotation, same layout. Uses ggml_rope_back directly, so there is no
+// need for upstream's trick of retyping a ROPE node to ROPE_BACK.
+static ggml_tensor * dsv4_rope_back_flipped(
         ggml_context * ctx, ggml_tensor * cur, ggml_tensor * pos, int n_dims, int rope_type,
         int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow) {
-    ggml_tensor * out = dsv4_rope_flipped_inplace(ctx, cur, pos, n_dims, rope_type, n_ctx_orig,
+    GGML_ASSERT(ggml_is_contiguous(cur));
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_dims <= cur->ne[0]);
+
+    ggml_tensor * out = ggml_rope_back(ctx, cur, pos, nullptr, n_dims, rope_type, n_ctx_orig,
             freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-    out->op = GGML_OP_ROPE_BACK;
+    out->op_params[15] = 1; // PXA_ROPE_FLIPPED_v1
+
+    // Structural guard, not decoration: an in-place rope here is a VIEW, and a
+    // view must write into its view_src's buffer, which the scheduler is free to
+    // put on another backend. That is exactly the sm_70 `-fa on` abort
+    // (ROPE_BACK -> illegal memory access). If anyone switches these back to the
+    // _inplace constructors, fail at graph build rather than at a random kernel.
+    GGML_ASSERT(out->view_src == nullptr &&
+            "DS4 flipped rope must own its destination");
 
     return out;
 }
@@ -650,12 +690,12 @@ ggml_tensor * llm_build_context::build_dsv4_hca_compressed_kv_from_state(
     comp = llm_build_norm(ctx0, comp, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(comp, name, il);
 
-    if (dsv4_rope_inplace_enabled()) {
+    if (dsv4_rope_flipped_enabled()) {
         // comp is already [n_embd_head, 1, n_blocks] here (sum_rows -> permute ->
         // cont -> norm), which is exactly the shape the rope needs: ne[2] must
         // equal comp_pos->ne[0]. Assert instead of inserting a no-op reshape.
         GGML_ASSERT(comp->ne[0] == n_embd_head && comp->ne[1] == 1 && comp->ne[2] == n_blocks);
-        comp = dsv4_rope_flipped_inplace(ctx0, comp, comp_pos, n_embd_head_rope, rope_type, n_ctx_orig,
+        comp = dsv4_rope_flipped(ctx0, comp, comp_pos, n_embd_head_rope, rope_type, n_ctx_orig,
                 hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
                 dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
         cb(comp, name, il);
@@ -747,12 +787,12 @@ ggml_tensor * llm_build_context::build_dsv4_overlap_compressed_kv_from_state(
     comp = llm_build_norm(ctx0, comp, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(comp, name, il);
 
-    if (dsv4_rope_inplace_enabled()) {
+    if (dsv4_rope_flipped_enabled()) {
         // comp is already [n_embd_head, 1, n_blocks] here (sum_rows -> permute ->
         // cont -> norm), which is exactly the shape the rope needs: ne[2] must
         // equal comp_pos->ne[0]. Assert instead of inserting a no-op reshape.
         GGML_ASSERT(comp->ne[0] == n_embd_head && comp->ne[1] == 1 && comp->ne[2] == n_blocks);
-        comp = dsv4_rope_flipped_inplace(ctx0, comp, comp_pos, n_embd_head_rope, rope_type, n_ctx_orig,
+        comp = dsv4_rope_flipped(ctx0, comp, comp_pos, n_embd_head_rope, rope_type, n_ctx_orig,
                 hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
                 dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
         cb(comp, name, il);
@@ -804,8 +844,8 @@ ggml_tensor * llm_build_context::build_dsv4_lid_top_k(
     indexer_q = ggml_reshape_3d(ctx0, indexer_q, n_embd_indexer_head, n_indexer_head, nt);
     cb(indexer_q, "lid_q", il);
 
-    if (dsv4_rope_inplace_enabled()) {
-        indexer_q = dsv4_rope_flipped_inplace(ctx0, indexer_q, inp_pos, n_embd_indexer_head_rope,
+    if (dsv4_rope_flipped_enabled()) {
+        indexer_q = dsv4_rope_flipped(ctx0, indexer_q, inp_pos, n_embd_indexer_head_rope,
                 rope_type, n_ctx_orig, hparams.dsv4_compress_rope_base, freq_scale,
                 ext_factor, dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
         cb(indexer_q, "lid_q_pe", il);
@@ -1156,8 +1196,8 @@ ggml_tensor * llm_build_context::build_dsv4_attention(
     q = ggml_rms_norm(ctx0, q, norm_rms_eps);
     cb(q, "q_norm", il);
 
-    if (dsv4_rope_inplace_enabled()) {
-        q = dsv4_rope_flipped_inplace(ctx0, q, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
+    if (dsv4_rope_flipped_enabled()) {
+        q = dsv4_rope_flipped(ctx0, q, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
                 freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
         cb(q, "q", il);
     } else {
@@ -1181,8 +1221,8 @@ ggml_tensor * llm_build_context::build_dsv4_attention(
     kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
     cb(kv, "kv_norm", il);
 
-    if (dsv4_rope_inplace_enabled()) {
-        kv = dsv4_rope_flipped_inplace(ctx0, kv, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
+    if (dsv4_rope_flipped_enabled()) {
+        kv = dsv4_rope_flipped(ctx0, kv, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
                 freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
         cb(kv, "kv", il);
     } else {
@@ -1397,8 +1437,8 @@ ggml_tensor * llm_build_context::build_dsv4_attention(
 
     // ---- de-rope, then the grouped output LoRA ----
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
-    if (dsv4_rope_inplace_enabled()) {
-        out = dsv4_rope_back_flipped_inplace(ctx0, out, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
+    if (dsv4_rope_flipped_enabled()) {
+        out = dsv4_rope_back_flipped(ctx0, out, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
                 freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
         cb(out, "attn_derope", il);
     } else {
