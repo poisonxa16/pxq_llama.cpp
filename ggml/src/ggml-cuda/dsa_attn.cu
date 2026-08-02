@@ -23,10 +23,17 @@
 //       - the softmax shared-memory request is checked against the device limit. The
 //         original asserts it inside the kernel launcher, which aborts the process for
 //         a large index list instead of falling back.
-//       - dst must be contiguous (k_copy_dst writes a dense block), the index list must
-//         have a dense dim 0 and at least Q->ne[1] rows, K/V row counts must match, and
-//         a sink tensor must be F32 with one entry per head.
+//       - dst must be contiguous AND shaped [V->ne[0], Q->ne[2], Q->ne[1]]; the index
+//         list must have a dense dim 0 and at least Q->ne[1] rows; K/V row counts must
+//         match; a sink tensor must be F32 with one entry per head.
+//       - op_params[3] (precision) must name a value this kernel serves. See the note in
+//         ggml_cuda_dsa_attn_ext(): upstream accumulates both GEMMs in F16 and never
+//         reads that field, while DeepSeek-V4 sets GGML_PREC_F32 on every attention
+//         node. Here both GEMMs accumulate in F32 and the score matrix is F32.
 //   * AMD is excluded: the path is untestable here, so it is not claimed.
+//
+//   * DEFAULT OFF (PXA_DSA_ATTN=1 to enable). Not bit-identical to the path it replaces
+//     and not yet measured end to end.
 //
 
 #include "dsa_attn.cuh"
@@ -88,16 +95,14 @@ static __global__ void k_prepare_one_batch_q(int ne0, int ne1, size_t nb1, size_
     q_out[i0 + (i2 + i1*ne1)*ne0] = __float2half(q_in[i0 + i1*nb1 + i2*nb2]);
 }
 
-static __global__ void k_copy_dst(int nelem, const half * kqv16, float * dst) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nelem) {
-        return;
-    }
-    dst[i] = __half2float(kqv16[i]);
-}
-
+// Scores in, probabilities out. The scores are F32 (cuBLAS accumulates in F32, see
+// ggml_cuda_dsa_attn_ext); the probabilities are written back as F16 because they are
+// the B operand of the following GEMM, which needs both operands in the same type.
+// Probabilities live in [0,1], where F16 carries ~5e-4 relative error -- the scores do
+// not, which is why only the score side was moved to F32.
 template <int ncols_template, int block_size_template>
-static __global__ void soft_max_f16_simple(half * x, const half * mask, const float * sinks,
+static __global__ void soft_max_f16_simple(const float * __restrict__ x_in, half * __restrict__ x_out,
+        const half * mask, const float * sinks,
         const int ncols_par, const int nrows_y, const float scale) {
     const int ncols = ncols_template == 0 ? ncols_par : ncols_template;
 
@@ -127,7 +132,7 @@ static __global__ void soft_max_f16_simple(half * x, const half * mask, const fl
         const int64_t ix = (int64_t)rowx*ncols + col;
         const int64_t iy = (int64_t)rowy*ncols + col;
 
-        const float val = scale*__half2float(x[ix]) + __half2float(mask[iy]);
+        const float val = scale*x_in[ix] + __half2float(mask[iy]);
 
         vals[col] = val;
         max_val = max(max_val, val);
@@ -196,7 +201,7 @@ static __global__ void soft_max_f16_simple(half * x, const half * mask, const fl
         }
 
         const int64_t ix = (int64_t)rowx*ncols + col;
-        x[ix] = __float2half(vals[col] * inv_sum);
+        x_out[ix] = __float2half(vals[col] * inv_sum);
     }
 }
 
@@ -204,7 +209,8 @@ static size_t dsa_soft_max_shmem(int ncols_x) {
     return (GGML_PAD((size_t) ncols_x, (size_t) WARP_SIZE) + WARP_SIZE)*sizeof(float);
 }
 
-static void soft_max_f16_cuda_simple(half * x, const half * mask, const float * sinks, const int ncols_x,
+static void soft_max_f16_cuda_simple(const float * x_in, half * x_out, const half * mask,
+        const float * sinks, const int ncols_x,
         const int nrows_x, const int nrows_y, const float scale, cudaStream_t stream) {
     int nth = WARP_SIZE;
     while (nth < ncols_x && nth < DSA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
@@ -218,25 +224,37 @@ static void soft_max_f16_cuda_simple(half * x, const half * mask, const float * 
     GGML_ASSERT(shmem < ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
     switch (ncols_x) {
-        case   32: soft_max_f16_simple<  32,   32><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        case   64: soft_max_f16_simple<  64,   64><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        case  128: soft_max_f16_simple< 128,  128><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        case  256: soft_max_f16_simple< 256,  256><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        case  512: soft_max_f16_simple< 512,  512><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        case 1024: soft_max_f16_simple<1024, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        case 2048: soft_max_f16_simple<2048, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        case 4096: soft_max_f16_simple<4096, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
-        default:   soft_max_f16_simple<   0,    0><<<block_nums, block_dims, shmem, stream>>>(x, mask, sinks, ncols_x, nrows_y, scale); break;
+        case   32: soft_max_f16_simple<  32,   32><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        case   64: soft_max_f16_simple<  64,   64><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        case  128: soft_max_f16_simple< 128,  128><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        case  256: soft_max_f16_simple< 256,  256><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        case  512: soft_max_f16_simple< 512,  512><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        case 1024: soft_max_f16_simple<1024, 1024><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        case 2048: soft_max_f16_simple<2048, 1024><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        case 4096: soft_max_f16_simple<4096, 1024><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
+        default:   soft_max_f16_simple<   0,    0><<<block_nums, block_dims, shmem, stream>>>(x_in, x_out, mask, sinks, ncols_x, nrows_y, scale); break;
     }
 }
 
-// PXA_DSA_ATTN=0 disables the sparse path entirely, so the same binary can be A/B'd
-// with one variable. Both the dispatcher and the scheduler gate go through this
-// predicate, so the switch cannot half-apply.
+// PXA_DSA_ATTN=1 enables the sparse path; anything else leaves it off. Both the
+// dispatcher and the scheduler gate go through this predicate, so the switch cannot
+// half-apply.
+//
+// ⚠ DEFAULT OFF, deliberately. Where DSA engages it is NOT bit-identical to the path it
+// replaces (F16 GEMM vs the CPU dense fallback), and it has no end-to-end measurement --
+// no perplexity, no KL against the pre-port binary, no throughput number. An opt-in
+// switch is what an unmeasured behaviour change is allowed to be. Turning it on is a
+// decision for whoever has a measurement, not a default.
+//
+// Note for whoever runs that measurement: at low fill DSA does not engage at all (the
+// compressed mask is narrower than the index list, so worth_it is false and src[5] is
+// never set), which makes an on-vs-off comparison there vacuously identical. Confirm
+// engagement in the same run -- GGML_SCHED_DEBUG=2 must show FLASH_ATTN on CUDA -- or the
+// comparison is measuring the pre-port engine against itself.
 static bool pxa_dsa_attn_enabled() {
     static const bool enabled = [] {
         const char * v = getenv("PXA_DSA_ATTN");
-        return !(v && v[0] == '0');
+        return v && v[0] == '1';
     }();
     return enabled;
 }
@@ -281,6 +299,14 @@ bool ggml_cuda_dsa_attn_supported(const ggml_tensor * dst, int cc) {
     memcpy(&logit_softcap, (const char *) dst->op_params + 2*sizeof(float), sizeof(float));
     if (max_bias != 0.0f || logit_softcap != 0.0f) return false;
 
+    // op_params[3] is the precision request (ggml_flash_attn_ext_set_prec). Both values
+    // this enum defines are served: the kernel accumulates in F32 unconditionally, which
+    // satisfies GGML_PREC_F32 and is permitted under GGML_PREC_DEFAULT. A third value
+    // added later would be a request we do not implement, so decline it rather than
+    // ignore it -- ignoring op_params is the failure mode this predicate exists to stop.
+    const int32_t precision = dst->op_params[3];
+    if (precision != GGML_PREC_DEFAULT && precision != GGML_PREC_F32) return false;
+
     // --- dtypes --------------------------------------------------------------
     if (Q->type != GGML_TYPE_F32) return false;
     if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) return false;
@@ -313,7 +339,12 @@ bool ggml_cuda_dsa_attn_supported(const ggml_tensor * dst, int cc) {
     if (Q->nb[1] % sizeof(float) != 0 || Q->nb[2] % sizeof(float) != 0) return false;
     if (K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half)) return false;
     if (mask->nb[0] != sizeof(half) || mask->nb[1] % sizeof(half) != 0) return false;
-    if (!ggml_is_contiguous(dst)) return false;          // k_copy_dst writes a dense block
+
+    // The PV GEMM writes dst directly, one query row per batch, so the destination must
+    // be exactly [V->ne[0], Q->ne[2], Q->ne[1]] and dense. Contiguity alone is not
+    // enough -- the batch stride is only dst->nb[2] if the first two dims are these.
+    if (!ggml_is_contiguous(dst)) return false;
+    if (dst->ne[0] != V->ne[0] || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1]) return false;
 
     // --- worth it? -----------------------------------------------------------
     // Gathering costs indexer->ne[0] rows per query, so the sparse path only wins if
@@ -354,7 +385,7 @@ void ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // stream -- every other cuBLAS caller in this tree sets it at the call site. Without
     // this, the GEMMs below run on whatever stream the handle was last left on while the
     // gather kernels run on ctx.stream(), so the GEMM can read k16/q16 before they are
-    // filled and k_copy_dst can read kqv16 before the GEMM lands.
+    // filled and the softmax can read the score matrix before the GEMM lands.
     //
     // It fails as a RACE, not as an error, which is why it is easy to miss: measured
     // here, head 128 was correct (0.15% vs an independent reference) while head 512 with
@@ -363,20 +394,37 @@ void ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // big enough to still be running when the GEMM starts.
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), ctx.stream()));
 
-    const half alpha = 1.0f;
-    const half beta  = 0.0f;
+    // ⚠ REQUIRED, and absent from the upstream original.
+    // build_dsv4_attn_mha() calls ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32) on
+    // every DeepSeek-V4 attention node -- the deliberate twin of the F32 accumulator it
+    // asks for on the non-FA score matmul ("DS4 scores need the F32 accumulator (long
+    // context, sinks, -inf masks)"). op_params[3] is where that request lives, and every
+    // other branch of ggml_cuda_flash_attn_ext() honours it by selecting an F32-accumulate
+    // kernel. The upstream DSA kernel never reads it: both GEMMs were cublasHgemm, i.e.
+    // F16 accumulate, and the score matrix was stored F16 as well. That is the same class
+    // of defect this file already rejects for ALiBi and logit softcapping one field over --
+    // a silently different answer, not a slower one -- and it is worst exactly where the
+    // request was aimed: the QK contraction is 512 deep and the PV reduction is n_idx deep
+    // and grows with context. Unscaled F16 scores could also overflow (F16 max 65504).
+    //
+    // So both GEMMs accumulate in F32 (CUBLAS_COMPUTE_32F, the same idiom ggml-cuda.cu
+    // uses for GGML_PREC_F32 mul_mat) and the score matrix is F32. This is unconditional:
+    // F32 accumulation also satisfies GGML_PREC_DEFAULT, which imposes no requirement, so
+    // there is no second path to keep correct.
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
 
     const int  n_idx      = indexer->ne[0];
     const int  max_rows   = std::min<int>(Q->ne[1], DSA_ATTN_MAX_ROWS);
     const bool is_k_view  = v_is_k_view(K, V);
     const size_t stride_idx = indexer->nb[1]/sizeof(int);
 
-    ggml_cuda_pool_alloc<half> q16   (ctx.pool(), (size_t) Q->ne[0]*Q->ne[2]*max_rows);
-    ggml_cuda_pool_alloc<half> kq16  (ctx.pool(), (size_t) n_idx*Q->ne[2]*max_rows);
-    ggml_cuda_pool_alloc<half> kqv16 (ctx.pool(), (size_t) V->ne[0]*Q->ne[2]*max_rows);
-    ggml_cuda_pool_alloc<half> mask16(ctx.pool(), (size_t) n_idx*Q->ne[1]);
-    ggml_cuda_pool_alloc<half> k16   (ctx.pool(), (size_t) n_idx*K->ne[0]*max_rows);
-    ggml_cuda_pool_alloc<half> v16   (ctx.pool());
+    ggml_cuda_pool_alloc<half>  q16   (ctx.pool(), (size_t) Q->ne[0]*Q->ne[2]*max_rows);
+    ggml_cuda_pool_alloc<float> kq32  (ctx.pool(), (size_t) n_idx*Q->ne[2]*max_rows); // scores
+    ggml_cuda_pool_alloc<half>  kqp16 (ctx.pool(), (size_t) n_idx*Q->ne[2]*max_rows); // probabilities
+    ggml_cuda_pool_alloc<half>  mask16(ctx.pool(), (size_t) n_idx*Q->ne[1]);
+    ggml_cuda_pool_alloc<half>  k16   (ctx.pool(), (size_t) n_idx*K->ne[0]*max_rows);
+    ggml_cuda_pool_alloc<half>  v16   (ctx.pool());
 
     size_t v_offset = 0;
     if (is_k_view) {
@@ -422,14 +470,15 @@ void ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // KQ^T over the gathered rows: [n_idx, n_head] per query row.
-        CUBLAS_CHECK(cublasHgemmStridedBatched(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        // KQ^T over the gathered rows: [n_idx, n_head] per query row, F16 in / F32 out.
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
                     n_idx, Q->ne[2], Q->ne[0],
-                    &alpha, k16.get(), K->ne[0], (long long) K->ne[0]*n_idx,
-                    q16.get(), Q->ne[0], (long long) Q->ne[0]*Q->ne[2],
-                    &beta, kq16.get(), n_idx, (long long) n_idx*Q->ne[2], nrows));
+                    &alpha, k16.get(), CUDA_R_16F, K->ne[0], (long long) K->ne[0]*n_idx,
+                            q16.get(), CUDA_R_16F, Q->ne[0], (long long) Q->ne[0]*Q->ne[2],
+                    &beta, kq32.get(), CUDA_R_32F, n_idx,    (long long) n_idx*Q->ne[2],
+                    nrows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-        soft_max_f16_cuda_simple(kq16.get(), mask16.get() + (size_t) first*n_idx,
+        soft_max_f16_cuda_simple(kq32.get(), kqp16.get(), mask16.get() + (size_t) first*n_idx,
                 sink ? (const float *) sink->data : nullptr,
                 n_idx, Q->ne[2]*nrows, Q->ne[2], scale, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
@@ -438,18 +487,16 @@ void ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const int    v_ld  = is_k_view ? K->ne[0] : V->ne[0];
         const long long v_stride = (long long) v_ld*n_idx;
 
-        CUBLAS_CHECK(cublasHgemmStridedBatched(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+        // PV, F16 in / F32 straight into dst. dst is contiguous and shaped
+        // [V->ne[0], Q->ne[2], Q->ne[1]] (both checked in the predicate), so the batch
+        // stride is exactly one query row and no staging copy is needed -- which also
+        // removes the F16 rounding the old k_copy_dst applied to the final output.
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
                     V->ne[0], Q->ne[2], n_idx,
-                    &alpha, v_src, v_ld, v_stride,
-                    kq16.get(), n_idx, (long long) n_idx*Q->ne[2],
-                    &beta, kqv16.get(), V->ne[0], (long long) V->ne[0]*Q->ne[2], nrows));
-
-        {
-            const int nelem  = V->ne[0]*Q->ne[2]*nrows;
-            const int nblock = (nelem + 255)/256;
-            k_copy_dst<<<nblock, 256, 0, ctx.stream()>>>(nelem, kqv16.get(),
-                    (float *)((char *) dst->data + dst->nb[2]*first));
-            CUDA_CHECK(cudaGetLastError());
-        }
+                    &alpha, v_src,       CUDA_R_16F, v_ld,  v_stride,
+                            kqp16.get(), CUDA_R_16F, n_idx, (long long) n_idx*Q->ne[2],
+                    &beta, (float *)((char *) dst->data + dst->nb[2]*first),
+                           CUDA_R_32F, V->ne[0], (long long) V->ne[0]*Q->ne[2],
+                    nrows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 }
