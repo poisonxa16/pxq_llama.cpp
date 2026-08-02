@@ -20496,8 +20496,13 @@ static void ggml_compute_forward_rope_f32(
                     }
                 }
 
-                if (is_inplace) {
-                    // nothing else to copy: dst IS src0
+                if (is_flipped && is_inplace) {
+                    // nothing else to copy: dst IS src0.
+                    // Deliberately NOT applied to non-flipped in-place ropes -
+                    // the K-shift path (llama-build-context.cpp) uses those on
+                    // every arch with context shift, and leaving that case
+                    // exactly as it was keeps this port structurally inert
+                    // outside DeepSeek-V4 rather than inert-by-argument.
                     continue;
                 }
 

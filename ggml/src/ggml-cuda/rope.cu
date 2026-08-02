@@ -857,9 +857,19 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             "flipped RoPE is not defined for mrope/vision layouts");
     GGML_ASSERT(!is_flipped || n_dims <= ne00);
 
-    // An in-place node shares src0's buffer: skip the passthrough block
-    // entirely and let the kernel touch only the rotated channels.
-    const bool is_inplace = src0->data == dst->data;
+    // An in-place node shares src0's buffer, so the passthrough block can be
+    // skipped entirely and the kernel need only touch the rotated channels.
+    //
+    // Restricted to FLIPPED nodes on purpose. Upstream routes EVERY in-place
+    // rope to the new kernels; that would also change the K-shift path
+    // (llama-build-context.cpp, every arch with context shift). Their kernel is
+    // arguably the more correct one there - the old path indexes dst as
+    // contiguous while reading src through its strides, which only agree
+    // because the K-shift view happens to have standard strides - but silently
+    // altering an unrelated arch's kernel is not something this port should do
+    // untested. With this restriction, a graph that sets no flipped flag is
+    // structurally byte-unchanged.
+    const bool is_inplace = is_flipped && src0->data == dst->data;
     const int64_t rope_offset = is_flipped ? ne00 - n_dims : 0;
 
     // compute
