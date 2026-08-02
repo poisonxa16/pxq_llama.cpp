@@ -4681,6 +4681,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             ggml_backend_tensor_set(lctx.inp_dspark_cap, lctx.dspark_cap_host.data(),
                     0, need*sizeof(float));
         }
+
+        // M4: the Markov chain's seed - the token the target just committed
+        // (ds4.c:59232, the `token` argument of ds4_session_prepare_dspark_draft_impl).
+        if (lctx.inp_dspark_prev) {
+            ggml_backend_tensor_set(lctx.inp_dspark_prev, &lctx.dspark_prev_host,
+                    0, sizeof(int32_t));
+        }
         return;
     }
 
@@ -5484,6 +5491,92 @@ static bool prepare_mtp_graph_inputs(
     return true;
 }
 
+// DSpark M4: pull the block drafter's per-position argmax ids and confidence logits off
+// the device once per forward.
+//
+// SIX transfers, 24 bytes, and they are six rather than one on purpose: the ids CANNOT be
+// packed in-graph. ggml_cuda's supports_op refuses CONCAT on an I32 src
+// (ggml-cuda.cu:7517-7520) and CPY handles only F32->F32/F16 (:7481-7492), so any packing
+// node would be scheduled onto the CPU and cost a D2H/H2D round trip of the whole chain
+// every proposal. Packing the CONFIDENCES is legal (they are F32) and is done in-graph, so
+// this is 1 + block_size reads rather than 2*block_size.
+//
+// The cost is instrumented (t_dspark_read_us) because it is the ONLY justification for the
+// fused GGML_OP_DSPARK_MARKOV_HEAD in plan 7.2, whose single F32 [2, block_size] dst makes
+// this one read. Do not add that op on a hunch; add it on this number.
+static void llama_dspark_extract_draft(llama_context & lctx, ggml_cgraph * gf) {
+    const auto & hp = lctx.model.hparams;
+    const int    nb = (int) hp.dspark_block_size;
+
+    lctx.dspark_draft_ok = false;
+    lctx.dspark_draft_ids .assign(nb, -1);
+    lctx.dspark_draft_conf.assign(nb, 0.0f);
+    if (nb <= 0) {
+        return;
+    }
+
+    // Exact names, not a sscanf prefix match: ggml derives view/cont node names from their
+    // source ("X (view)", "X (cont)"), so a prefix match would happily bind a view of an id
+    // instead of the id. Nothing views these today; the point is that nothing can.
+    std::vector<std::string> want(nb);
+    for (int k = 0; k < nb; ++k) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "dspark_id_%d", k);
+        want[k] = nm;
+    }
+
+    struct ggml_tensor * conf = nullptr;
+    std::vector<struct ggml_tensor *> ids(nb, nullptr);
+    int found = 0;
+    for (int i = gf->n_nodes - 1; i >= 0 && found < nb + 1; --i) {
+        struct ggml_tensor * t = gf->nodes[i];
+        if (!conf && strcmp(t->name, "result_dspark_conf") == 0) {
+            conf = t;
+            ++found;
+            continue;
+        }
+        for (int k = 0; k < nb; ++k) {
+            if (!ids[k] && want[k] == t->name) { ids[k] = t; ++found; break; }
+        }
+    }
+    if (!conf) {
+        return;
+    }
+    for (int k = 0; k < nb; ++k) {
+        if (!ids[k]) return;
+    }
+    GGML_ASSERT(ggml_nelements(conf) == nb && "result_dspark_conf is [1, block_size]");
+
+    // Drain the forward FIRST and start the clock after. The pending compute (and the
+    // logits copy issued just above) has to complete regardless of DSpark, so charging it
+    // to the readback would report ~800 us for 24 bytes and make the fused-op decision on
+    // a number that is almost entirely somebody else's.
+    ggml_backend_sched_synchronize(lctx.sched);
+    const int64_t t0 = ggml_time_us();
+
+    // async reads on each node's own backend, then ONE scheduler-wide sync. The
+    // synchronous ggml_backend_tensor_get would copy on cudaStreamPerThread, which is not
+    // the backend's compute stream - correct only by luck.
+    struct ggml_backend * b = ggml_backend_sched_get_tensor_backend(lctx.sched, conf);
+    GGML_ASSERT(b != nullptr);
+    ggml_backend_tensor_get_async(b, conf, lctx.dspark_draft_conf.data(), 0, (size_t) nb*sizeof(float));
+
+    std::vector<int32_t> raw(nb, -1);
+    for (int k = 0; k < nb; ++k) {
+        struct ggml_backend * bk = ggml_backend_sched_get_tensor_backend(lctx.sched, ids[k]);
+        GGML_ASSERT(bk != nullptr);
+        ggml_backend_tensor_get_async(bk, ids[k], &raw[k], 0, sizeof(int32_t));
+    }
+    ggml_backend_sched_synchronize(lctx.sched);
+
+    for (int k = 0; k < nb; ++k) {
+        lctx.dspark_draft_ids[k] = (llama_token) raw[k];
+    }
+    lctx.t_dspark_read_us += ggml_time_us() - t0;
+    lctx.n_dspark_read    += 1;
+    lctx.dspark_draft_ok   = true;
+}
+
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -5851,6 +5944,19 @@ static int llama_decode_internal(
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
         struct ggml_tensor * embd = nullptr;
 
+        // ... except for DSpark, where it structurally cannot be: the M4 Markov chain
+        // CONSUMES result_output, so it is appended after it and the chain's tail is the
+        // last node. Trusting the position here fires the "missing result_output" assert
+        // below on every single drafter forward. Name-scan instead - the same thing the
+        // embeddings branch already does a few lines down.
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+            res = nullptr;
+            for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                if (strcmp(gf->nodes[i]->name, "result_output") == 0) { res = gf->nodes[i]; break; }
+            }
+            GGML_ASSERT(res && "dspark graph has no result_output node");
+        }
+
         if (lctx.n_outputs == 0) {
             // no output
             res = nullptr;
@@ -5965,6 +6071,11 @@ static int llama_decode_internal(
             tim2 = ggml_time_us();
             printf("get_result(...): %d us\n", int(tim2-tim1));
 #endif
+        }
+
+        // extract the DSpark M4 draft (ids + confidence logits)
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+            llama_dspark_extract_draft(lctx, gf);
         }
 
         // extract embeddings
@@ -8064,6 +8175,140 @@ bool llama_dspark_set_capture(struct llama_context * ctx, const float * data, si
         return false;
     }
     ctx->dspark_cap_host.assign(data, data + n);
+    return true;
+}
+
+// ---- M4: the Markov chain + confidence head, host side ---------------------
+
+bool llama_dspark_set_prev(struct llama_context * ctx, llama_token prev) {
+    if (!ctx) return false;
+    if (ctx->model.arch != LLM_ARCH_DEEPSEEK4_DSPARK) {
+        LLAMA_LOG_ERROR("%s: context is not a DSpark drafter\n", __func__);
+        return false;
+    }
+    if (prev < 0 || (uint32_t) prev >= ctx->model.hparams.n_vocab) {
+        LLAMA_LOG_ERROR("%s: prev token %d outside the vocab\n", __func__, prev);
+        return false;
+    }
+    ctx->dspark_prev_host = (int32_t) prev;
+    return true;
+}
+
+int llama_dspark_get_draft(struct llama_context * ctx, llama_token * ids_out, float * conf_out) {
+    if (!ctx || ctx->model.arch != LLM_ARCH_DEEPSEEK4_DSPARK) return -1;
+    if (!ctx->dspark_draft_ok) return -1;
+    const int nb = (int) ctx->model.hparams.dspark_block_size;
+    for (int k = 0; k < nb; ++k) {
+        if (ids_out)  ids_out [k] = ctx->dspark_draft_ids [k];
+        if (conf_out) conf_out[k] = ctx->dspark_draft_conf[k];
+    }
+    return nb;
+}
+
+// The reference's dspark_confident_prefix_len (ds4.c:32330-32341), verbatim, with ds4's
+// own sigmoid_stable (ds4.c ~:31500). It lives here rather than in each caller so the
+// truncation rule cannot drift between the harness, the spec loop and the server.
+//
+// threshold <= 0 disables pruning entirely (ds4's --dspark-confidence 0): the full block is
+// proposed. That is also the fixed-shape mode, and the A/B-parity mode against ds4.
+int llama_dspark_confident_prefix(const float * conf_logits, int n, float threshold) {
+    if (!conf_logits || n <= 0) return 0;
+    if (!(threshold > 0.0f))    return n;
+    int len = 0;
+    for (int k = 0; k < n; ++k) {
+        const float x = conf_logits[k];
+        const float p = x >= 0.0f ? 1.0f/(1.0f + expf(-x)) : expf(x)/(1.0f + expf(x));
+        if (p < threshold) break;
+        ++len;
+    }
+    return len;
+}
+
+void llama_dspark_read_stats(const struct llama_context * ctx, int64_t * n_reads, int64_t * total_us) {
+    if (n_reads)  *n_reads  = ctx ? ctx->n_dspark_read    : 0;
+    if (total_us) *total_us = ctx ? ctx->t_dspark_read_us : 0;
+}
+
+// ---- M4 self-test: synthetic successor weights -----------------------------
+//
+// Installs a synthetic markov_w1/markov_w2 pair with ONE property:
+//
+//     argmax_v ( w2[v] . w1[:, p] )  ==  (p + 1) mod n_vocab,  with a margin far larger
+//                                        than the real logit range
+//
+// so a genuinely SEQUENTIAL chain seeded with prev=t must emit [t+1, t+2, t+3, t+4, t+5]
+// while a PARALLELISED one emits [t+1, t+1, t+1, t+1, t+1]. That is a check with a
+// specific, loud, arithmetic failure mode - the opposite of a check that can only say yes.
+//
+// Construction: write p in base 64 as (c0, c1, c2) - 64^3 = 262144 > any vocab we serve -
+// and one-hot each digit into its own 64-wide slice of the rank-256 state. w2[v] carries
+// the one-hot of pp = (v-1) mod n_vocab. The dot product is then A^2 * (number of matching
+// digits): 3*A^2 at the unique successor, at most 2*A^2 anywhere else. A = 12 puts the
+// margin at 144, versus a measured real logit span of about 50 (M3a: about +-25).
+//
+// This mutates model weights, so it is an explicit call, never an env var: it must be
+// impossible for a production path to wander into it.
+bool llama_dspark_install_selftest_weights(struct llama_model * drafter) {
+    if (!drafter || drafter->arch != LLM_ARCH_DEEPSEEK4_DSPARK) return false;
+    const auto & hp = drafter->hparams;
+    if (hp.n_layer == 0) return false;
+
+    ggml_tensor * w1 = drafter->layers[hp.n_layer-1].dspark_markov_w1;
+    ggml_tensor * w2 = drafter->layers[hp.n_layer-1].dspark_markov_w2;
+    if (!w1 || !w2) return false;
+    if (w1->type != GGML_TYPE_Q8_0 || w2->type != GGML_TYPE_Q8_0) {
+        LLAMA_LOG_ERROR("%s: expected Q8_0 markov weights, got %s/%s\n",
+                __func__, ggml_type_name(w1->type), ggml_type_name(w2->type));
+        return false;
+    }
+
+    const int64_t rank = w1->ne[0];
+    const int64_t V    = w1->ne[1];
+    if (rank < 192) {
+        LLAMA_LOG_ERROR("%s: rank %lld < 192, the base-64 digit encoding does not fit\n",
+                __func__, (long long) rank);
+        return false;
+    }
+    if (V > 64LL*64LL*64LL) {
+        LLAMA_LOG_ERROR("%s: vocab %lld exceeds the base-64 encoding\n", __func__, (long long) V);
+        return false;
+    }
+
+    const float A = 12.0f;
+    const int64_t CHUNK = 4096;
+    std::vector<float>   f(rank*CHUNK);
+    std::vector<uint8_t> q((size_t) ggml_row_size(GGML_TYPE_Q8_0, rank) * CHUNK);
+
+    auto write_rows = [&](ggml_tensor * t, bool successor) {
+        for (int64_t base = 0; base < V; base += CHUNK) {
+            const int64_t nr = std::min<int64_t>(CHUNK, V - base);
+            std::fill(f.begin(), f.begin() + rank*nr, 0.0f);
+            for (int64_t r = 0; r < nr; ++r) {
+                const int64_t v  = base + r;
+                // w1 is indexed by p directly; w2[v] must carry the code of the p that
+                // maps TO v, i.e. pp = v-1.
+                const int64_t pp = successor ? ((v - 1 + V) % V) : v;
+                const int64_t c0 =  pp        % 64;
+                const int64_t c1 = (pp /   64) % 64;
+                const int64_t c2 = (pp / 4096) % 64;
+                float * row = f.data() + r*rank;
+                row[      c0] = A;
+                row[ 64 + c1] = A;
+                row[128 + c2] = A;
+            }
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), q.data(), 0, nr, rank, nullptr, nullptr);
+            ggml_backend_tensor_set(t, q.data(),
+                    (size_t) ggml_row_size(GGML_TYPE_Q8_0, rank) * base,
+                    (size_t) ggml_row_size(GGML_TYPE_Q8_0, rank) * nr);
+        }
+    };
+
+    write_rows(w1, /*successor*/ false);
+    write_rows(w2, /*successor*/ true);
+
+    LLAMA_LOG_WARN("%s: SYNTHETIC successor weights installed over markov_w1/w2 "
+                   "(rank=%lld vocab=%lld A=%.1f). This model no longer drafts real tokens.\n",
+                   __func__, (long long) rank, (long long) V, (double) A);
     return true;
 }
 

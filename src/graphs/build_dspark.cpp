@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 // ============================================================================
 // DSpark block drafter (M3).
@@ -95,6 +96,11 @@ ggml_cgraph * llm_build_context::build_dspark() {
     lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
     ggml_set_input(lctx.inp_tokens);
     cb(lctx.inp_tokens, "dspark_inp_tokens", -1);
+
+    // M4: the Markov chain's seed - the token the target just committed.
+    lctx.inp_dspark_prev = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_input(lctx.inp_dspark_prev);
+    cb(lctx.inp_dspark_prev, "dspark_prev", -1);
 
     ggml_tensor * inp_pos = build_inp_pos();
 
@@ -332,17 +338,183 @@ ggml_cgraph * llm_build_context::build_dspark() {
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
-    cb(cur, "dspark_head_in", -1);
+    ggml_tensor * head_in = cur;                                  // [n_embd, n_out]
+    cb(head_in, "dspark_head_in", -1);
 
-    cur = llm_build_lora_mm(lctx, ctx0, tgt->output, cur);
-    cb(cur, "result_output", -1);                                 // [n_vocab, n_block]
+    ggml_tensor * logits = llm_build_lora_mm(lctx, ctx0, tgt->output, head_in);
+    cb(logits, "result_output", -1);                              // [n_vocab, n_out]
 
-    ggml_build_forward_expand(gf, cur);
+    // MANDATORY once anything is appended after it, and MEASURED - not a precaution.
+    // In every other arch result_output is the graph's last node, so ggml-alloc never gets
+    // the chance to recycle it and llama_decode's readback is safe by position. Here the
+    // M4 chain consumes it and then keeps allocating: the moment position k's view/cont is
+    // done, result_output's last child is gone, ggml_gallocr_free_node hands its 2.5 MB
+    // back (ggml-alloc.c:547) and the next 517 KB node in the chain lands on top of ROW 0.
+    // The chain itself still computes the right answer - it had already read the row - but
+    // llama_get_logits() then returns a corrupted first row, silently. Measured exactly
+    // that way: positions 1..4 of the readback matched the tapped values bit-for-bit and
+    // position 0 matched nothing at all.
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
 
-    // 3e (M4): the rank-256 Markov chain and the confidence head are applied to these
-    // logits, sequentially over k, with confidence evaluated BEFORE the bias at each
-    // position and short-circuiting (ds4.c:31941-31986, :32060-32227). Composed from
-    // existing ops first, as the bit-exactness oracle for any later fused kernel.
+    // ========================================================================
+    // 3e (M4): the rank-256 Markov chain and the confidence head.
+    //
+    //   state_k = markov_w1[:, prev]                                 ds4.c:32169-32172
+    //   feat_k  = concat( hidden[k] (n_embd), state_k (rank) )   <- hidden FIRST
+    //                                                                ds4.c:32088-32095
+    //   conf_k  = sigmoid( conf_proj . feat_k )                      ds4.c:32180-32190
+    //   id_k    = argmax( logits[:,k] + markov_w2^T . state_k )      ds4.c:32242-32257
+    //   prev    = id_k                                               ds4.c:32266
+    //
+    // Composed entirely from existing ggml ops (plan 7.1). The chain is the bit-exactness
+    // ORACLE for any later fused GGML_OP_DSPARK_MARKOV_HEAD: a new op must never be the
+    // reason temp-0 output drifts.
+    //
+    // WHERE THIS DIFFERS FROM THE REFERENCE, AND WHY IT IS NOT AN APPROXIMATION: ds4 ships
+    // TWO paths. The lazy runtime one BREAKS out of the loop the moment a confidence falls
+    // under the threshold (ds4.c:32187-32190); the probe one computes ALL block_size
+    // confidences with dspark_eval_confidence_probe (ds4.c:32053-32105) and truncates
+    // afterwards with dspark_confident_prefix_len (ds4.c:32330-32341). A static graph can
+    // express the second exactly, and the two produce the IDENTICAL proposal - the break is
+    // a compute saver, not a semantic. Truncation happens on the host
+    // (llama_dspark_confident_prefix), which is the same function ds4 uses.
+    //
+    // sigmoid is deliberately NOT built. It is monotone, so comparing its argument against
+    // logit(threshold) is identical; leaving it out removes an op and a rounding step. The
+    // stored value is the RAW LOGIT and the host applies the stable sigmoid.
+    //
+    // THREE TRAPS, all of them silent rather than loud:
+    //  A. the five ids CANNOT be packed into one I32 tensor in-graph. ggml_cuda's
+    //     supports_op REFUSES CONCAT on an I32 src (ggml-cuda.cu:7517-7520) and CPY only
+    //     handles F32->F32/F16 (:7481-7492), so a pack would be scheduled onto the CPU and
+    //     cost a D2H/H2D round trip of the chain per proposal - which reads as "DSpark is
+    //     mysteriously slower", not as an error. Five 4-byte reads is the cheaper answer;
+    //     the fused op (plan 7.2, one F32 [2,block_size] dst) is the real fix if the
+    //     instrumented read cost ever justifies it.
+    //  B. for the same reason the argmax result is touched ONLY as src[1] of the next
+    //     get_rows. No cont, no reshape, no view-of-a-view - each of those is a cpy.
+    //  C. ggml-alloc REUSES a tensor's storage the moment its last consumer is done
+    //     (ggml-alloc.c:500,547) unless GGML_TENSOR_FLAG_OUTPUT is set. Without
+    //     ggml_set_output the host reads back whatever overwrote id_0..id_3 - measured, in
+    //     the M4 preflight, as ids like 999080960, which are float bit patterns. Every id
+    //     and the packed confidence MUST be flagged.
+    // ========================================================================
+    {
+        const auto & fin = model.layers[n_layer-1];   // stage 2 carries both heads
+        GGML_ASSERT(fin.dspark_markov_w1 && fin.dspark_markov_w2 && fin.dspark_conf_proj &&
+                "DSpark M4: the final stage must carry markov_w1/w2 and confidence_head.proj");
+
+        const int64_t rank    = hparams.dspark_markov_rank;
+        const int64_t n_vocab = logits->ne[0];
+        GGML_ASSERT(fin.dspark_markov_w1->ne[0] == rank && fin.dspark_markov_w2->ne[0] == rank);
+        GGML_ASSERT(fin.dspark_conf_proj->ne[0] == n_embd + rank &&
+                "conf_proj is [n_embd+markov_rank, 1] - the feature is concat(hidden, state)");
+        // The chain indexes rows 0..n_block-1 of BOTH logits and head_in, so the drafter
+        // batch must flag exactly the k draft rows and nothing else. In the worst-case
+        // reserve n_outputs is the whole batch, which is wider - that graph is never run,
+        // and being wider keeps the node count identical so the reserve still covers the
+        // real graph.
+        GGML_ASSERT(logits->ne[1] >= n_block && head_in->ne[1] >= n_block);
+        if (!is_reserve) {
+            GGML_ASSERT(logits->ne[1] == n_block &&
+                    "DSpark M4: the drafter batch must flag exactly block_size output rows");
+        }
+
+        std::vector<ggml_tensor *> state_node(n_block, nullptr);
+        std::vector<ggml_tensor *> id_node   (n_block, nullptr);
+        std::vector<ggml_tensor *> conf_node (n_block, nullptr);
+
+        // NEGATIVE CONTROL, and the only reason it exists: a gate that cannot fail is not
+        // a gate. PXA_DSPARK_BREAK_CHAIN=1 seeds every position from inp_dspark_prev
+        // instead of from its predecessor - i.e. it builds exactly the parallelised chain
+        // that reproduces DFlash's suffix decay - so both property-3 gates (the pointer
+        // asserts below, and the successor self-test in the M4 harness) can be shown to
+        // catch it. It is loud, it is off by default, and it must never be set anywhere
+        // except a deliberate control run.
+        const bool break_chain = getenv("PXA_DSPARK_BREAK_CHAIN") &&
+                                 atoi(getenv("PXA_DSPARK_BREAK_CHAIN")) != 0;
+        if (break_chain) {
+            fprintf(stderr, "%s: *** PXA_DSPARK_BREAK_CHAIN=1: the Markov chain is being "
+                            "built PARALLEL. This is a negative control. Proposals from "
+                            "this graph are WRONG by construction. ***\n", __func__);
+        }
+
+        ggml_tensor * prev = lctx.inp_dspark_prev;
+
+        for (int64_t k = 0; k < n_block; ++k) {
+            // ---- the state is SHARED by the confidence at k and the bias at k ----
+            ggml_tensor * state = ggml_get_rows(ctx0, fin.dspark_markov_w1, prev);   // F32 [rank,1]
+            cb(state, "dspark_state", (int) k);
+
+            // ---- confidence at k: conf_proj . concat(hidden_k, state) ----
+            ggml_tensor * h_k = ggml_view_2d(ctx0, head_in, n_embd, 1,
+                    head_in->nb[1], (size_t) k * head_in->nb[1]);
+            ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, h_k), state, 0);  // F32 [E+r,1]
+            ggml_tensor * cfl  = ggml_mul_mat(ctx0, fin.dspark_conf_proj, feat);     // F32 [1,1]
+            cb(cfl, "dspark_conf", (int) k);
+
+            // ---- Markov bias + argmax at k ----
+            ggml_tensor * bias = ggml_mul_mat(ctx0, fin.dspark_markov_w2, state);    // F32 [V,1]
+            cb(bias, "dspark_bias", (int) k);
+            ggml_tensor * lgk  = ggml_view_2d(ctx0, logits, n_vocab, 1,
+                    logits->nb[1], (size_t) k * logits->nb[1]);
+            ggml_tensor * biased = ggml_add(ctx0, ggml_cont(ctx0, lgk), bias);       // F32 [V,1]
+            cb(biased, "dspark_biased", (int) k);
+            ggml_tensor * id_k   = ggml_argmax(ctx0, biased);                        // I32 [1]
+
+            ggml_format_name(id_k, "dspark_id_%d", (int) k);
+            ggml_set_output(id_k);                       // trap C
+            ggml_build_forward_expand(gf, id_k);
+
+            state_node[k] = state;
+            id_node  [k]  = id_k;
+            conf_node[k]  = cfl;
+
+            prev = break_chain ? lctx.inp_dspark_prev : id_k;   // <<<< PROPERTY 3: THE SEQUENTIAL EDGE
+        }
+
+        // Pack ONLY the confidences - they are F32, so concat is legal (trap A).
+        ggml_tensor * conf = conf_node[0];
+        for (int64_t k = 1; k < n_block; ++k) {
+            conf = ggml_concat(ctx0, conf, conf_node[k], 1);
+        }
+        ggml_set_name(conf, "result_dspark_conf");                                  // F32 [1,k]
+        ggml_set_output(conf);                           // trap C
+        ggml_build_forward_expand(gf, conf);
+
+        // ---- PROPERTY 3, ENFORCED STRUCTURALLY, IN EVERY BUILD ----------------
+        // Parallelising the chain (every position reading the last REAL token instead of
+        // its predecessor's argmax) reproduces exactly the DFlash suffix decay that DSpark
+        // exists to fix - worth +16.3% accepted length. It cannot crash. It surfaces only
+        // as low acceptance, which is indistinguishable from "the drafter is mediocre".
+        // So it is asserted on POINTER IDENTITY, not on shapes: a batched rewrite (one
+        // get_rows over five ids, one argmax over [V,k]) fails here at graph-build time,
+        // in every build, before a single token is ever drafted.
+        GGML_ASSERT(state_node[0]->src[1] == lctx.inp_dspark_prev &&
+                "DSpark M4: step 0's state must be seeded from inp_dspark_prev");
+        for (int64_t k = 1; k < n_block && !break_chain; ++k) {
+            GGML_ASSERT(state_node[k]->src[1] == id_node[k-1] &&
+                    "DSpark M4: the Markov chain has been PARALLELISED - see plan 1.4 property 3");
+        }
+        if (break_chain) {
+            // prove the assert above would have fired, without aborting the control run
+            for (int64_t k = 1; k < n_block; ++k) {
+                if (state_node[k]->src[1] != id_node[k-1]) {
+                    fprintf(stderr, "%s: NEGATIVE CONTROL: the structural assert WOULD have "
+                                    "fired at k=%d (state src is not the previous argmax)\n",
+                                    __func__, (int) k);
+                    break;
+                }
+            }
+        }
+        int n_argmax = 0;
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            if (gf->nodes[i]->op == GGML_OP_ARGMAX) ++n_argmax;
+        }
+        GGML_ASSERT(n_argmax == (int) n_block &&
+                "DSpark M4: exactly one argmax per block position, unrolled");
+    }
 
     return gf;
 }

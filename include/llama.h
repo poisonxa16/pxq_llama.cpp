@@ -620,6 +620,39 @@ extern "C" {
     LLAMA_API bool llama_dspark_set_capture(struct llama_context * ctx,
                                             const float * data, size_t n);
 
+    // M4. Seed the rank-256 Markov chain with the token the TARGET just committed
+    // (ds4.c:59232). Must be called before every drafter llama_decode().
+    LLAMA_API bool llama_dspark_set_prev(struct llama_context * ctx, llama_token prev);
+
+    // M4. Read back the last proposal: block_size argmax ids and block_size confidence
+    // values. Returns block_size, or -1 if the last decode produced no draft.
+    //
+    // conf_out receives the confidence head's RAW LOGIT, not sigmoid(x). sigmoid is
+    // monotone so thresholding its argument is identical, and keeping it out of the graph
+    // removes an op and a rounding step - use llama_dspark_confident_prefix() to turn
+    // these into a proposal length rather than re-deriving the rule.
+    LLAMA_API int llama_dspark_get_draft(struct llama_context * ctx,
+                                         llama_token * ids_out,
+                                         float       * conf_out);
+
+    // M4. The reference's dspark_confident_prefix_len (ds4.c:32330-32341): the length of
+    // the leading run whose sigmoid(conf) >= threshold. 0 means propose nothing this
+    // cycle; threshold <= 0 disables pruning and returns n (ds4's --dspark-confidence 0).
+    LLAMA_API int llama_dspark_confident_prefix(const float * conf_logits, int n, float threshold);
+
+    // M4. Cost of the per-proposal device->host readback of the ids and confidences. This
+    // is the ONLY number that justifies fusing the Markov head into one kernel.
+    LLAMA_API void llama_dspark_read_stats(const struct llama_context * ctx,
+                                           int64_t * n_reads, int64_t * total_us);
+
+    // M4 TEST HOOK - DESTRUCTIVE. Overwrites markov_w1/markov_w2 with a synthetic pair
+    // whose only property is argmax_v(w2[v] . w1[:,p]) == (p+1) mod n_vocab, so a
+    // sequential chain seeded with t must emit [t+1 .. t+block_size] and a parallelised one
+    // emits [t+1, t+1, ...]. The model no longer drafts real tokens afterwards. Requires
+    // the markov tensors to sit in a WRITABLE buffer (offloaded, or loaded with
+    // use_mmap=false); a read-only mmap will fault.
+    LLAMA_API bool llama_dspark_install_selftest_weights(struct llama_model * drafter);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);

@@ -58,6 +58,7 @@ llm_build_context::llm_build_context(
         n_expert         (hparams.n_expert),
         n_expert_used    (warmup ? hparams.n_expert : hparams.n_expert_used),
         is_warmup        (warmup),
+        is_reserve       (worst_case),
         freq_base        (cparams.rope_freq_base),
         freq_scale       (cparams.rope_freq_scale),
         ext_factor       (cparams.yarn_ext_factor),

@@ -322,6 +322,24 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_dspark_cap = nullptr; // F32 [n_capture*n_embd, 1]
     std::vector<float>   dspark_cap_host;          // host side of the above
+
+    // M4 - the Markov chain's seed. It is the token the TARGET just committed, i.e. the
+    // `token` argument of ds4_session_prepare_dspark_draft_impl (ds4.c:59232). Deliberately
+    // NOT a view of inp_tokens[1]: that view happens to carry the same value today, but it
+    // welds the chain to the block-seeding convention and to a contiguity contract for no
+    // gain.
+    struct ggml_tensor * inp_dspark_prev = nullptr; // I32 [1]
+    int32_t              dspark_prev_host = 0;
+
+    // M4 outputs, extracted once per drafter forward (see llama_dspark_extract_draft).
+    // conf holds the confidence head's RAW LOGIT, not sigmoid(x): sigmoid is monotone so
+    // the threshold comparison is identical, and leaving it out of the graph removes an op
+    // and a rounding step.
+    std::vector<llama_token> dspark_draft_ids;
+    std::vector<float>       dspark_draft_conf;
+    bool                     dspark_draft_ok  = false;
+    int64_t                  t_dspark_read_us = 0;   // cost of the per-cycle D2H readbacks
+    int64_t                  n_dspark_read    = 0;
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
