@@ -549,7 +549,7 @@ void llama_dsv4_set_inputs(llama_context & lctx, const llama_batch & batch) {
     }
     dsv4_fill(inp.raw_k_idxs, mem.raw_k_idxs_host);
 
-    if (inp.raw_win_idxs && llama_dsv4_raw_window_mode() == 2) {
+    if (inp.raw_win_idxs && llama_dsv4_raw_window_mode(lctx) == 2) {
         // bisect: the FULL ring through the window plumbing, so the maths is the ring's
         std::vector<int32_t> ident((size_t) mem.raw_size);
         for (uint32_t j = 0; j < mem.raw_size; ++j) {
@@ -558,7 +558,7 @@ void llama_dsv4_set_inputs(llama_context & lctx, const llama_batch & batch) {
         ggml_backend_tensor_set(inp.raw_win_idxs, ident.data(), 0, ident.size()*sizeof(int32_t));
     }
 
-    if (inp.raw_kq_mask && llama_dsv4_raw_window_mode() == 1) {
+    if (inp.raw_kq_mask && llama_dsv4_raw_window_mode(lctx) == 1) {
         // window mode: K = [prior n_swa rows from the ring | the nt in-batch keys]
         const llama_pos n_swa    = (llama_pos) mem.n_swa;
         const int64_t   n_kv_raw = inp.raw_kq_mask->ne[0];
@@ -576,17 +576,19 @@ void llama_dsv4_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // ([P, P+nt)) and the prior window ([P-n_swa, P)) never share a ring row.
         // safe filler row: a row this pass definitely wrote, so no gathered row is ever
         // uninitialised. The mask leaves every filler column -inf, so it contributes zero.
-        // ORDER: [in-batch | prior]. Every query's own key lands in column < nt, so the
-        // leading tile is never fully masked (see v6 header). The visible key SET is
-        // identical either way.
+        // ORDER: [prior | in-batch] — KV positions monotonic, the ordering whose maths
+        // was proven byte-identical to the ring on the soft_max graph (checkpoint 12
+        // arms #4/#5). The swapped [in-batch | prior] order (v6) exists only to appease
+        // the fallback FA kernel's leading-tile behaviour and produces WRONG TEXT there;
+        // window mode is not enabled under flash-attn (see llama_dsv4_raw_window_mode).
         const int32_t safe = nt > 0 ? (int32_t) mem.raw_k_idxs_host[0] : 0;
         std::vector<int32_t> win((size_t) n_kv_raw, safe);
-        for (int32_t k = 0; k < nt; ++k) {
-            win[(size_t) k] = (int32_t) mem.raw_k_idxs_host[k];
-        }
         for (llama_pos j = 0; j < n_swa; ++j) {
             const llama_pos pos_j = P - n_swa + j;
-            win[(size_t) nt + (size_t) j] = pos_j >= 0 ? (int32_t) (pos_j % (llama_pos) mem.raw_size) : safe;
+            win[(size_t) j] = pos_j >= 0 ? (int32_t) (pos_j % (llama_pos) mem.raw_size) : safe;
+        }
+        for (int32_t k = 0; k < nt; ++k) {
+            win[(size_t) n_swa + (size_t) k] = (int32_t) mem.raw_k_idxs_host[k];
         }
         if (inp.raw_win_idxs) {
             ggml_backend_tensor_set(inp.raw_win_idxs, win.data(), 0, win.size()*sizeof(int32_t));
@@ -598,16 +600,16 @@ void llama_dsv4_set_inputs(llama_context & lctx, const llama_batch & batch) {
             if (p < 0) {
                 continue;
             }
-            for (int32_t k = 0; k < nt; ++k) {
-                const llama_pos pk = dsv4_batch_pos(batch, k);
-                if (pk >= 0 && pk <= p && p - pk < n_swa) {
-                    mask[(size_t) i*n_kv_raw + (size_t) k] = 0.0f;
-                }
-            }
             for (llama_pos j = 0; j < n_swa; ++j) {
                 const llama_pos pos_j = P - n_swa + j;
                 if (pos_j >= 0 && pos_j <= p && p - pos_j < n_swa) {
-                    mask[(size_t) i*n_kv_raw + (size_t) nt + (size_t) j] = 0.0f;
+                    mask[(size_t) i*n_kv_raw + (size_t) j] = 0.0f;
+                }
+            }
+            for (int32_t k = 0; k < nt; ++k) {
+                const llama_pos pk = dsv4_batch_pos(batch, k);
+                if (pk >= 0 && pk <= p && p - pk < n_swa) {
+                    mask[(size_t) i*n_kv_raw + (size_t) n_swa + (size_t) k] = 0.0f;
                 }
             }
         }
@@ -698,32 +700,52 @@ uint32_t llama_dsv4_get_raw_swa(const llama_context & /*lctx*/) {
     return dsv4_mem().n_swa;
 }
 
-int llama_dsv4_raw_window_mode() {
-    static const int mode = []() {
-        // DEFAULT OFF: the window path is an unfinished experiment that NaNs (see
-        // DS4-QUANT-LADDER checkpoint 12). The shipping behaviour is the full ring.
+int llama_dsv4_raw_window_mode(const llama_context & lctx) {
+    static const int env_mode = []() {
         const char * e = getenv("PXA_DSV4_RAW_WINDOW_KV");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : -1;   // -1 = no explicit override
     }();
-    return mode;
+    if (env_mode >= 0) {
+        return env_mode;
+    }
+    // DEFAULT: window (mode 1) on the non-flash-attn graph, ring (mode 0) under
+    // flash-attn.
+    //
+    // The window path is proven byte-identical to the ring on the soft_max graph
+    // (DS4-QUANT-LADDER checkpoint 12, arms #4/#5), and it is the arm that matches
+    // upstream's raw-attention width (n_swa + n_tokens instead of the whole padded
+    // ring: 640 vs 768 at ub=512 prefill, 129+pad vs 768 at decode). Under
+    // cparams.flash_attn the executing FA kernel rejects the window layout — NaN
+    // with [prior | in-batch] order (online softmax seeded from a fully-masked
+    // leading tile computes exp(-inf - -inf)), wrong text with [in-batch | prior]
+    // (the kernel relies on KV order) — so flash-attn contexts stay on the ring.
+    // NOTE this is the *fallback* FA kernel: CUDA flash-attention itself never runs
+    // for DS4 on sm_70 (head dim 512 needs new_mma / Ampere+, and
+    // ggml_cuda_fattn_is_supported() returns false, see ggml-cuda/fattn.cu).
+    return lctx.cparams.flash_attn ? 0 : 1;
 }
 
-bool llama_dsv4_raw_window_enabled() {
-    return llama_dsv4_raw_window_mode() != 0;
+bool llama_dsv4_raw_window_enabled(const llama_context & lctx) {
+    return llama_dsv4_raw_window_mode(lctx) != 0;
 }
 
-// The CUDA flash-attention launcher asserts K->ne[1] % FATTN_KQ_STRIDE == 0 with
-// FATTN_KQ_STRIDE = 256 (ggml-cuda/fattn-common.cuh). A window width that is not a
-// multiple of 256 is OUTSIDE the kernel contract -- that is what the 132- and 192-wide
-// experiments were, and they produced NaN rather than a clean abort. Never emit one.
+// Window width padding. Default 64: enough that the soft_max path's kernels never
+// see a degenerate tail, and prefill at ub=512 keeps the full lever (128+512 = 640
+// is already a multiple of 64).
+//
+// The old default here was 256, imposed for the CUDA flash-attention contract
+// (K->ne[1] % FATTN_KQ_STRIDE, fattn-common.cuh) — but that contract belongs to a
+// path DS4 cannot take on sm_70: fattn_wmma_f16 supports head dims
+// {64,80,96,112,128,256} and DS4 is 512, whose branch requires new_mma_available
+// (Ampere+). ggml_cuda_fattn_is_supported() therefore returns false and the FA op
+// never reaches a CUDA FA kernel here. Padding to 256 also erased the lever's
+// prefill benefit entirely (640 -> 768 = exactly the ring). If a future target ever
+// routes DS4 through CUDA FA, set PXA_DSV4_RAW_WINDOW_ALIGN=256.
 static uint32_t dsv4_raw_window_align() {
     static const uint32_t a = []() {
         const char * e = getenv("PXA_DSV4_RAW_WINDOW_ALIGN");
-        const int v = e ? atoi(e) : 256;
-        uint32_t r = (uint32_t) (v > 0 ? v : 256);
-        if (r % 256u != 0u) {                 // round UP to the contract, never below it
-            r = ((r / 256u) + 1u) * 256u;
-        }
+        const int v = e ? atoi(e) : 64;
+        uint32_t r = (uint32_t) (v > 0 ? v : 64);
         return r;
     }();
     return a;
@@ -733,8 +755,6 @@ uint32_t llama_dsv4_raw_window_width(const llama_context & /*lctx*/, int64_t n_t
     const uint32_t w = GGML_PAD((uint32_t) (dsv4_mem().n_swa + (uint32_t) n_tokens),
                                 dsv4_raw_window_align());
     const uint32_t r = w < dsv4_mem().raw_size ? w : dsv4_mem().raw_size;
-    // raw_size is itself GGML_PAD(...,256), so both branches stay contract-legal.
-    GGML_ASSERT(r % 256u == 0u && "raw window width must satisfy the FA KQ-stride contract");
     return r;
 }
 

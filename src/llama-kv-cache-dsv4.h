@@ -89,12 +89,15 @@ llama_dsv4_inputs &          llama_dsv4_get_inputs   (llama_context & lctx);
 const llama_dsv4_comp_plan & llama_dsv4_get_plan     (const llama_context & lctx, llama_dsv4_stream s);
 uint32_t                     llama_dsv4_get_raw_n_kv (const llama_context & lctx);
 uint32_t                     llama_dsv4_get_raw_swa  (const llama_context & lctx);
-// PXA_DSV4_RAW_WINDOW_KV (default ON, =0 rolls back): raw attention spans
-// [prior-window gather | in-batch keys] = n_swa + n_tokens rows instead of the whole
-// ring. Same visible key set, far fewer rows (decode: 129 vs ring 768 at ub=512).
-bool                         llama_dsv4_raw_window_enabled();
+// Raw-window lever: raw attention spans [prior-window gather | in-batch keys]
+// = n_swa + n_tokens rows instead of the whole padded ring. Same visible key set,
+// far fewer rows (prefill 640 vs 768 at ub=512; decode 192 vs 768).
+// DEFAULT: ON for non-flash-attn contexts (proven byte-identical there), OFF under
+// flash-attn (the fallback FA kernel rejects the layout — checkpoint 12).
+// PXA_DSV4_RAW_WINDOW_KV=0|1|2 overrides unconditionally.
+bool                         llama_dsv4_raw_window_enabled(const llama_context & lctx);
 // 0 = ring, 1 = window lever, 2 = identity-gather bisect (ring maths, window plumbing)
-int                          llama_dsv4_raw_window_mode();
+int                          llama_dsv4_raw_window_mode(const llama_context & lctx);
 // window K width, padded so the attention kernel never sees a partial trailing tile
 uint32_t                     llama_dsv4_raw_window_width(const llama_context & lctx, int64_t n_tokens);
 int64_t                      llama_dsv4_get_raw_nrot (const llama_context & lctx);  // 0 => no raw k_rot
