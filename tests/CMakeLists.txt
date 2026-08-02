@@ -207,6 +207,26 @@ llama_build_and_test(test-regex-partial.cpp)
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
+# DeepSeek-V4 CUDA correctness harnesses. Both need a real CUDA device (a few hundred MB
+# of VRAM each), so they are LABEL "cuda" and excluded from the default ctest run:
+#     ctest -L cuda
+# They are registered here on purpose. They ARE the correctness basis for the DSA and
+# flipped-RoPE ports, and a correctness basis that only exists as an ad-hoc compile line
+# on one borrowed machine is a correctness basis that will be lost.
+#
+# test-dsa-attn is deliberately registered WITHOUT PXA_DSA_ATTN=1: in that mode it
+# asserts the shipped default (DSA declined). Run it with PXA_DSA_ATTN=1 by hand to
+# exercise the kernel numerics.
+if (GGML_CUDA)
+    llama_build(test-dsa-attn.cpp)
+    target_link_libraries(test-dsa-attn PRIVATE ggml)
+    llama_test(test-dsa-attn LABEL "cuda")
+
+    llama_build(test-rope-flipped.cpp)
+    target_link_libraries(test-rope-flipped PRIVATE ggml)
+    llama_test(test-rope-flipped LABEL "cuda")
+endif()
+
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
