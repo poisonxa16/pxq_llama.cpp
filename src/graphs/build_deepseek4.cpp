@@ -176,10 +176,12 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
 // raised by an earlier kernel), while the same binary with the switch off, and
 // the same binary at `-fa off`, both complete.
 //
-// Cause: on sm_70 head dim 512 has no CUDA flash-attention kernel, so at
-// `-fa on` every DS4 attention node is placed on the CPU backend and the
-// attention output lives in host memory. An in-place rope is a VIEW of that
-// tensor, and ggml_backend_cuda_supports_op returns true unconditionally for
+// Cause: on sm_70 head dim 512 has no CUDA flash-attention kernel, so most DS4
+// attention nodes end up on the CPU backend and their outputs live in host
+// memory. Measured with GGML_SCHED_DEBUG=2 at this fill: FLASH_ATTN CUDA=43
+// CPU=86, while ROPE_BACK is CUDA=129 CPU=0 -- every de-rope assigned to CUDA0,
+// 86 of them viewing a host-resident tensor. An in-place rope is a VIEW, and
+// ggml_backend_cuda_supports_op returns true unconditionally for
 // ROPE/ROPE_BACK, so the scheduler is free to assign the view to CUDA. A view
 // cannot be satisfied by inserting a copy -- it must write into its view_src's
 // actual buffer -- so the kernel writes to a host pointer. Upstream does not
