@@ -172,7 +172,14 @@ static void llm_load_hparams_dspark(llama_model_loader & ml, llama_model & model
     // n_expert_used==0.
     hparams.n_expert_used = 6;
 
-    model.type = e_model::MODEL_UNKNOWN;
+    model.type  = e_model::MODEL_UNKNOWN;
+    model.ftype = ml.ftype;
+
+    // llm_load_hparams' epilogue never runs for this arch (we returned early), and
+    // that epilogue is what populates rope_type. Unset it stays LLAMA_ROPE_TYPE_NONE
+    // (-1), and -1 & 1 == 1 trips ggml_rope's mode assert on the first rope node.
+    // Use the same single source of truth every other arch uses.
+    hparams.rope_type = llama_rope_type(&model);
 
     LLAMA_LOG_INFO("%s: DSpark support: stages=%u block_size=%u markov_rank=%u noise_id=%d "
                    "n_embd=%u n_vocab=%u n_head=%u kv_lora=%u q_lora=%u n_expert=%u n_ff_exp=%u hc=%u\n",

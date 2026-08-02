@@ -7391,6 +7391,21 @@ struct llama_context * llama_init_from_model(
 
     cparams.n_ubatch         = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // DSpark: the drafter's ubatch IS the block. Every forward is exactly
+    // block_size+1 rows (the target row plus k draft rows), the shape is constant by
+    // design so `can_reuse_graph` holds, and the worst-case graph reserve at context
+    // creation builds with n_ubatch - so anything else makes the reserve build a graph
+    // the drafter can never actually run. Forced here rather than left to the caller.
+    if (model->arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+        const uint32_t n_rows = model->hparams.dspark_block_size + 1;
+        if (cparams.n_batch != n_rows || cparams.n_ubatch != n_rows) {
+            LLAMA_LOG_INFO("%s: DSpark drafter: forcing n_batch/n_ubatch to block_size+1 = %u\n",
+                    __func__, n_rows);
+        }
+        cparams.n_batch  = n_rows;
+        cparams.n_ubatch = n_rows;
+    }
+
     cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
@@ -8014,6 +8029,7 @@ bool llama_dspark_bind_target(struct llama_model * drafter, const struct llama_m
         { target->output   != nullptr,                                     "target carries output.weight" },
         { dh.dspark_markov_rank % 32 == 0,                                 "markov_rank % 32 == 0 (Q8_0 gemv)" },
         { dh.n_expert_used > 0 && dh.n_expert > 0,                         "MoE routing constants are set" },
+        { dh.rope_type == th.rope_type,                                    "drafter and target share a rope convention" },
     };
 
     bool ok = true;

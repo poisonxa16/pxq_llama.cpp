@@ -100,8 +100,11 @@ ggml_cgraph * llm_build_context::build_dspark() {
 
     // Non-causal within the block. Filled by llama_set_inputs; NOT build_inp_KQ_mask(),
     // whose fill is driven by cparams.causal_attn and would hide row 3 from row 1.
+    // NOTE: n_kv is the llm_build_context member (worst_case ? kv_self.size : kv_self.n).
+    // Do NOT shadow it with kv_self.n: during the worst-case graph reserve at context
+    // creation kv_self.n is 0, which builds a zero-width K and a zero-width mask and
+    // trips ggml_mul_mat deep inside the attention.
     const auto & kv_self = lctx.kv_self;
-    const int64_t n_kv   = kv_self.n;
     {
         const int64_t n_mask_rows = GGML_PAD(n_rows, GGML_KQ_MASK_PAD);
         lctx.inp_KQ_mask = ggml_new_tensor_2d(ctx0,
@@ -321,9 +324,14 @@ ggml_cgraph * llm_build_context::build_dspark() {
     cur = llm_build_norm(ctx0, cur, hparams,
             model.layers[n_layer-1].dspark_norm, nullptr, LLM_NORM_RMS, cb, -1);
 
-    // drop the target row: only the k draft positions get logits
-    cur = ggml_view_2d(ctx0, cur, n_embd, n_block, cur->nb[1], cur->nb[1]);
-    cur = ggml_cont(ctx0, cur);
+    // Drop the target row: only the k draft positions get logits. Driven by the batch's
+    // own out_ids rather than a hardcoded slice - llama_set_inputs asserts the tensor
+    // exists whenever n_outputs < n_tokens, and using it keeps the head in agreement with
+    // whatever rows the caller actually flagged.
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "dspark_head_in", -1);
 
     cur = llm_build_lora_mm(lctx, ctx0, tgt->output, cur);
