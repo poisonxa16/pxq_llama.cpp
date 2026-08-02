@@ -4649,14 +4649,35 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         float     * d32 = cparams.flash_attn ? nullptr : (float *)     lctx.inp_KQ_mask->data;
         ggml_half * d16 = cparams.flash_attn ? (ggml_half *) lctx.inp_KQ_mask->data : nullptr;
 
+        // The mask is ALLOCATED at width `n_kv` (the llm_build_context member) and FILLED
+        // here at width `kv_self.n`. They agree by convention, not by construction; if they
+        // ever diverge the tail of every row is uninitialised backend memory and random rows
+        // attend to random cells, silently. Fill the whole ALLOCATED width and mask
+        // everything past the live KV, so the invariant cannot be violated by accident.
+        const int64_t n_mask_w = lctx.inp_KQ_mask->ne[0];
+        GGML_ASSERT(n_mask_w >= n_kv);
+
+        // NEGATIVE CONTROL for property 2 (non-causal intra-block attention). That property
+        // is invisible to any gate that reads this same forward's output - a causal mask
+        // cancels on both sides of such a comparison. PXA_DSPARK_FORCE_CAUSAL=1 fills the
+        // block square lower-triangular instead, so a gate can be shown to FAIL. If flipping
+        // it does NOT change the proposal, the mask is not reaching the attention at all and
+        // property 2 is unimplemented in practice whatever this code says.
+        static const bool force_causal = [] {
+            const char * e = getenv("PXA_DSPARK_FORCE_CAUSAL");
+            return e && *e && *e != '0';
+        }();
+
         for (int64_t i = 0; i < n_padded; ++i) {
-            for (int64_t j = 0; j < n_kv; ++j) {
+            for (int64_t j = 0; j < n_mask_w; ++j) {
                 float v = -INFINITY;
-                if (i < n_rows) {
+                if (i < n_rows && j < n_kv) {
                     const bool in_block = (j >= block_first && j < block_first + n_rows);
                     if (in_block) {
                         // NON-CAUSAL: the whole block square is open, both directions.
-                        v = 0.0f;
+                        // Block row i occupies KV cell block_first + i, so the causal
+                        // control hides every cell strictly right of the diagonal.
+                        v = (force_causal && (j - block_first) > i) ? -INFINITY : 0.0f;
                     } else if (!kv_self.cells[j].is_empty() &&
                                 kv_self.cells[j].has_seq_id(batch.seq_id[0][0]) &&
                                 kv_self.cells[j].pos <= base_pos) {
@@ -4668,8 +4689,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         }
                     }
                 }
-                if (d32) d32[i*n_kv + j] = v;
-                else     d16[i*n_kv + j] = ggml_fp32_to_fp16(v);
+                if (d32) d32[i*n_mask_w + j] = v;
+                else     d16[i*n_mask_w + j] = ggml_fp32_to_fp16(v);
             }
         }
 
