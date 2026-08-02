@@ -998,7 +998,16 @@ ggml_tensor * llm_build_context::build_dsv4_raw_attention(
 
     ggml_tensor * kq_mask = dsv4_finalize_kq_mask(ctx0, inp.raw_kq_mask, cparams.flash_attn);
 
-    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k, k, kq_mask, sinks, kq_scale, il);
+    // Same n_swa bound as the raw half of the other two regimes. There is no compressed
+    // stream here, so this only pays when the padded ring is much wider than the window
+    // -- which is exactly the ring-mode decode case, where raw_size is
+    // PAD(n_ubatch + n_swa + 1, 256) but a query still sees at most n_swa rows.
+    // In window mode the raw view is already tight and the worth-it test declines.
+    // (ik passes -1 here because their raw path is per-ubatch and already narrow; ours
+    // is a modular ring, so the same argument does not carry over.)
+    const int64_t n_visible_max = (int64_t) llama_dsv4_get_raw_swa(lctx);
+
+    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k, k, kq_mask, sinks, kq_scale, il, n_visible_max);
     if (k_rot) {
         out = dsv4_mul_mat_rot(ctx0, out, k_rot);
     }
