@@ -9421,7 +9421,12 @@ static struct ggml_tensor * ggml_rope_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    // PXA_ROPE_FLIPPED_v1: op_params[15] is the "flipped" flag (rotate the
+    // TRAILING n_dims channels instead of the leading ones). It is written
+    // after construction by the caller, so zero it here explicitly rather than
+    // relying on ggml_new_tensor_impl's { 0 } initialiser - a stale 1 would
+    // silently rotate the wrong half of every rope in the graph.
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
@@ -9433,6 +9438,7 @@ static struct ggml_tensor * ggml_rope_impl(
     } else {
         memset(params + 11, 0,         sizeof(int32_t) * GGML_MROPE_SECTIONS);
     }
+    params[15] = 0; // GGML_ROPE_FLIPPED_PARAM
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ROPE;
@@ -9616,13 +9622,19 @@ struct ggml_tensor * ggml_rope_back(
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 
-    int32_t params[11] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    // params[11..14] are the mrope sections, params[15] is the flipped flag
+    // (PXA_ROPE_FLIPPED_v1). Both are read unconditionally by the forward
+    // implementations, so write them explicitly instead of leaning on the
+    // tensor allocator's zero-init.
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
     memcpy(params +  8, &attn_factor,  sizeof(float));
     memcpy(params +  9, &beta_fast,    sizeof(float));
     memcpy(params + 10, &beta_slow,    sizeof(float));
+    memset(params + 11, 0,             sizeof(int32_t) * GGML_MROPE_SECTIONS);
+    params[15] = 0; // GGML_ROPE_FLIPPED_PARAM
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op   = GGML_OP_ROPE_BACK;
@@ -20389,6 +20401,23 @@ static void ggml_compute_forward_rope_f32(
     // this essentially just switches the sign of sin.
     const float sin_sign = forward ? 1.0f : -1.0f;
 
+    // PXA_ROPE_FLIPPED_v1: rotate the TRAILING n_dims channels of each row and
+    // leave the leading (ne0 - n_dims) alone. Partial-RoPE architectures store
+    // rows as [nope | pe], so the flipped form removes the view/rope/concat
+    // triple: the row is roped in place and the nope half never moves.
+    //
+    // Deliberately stricter than upstream, which silently ignores the flag for
+    // mrope/vision: those layouts address the tail channels themselves, so a
+    // flipped request there is a caller bug and must be loud, not silent.
+    const bool is_flipped = dst->op_params[15] != 0;
+    GGML_ASSERT(!(is_flipped && (is_mrope || is_vision)) &&
+            "flipped RoPE is not defined for mrope/vision layouts");
+    const int64_t rope_offset = is_flipped ? ne0 - n_dims : 0;
+
+    // an in-place node shares src0's buffer, so the channels this op does not
+    // rotate are already in place and the passthrough copy below is a no-op.
+    const bool is_inplace = src0->data == dst->data;
+
     const int32_t * pos = (const int32_t *) src1->data;
 
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
@@ -20432,7 +20461,9 @@ static void ggml_compute_forward_rope_f32(
                         }
                     } else {
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
-                            const int64_t ic = i0/2;
+                            // rope_offset is 0 unless flipped; when flipped the
+                            // pair (ic, ic + n_dims/2) slides into the tail.
+                            const int64_t ic = i0/2 + rope_offset;
 
                             const float cos_theta = cache[i0 + 0];
                             const float sin_theta = cache[i0 + 1];
@@ -20449,11 +20480,13 @@ static void ggml_compute_forward_rope_f32(
                     }
                 } else {
                     for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+                        const int64_t ic = i0 + rope_offset;
+
                         const float cos_theta = cache[i0 + 0];
                         const float sin_theta = cache[i0 + 1];
 
-                        const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-                              float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
+                        const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
+                              float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + ic*nb0);
 
                         const float x0 = src[0];
                         const float x1 = src[1];
@@ -20461,6 +20494,11 @@ static void ggml_compute_forward_rope_f32(
                         dst_data[0] = x0*cos_theta - x1*sin_theta;
                         dst_data[1] = x0*sin_theta + x1*cos_theta;
                     }
+                }
+
+                if (is_inplace) {
+                    // nothing else to copy: dst IS src0
+                    continue;
                 }
 
                 if (is_vision) {
@@ -20480,8 +20518,12 @@ static void ggml_compute_forward_rope_f32(
                         dst_data[n_dims] = x0*sin_theta + x1*cos_theta;
                     }
                 } else {
-                    // fill the remain channels with data from src tensor
-                    for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
+                    // fill the remain channels with data from src tensor.
+                    // flipped ropes rotate [rope_offset, ne0) so the untouched
+                    // channels are the LEADING [0, rope_offset) instead.
+                    const int64_t pass0 = is_flipped ? 0           : n_dims;
+                    const int64_t pass1 = is_flipped ? rope_offset : ne0;
+                    for (int64_t i0 = pass0; i0 < pass1; i0 += 2) {
                         const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
 
@@ -20512,6 +20554,14 @@ static void ggml_compute_forward_rope_f16(
     const int mode       = ((int32_t *) dst->op_params)[2];
     //const int n_ctx      = ((int32_t *) dst->op_params)[3];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    // PXA_ROPE_FLIPPED_v1 is implemented for f32 (CPU) and f32/f16 (CUDA) only.
+    // Abort rather than silently rotating the leading channels: this path is
+    // never taken by any arch that sets the flag, and a wrong answer here would
+    // be invisible.
+    GGML_ASSERT(dst->op_params[15] == 0 &&
+            "flipped RoPE is not implemented for f16 on the CPU backend");
+
     memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
     memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
     memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));

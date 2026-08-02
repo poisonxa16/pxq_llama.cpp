@@ -37,11 +37,21 @@ static __device__ void rope_yarn(
     }
 }
 
+// PXA_ROPE_FLIPPED_v1
+//
+// is_flipped == false (the classic layout): channels [0, n_dims) are rotated,
+// [n_dims, ne0) are copied through.
+// is_flipped == true: channels [ne0 - n_dims, ne0) are rotated, [0, ne0-n_dims)
+// are copied through. Thread i0 keeps the same meaning in both cases - it is
+// the index WITHIN the rotated block - so theta is always derived from i0 and
+// only the memory index picks up rope_offset. The passthrough threads
+// (i0 >= n_dims) map onto the leading block when flipped.
 template<bool forward, bool has_ff, typename T>
 static __global__ void rope_norm(
         const T * x, T * dst, const int ne0, const int ne1, const int s1, const int s2, const int n_dims,
         const int32_t * pos, const float freq_scale, const float ext_factor, const float attn_factor,
-        const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors) {
+        const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
+        const bool is_flipped) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne0) {
@@ -53,15 +63,59 @@ static __global__ void rope_norm(
     const int row_x     = row_dst % ne1;
     const int channel_x = row_dst / ne1;
 
-    const int idst = row_dst*ne0 + i0;
-    const int ix   = channel_x*s2 + row_x*s1 + i0;
+    const int idst_base = row_dst*ne0;
+    const int ix_base   = channel_x*s2 + row_x*s1;
+
+    const int rope_offset = is_flipped ? ne0 - n_dims : 0;
 
     if (i0 >= n_dims) {
-        dst[idst + 0] = x[ix + 0];
-        dst[idst + 1] = x[ix + 1];
+        // passthrough block: [n_dims, ne0) normally, [0, ne0-n_dims) when flipped
+        const int ic = is_flipped ? i0 - n_dims : i0;
+
+        dst[idst_base + ic + 0] = x[ix_base + ic + 0];
+        dst[idst_base + ic + 1] = x[ix_base + ic + 1];
 
         return;
     }
+
+    const int ic = i0 + rope_offset;
+
+    const float theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
+
+    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+
+    float cos_theta;
+    float sin_theta;
+
+    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+
+    const float x0 = x[ix_base + ic + 0];
+    const float x1 = x[ix_base + ic + 1];
+
+    dst[idst_base + ic + 0] = x0*cos_theta - x1*sin_theta;
+    dst[idst_base + ic + 1] = x0*sin_theta + x1*cos_theta;
+}
+
+// In-place variant: dst IS x, so the passthrough block does not exist and only
+// n_dims/2 threads per row are launched. The caller has already advanced the
+// base pointer by rope_offset, so this kernel is layout-agnostic.
+template<bool forward, bool has_ff, typename T>
+static __global__ void rope_norm_inplace(
+        T * x, const int ne1, const int s1, const int s2, const int n_dims,
+        const int32_t * pos, const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors) {
+    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
+
+    if (i0 >= n_dims) {
+        return;
+    }
+
+    const int row_dst = blockDim.x*blockIdx.x + threadIdx.x;
+
+    const int row_x     = row_dst % ne1;
+    const int channel_x = row_dst / ne1;
+
+    const int ix = channel_x*s2 + row_x*s1 + i0;
 
     const float theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
 
@@ -75,8 +129,8 @@ static __global__ void rope_norm(
     const float x0 = x[ix + 0];
     const float x1 = x[ix + 1];
 
-    dst[idst + 0] = x0*cos_theta - x1*sin_theta;
-    dst[idst + 1] = x0*sin_theta + x1*cos_theta;
+    x[ix + 0] = x0*cos_theta - x1*sin_theta;
+    x[ix + 1] = x0*sin_theta + x1*cos_theta;
 }
 
 static __global__ void rope_norm_fast(const float * src0, const float * src1, float * dst, int ne0, int ne1, int nelem,
@@ -110,11 +164,18 @@ static __global__ void rope_norm_fast(const float * src0, const float * src1, fl
     dst[idst + 1] = x0*sin_theta + x1*cos_theta;
 }
 
+// Flipped neox follows exactly the same thread mapping as flipped rope_norm:
+// thread i0 addresses the rotated block, offset by rope_offset. Upstream's
+// version derives the pair index from i0/2 + rope_offset, which walks off the
+// end of the row for any ne0 > n_dims - it is unreachable in their build
+// because DS4 always takes the in-place path, but it is wrong, so this is
+// written from the thread index instead.
 template<bool forward, bool has_ff, typename T>
 static __global__ void rope_neox(
         const T * x, T * dst, const int ne0, const int ne1, const int s1, const int s2, const int n_dims,
         const int32_t * pos, const float freq_scale, const float ext_factor, const float attn_factor,
-        const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors) {
+        const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
+        const bool is_flipped) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne0) {
@@ -126,15 +187,55 @@ static __global__ void rope_neox(
     const int row_x     = row_dst % ne1;
     const int channel_x = row_dst / ne1;
 
-    const int idst = row_dst*ne0 + i0/2;
-    const int ix   = channel_x*s2 + row_x*s1 + i0/2;
+    const int idst_base = row_dst*ne0;
+    const int ix_base   = channel_x*s2 + row_x*s1;
+
+    const int rope_offset = is_flipped ? ne0 - n_dims : 0;
 
     if (i0 >= n_dims) {
-        dst[idst + i0/2 + 0] = x[ix + i0/2 + 0];
-        dst[idst + i0/2 + 1] = x[ix + i0/2 + 1];
+        const int ic = is_flipped ? i0 - n_dims : i0;
+
+        dst[idst_base + ic + 0] = x[ix_base + ic + 0];
+        dst[idst_base + ic + 1] = x[ix_base + ic + 1];
 
         return;
     }
+
+    const int ic = i0/2 + rope_offset;
+
+    const float theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
+
+    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+
+    float cos_theta;
+    float sin_theta;
+
+    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+
+    const float x0 = x[ix_base + ic + 0];
+    const float x1 = x[ix_base + ic + n_dims/2];
+
+    dst[idst_base + ic + 0]        = x0*cos_theta - x1*sin_theta;
+    dst[idst_base + ic + n_dims/2] = x0*sin_theta + x1*cos_theta;
+}
+
+template<bool forward, bool has_ff, typename T>
+static __global__ void rope_neox_inplace(
+        T * x, const int ne1, const int s1, const int s2, const int n_dims,
+        const int32_t * pos, const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors) {
+    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
+
+    if (i0 >= n_dims) {
+        return;
+    }
+
+    const int row_dst = blockDim.x*blockIdx.x + threadIdx.x;
+
+    const int row_x     = row_dst % ne1;
+    const int channel_x = row_dst / ne1;
+
+    const int ix = channel_x*s2 + row_x*s1 + i0/2;
 
     const float theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
 
@@ -148,8 +249,8 @@ static __global__ void rope_neox(
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
 
-    dst[idst + 0]        = x0*cos_theta - x1*sin_theta;
-    dst[idst + n_dims/2] = x0*sin_theta + x1*cos_theta;
+    x[ix + 0]        = x0*cos_theta - x1*sin_theta;
+    x[ix + n_dims/2] = x0*sin_theta + x1*cos_theta;
 }
 
 static __global__ void rope_neox_fast(const float * src0, const float * src1, float * dst, int ne0, int ne1, int nelem,
@@ -460,7 +561,7 @@ template<bool forward, typename T>
 static void rope_norm_cuda(
         const T * x, T * dst, const int ne0, const int ne1, const int s1, const int s2, const int n_dims, const int nr,
         const int32_t * pos, const float freq_scale, const float freq_base, const float ext_factor, const float attn_factor,
-        const rope_corr_dims corr_dims, const float * freq_factors, cudaStream_t stream) {
+        const rope_corr_dims corr_dims, const float * freq_factors, const bool is_flipped, cudaStream_t stream) {
     GGML_ASSERT(ne0 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int n_blocks_x = (ne0 + 2*CUDA_ROPE_BLOCK_SIZE - 1) / (2*CUDA_ROPE_BLOCK_SIZE);
@@ -471,10 +572,36 @@ static void rope_norm_cuda(
     if (freq_factors == nullptr) {
         rope_norm<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors);
+            attn_factor, corr_dims, theta_scale, freq_factors, is_flipped);
     } else {
         rope_norm<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
+            attn_factor, corr_dims, theta_scale, freq_factors, is_flipped);
+    }
+}
+
+// PXA_ROPE_FLIPPED_v1: in-place launcher. Only n_dims/2 threads per row are
+// needed because there is no passthrough block to copy. `x` must already point
+// at the first rotated channel (the caller adds rope_offset).
+template<bool forward, typename T>
+static void rope_norm_cuda_inplace(
+        T * x, const int ne1, const int s1, const int s2, const int n_dims, const int nr,
+        const int32_t * pos, const float freq_scale, const float freq_base, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float * freq_factors, cudaStream_t stream) {
+    GGML_ASSERT(n_dims % 2 == 0);
+    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
+    const int n_blocks_x = (n_dims + 2*CUDA_ROPE_BLOCK_SIZE - 1) / (2*CUDA_ROPE_BLOCK_SIZE);
+    const dim3 block_nums(nr, n_blocks_x, 1);
+
+    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+
+    if (freq_factors == nullptr) {
+        rope_norm_inplace<forward, false><<<block_nums, block_dims, 0, stream>>>(
+            x, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
+            attn_factor, corr_dims, theta_scale, freq_factors);
+    } else {
+        rope_norm_inplace<forward, true><<<block_nums, block_dims, 0, stream>>>(
+            x, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors);
     }
 }
@@ -483,7 +610,7 @@ template<bool forward, typename T>
 static void rope_neox_cuda(
         const T * x, T * dst, const int ne0, const int ne1, const int s1, const int s2, const int n_dims, const int nr,
         const int32_t * pos, const float freq_scale, const float freq_base, const float ext_factor, const float attn_factor,
-        const rope_corr_dims corr_dims, const float * freq_factors, cudaStream_t stream) {
+        const rope_corr_dims corr_dims, const float * freq_factors, const bool is_flipped, cudaStream_t stream) {
     GGML_ASSERT(ne0 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int n_blocks_x = (ne0 + 2*CUDA_ROPE_BLOCK_SIZE - 1) / (2*CUDA_ROPE_BLOCK_SIZE);
@@ -494,10 +621,33 @@ static void rope_neox_cuda(
     if (freq_factors == nullptr) {
         rope_neox<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors);
+            attn_factor, corr_dims, theta_scale, freq_factors, is_flipped);
     } else {
         rope_neox<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
+            attn_factor, corr_dims, theta_scale, freq_factors, is_flipped);
+    }
+}
+
+template<bool forward, typename T>
+static void rope_neox_cuda_inplace(
+        T * x, const int ne1, const int s1, const int s2, const int n_dims, const int nr,
+        const int32_t * pos, const float freq_scale, const float freq_base, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float * freq_factors, cudaStream_t stream) {
+    GGML_ASSERT(n_dims % 2 == 0);
+    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
+    const int n_blocks_x = (n_dims + 2*CUDA_ROPE_BLOCK_SIZE - 1) / (2*CUDA_ROPE_BLOCK_SIZE);
+    const dim3 block_nums(nr, n_blocks_x, 1);
+
+    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+
+    if (freq_factors == nullptr) {
+        rope_neox_inplace<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
+            x, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
+            attn_factor, corr_dims, theta_scale, freq_factors);
+    } else {
+        rope_neox_inplace<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
+            x, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors);
     }
 }
@@ -698,16 +848,42 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     rope_corr_dims corr_dims;
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
 
+    // PXA_ROPE_FLIPPED_v1: rotate the trailing n_dims channels instead of the
+    // leading ones. Asserted rather than silently ignored for mrope/vision
+    // (upstream ignores it there), because those layouts address the tail
+    // channels themselves and a flipped request would be a caller bug.
+    const bool is_flipped = dst->op_params[15] != 0;
+    GGML_ASSERT(!(is_flipped && (is_mrope || is_vision)) &&
+            "flipped RoPE is not defined for mrope/vision layouts");
+    GGML_ASSERT(!is_flipped || n_dims <= ne00);
+
+    // An in-place node shares src0's buffer: skip the passthrough block
+    // entirely and let the kernel touch only the rotated channels.
+    const bool is_inplace = src0->data == dst->data;
+    const int64_t rope_offset = is_flipped ? ne00 - n_dims : 0;
+
     // compute
     if (is_neox) {
         if (src0->type == GGML_TYPE_F32) {
-            rope_neox_cuda<forward>(
-                (const float *) src0_d, (float *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
-                freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            if (is_inplace) {
+                rope_neox_cuda_inplace<forward>(
+                    (float *) dst_d + rope_offset, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            } else {
+                rope_neox_cuda<forward>(
+                    (const float *) src0_d, (float *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, is_flipped, stream);
+            }
         } else if (src0->type == GGML_TYPE_F16) {
-            rope_neox_cuda<forward>(
-                (const half *) src0_d, (half *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
-                freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            if (is_inplace) {
+                rope_neox_cuda_inplace<forward>(
+                    (half *) dst_d + rope_offset, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            } else {
+                rope_neox_cuda<forward>(
+                    (const half *) src0_d, (half *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, is_flipped, stream);
+            }
         } else {
             GGML_ABORT("fatal error");
         }
@@ -737,13 +913,25 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         }
     } else {
         if (src0->type == GGML_TYPE_F32) {
-            rope_norm_cuda<forward>(
-                (const float *) src0_d, (float *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
-                freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            if (is_inplace) {
+                rope_norm_cuda_inplace<forward>(
+                    (float *) dst_d + rope_offset, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            } else {
+                rope_norm_cuda<forward>(
+                    (const float *) src0_d, (float *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, is_flipped, stream);
+            }
         } else if (src0->type == GGML_TYPE_F16) {
-            rope_norm_cuda<forward>(
-                (const half *) src0_d, (half *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
-                freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            if (is_inplace) {
+                rope_norm_cuda_inplace<forward>(
+                    (half *) dst_d + rope_offset, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+            } else {
+                rope_norm_cuda<forward>(
+                    (const half *) src0_d, (half *) dst_d, ne00, ne01, s01, s02, n_dims, nr, pos, freq_scale,
+                    freq_base, ext_factor, attn_factor, corr_dims, freq_factors, is_flipped, stream);
+            }
         } else {
             GGML_ABORT("fatal error");
         }
@@ -822,6 +1010,9 @@ void ggml_cuda_op_rope_cache_impl(ggml_backend_cuda_context & ctx, ggml_tensor *
         GGML_ASSERT(n_dims == dst->ne[0]);
     }
 
+    // PXA_ROPE_FLIPPED_v1: this path has no flipped implementation.
+    GGML_ASSERT(dst->op_params[15] == 0);
+
     const float * freq_factors = NULL;
     if (dst->src[1] != NULL) {
         GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F32);
@@ -860,6 +1051,8 @@ void ggml_cuda_op_rope_fast(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == dst->type);
+    // PXA_ROPE_FLIPPED_v1: this path has no flipped implementation.
+    GGML_ASSERT(dst->op_params[15] == 0);
 
     const int64_t ne00 = src0->ne[0]; // head dims
     const int64_t ne01 = src0->ne[1]; // num heads
@@ -900,6 +1093,8 @@ void ggml_cuda_op_rope_fast(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 bool ggml_cuda_op_fused_rope_fast(ggml_backend_cuda_context & ctx, ggml_tensor * dst1, ggml_tensor * dst2) {
 
     if (dst1->src[1] != dst2->src[1]) return false;
+    // PXA_ROPE_FLIPPED_v1: this path has no flipped implementation.
+    if (dst1->op_params[15] != 0 || dst2->op_params[15] != 0) return false;
 
     const ggml_tensor * src0_1 = dst1->src[0];
     const ggml_tensor * src0_2 = dst2->src[0];
@@ -956,6 +1151,8 @@ bool ggml_cuda_op_fused_rope_fast(ggml_backend_cuda_context & ctx, ggml_tensor *
 bool ggml_cuda_op_fused_rms_rope_fast(ggml_backend_cuda_context & ctx, ggml_tensor * dst1, ggml_tensor * dst2) {
 
     if (dst1->src[1] != dst2->src[1]) return false;
+    // PXA_ROPE_FLIPPED_v1: this path has no flipped implementation.
+    if (dst1->op_params[15] != 0 || dst2->op_params[15] != 0) return false;
 
     const auto rms_1 = dst1->src[0];
     const auto rms_2 = dst2->src[0];
@@ -1372,6 +1569,10 @@ bool ggml_cuda_op_rope_rope_impl(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (dst1->type != dst2->type) return false;
     if (dst1->src[0]->type != GGML_TYPE_F32 && dst1->src[0]->type != GGML_TYPE_F16) return false;
     if (dst1->src[0]->type != dst1->type) return false;
+    // PXA_ROPE_FLIPPED_v1: the fused two-rope kernel has no flipped variant and
+    // would silently rotate the LEADING channels. DS4 emits adjacent ROPE nodes
+    // for q and kv, so this guard is live, not defensive.
+    if (dst1->op_params[15] != 0 || dst2->op_params[15] != 0) return false;
 
     const int64_t ne00   = dst1->src[0]->ne[0];
     const int64_t ne01_1 = dst1->src[0]->ne[1];
