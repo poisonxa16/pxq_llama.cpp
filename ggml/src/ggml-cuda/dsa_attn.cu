@@ -349,6 +349,20 @@ void ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
 
+    // ⚠ REQUIRED, and absent from the upstream original.
+    // ggml_backend_cuda_context::cublas_handle() creates the handle but never binds a
+    // stream -- every other cuBLAS caller in this tree sets it at the call site. Without
+    // this, the GEMMs below run on whatever stream the handle was last left on while the
+    // gather kernels run on ctx.stream(), so the GEMM can read k16/q16 before they are
+    // filled and k_copy_dst can read kqv16 before the GEMM lands.
+    //
+    // It fails as a RACE, not as an error, which is why it is easy to miss: measured
+    // here, head 128 was correct (0.15% vs an independent reference) while head 512 with
+    // n_head 8 x 4 tokens produced garbage (values of 224, non-finite entries), and both
+    // n_head=1 and n_tokens=1 passed at head 512 -- i.e. it only bites once the gather is
+    // big enough to still be running when the GEMM starts.
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), ctx.stream()));
+
     const half alpha = 1.0f;
     const half beta  = 0.0f;
 
