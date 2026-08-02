@@ -475,8 +475,18 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
         // rows each query can actually see instead of a full-width score matrix.
         // n_visible_max must bound the visible count for EVERY query row; the padded
         // list is only built when it is genuinely narrower than the dense mask.
+        // PXA_DSA_ATTN=0 must reproduce the PRE-PORT graph exactly, not merely stop the
+        // kernel from firing. Measured: with the switch honoured only in the kernel, the
+        // off arm still built 43 mask_to_idx nodes per decode graph that nothing consumed
+        // -- dead work charged to the baseline, which would bias any A/B in DSA's favour.
+        // Mirrors the kernel-side switch in ggml-cuda/dsa_attn.cu.
+        static const bool dsa_enabled = [] {
+            const char * v = getenv("PXA_DSA_ATTN");
+            return !(v && v[0] == '0');
+        }();
+
         ggml_tensor * selected = nullptr;
-        if (n_visible_max > 0) {
+        if (dsa_enabled && n_visible_max > 0) {
             // The 256-round-up is required by the kernel's launch geometry, and it
             // doubles as slack: up to 255 rows more than the caller's bound still fit.
             const int64_t n_sel = GGML_PAD(n_visible_max, 256);
