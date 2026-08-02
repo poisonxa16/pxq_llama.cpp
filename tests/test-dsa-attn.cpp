@@ -212,6 +212,19 @@ int main() {
     ggml_backend_t cuda = ggml_backend_cuda_init(0, nullptr);
     if (!cuda) { printf("no CUDA device -- cannot run\n"); return 2; }
 
+    // DSA is opt-in (PXA_DSA_ATTN=1). The harness deliberately does NOT set it for
+    // itself: that would make the default unobservable. Instead it reads the switch and
+    // flips every expectation, so BOTH invocations are checks that can fail --
+    //
+    //   PXA_DSA_ATTN=1 ./test-dsa-attn   every DSA case must be accepted and correct
+    //   ./test-dsa-attn                  every DSA case must be DECLINED (default-off)
+    //
+    // -- and a default that leaked back to on would fail the second one.
+    const char * dsa_env = getenv("PXA_DSA_ATTN");
+    const bool   dsa_on  = dsa_env && dsa_env[0] == '1';
+    printf("PXA_DSA_ATTN=%s -> DSA %s\n\n", dsa_env ? dsa_env : "(unset)",
+           dsa_on ? "ENABLED" : "DISABLED (running as the default-off control)");
+
     printf("=== 1. GGML_OP_MASK_TO_IDX: CPU vs CUDA (exact) ===\n");
     {
         const int64_t n_kv = 2048, rows = 16, w = 256;
@@ -261,21 +274,31 @@ int main() {
     {
         // Bisect on head dim, head count and visible count. head 128 passes and head 512
         // does not, so walk the dimension and vary one thing at a time.
-        struct { const char * name; attn_shapes s; bool indep_ref; } cases[] = {
+        // must_diverge: the index list is NARROWER than the visible set, so the sparse
+        // path physically cannot see every row the mask admits. GGML_OP_MASK_TO_IDX
+        // clamps and drops the overflow with no diagnostic, which is exactly the
+        // silently-wrong-engine failure the graph builder's n_visible_max bound exists to
+        // prevent. Nothing in the kernel can detect it -- the bound is an argument, not a
+        // runtime check -- so this case exists to prove the argument is load-bearing: if
+        // truncation were harmless the bound would not matter, and the fact that it is
+        // NOT harmless is what must be demonstrated, not assumed.
+        struct { const char * name; attn_shapes s; bool indep_ref; bool must_diverge; } cases[] = {
             //                                          d  nh   n_kv  nt  vis  n_idx
-            { "head 128, no index list (CUDA dense)", { 128, 8, 2048,  4, 200,   0 }, true },
-            { "head 128, DSA",                        { 128, 8, 2048,  4, 200, 256 }, true },
-            { "head 256, DSA",                        { 256, 8, 2048,  4, 200, 256 }, true },
-            { "head 384, DSA",                        { 384, 8, 2048,  4, 200, 256 }, true },
-            { "head 512, DSA          (TARGET)",      { 512, 8, 2048,  4, 200, 256 }, true },
-            { "head 512, DSA, 1 head",                { 512, 1, 2048,  4, 200, 256 }, true },
-            { "head 512, DSA, 1 token",               { 512, 8, 2048,  1, 200, 256 }, true },
-            { "head 512, DSA, 1 visible col",         { 512, 8, 2048,  4,   1, 256 }, true },
-            { "head 512, DSA, idx width 512",         { 512, 8, 4096,  4, 200, 512 }, true },
+            { "head 128, no index list (CUDA dense)", { 128, 8, 2048,  4, 200,   0 }, true, false },
+            { "head 128, DSA",                        { 128, 8, 2048,  4, 200, 256 }, true, false },
+            { "head 256, DSA",                        { 256, 8, 2048,  4, 200, 256 }, true, false },
+            { "head 384, DSA",                        { 384, 8, 2048,  4, 200, 256 }, true, false },
+            { "head 512, DSA          (TARGET)",      { 512, 8, 2048,  4, 200, 256 }, true, false },
+            { "head 512, DSA, 1 head",                { 512, 1, 2048,  4, 200, 256 }, true, false },
+            { "head 512, DSA, 1 token",               { 512, 8, 2048,  1, 200, 256 }, true, false },
+            { "head 512, DSA, 1 visible col",         { 512, 8, 2048,  4,   1, 256 }, true, false },
+            { "head 512, DSA, idx width 512",         { 512, 8, 4096,  4, 200, 512 }, true, false },
             // 64 tokens > DSA_ATTN_MAX_ROWS(32), so this is the only case that exercises
             // the multi-step loop (nstep=2) and the `first` offsets into Q/idx/dst.
             // n_head trimmed to 2 purely to keep the O(n_kv*d*nt*nh) reference cheap.
-            { "head 512, DSA, 64 tok (nstep=2)",      { 512, 2, 4096, 64, 200, 256 }, true },
+            { "head 512, DSA, 64 tok (nstep=2)",      { 512, 2, 4096, 64, 200, 256 }, true, false },
+            // 400 visible rows into a 256-wide list: 144 rows per query are dropped.
+            { "head 512, idx TOO NARROW -> must diverge",{ 512, 2, 4096,  4, 400, 256 }, true, true  },
         };
         for (auto & c : cases) {
             std::vector<float> qh, ref, cpu_o, cuda_o; std::vector<ggml_fp16_t> kh, mh;
@@ -285,6 +308,15 @@ int main() {
             const bool ok_cpu  = run_attn(cpu,  c.s, qh, kh, mh, cpu_o);
             const bool ok_cuda = run_attn(cuda, c.s, qh, kh, mh, cuda_o, &sup);
             if (!ok_cpu || !ok_cuda) { report(c.name, false, "(compute failed)"); continue; }
+
+            // With DSA off, every case that carries an index list must be DECLINED --
+            // that is the whole content of the default-off control, and it fails if the
+            // switch stops applying. The n_idx==0 case uses no DSA and must still run.
+            if (!dsa_on && c.s.n_idx > 0) {
+                report(c.name, !sup, sup ? "(ACCEPTED with DSA off -- switch leaked)"
+                                         : "(declined, as the default-off control requires)");
+                continue;
+            }
             if (!sup)                { report(c.name, false, "(CUDA declined the node)"); continue; }
 
             double mx1 = 0.0, mx2 = 0.0, mx3 = 0.0;
@@ -299,6 +331,15 @@ int main() {
                          cuda_vs_ref, cpu_vs_ref, cuda_vs_cpu);
                 // Scored against the INDEPENDENT reference, so a broken ggml CPU path
                 // cannot make a correct CUDA path look wrong (or vice versa).
+                if (c.must_diverge) {
+                    // Inverted expectation: dropping 144 of 400 visible rows per query
+                    // must show up. If this ever "passes" at <2% the truncation is
+                    // invisible in the output, and the n_visible_max bound protecting the
+                    // three graph call sites would be untestable rather than merely
+                    // unasserted -- which is a reason to look at it, not to relax it.
+                    report(c.name, cuda_vs_ref > 5.0, d);
+                    continue;
+                }
                 report(c.name, cuda_vs_ref < 2.0, d);
                 if (cuda_vs_ref >= 2.0) {
                     // Show the shape of the error, not just its size.
@@ -325,7 +366,11 @@ int main() {
     }
 
     printf("\n=== 4. gate negative controls ===\n");
-    report("head 512 + valid index list -> SUPPORTED (positive)", gate_probe(cuda, 512, PROBE_OK) == true);
+    // The positive probe follows the switch: accepted iff DSA is on. This is the
+    // sharpest test of the default -- with the variable unset it must come back false.
+    report(dsa_on ? "head 512 + valid index list -> SUPPORTED (positive)"
+                  : "head 512 + valid index list -> rejected (DSA off)",
+           gate_probe(cuda, 512, PROBE_OK) == dsa_on);
     report("head 512, no index list     -> rejected",             gate_probe(cuda, 512, PROBE_NO_IDX) == false);
     report("head 512, index width 300   -> rejected",             gate_probe(cuda, 512, PROBE_BAD_WIDTH) == false);
     report("head 512, ALiBi max_bias!=0 -> rejected",             gate_probe(cuda, 512, PROBE_ALIBI) == false);

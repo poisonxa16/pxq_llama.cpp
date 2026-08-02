@@ -576,10 +576,12 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
         // kernel from firing. Measured: with the switch honoured only in the kernel, the
         // off arm still built 43 mask_to_idx nodes per decode graph that nothing consumed
         // -- dead work charged to the baseline, which would bias any A/B in DSA's favour.
-        // Mirrors the kernel-side switch in ggml-cuda/dsa_attn.cu.
+        // Mirrors the kernel-side switch in ggml-cuda/dsa_attn.cu, INCLUDING its default:
+        // off unless PXA_DSA_ATTN=1. If these two disagree the graph and the kernel
+        // disagree about which engine is running, which is worse than either default.
         static const bool dsa_enabled = [] {
             const char * v = getenv("PXA_DSA_ATTN");
-            return !(v && v[0] == '0');
+            return v && v[0] == '1';
         }();
 
         ggml_tensor * selected = nullptr;
