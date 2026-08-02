@@ -431,8 +431,14 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
         ggml_tensor * kq_mask,
         ggml_tensor * sinks,
         float         kq_scale,
-        int           il) const {
+        int           il,
+        int64_t       n_visible_max) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+
+    // Captured before the permutes: ggml_permute() returns a fresh view struct each
+    // call, so after permuting, k and v are never pointer-equal even when the caller
+    // passed the same tensor twice (all three DS4 regimes do).
+    const bool v_aliases_k = (v == k) && !v_trans;
 
     const int64_t n_stream = k->ne[3];
     GGML_ASSERT(n_stream == 1 && "DSV4 first cut is single-stream (-np 1)");
@@ -454,14 +460,51 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
-        if (v->type == GGML_TYPE_F32) {
+        if (v_aliases_k) {
+            // Keep V the *same tensor* as K rather than casting it a second time.
+            // Two ggml_cast() calls produce two distinct F16 buffers, which doubles the
+            // F16 conversion and defeats the DSA kernel's v_is_k_view fast path (it
+            // would then gather the value rows a second time).
+            v = k;
+        } else if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
+        // Sparse attention: when the mask is mostly -inf, hand the kernel the list of
+        // rows each query can actually see instead of a full-width score matrix.
+        // n_visible_max must bound the visible count for EVERY query row; the padded
+        // list is only built when it is genuinely narrower than the dense mask.
+        ggml_tensor * selected = nullptr;
+        if (n_visible_max > 0) {
+            // The 256-round-up is required by the kernel's launch geometry, and it
+            // doubles as slack: up to 255 rows more than the caller's bound still fit.
+            const int64_t n_sel = GGML_PAD(n_visible_max, 256);
+            const int64_t n_kv  = kq_mask->ne[0];
+            const int64_t nt    = q->ne[1];   // post-permute: q is [n_embd_head, n_tokens, n_head]
+
+            // Mirror of the "worth it?" block in ggml_cuda_dsa_attn_supported(). The
+            // gather costs n_sel rows per query, so a barely-narrower list is a loss.
+            // Applying the same rule here means we never spend a mask_to_idx node
+            // building a list the kernel would then decline to use.
+            const bool worth_it = nt <= 16 ? n_sel < n_kv : n_kv >= 4*n_sel;
+
+            if (worth_it) {
+                selected = ggml_mask_to_index(ctx0, kq_mask, n_sel);
+                cb(selected, "dsa_mask_to_idx", il);
+                ggml_build_forward_expand(gf, selected);
+            }
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        if (selected) {
+            // Backends that do not implement the sparse path ignore src[5] and compute
+            // the dense result, so this stays correct everywhere; it only ever changes
+            // which kernel runs.
+            cur->src[5] = selected;
+        }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
@@ -837,7 +880,18 @@ ggml_tensor * llm_build_context::build_dsv4_csa_lid_attention(
     kq_mask = dsv4_finalize_kq_mask(ctx0, kq_mask, cparams.flash_attn);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
-    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il);
+    // Visible-row bound for the sparse path. kq_mask is [raw | csa]:
+    //   raw  - the ring/window mask admits a key only when 0 <= p - pos < n_swa
+    //          (llama-kv-cache-dsv4.cpp), so at most n_swa rows per query, however
+    //          wide the padded ring is;
+    //   csa  - build_dsv4_top_k_mask() starts all -inf and zeroes exactly the
+    //          top_k->ne[0] selected rows before adding the base mask, so at most
+    //          top_k->ne[0] rows.
+    // Their sum is therefore a true upper bound, and it does not grow with context
+    // while the dense mask does -- which is where the win comes from.
+    const int64_t n_visible_max = (int64_t) llama_dsv4_get_raw_swa(lctx) + top_k->ne[0];
+
+    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il, n_visible_max);
     if (k_rot) {
         out = dsv4_mul_mat_rot(ctx0, out, k_rot);
     }
@@ -894,7 +948,13 @@ ggml_tensor * llm_build_context::build_dsv4_hca_attention(
     kq_mask = dsv4_finalize_kq_mask(ctx0, kq_mask, cparams.flash_attn);
     cb(kq_mask, "hca_kq_mask", il);
 
-    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il);
+    // As in the CSA regime, but HCA applies no top-k sparsity: every one of the n_hca
+    // compressed rows may be visible. The bound is still below the dense mask width
+    // whenever the padded raw ring is wider than n_swa, which it always is here
+    // (raw_size = PAD(n_ubatch + n_swa + 1, 256)).
+    const int64_t n_visible_max = (int64_t) llama_dsv4_get_raw_swa(lctx) + n_hca;
+
+    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il, n_visible_max);
     if (k_rot) {
         out = dsv4_mul_mat_rot(ctx0, out, k_rot);
     }

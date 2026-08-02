@@ -349,8 +349,14 @@ struct llm_build_context {
             ggml_tensor * hc_scale, ggml_tensor * hc_base) const;
 
     // attention core (upstream llm_graph_context::build_attn_mha, kq_b/v_mla dropped)
+    // n_visible_max: an UPPER BOUND on how many KV rows any single query row can see
+    // through kq_mask, or -1 when unknown/not worth it. When it is materially smaller
+    // than the mask width the flash-attention node gets a sparse index list (src[5])
+    // and attends only the visible rows. It must be a true upper bound -- too small
+    // silently drops KV. See build_dsv4_attn_mha() for the derivation at each caller.
     ggml_tensor * build_dsv4_attn_mha(ggml_cgraph * gf, ggml_tensor * q, ggml_tensor * k,
-            ggml_tensor * v, ggml_tensor * kq_mask, ggml_tensor * sinks, float kq_scale, int il) const;
+            ggml_tensor * v, ggml_tensor * kq_mask, ggml_tensor * sinks, float kq_scale, int il,
+            int64_t n_visible_max = -1) const;
 
     // compressed-KV reconstruction from the compressor ring state
     ggml_tensor * build_dsv4_hca_compressed_kv_from_state(ggml_tensor * kv_state, ggml_tensor * score_state,

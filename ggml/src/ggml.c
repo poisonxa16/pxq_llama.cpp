@@ -4461,9 +4461,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_SPLIT_SINKHORN",
     "DSV4_HC_WEIGHTED_SUM",
     "DSV4_HC_EXPAND",
+
+    "MASK_TO_IDX",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4585,9 +4587,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_split_sinkhorn(x)",
     "dsv4_hc_weighted_sum(x,w)",
     "dsv4_hc_expand(x,r,p,c)",
+
+    "mask_to_idx(m)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -10349,6 +10353,25 @@ struct ggml_tensor * ggml_dsv4_hc_expand(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_mask_to_index
+
+struct ggml_tensor * ggml_mask_to_index(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        int64_t               max_row_size) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(max_row_size > 0);
+
+    const int64_t ne0 = MIN(mask->ne[0], max_row_size);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne0, mask->ne[1], mask->ne[2], mask->ne[3]);
+
+    result->op     = GGML_OP_MASK_TO_IDX;
+    result->src[0] = mask;
 
     return result;
 }
@@ -23551,6 +23574,57 @@ static void ggml_compute_forward_dsv4_hc_expand(
     }
 }
 
+// ggml_compute_forward_mask_to_idx
+
+static void ggml_compute_forward_mask_to_idx(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * mask = dst->src[0];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask->ne[1] == dst->ne[1] && mask->ne[2] == dst->ne[2] && mask->ne[3] == dst->ne[3]);
+    GGML_ASSERT(mask->ne[0] >= dst->ne[0]);
+    GGML_ASSERT(dst->nb[0] == sizeof(int32_t));
+
+    const int64_t ne00 = mask->ne[0];
+    const int64_t ne0  = dst->ne[0];
+
+    // Rows are independent; split them across threads.
+    const int64_t nr = ggml_nrows(dst);
+    const int64_t r0 = (nr * params->ith) / params->nth;
+    const int64_t r1 = (nr * (params->ith + 1)) / params->nth;
+
+    for (int64_t ir = r0; ir < r1; ++ir) {
+        const int64_t i1 = ir % dst->ne[1];
+        const int64_t i2 = (ir / dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = ir / (dst->ne[1] * dst->ne[2]);
+
+        const char    * mask_r = (const char *) mask->data + i1*mask->nb[1] + i2*mask->nb[2] + i3*mask->nb[3];
+              int32_t * idx_r  = (int32_t *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t j = 0; j < ne0; ++j) {
+            idx_r[j] = -1;
+        }
+
+        int64_t n = 0;
+        for (int64_t j = 0; j < ne00 && n < ne0; ++j) {
+            const float v = mask->type == GGML_TYPE_F16
+                ? GGML_FP16_TO_FP32(((const ggml_fp16_t *) mask_r)[j])
+                : ((const float *) mask_r)[j];
+            // Keep every row the mask does not hard-exclude. `!(v <= -inf)` is
+            // deliberately not `v == 0`: it also keeps finite-but-negative bias
+            // entries (ALiBi) and NaN, so the index list is always a SUPERSET of
+            // the visible set. A superset stays correct because the consumer
+            // re-applies the real mask value at each selected row; a subset would
+            // silently drop KV. See the contract note on ggml_mask_to_index().
+            if (!(v <= -INFINITY)) {
+                idx_r[n++] = (int32_t) j;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_win_part
 
 static void ggml_compute_forward_win_part_f32(
@@ -25297,6 +25371,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_dsv4_hc_expand(params, tensor);
             } break;
+        case GGML_OP_MASK_TO_IDX:
+            {
+                ggml_compute_forward_mask_to_idx(params, tensor);
+            } break;
         case GGML_OP_WIN_PART:
             {
                 ggml_compute_forward_win_part(params, tensor);
@@ -26360,6 +26438,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_MASK_TO_IDX:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -27097,6 +27176,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_MASK_TO_IDX:
             {
                 n_tasks = n_threads;
             } break;

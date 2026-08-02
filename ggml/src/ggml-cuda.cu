@@ -41,6 +41,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/mask_to_idx.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/pxq-mmvq.cuh"
@@ -6207,6 +6208,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_EXPAND:
             ggml_cuda_op_dsv4_hc_expand(ctx, dst);
             break;
+        case GGML_OP_MASK_TO_IDX:
+            ggml_cuda_op_mask_to_idx(ctx, dst);
+            break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
@@ -7627,6 +7631,18 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_MASK_TO_IDX:
+            // the gate and the implementation must agree (the I32->I32 cpy lesson):
+            // k_mask_to_idx handles F16/F32 masks only, writes I32, and indexes both
+            // tensors' dim 0 as a dense array.
+            return op->type == GGML_TYPE_I32 &&
+                   (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                   op->nb[0] == sizeof(int32_t) &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[0]->ne[0] >= op->ne[0] &&
+                   op->src[0]->ne[1] == op->ne[1] &&
+                   op->src[0]->ne[2] == op->ne[2] &&
+                   op->src[0]->ne[3] == op->ne[3];
         case GGML_OP_FLASH_ATTN_EXT:
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
             return (op->src[0]->ne[0] == 64 && op->src[1]->type == GGML_TYPE_F16) || op->src[0]->ne[0] == 128;
