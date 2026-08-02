@@ -3276,6 +3276,7 @@ static bool is_model_split_supported(const llama_model & model) {
         LLM_ARCH_QWEN35MOE,
         LLM_ARCH_GEMMA4,
         LLM_ARCH_DEEPSEEK2,
+        LLM_ARCH_DEEPSEEK4,   // SM-PROBE ONLY: no TP graph path exists for DS4. This flip exists to MEASURE the failure mode. DO NOT MERGE.
         LLM_ARCH_GLM_DSA,
         LLM_ARCH_MISTRAL4,
         LLM_ARCH_MELLUM,
