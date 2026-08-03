@@ -134,6 +134,11 @@ void ggml_cuda_op_pxa_smalln(
     const int64_t nrows_dst = id == ctx.device ? ne0 : row_diff;
 
     switch (src1_ncols) {
+        // R=1 (2026-08-03): the plain decode GEMV. Added after the dmmv route was measured a
+        // LOSS on the 122B 4xP100 rig (deep decode 24.97 -> 14.7 t/s): the legacy dmmv template
+        // indexes the device-global kvalues table divergently and re-decodes the E8M0 scale per
+        // value pair. This kernel stages the table in smem and decodes the scale once per block.
+        case 1: pxa_smalln_launch<1>(src0->type, src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, nrows_dst, stream); break;
         case 2: pxa_smalln_launch<2>(src0->type, src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, nrows_dst, stream); break;
         case 3: pxa_smalln_launch<3>(src0->type, src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, nrows_dst, stream); break;
         case 4: pxa_smalln_launch<4>(src0->type, src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, ne00, nrows_dst, stream); break;

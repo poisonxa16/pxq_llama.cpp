@@ -3216,36 +3216,45 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // quantized backbone at spec-verify batch sizes (ne11 2..8) to the multi-column dequant-FMA
     // GEMV instead of emulated-dp4a MMVQ. See pxa-smalln.cuh. Default OFF (PXA_SPEC_SMALLN=1).
     static const bool pxa_spec_smalln = getenv("PXA_SPEC_SMALLN") && atoi(getenv("PXA_SPEC_SMALLN")) != 0;
-    if (pxa_spec_smalln && cc < CC_VOLTA && ggml_cuda_pxa_smalln_supported(src0->type)
-        && src1->ne[1] >= 2 && src1->ne[1] <= 8
+    // PXA_SMALLN_GEMV (2026-08-03): route the ne11==1 dense backbone GEMV through the same
+    // dequant-FMA kernel on sm_60. Profiled (nsys, 122B PXQU48, 4xP100, deep fill): the mxfp4
+    // dense matvecs on emulated-dp4a MMVQ were 14.2 ms/token (35% of decode wall), q8_0 (incl.
+    // the 248320-row head) another 3.0 ms. The legacy dmmv template was A/B'd first and LOST
+    // (24.97 -> 14.7 t/s deep decode: divergent global-table lookups + per-pair scale decode);
+    // k_pxa_smalln_* stages the table in smem and decodes the scale once per block.
+    // Unset = auto (on iff cc==600 exactly: P100 has no DP4A; sm_61 has it and keeps MMVQ).
+    // PXA_SMALLN_GEMV=1 forces on for any pre-Volta, =0 off.
+    static const int pxa_smalln_gemv = [](){
+        const char * e = getenv("PXA_SMALLN_GEMV");
+        return e ? atoi(e) : -1;
+    }();
+    const bool pxa_smalln_take_gemv = (pxa_smalln_gemv == 1 || (pxa_smalln_gemv == -1 && cc == 600))
+        && src1->ne[1] == 1;
+    if ((pxa_smalln_take_gemv || (pxa_spec_smalln && src1->ne[1] >= 2 && src1->ne[1] <= 8))
+        && cc < CC_VOLTA && ggml_cuda_pxa_smalln_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[2]*src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1
         && src0->ne[0] % 32 == 0 && !bad_padding_clear
         && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        if (pxa_smalln_take_gemv) {
+            static std::atomic<bool> logged{false};
+            bool exp = false;
+            if (logged.compare_exchange_strong(exp, true)) {
+                fprintf(stderr, "PXA_SMALLN_GEMV: FIRING (cc=%d, %s ne11=1 GEMV -> smalln dequant-FMA; PXA_SMALLN_GEMV=0 reverts)\n",
+                        cc, ggml_type_name(src0->type));
+            }
+        }
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_pxa_smalln, nullptr);
         return node_n;
     }
 
-    // 2026-08-03: DEFAULT ON for sm_60 exactly (P100 GP100: no DP4A, 2:1 fp16). Profiled on the
-    // 122B-A10B PXQU48 4xP100 rig: the dense mxfp4 backbone on emulated-dp4a MMVQ was 251
-    // matvecs/token at 57us avg = 14.2 ms/token (35% of decode wall); q8_0 (incl. the 248320-row
-    // output head) another 3.0 ms. dmmv is the dequant-FMA form this card is fast at. sm_61
-    // (1080Ti) HAS DP4A, so it keeps MMVQ unless the env forces otherwise.
-    // PXA_PASCAL_DMMV: unset = auto (on iff cc==600); 1 = on for all pre-Volta; 0 = off.
-    static const int pxa_pascal_dmmv = [](){
-        const char * e = getenv("PXA_PASCAL_DMMV");
-        return e ? atoi(e) : -1;
-    }();
-    const bool pxa_dmmv_take = (pxa_pascal_dmmv == 1 || (pxa_pascal_dmmv == -1 && cc == 600))
-        && cc < CC_VOLTA && use_dequantize_mul_mat_vec;
-    if (pxa_dmmv_take) {
-        static std::atomic<bool> logged{false};
-        bool exp = false;
-        if (logged.compare_exchange_strong(exp, true)) {
-            fprintf(stderr, "PXA_PASCAL_DMMV: FIRING (cc=%d, %s dense GEMV -> dequant-FMA dmmv; PXA_PASCAL_DMMV=0 reverts)\n",
-                    cc, ggml_type_name(src0->type));
-        }
-    }
+    // PXA_PASCAL_DMMV stays ENV-ONLY (default OFF) — the sm_60 auto-arm was A/B'd 2026-08-03 on
+    // the 122B PXQU48 4xP100 rig and MEASURED A LOSS: deep decode 24.97 -> 14.7 t/s (-41%) with
+    // mxfp4+q8_0 dense GEMVs on the legacy dmmv template (divergent device-global kvalues
+    // lookups, per-pair E8M0 decode, 64-thread low-ILP blocks). The sm_60 GEMV fix that WON is
+    // candidate is PXA_SMALLN_GEMV above (its own A/B pending). Kept env-gated for experiments.
+    static const bool pxa_pascal_dmmv = getenv("PXA_PASCAL_DMMV") && atoi(getenv("PXA_PASCAL_DMMV")) != 0;
+    const bool pxa_dmmv_take = pxa_pascal_dmmv && cc < CC_VOLTA && use_dequantize_mul_mat_vec;
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1 && !pxa_dmmv_take) {
         return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
     }
