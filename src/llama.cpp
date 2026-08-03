@@ -3519,6 +3519,22 @@ static bool llm_load_tensors(
             LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
             LLAMA_LOG_WARN("=======================================================\n\n");
             split_mode = LLAMA_SPLIT_MODE_LAYER;
+        } else if ((model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35) &&
+                   !(getenv("PXA_ALLOW_GRAPH_SPLIT_HYBRID") && atoi(getenv("PXA_ALLOW_GRAPH_SPLIT_HYBRID")) != 0)) {
+            // MEASURED DEFECT (2026-08-03, qwen35moe 122B, 4xP100): split mode 'graph' produces
+            // fully degenerate output ('!!!!...' at temp 0) for the DeltaNet hybrid-recurrent
+            // arches — reproduced with the FA/GEMV levers disabled, so it is the graph-split
+            // handling of the recurrent conv/ssm state itself, not a kernel. qwen3next/qwen35
+            // share the delta_net machinery and are guarded by construction (unverified).
+            // Until the state handling is fixed, silently emitting garbage is not an option:
+            // fall back to 'layer'. PXA_ALLOW_GRAPH_SPLIT_HYBRID=1 bypasses (debugging only).
+            LLAMA_LOG_WARN("\n==================================================================\n");
+            LLAMA_LOG_WARN("Split mode 'graph' corrupts DeltaNet recurrent state for this arch\n");
+            LLAMA_LOG_WARN("(measured: degenerate output at temp 0)\n");
+            LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
+            LLAMA_LOG_WARN("  (PXA_ALLOW_GRAPH_SPLIT_HYBRID=1 overrides, for debugging only)\n");
+            LLAMA_LOG_WARN("==================================================================\n\n");
+            split_mode = LLAMA_SPLIT_MODE_LAYER;
         } else {
             if (model.arch == LLM_ARCH_MIMO2 && model.devices.size() > 4 && (max_gpu == 0 || max_gpu > 4)) {
                 LLAMA_LOG_WARN("\n================================================================\n");

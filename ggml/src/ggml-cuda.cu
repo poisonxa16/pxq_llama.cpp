@@ -85,6 +85,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <condition_variable>
 #include <stdint.h>
 #include <stdio.h>
@@ -3312,6 +3313,17 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
         if (debug) printf("%s(%s, %s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_cublas)\n", __func__, dst->name, ggml_type_name(src0->type));
+        // PXA_GEMV_DBG=1: name every decode-time GEMV that lands on the cuBLAS fallback, once
+        // per tensor name. Profiling found 48 anonymous f32 GEMVs/token at 25.7us each here.
+        static const bool pxa_gemv_dbg = getenv("PXA_GEMV_DBG") && atoi(getenv("PXA_GEMV_DBG")) != 0;
+        if (pxa_gemv_dbg && src1->ne[1] == 1) {
+            static std::mutex mtx; static std::set<std::string> seen;
+            std::lock_guard<std::mutex> lk(mtx);
+            if (seen.insert(src0->name).second) {
+                fprintf(stderr, "PXA_GEMV_DBG: cublas GEMV src0=%s type=%s ne=[%ld,%ld] src1_ne1=%ld\n",
+                        src0->name, ggml_type_name(src0->type), (long)src0->ne[0], (long)src0->ne[1], (long)src1->ne[1]);
+            }
+        }
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
     return node_n;

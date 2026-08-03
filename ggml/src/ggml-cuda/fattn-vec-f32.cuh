@@ -14,7 +14,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int Dk, int Dv, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // Dk, Dv == K-, V-head size
+template<int Dk, int Dv, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool pxa_vilp = false> // Dk, Dv == K-, V-head size
 #ifndef GGML_USE_HIP
 __launch_bounds__(Dk, 1)
 #endif // GGML_USE_HIP
@@ -266,6 +266,27 @@ static __global__ void flash_attn_vec_ext_f32(
 
         __syncthreads();
 
+        if constexpr (pxa_vilp && ncols == 1) {
+            // PXA_FA_VEC_ILP (2026-08-03): the stock V pass below is a single serial FMA chain
+            // of Dv dependent adds per thread (nvcc does not reassociate fp adds), each add
+            // waiting on a 2-byte V load. Profiled 403 us/call at 9k KV on P100 (183 GB/s,
+            // ~2.5x off achievable). Four independent partial accumulators quadruple the ILP;
+            // the fixed pairwise fold keeps the per-tile reduction order deterministic.
+            // NOT bit-exact vs the serial chain (summation order) — banner-gated, ppl-verified.
+            float vacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int k0 = 0; k0 < Dv; k0 += 4) {
+                if (FATTN_KQ_STRIDE % Dv != 0 && k_VKQ_0 + k0 >= ne11) {
+                    break;
+                }
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float V_ki = dequantize_1_v(V + (k0 + u)*nb21, tid);
+                    vacc[u] += V_ki*KQ[k0 + u];
+                }
+            }
+            VKQ[0] += (vacc[0] + vacc[1]) + (vacc[2] + vacc[3]);
+        } else {
 #pragma unroll
         for (int k = 0; k < Dv; ++k) {
             if (FATTN_KQ_STRIDE % Dv != 0 && k_VKQ_0 + k >= ne11) {
@@ -277,6 +298,7 @@ static __global__ void flash_attn_vec_ext_f32(
             for (int j = 0; j < ncols; ++j) {
                 VKQ[j] += V_ki*KQ[j*Dk + k];
             }
+        }
         }
 
         __syncthreads();
@@ -352,7 +374,22 @@ static __global__ void flash_attn_vec_ext_f32(
 template <int Dk, int Dv, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_f32_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int nwarps = Dk/WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_vec_ext_f32<Dk, Dv, cols_per_block, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel;
+    if constexpr (Dk == 256 && Dv == 256 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
+        // PXA_FA_VEC_ILP: D=256 f16-KV decode gets the 4-accumulator V pass (see the kernel).
+        // Default ON; =0 reverts to the serial-chain form. Only this instantiation carries the
+        // twin, so compile cost is one extra kernel.
+        static const bool vilp = [](){
+            const char * e = getenv("PXA_FA_VEC_ILP");
+            const bool on = !(e && atoi(e) == 0);
+            fprintf(stderr, "PXA_FA_VEC_ILP: %s (D=256 decode V-pass 4-way ILP; PXA_FA_VEC_ILP=0 reverts)\n", on ? "ON" : "OFF");
+            return on;
+        }();
+        fattn_kernel = vilp ? flash_attn_vec_ext_f32<Dk, Dv, cols_per_block, type_K, type_V, use_logit_softcap, true>
+                            : flash_attn_vec_ext_f32<Dk, Dv, cols_per_block, type_K, type_V, use_logit_softcap, false>;
+    } else {
+        fattn_kernel = flash_attn_vec_ext_f32<Dk, Dv, cols_per_block, type_K, type_V, use_logit_softcap>;
+    }
     constexpr bool need_f16_K = Dk != 128 && Dk != 256;
     constexpr bool need_f16_V = Dv != 64 && Dv != 128 && Dv != 256;
     constexpr size_t nbytes_shared = 0;
