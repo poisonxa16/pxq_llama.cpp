@@ -273,8 +273,11 @@ static __global__ void flash_attn_vec_ext_f32(
             // ~2.5x off achievable). Four independent partial accumulators quadruple the ILP;
             // the fixed pairwise fold keeps the per-tile reduction order deterministic.
             // NOT bit-exact vs the serial chain (summation order) — banner-gated, ppl-verified.
+            // Partial unroll only: a full Dv-unroll with 4 chains made the register allocator
+            // keep dozens of V loads in flight -> spills, and the spill cost scales with KV
+            // tiles (measured: deep decode 26.8 -> 18.6 while shallow was unchanged).
             float vacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
+#pragma unroll 8
             for (int k0 = 0; k0 < Dv; k0 += 4) {
                 if (FATTN_KQ_STRIDE % Dv != 0 && k_VKQ_0 + k0 >= ne11) {
                     break;
