@@ -3222,14 +3222,18 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // the 248320-row head) another 3.0 ms. The legacy dmmv template was A/B'd first and LOST
     // (24.97 -> 14.7 t/s deep decode: divergent global-table lookups + per-pair scale decode);
     // k_pxa_smalln_* stages the table in smem and decodes the scale once per block.
-    // Unset = auto (on iff cc==600 exactly: P100 has no DP4A; sm_61 has it and keeps MMVQ).
-    // PXA_SMALLN_GEMV=1 forces on for any pre-Volta, =0 off.
+    // MEASURED (2026-08-03, 122B PXQU48 4xP100, banner-verified): the R=1 route is a LOSS too —
+    // deep decode 25.4 -> 18.4 t/s (b2048), 26.1 -> 19.0 (b512). Better than dmmv's 14.7 but
+    // still -28% vs emulated-dp4a MMVQ. Verdict: the sm_60 dense GEMV is INSTRUCTION-economy
+    // bound, not bandwidth bound — mmvq's packed-q8_1 integer form beats scalar dequant-FMA
+    // (2 loads + table + 2 FMA per weight pair) even with dp4a emulated. Default OFF everywhere;
+    // env-only for interleaved A/Bs. A winning replacement must cut instructions/weight
+    // (half2 __hfma2 math, packed nibble decode), not just avoid the int8 path.
     static const int pxa_smalln_gemv = [](){
         const char * e = getenv("PXA_SMALLN_GEMV");
-        return e ? atoi(e) : -1;
+        return e ? atoi(e) : 0;
     }();
-    const bool pxa_smalln_take_gemv = (pxa_smalln_gemv == 1 || (pxa_smalln_gemv == -1 && cc == 600))
-        && src1->ne[1] == 1;
+    const bool pxa_smalln_take_gemv = pxa_smalln_gemv == 1 && src1->ne[1] == 1;
     if ((pxa_smalln_take_gemv || (pxa_spec_smalln && src1->ne[1] >= 2 && src1->ne[1] <= 8))
         && cc < CC_VOLTA && ggml_cuda_pxa_smalln_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
