@@ -8,6 +8,11 @@
 #include "common.cuh"
 #include "fattn-vec-common.cuh"
 
+// PXA_FA_GQA_PACK ship default (0 = off). See the kernel comment further down.
+#ifndef PXA_FA_GQA_PACK_DEFAULT
+#define PXA_FA_GQA_PACK_DEFAULT 0
+#endif
+
 // Currenlty llvm with the amdgcn target dose not support unrolling loops
 // that contain a break that can not be resolved at compile time.
 #ifdef __clang__
@@ -374,11 +379,342 @@ static __global__ void flash_attn_vec_ext_f32(
 #pragma clang diagnostic pop
 #endif // __clang__
 
+// =================================================================================================
+// PXA_FA_GQA_PACK (2026-08-03) — GQA head-packed D=256 f16-KV decode vec kernel.
+//
+// WHY. flash_attn_vec_ext_f32 gives one block to ONE Q head, so under grouped-query attention it
+// re-reads the whole K and V cache once per Q head in the group. qwen35moe-122B decodes with 32 Q
+// heads over 2 KV heads (gqa_ratio 16): profiled at fill 8881 on a P100 the kernel issues ~291 MB
+// of K+V loads per full-attention layer against 18.2 MB of unique cache, and costs 396 us/call =
+// 4.82 ms of a 36.0 ms token — the largest single attention item in the decode profile. It also
+// compiles to 242 registers, so cudaOccupancyMaxActiveBlocksPerMultiprocessor returns 1 and each
+// SM runs 8 of its 64 possible warps.
+//
+// WHAT. One block takes NH Q heads that share a KV head. The K row is loaded into registers ONCE
+// per block and dotted against NH query vectors; each V element is loaded once and fused into NH
+// accumulators. Load traffic and load-INSTRUCTION count both fall by NH while the FMA count is
+// unchanged, trading a memory-issue bound for an arithmetic one. The NH independent VKQ chains
+// also supply the instruction-level parallelism that PXA_FA_VEC_ILP had to fake with 4 partial
+// accumulators, so the V pass keeps ONE accumulator per head and stays in the stock ascending-k
+// summation order (i.e. it is the bit-exact non-ILP order, not the PXA_FA_VEC_ILP order).
+//
+// GATES. ncols == 1 (decode), K == V == f16, Dk == Dv == 256, no logit softcap, NH divides the
+// gqa_ratio and the head count, mask (if any) shared by the group — which it is, the mask is
+// indexed by (token, kv position) only. Everything outside that falls back to the stock kernel.
+// =================================================================================================
+template<int D, int NH>
+#ifndef GGML_USE_HIP
+__launch_bounds__(D, 1)
+#endif // GGML_USE_HIP
+static __global__ void flash_attn_vec_ext_f32_gqa(
+        const char  * __restrict__ Q,
+        const char  * __restrict__ K,
+        const char  * __restrict__ V,
+        const char  * __restrict__ mask,
+        const char  * __restrict__ sinks,
+        const int2  * __restrict__ KV_min_max,
+        float       * __restrict__ dst,
+        float2      * __restrict__ dst_meta,
+        const float scale,
+        const float max_bias,
+        const float m0,
+        const float m1,
+        const uint32_t n_head_log2,
+        const float logit_softcap,
+        const int32_t ne00, const int32_t ne01, const int32_t ne02, const int32_t ne03,
+                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
+                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+    GGML_UNUSED(logit_softcap); GGML_UNUSED(ne00); GGML_UNUSED(ne10); GGML_UNUSED(ne13);
+    GGML_UNUSED(ne31); GGML_UNUSED(ne32); GGML_UNUSED(nb32);
+
+    static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
+    static_assert(FATTN_KQ_STRIDE % D == 0, "the KV tail guard is elided on this assumption");
+
+    constexpr int nwarps = D/WARP_SIZE;                      // 8 warps for D == 256
+    constexpr int QPL    = D/(2*WARP_SIZE);                  // float2 / half2 per lane per row
+    constexpr dequantize_1_f32_t dequantize_1_v = get_dequantize_1_f32(GGML_TYPE_F16);
+
+    const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    __builtin_assume(tid < D);
+
+    const int ic0       = blockIdx.x;                        // Q column (token); ncols == 1
+    const int ne02g     = ne02 / NH;                         // head groups per sequence
+    const int sequence  = blockIdx.z / ne02g;
+    const int head0     = (blockIdx.z - sequence*ne02g) * NH;
+    const int gqa_ratio = ne02 / ne12;
+
+    Q += (size_t)nb03*sequence + (size_t)nb02*head0 + (size_t)nb01*ic0;
+    K += (size_t)nb13*sequence + (size_t)nb12*(head0 / gqa_ratio);
+    V += (size_t)nb23*sequence + (size_t)nb22*(head0 / gqa_ratio);
+
+    const half  * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    const float * sinksf = (const float *) (sinks);
+
+    float slope[NH];
+#pragma unroll
+    for (int j = 0; j < NH; ++j) {
+        slope[j] = get_alibi_slope(max_bias, head0 + j, n_head_log2, m0, m1);
+    }
+
+    __shared__ float KQ[NH*D];
+#pragma unroll
+    for (int j = 0; j < NH; ++j) {
+        KQ[j*D + tid] = -FLT_MAX/2.0f;
+    }
+
+    __shared__ float kqmax_shared[NH][WARP_SIZE];
+    __shared__ float kqsum_shared[NH][WARP_SIZE];
+#pragma unroll
+    for (int j = 0; j < NH; ++j) {
+        if (threadIdx.y == 0) {
+            kqmax_shared[j][threadIdx.x] = -FLT_MAX/2.0f;
+            kqsum_shared[j][threadIdx.x] = 0.0f;
+        }
+    }
+
+    // The mask depends on (token, kv position) only, so ONE row serves the whole head group.
+    __shared__ float maskf_shared[D];
+    maskf_shared[tid] = 0.0f;
+
+    __syncthreads();
+
+    float kqmax[NH], kqsum[NH], VKQ[NH];
+#pragma unroll
+    for (int j = 0; j < NH; ++j) {
+        kqmax[j] = -FLT_MAX/2.0f;
+        kqsum[j] = 0.0f;
+        VKQ [j] = 0.0f;
+    }
+
+    float2 Q_f2[NH][QPL];
+#pragma unroll
+    for (int j = 0; j < NH; ++j) {
+        const float2 * Q_f2_j = (const float2 *) (Q + (size_t)j*nb02);
+#pragma unroll
+        for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+            Q_f2[j][i0/WARP_SIZE]    = Q_f2_j[i0 + threadIdx.x];
+            Q_f2[j][i0/WARP_SIZE].x *= scale;
+            Q_f2[j][i0/WARP_SIZE].y *= scale;
+        }
+    }
+
+    const int k_VKQ_max = KV_min_max ? KV_min_max[sequence*gridDim.x + blockIdx.x].y : ne11;
+    const int first_y   = KV_min_max ? KV_min_max[sequence*gridDim.x + blockIdx.x].x : 0;
+
+    K     += (size_t)(first_y + blockIdx.y*D) * nb11;
+    V     += (size_t)(first_y + blockIdx.y*D) * nb21;
+    maskh += (first_y + blockIdx.y*D);
+
+    for (int k_VKQ_0 = first_y + blockIdx.y*D; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*D,
+             K += (size_t)gridDim.y*D*nb11, V += (size_t)gridDim.y*D*nb21, maskh += gridDim.y*D) {
+
+        if (mask) {
+            maskf_shared[tid] = __half2float(maskh[tid]);
+            __syncthreads();
+        }
+
+        float kqmax_new_arr[NH];
+#pragma unroll
+        for (int j = 0; j < NH; ++j) {
+            kqmax_new_arr[j] = kqmax[j];
+        }
+
+        for (int i_KQ_0 = 0; i_KQ_0 < D; i_KQ_0 += nwarps) {
+            const int i_KQ = i_KQ_0 + threadIdx.y;
+
+            // THE POINT OF THIS KERNEL: one K-row fetch feeds NH dot products.
+            const half2 * K_h2 = (const half2 *) (K + (size_t)i_KQ*nb11);
+            half2 K_ik[QPL];
+#pragma unroll
+            for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+                K_ik[i0/WARP_SIZE] = K_h2[i0 + threadIdx.x];
+            }
+
+#pragma unroll
+            for (int j = 0; j < NH; ++j) {
+                // same ascending (low, high) accumulation order as vec_dot_fattn_vec_KQ_f16
+                float sum = 0.0f;
+#pragma unroll
+                for (int i = 0; i < QPL; ++i) {
+                    sum +=  __low2float(K_ik[i]) * Q_f2[j][i].x;
+                    sum += __high2float(K_ik[i]) * Q_f2[j][i].y;
+                }
+                sum = warp_reduce_sum(sum);
+
+                sum += slope[j]*maskf_shared[i_KQ];
+
+                kqmax_new_arr[j] = fmaxf(kqmax_new_arr[j], sum);
+
+                if (threadIdx.x == 0) {
+                    KQ[j*D + i_KQ] = sum;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < NH; ++j) {
+            if (threadIdx.x == 0) {
+                kqmax_shared[j][threadIdx.y] = kqmax_new_arr[j];
+            }
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (int j = 0; j < NH; ++j) {
+            float kqmax_new_j = kqmax_shared[j][threadIdx.x];
+            kqmax_new_j = warp_reduce_max(kqmax_new_j);
+
+            const float KQ_max_scale = expf(kqmax[j] - kqmax_new_j);
+            kqmax[j] = kqmax_new_j;
+
+            const float val = expf(KQ[j*D + tid] - kqmax[j]);
+            kqsum[j] = kqsum[j]*KQ_max_scale + val;
+            KQ[j*D + tid] = val;
+
+            VKQ[j] *= KQ_max_scale;
+        }
+
+        __syncthreads();
+
+        // One V fetch, NH fused multiply-adds. Partial unroll only: a full D-unroll keeps dozens
+        // of V loads in flight and spills (the lesson banked by PXA_FA_VEC_ILP).
+#pragma unroll 4
+        for (int k = 0; k < D; ++k) {
+            const float V_ki = dequantize_1_v(V + (size_t)k*nb21, tid);
+#pragma unroll
+            for (int j = 0; j < NH; ++j) {
+                VKQ[j] += V_ki*KQ[j*D + k];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (sinksf && blockIdx.y == 0) {
+#pragma unroll
+        for (int j = 0; j < NH; ++j) {
+            if (threadIdx.x == 0) {
+                kqmax_shared[j][threadIdx.y] = fmaxf(kqmax[j], sinksf[head0 + j]);
+            }
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (int j = 0; j < NH; ++j) {
+            float kqmax_new_j = kqmax_shared[j][threadIdx.x];
+            kqmax_new_j = warp_reduce_max(kqmax_new_j);
+
+            const float KQ_max_scale = expf(kqmax[j] - kqmax_new_j);
+            kqmax[j] = kqmax_new_j;
+
+            const float val = expf(sinksf[head0 + j] - kqmax[j]);
+            kqsum[j] = kqsum[j]*KQ_max_scale;
+
+            if (tid == 0) {
+                kqsum[j] += val;
+            }
+
+            VKQ[j] *= KQ_max_scale;
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < NH; ++j) {
+        kqsum[j] = warp_reduce_sum(kqsum[j]);
+        if (threadIdx.x == 0) {
+            kqsum_shared[j][threadIdx.y] = kqsum[j];
+        }
+    }
+
+    __syncthreads();
+
+#pragma unroll
+    for (int j = 0; j < NH; ++j) {
+        kqsum[j] = kqsum_shared[j][threadIdx.x];
+        kqsum[j] = warp_reduce_sum(kqsum[j]);
+
+        float dst_val = VKQ[j];
+        if (gridDim.y == 1) {
+            dst_val /= kqsum[j];
+        }
+        dst[(((size_t)(sequence*ne01 + ic0)*ne02 + head0 + j)*gridDim.y + blockIdx.y)*D + tid] = dst_val;
+    }
+
+    // NOTE: `j` must stay a compile-time constant here — indexing kqmax[]/kqsum[] with a runtime
+    // `tid` (as the stock ncols kernel can, because ncols is 1 there) would force both register
+    // arrays into local memory.
+    if (gridDim.y != 1) {
+#pragma unroll
+        for (int j = 0; j < NH; ++j) {
+            if (tid == j) {
+                dst_meta[((size_t)(sequence*ne01 + ic0)*ne02 + head0 + j)*gridDim.y + blockIdx.y]
+                    = make_float2(kqmax[j], kqsum[j]);
+            }
+        }
+    }
+}
+
+// PXA_FA_GQA_PACK resolver: 0 = off (stock per-head kernel), else the number of Q heads packed
+// into one block. Only 2/4/8 are instantiated.
+static inline int pxa_fa_gqa_pack() {
+    static const int nh = [](){
+        const char * e = getenv("PXA_FA_GQA_PACK");
+        int v = e ? atoi(e) : PXA_FA_GQA_PACK_DEFAULT;
+        if (v != 0 && v != 2 && v != 4 && v != 8) {
+            fprintf(stderr, "PXA_FA_GQA_PACK: %d is not one of 0/2/4/8 — falling back to OFF\n", v);
+            v = 0;
+        }
+        fprintf(stderr, "PXA_FA_GQA_PACK: NH=%d (%s)\n", v,
+                v ? "D=256 f16-KV decode packs NH GQA heads per block; PXA_FA_GQA_PACK=0 reverts"
+                  : "OFF — stock one-block-per-head vec kernel");
+        return v;
+    }();
+    return nh;
+}
+
 template <int Dk, int Dv, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_f32_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int nwarps = Dk/WARP_SIZE;
     fattn_kernel_t fattn_kernel;
     if constexpr (Dk == 256 && Dv == 256 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
+        // PXA_FA_GQA_PACK: pack NH GQA heads per block (see the kernel above). Requires NH to
+        // divide BOTH the head count and the gqa_ratio, so the packed heads share one KV head.
+        if constexpr (!use_logit_softcap) {
+            const ggml_tensor * Qt = dst->src[0];
+            const ggml_tensor * Kt = dst->src[1];
+            const int nh_env    = pxa_fa_gqa_pack();
+            const int n_head    = (int) Qt->ne[2];
+            const int gqa_ratio = Kt->ne[2] > 0 ? (int)(Qt->ne[2] / Kt->ne[2]) : 1;
+            const int nh = (nh_env && n_head % nh_env == 0 && gqa_ratio % nh_env == 0) ? nh_env : 0;
+
+            constexpr bool need_f16_K_g = false;   // Dk == 256 -> the vec kernel reads f16 K directly
+            constexpr bool need_f16_V_g = false;
+            constexpr size_t nbytes_shared_g = 0;
+            switch (nh) {
+                case 2:
+                    launch_fattn<Dv, cols_per_block, 2>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 2>,
+                            nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
+                    return;
+                case 4:
+                    launch_fattn<Dv, cols_per_block, 4>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 4>,
+                            nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
+                    return;
+                case 8:
+                    launch_fattn<Dv, cols_per_block, 8>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 8>,
+                            nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
+                    return;
+                default:
+                    break;
+            }
+        }
         // PXA_FA_VEC_ILP: D=256 f16-KV decode gets the 4-accumulator V pass (see the kernel).
         // Default ON; =0 reverts to the serial-chain form. Only this instantiation carries the
         // twin, so compile cost is one extra kernel.
