@@ -259,7 +259,7 @@ static inline int pxa_router_fuse_mode_resolve() {
     const char * e = getenv("PXA_ROUTER_FUSE");
     if (e) {
         int m = atoi(e);
-        mode = (m < 0 || m > 2) ? 0 : m;
+        mode = (m < 0 || m > 3) ? 0 : m;   // 3 = sm_60-shaped 128-thr float4 GEMV (2026-08-03)
     } else if (pxa_config_level() == 2 && g_pxa_topology.valid
                && g_pxa_topology.has_sm70 && !g_pxa_topology.mixed
                && (!pxa_model_known() || pxa_model_is_moe())) {
@@ -277,7 +277,7 @@ static inline int pxa_router_fuse_mode_resolve() {
 // static-cached above.
 static inline bool pxa_router_fuse_on(int cc) {
     const int m = pxa_router_fuse_mode_resolve();
-    return m == 2 || (m == 1 && cc == 700);
+    return m == 2 || m == 3 || (m == 1 && cc == 700);
 }
 
 // PXA_SPEC_RELAXED level default (the actual consumer is common/sampling.cpp, which mirrors

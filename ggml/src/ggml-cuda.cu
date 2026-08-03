@@ -3043,6 +3043,37 @@ static __global__ void k_pxa_router_gemv_f32(
     }
 }
 
+// ROUTER_FUSE mode 3 (2026-08-03): the sm_60-shaped router GEMV. The mode-1/2 kernel above is
+// ONE WARP per expert row — on a P100 that is 256 lonely warps with a 96-step serial FMA chain
+// each, and it measured a 1.6% KILL vs cuBLAS on sm_60. That verdict was about the kernel
+// shape, not the idea: cuBLAS gemv2T still burns 25.7 us/call (48 calls/token profiled on the
+// qwen35moe 122B) for a 3 MB read whose BW floor is ~4 us. This form is 128 threads per row
+// with float4 loads and a warp/smem tree — the same shape the F16 small-R GEMV ships with.
+static __global__ void __launch_bounds__(128) k_pxa_router_gemv_f32_v2(
+        const float * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int ne00, const size_t nb01) {
+    const int row = blockIdx.x;
+    const float4 * w4 = (const float4 *)((const char *) w + (size_t) row * nb01);
+    const float4 * x4 = (const float4 *) x;
+    const int k4 = ne00/4;
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < k4; k += 128) {
+        const float4 a = w4[k];
+        const float4 b = x4[k];
+        sum += (a.x*b.x + a.y*b.y) + (a.z*b.z + a.w*b.w);
+    }
+    __shared__ float warpsum[4];
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, off);
+    }
+    if ((threadIdx.x & (WARP_SIZE-1)) == 0) warpsum[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        y[row] = (warpsum[0] + warpsum[1]) + (warpsum[2] + warpsum[3]);
+    }
+}
+
 // PXA_F16_GEMV (2026-07-26): small-R F16 GEMV for ne11==1 decode nodes. Motivation: the rev-2
 // backbone table promotes the per-head attn_gate (ne[1] = n_head, 48..64 on the Laguna family)
 // to F16, and an F16 x F32 ne11==1 GEMV misses every fast dispatch path (dmmv/mmvq need a
@@ -3140,6 +3171,18 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
     }
     const int ne00 = (int) src0->ne[0];
     const int ne01 = (int) src0->ne[1];
+    if (pxa_router_fuse_mode_resolve() == 3) {
+        if (ne00 % 4 != 0 || (src0->nb[1] % 16) != 0) return false;   // float4 loads
+        static std::atomic<bool> logged{false};
+        bool exp = false;
+        if (logged.compare_exchange_strong(exp, true)) {
+            fprintf(stderr, "PXA_ROUTER_FUSE: mode 3 FIRING (128-thr float4 router GEMV, %dx%d f32; PXA_ROUTER_FUSE=0 reverts to cuBLAS)\n", ne00, ne01);
+        }
+        k_pxa_router_gemv_f32_v2<<<ne01, 128, 0, ctx.stream()>>>(
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+            ne00, src0->nb[1]);
+        return true;
+    }
     k_pxa_router_gemv_f32<<<ne01, WARP_SIZE, 0, ctx.stream()>>>(
         (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
         ne00, src0->nb[1]);
