@@ -12,6 +12,9 @@
 #ifndef PXA_FA_GQA_PACK_DEFAULT
 #define PXA_FA_GQA_PACK_DEFAULT 0
 #endif
+#ifndef PXA_FA_GQA_QSMEM_DEFAULT
+#define PXA_FA_GQA_QSMEM_DEFAULT 0
+#endif
 
 // Currenlty llvm with the amdgcn target dose not support unrolling loops
 // that contain a break that can not be resolved at compile time.
@@ -402,7 +405,7 @@ static __global__ void flash_attn_vec_ext_f32(
 // gqa_ratio and the head count, mask (if any) shared by the group — which it is, the mask is
 // indexed by (token, kv position) only. Everything outside that falls back to the stock kernel.
 // =================================================================================================
-template<int D, int NH>
+template<int D, int NH, bool QSMEM = false>
 #ifndef GGML_USE_HIP
 __launch_bounds__(D, 1)
 #endif // GGML_USE_HIP
@@ -490,16 +493,34 @@ static __global__ void flash_attn_vec_ext_f32_gqa(
         VKQ [j] = 0.0f;
     }
 
-    float2 Q_f2[NH][QPL];
+    // Q lives in registers (QSMEM == false) or in shared memory (QSMEM == true).
+    //
+    // NH*QPL float2 per lane is 8*4 = 64 registers at NH=8, which is what pushes that variant to
+    // 161 registers and 1 block/SM. The measured NH sweep is explained exactly by the product
+    // (traffic reduction NH) x (blocks/SM): NH=2 2x3=6 -> 29.38, NH=4 4x2=8 -> 29.67, NH=8
+    // 8x1=8 -> 29.59. To move past that product, NH=8 has to reach 2 blocks/SM, so Q goes to
+    // shared. Layout [j][i][lane] keeps consecutive lanes on consecutive banks.
+    float2 Q_reg[QSMEM ? 1 : NH][QPL];
+    __shared__ float2 Q_sh[QSMEM ? NH*QPL*WARP_SIZE : 1];
 #pragma unroll
     for (int j = 0; j < NH; ++j) {
         const float2 * Q_f2_j = (const float2 *) (Q + (size_t)j*nb02);
 #pragma unroll
         for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
-            Q_f2[j][i0/WARP_SIZE]    = Q_f2_j[i0 + threadIdx.x];
-            Q_f2[j][i0/WARP_SIZE].x *= scale;
-            Q_f2[j][i0/WARP_SIZE].y *= scale;
+            float2 q = Q_f2_j[i0 + threadIdx.x];
+            q.x *= scale;
+            q.y *= scale;
+            if constexpr (QSMEM) {
+                if (threadIdx.y == 0) {           // Q is warp-invariant: warp 0 stages it once
+                    Q_sh[(j*QPL + i0/WARP_SIZE)*WARP_SIZE + threadIdx.x] = q;
+                }
+            } else {
+                Q_reg[j][i0/WARP_SIZE] = q;
+            }
         }
+    }
+    if constexpr (QSMEM) {
+        __syncthreads();
     }
 
     const int k_VKQ_max = KV_min_max ? KV_min_max[sequence*gridDim.x + blockIdx.x].y : ne11;
@@ -540,8 +561,10 @@ static __global__ void flash_attn_vec_ext_f32_gqa(
                 float sum = 0.0f;
 #pragma unroll
                 for (int i = 0; i < QPL; ++i) {
-                    sum +=  __low2float(K_ik[i]) * Q_f2[j][i].x;
-                    sum += __high2float(K_ik[i]) * Q_f2[j][i].y;
+                    const float2 q = QSMEM ? Q_sh[(j*QPL + i)*WARP_SIZE + threadIdx.x]
+                                           : Q_reg[QSMEM ? 0 : j][i];
+                    sum +=  __low2float(K_ik[i]) * q.x;
+                    sum += __high2float(K_ik[i]) * q.y;
                 }
                 sum = warp_reduce_sum(sum);
 
@@ -680,6 +703,19 @@ static inline int pxa_fa_gqa_pack() {
     return nh;
 }
 
+// PXA_FA_GQA_QSMEM: stage the NH query rows in shared memory instead of registers, trading a
+// shared load per dot term for ~64 registers at NH=8 (the difference between 1 and 2 blocks/SM).
+// Only the NH=4 and NH=8 kernels carry the twin.
+static inline bool pxa_fa_gqa_qsmem() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_FA_GQA_QSMEM");
+        const bool on = e ? atoi(e) != 0 : (PXA_FA_GQA_QSMEM_DEFAULT != 0);
+        fprintf(stderr, "PXA_FA_GQA_QSMEM: %s (Q staged in shared for NH=4/8)\n", on ? "ON" : "OFF");
+        return on;
+    }();
+    return v;
+}
+
 template <int Dk, int Dv, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_f32_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int nwarps = Dk/WARP_SIZE;
@@ -695,20 +731,23 @@ void ggml_cuda_flash_attn_ext_vec_f32_case_impl(ggml_backend_cuda_context & ctx,
             const int gqa_ratio = Kt->ne[2] > 0 ? (int)(Qt->ne[2] / Kt->ne[2]) : 1;
             const int nh = (nh_env && n_head % nh_env == 0 && gqa_ratio % nh_env == 0) ? nh_env : 0;
 
+            const bool qs = pxa_fa_gqa_qsmem();
             constexpr bool need_f16_K_g = false;   // Dk == 256 -> the vec kernel reads f16 K directly
             constexpr bool need_f16_V_g = false;
             constexpr size_t nbytes_shared_g = 0;
             switch (nh) {
                 case 2:
-                    launch_fattn<Dv, cols_per_block, 2>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 2>,
+                    launch_fattn<Dv, cols_per_block, 2>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 2, false>,
                             nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
                     return;
                 case 4:
-                    launch_fattn<Dv, cols_per_block, 4>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 4>,
+                    launch_fattn<Dv, cols_per_block, 4>(ctx, dst,
+                            qs ? flash_attn_vec_ext_f32_gqa<Dv, 4, true> : flash_attn_vec_ext_f32_gqa<Dv, 4, false>,
                             nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
                     return;
                 case 8:
-                    launch_fattn<Dv, cols_per_block, 8>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 8>,
+                    launch_fattn<Dv, cols_per_block, 8>(ctx, dst,
+                            qs ? flash_attn_vec_ext_f32_gqa<Dv, 8, true> : flash_attn_vec_ext_f32_gqa<Dv, 8, false>,
                             nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
                     return;
                 default:
