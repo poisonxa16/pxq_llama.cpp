@@ -166,6 +166,37 @@ static inline void pxa_pxq6_rowx2_log(int site, bool engaged) {
                     : "DECLINED -> 256-thr incumbent (no x2 instantiation)");
 }
 
+// Q1 (PXA_PXQ6_QPF): one-slab-lookahead register prefetch in the decode chunk walk.
+// 0 = off (default), 1 = single-weight mmv family, 2 = gateup family, 3 = both — split so
+// the two register-cliff exposures A/B independently (the gateup twin carries 2x the
+// prefetch state). At every site Q1 yields to an engaged R2 twin (no double-restructure).
+static inline int pxa_pxq6_qpf() {
+    static const int v = [](){
+        const char * e = getenv("PXA_PXQ6_QPF");
+        int m = e ? atoi(e) : 0;
+        if (m < 0 || m > 3) { fprintf(stderr, "PXA_PXQ6_QPF=%d invalid (want 0-3) -- OFF\n", m); m = 0; }
+        if (m) fprintf(stderr, "PXA_PXQ6_QPF: armed (%s%s) -- Q1 decode slab prefetch, bit-exact; "
+                               "an A/B without the in-run ENGAGED banner is void\n",
+                       (m & 1) ? "mmv " : "", (m & 2) ? "gateup" : "");
+        return m;
+    }();
+    return v;
+}
+
+// Q1 first-fire / first-decline, one line per dispatch site (phantom-lever discipline).
+static inline void pxa_pxq6_qpf_log(int site, bool engaged) {
+    static std::atomic<uint32_t> seen{0};
+    if (site < 0 || site >= 6) return;
+    const uint32_t bit = 1u << (2*site + (engaged ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    static const char * names[6] = {"2d-mmv", "2d-mmv-split", "moe-gateup-split",
+                                    "dense-gateup-split", "moe-down-split", "moe-down"};
+    fprintf(stderr, "PXA_PXQ6_QPF %s: %s\n", names[site],
+            engaged ? "ENGAGED (Q1 one-slab-lookahead twin)"
+                    : "DECLINED -> incumbent (no qp instantiation)");
+}
+
+
 // PXQ6R (GGML_TYPE_PXQ6 = 256, display "pxq6") master gate + host self-check. Default ON;
 // PXA_PXQ6R=0 disables (dequant->cublas fallback). Invariants of the frozen LM32 book:
 // exactly 32 entries, strictly ascending, fp16-snap idempotent, book[16] == +0.0f (PXQ6R_ZIDX),
@@ -1420,6 +1451,386 @@ k_pxq6_gateup_mmv_ksplit_gen(const uint8_t * __restrict__ Wu, const uint8_t * __
         }
         wsj[(size_t)(c*PXQ4_MMV_KSEG + kseg)*R + grow]           = tu;
         wsj[(guslots + (size_t)(c*PXQ4_MMV_KSEG + kseg))*R + grow] = tg;
+    }
+    if (counters == nullptr) return;                 // driver launches k_pxq6_gateup_reduce_gen instead
+    __threadfence();
+    __syncthreads();
+    __shared__ int lastblk;
+    if (threadIdx.x == 0) {
+        const int done = atomicAdd(&counters[iy*n_ids + j], 1) + 1;
+        lastblk = (done == (int)gridDim.x);
+        if (lastblk) counters[iy*n_ids + j] = 0;
+    }
+    __syncthreads();
+    if (!lastblk) return;
+    const float * wsj2 = wsj;
+    float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+    for (int gr = threadIdx.x; gr < R; gr += blockDim.x) {
+        float u = 0.f, g = 0.f;
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) {
+            float sus = 0.f, sgs = 0.f;
+            for (int c = 0; c < nfix; ++c) {
+                sus += wsj2[(size_t)(c*PXQ4_MMV_KSEG + s)*R + gr];
+                sgs += wsj2[(guslots + (size_t)(c*PXQ4_MMV_KSEG + s))*R + gr];
+            }
+            u += sus;
+            g += sgs;
+        }
+        if (bias_u) u += *(const float *)((const char *)bias_u + (size_t)e*bias_u_nb1 + (size_t)gr*sizeof(float));
+        if (bias_g) g += *(const float *)((const char *)bias_g + (size_t)e*bias_g_nb1 + (size_t)gr*sizeof(float));
+        out[gr] = pxq4_glu_apply(g, u, unary, alpha, limit);
+    }
+}
+
+
+// =============================================================================================
+// Q1 — PXA_PXQ6_QPF (2026-08-04): one-slab-lookahead register prefetch twins of the fired
+// decode kernels. WHY: with SHFL shipped, the residual term is EXPOSED PER-WARP DRAM LATENCY,
+// not a throughput pipe — every issue-side lever pays ~0.2:1 (SHFL -18% loop instructions ->
+// +4.2%; PAIRL3 ~-160 instructions -> +2.7%; +33% occupancy -> +0.14% null), and the SASS
+// shows the code LDG consumed by the IMMEDIATELY next instruction with zero cross-iteration
+// lookahead: each warp eats the full DRAM latency once per slab, serially. These twins issue
+// slab i+1's code words + scale byte(s) BEFORE slab i's unpack/FMA chain, so the latency
+// overlaps compute that was being issued anyway (the decode analog of the GEMM K5 PIPE
+// prologue staging in k_pxq6_gemm_grouped).
+//
+// BIT-EXACT BY CONSTRUCTION: the (c, kb) walk order, per-chunk fold boundaries, per-lane fp32
+// chains, ws slots, and epilogues are copied from the incumbents verbatim; pxq6_dot32_qp
+// computes pxq6_dot32's arithmetic on operands loaded EARLIER from the same read-only
+// addresses. Only load issue time changes => temp-0 sha must match the incumbents.
+//
+// WALK GUARANTEE the pipeline leans on: pxq6_canon_nfix caps nfix at kslabs/PXQ4_MMV_KSEG,
+// so every fixed chunk spans >= KSEG slabs and every (chunk, kseg lane) runs >= 1 iteration
+// — the successor step below never has to skip an empty chunk, and every ws slot the
+// incumbent writes is written here (same value, same order).
+//
+// REGISTER DISCIPLINE: prefetch state = CODE_WORDS+1 regs per tensor per stage (P2: 3, P6: 5,
+// P6R: 6; gateup doubles it). 256 threads, plain __launch_bounds__(256) — NEVER (256, 1):
+// the neutral-looking minBlocksPerMultiprocessor=1 lifts the register ceiling (74->121 regs
+// happened once). GATE every fired instantiation with cuobjdump -res-usage before GPU time.
+// =============================================================================================
+
+// per-(lane, slab) weight-side state: code words + packed scale byte(s), loaded EARLY
+template <class POL>
+struct pxq6_pfslab {
+    uint32_t q[POL::CODE_WORDS];
+    uint32_t sb;   // 1 B scale byte (NEFF 2) / LE u16 byte pair (NEFF 4)
+};
+
+template <class POL, bool CS>
+static __device__ __forceinline__ void pxq6_qp_ld(const uint8_t * __restrict__ pan, int kb, int row,
+                                                  pxq6_pfslab<POL> & st) {
+    const uint8_t * slab = pan + POL::HDR + (size_t)kb*POL::SLAB;
+    pxq6_ldcodes<POL, CS>(slab + POL::CODE_OFF + row*POL::CODE_BYTES, st.q);
+    if constexpr (POL::NEFF == 4) st.sb = *(const uint16_t *)(slab + 2*row);   // 2-B aligned (HDR/SLAB even)
+    else                          st.sb = slab[row];
+}
+
+// successor of (c, kb) in the canonical chunk walk; false when exhausted. Single-step chunk
+// advance is sufficient (no empty chunks — see the walk guarantee above).
+static __device__ __forceinline__ bool pxq6_qp_next(int & c, int & kb, int & bnd,
+                                                    const int c_end, const int kslabs,
+                                                    const int nfix, const int kseg) {
+    kb += PXQ4_MMV_KSEG;
+    if (kb < bnd) return true;
+    if (++c >= c_end) return false;
+    kb  = (kslabs*c)/nfix + kseg;
+    bnd = (kslabs*(c+1))/nfix;
+    return true;
+}
+
+// pxq6_dot32 on a pre-loaded pxq6_pfslab: the eff computation replicates every policy's
+// row_effs shape exactly (all NEFF==2 policies share the 1-byte SUB16 form; NEFF==4 is the
+// pxq6_pol_p6hq 2-byte SUB8 form), and the pair loop is pxq6_dot32's verbatim with q -> st.q.
+// Same operands, same order => bit-exact vs pxq6_dot32 for every MODE (incl. the K2d bv stage).
+template <class POL, int MODE, bool VECX>
+static __device__ __forceinline__ float pxq6_dot32_qp(const pxq6_pfslab<POL> & st, float anch,
+                                                      const float * __restrict__ xk,
+                                                      const float * __restrict__ tab,
+                                                      const float * __restrict__ sub,
+                                                      const float2 * __restrict__ plut,
+                                                      const pxq6_prmt_book & pb) {
+    using M = pxq6_mode<MODE>;
+    float eff[POL::NEFF];
+    if constexpr (POL::NEFF == 4) {
+        const int sb0 = (int)(st.sb & 0xff), sb1 = (int)(st.sb >> 8);
+        eff[0] = anch * sub[sb0 & 0xf];
+        eff[1] = anch * sub[sb0 >> 4];
+        eff[2] = anch * sub[sb1 & 0xf];
+        eff[3] = anch * sub[sb1 >> 4];
+    } else {
+        const int sb = (int)st.sb;
+        eff[0] = anch * sub[sb & 0xf];
+        eff[1] = anch * sub[sb >> 4];
+    }
+    // K2d (MODE SHFL): same bv staging as pxq6_dot32 — dead code for every other mode.
+    float bv = 0.f;
+    if constexpr (M::shfl) bv = tab[threadIdx.x & 31];
+    float t[POL::NEFF];
+    #pragma unroll
+    for (int i = 0; i < POL::NEFF; ++i) t[i] = 0.f;
+    if (VECX) {
+        #pragma unroll
+        for (int b = 0; b < 16; b += 2) {
+            const float4 xv = *(const float4 *)&xk[2*b];
+            const float2 p0 = pxq6_pairx<POL, MODE>(st.q, b,   tab, plut, pb, bv);
+            const float2 p1 = pxq6_pairx<POL, MODE>(st.q, b+1, tab, plut, pb, bv);
+            t[(b*POL::NEFF) >> 4]     = pxq6_acc2(t[(b*POL::NEFF) >> 4],     p0.x, xv.x, p0.y, xv.y);
+            t[((b+1)*POL::NEFF) >> 4] = pxq6_acc2(t[((b+1)*POL::NEFF) >> 4], p1.x, xv.z, p1.y, xv.w);
+        }
+    } else {
+        #pragma unroll
+        for (int b = 0; b < 16; ++b) {
+            const float2 p = pxq6_pairx<POL, MODE>(st.q, b, tab, plut, pb, bv);
+            t[(b*POL::NEFF) >> 4] = pxq6_acc2(t[(b*POL::NEFF) >> 4], p.x, xk[2*b], p.y, xk[2*b+1]);
+        }
+    }
+    if (POL::NEFF == 1) return eff[0]*t[0];
+    if (POL::NEFF == 2) return eff[0]*t[0] + eff[1]*t[1];
+    return (eff[0]*t[0] + eff[1]*t[1]) + (eff[2]*t[2] + eff[3]*t[3]);
+}
+
+// Q1 twin of k_pxq6_mmv: identical grid/smem/prologue/epilogue; only the chunk walk is
+// software-pipelined one slab deep.
+template <class POL, int MODE, bool VECX>
+static __global__ void __launch_bounds__(256)
+k_pxq6_mmv_qp(const uint8_t * __restrict__ W,
+              const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+              char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+              const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+              const int R, const int K, const int n_as) {
+    const int p  = blockIdx.x;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    extern __shared__ float pxq6_smem[];
+    float * xs = pxq6_smem;
+    float * red = pxq6_smem + K;
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride);
+    for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
+
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
+    __shared__ float sub[16];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 256);
+    __syncthreads();
+    pxq6_prmt_book pb{};
+    if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    // PXQ_CANON_v1 walk, Q1-pipelined: same (c, kb) sequence, same per-chunk fold order,
+    // same dot32 chains — only WHEN the read-only weight-side loads issue changes.
+    const int nfix = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);
+    float su = 0.f;
+    {
+        int c = 0, kb = kseg, bnd = kslabs/nfix;
+        pxq6_pfslab<POL> cur, nxt;
+        pxq6_qp_ld<POL, pxq6_mode<MODE>::cs>(pan, kb, row, cur);
+        float t = 0.f;
+        for (;;) {
+            int cn = c, kbn = kb, bn = bnd;
+            const bool more = pxq6_qp_next(cn, kbn, bn, nfix, kslabs, nfix, kseg);
+            if (more) pxq6_qp_ld<POL, pxq6_mode<MODE>::cs>(pan, kbn, row, nxt);   // in flight over this slab's math
+            t += pxq6_dot32_qp<POL, MODE, VECX>(cur, anch, xs + kb*PXQ6_QK, tab, sub, plut, pb);
+            if (cn != c) { su += t; t = 0.f; }        // chunk close: same fold order as incumbent
+            if (!more) break;
+            c = cn; kb = kbn; bnd = bn; cur = nxt;
+        }
+    }
+    red[kseg*64 + row] = su;
+    __syncthreads();
+    if (kseg == 0) {
+        float u = 0.f;
+        #pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += red[s*64 + row];
+        float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+        out[p*PXQ6_BM + row] = u;
+    }
+}
+
+// Q1 twin of k_pxq6_mmv_ksplit_gen: identical grid/smem/ws layout/FUSERED tail; pipelined walk.
+template <class POL, int MODE, bool VECX>
+static __global__ void __launch_bounds__(256)
+k_pxq6_mmv_ksplit_gen_qp(const uint8_t * __restrict__ W,
+                         const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+                         float * __restrict__ ws,
+                         const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                         char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+                         int * __restrict__ counters,
+                         const int R, const int K, const int n_as, const int n_ids, const int S) {
+    const int pk = blockIdx.x;
+    const int p     = pk / S;
+    const int chunk = pk % S;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    const int kslabs = K / PXQ6_QK;
+    const int nfix = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);   // S divides nfix (driver-guaranteed)
+    const int cpb  = nfix/S;                                        // fixed chunks per block
+    const int c0 = chunk*cpb, c1 = c0 + cpb;
+    const int kb0 = (kslabs*c0)/nfix, kb1 = (kslabs*c1)/nfix;
+    const int Kc  = (kb1 - kb0)*PXQ6_QK;
+
+    extern __shared__ float pxq6_smem[];
+    float * xs  = pxq6_smem;                      // Kc floats (chunk slice only)
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride) + kb0*PXQ6_QK;
+    for (int idx = threadIdx.x; idx < Kc; idx += blockDim.x) xs[idx] = x[idx];
+
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
+    __shared__ float sub[16];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 256);
+    __syncthreads();
+    pxq6_prmt_book pb{};
+    if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    float * wsj = ws + ((size_t)iy*n_ids + j)*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*R;
+    {
+        int c = c0, kb = kb0 + kseg, bnd = (kslabs*(c0+1))/nfix;
+        pxq6_pfslab<POL> cur, nxt;
+        pxq6_qp_ld<POL, pxq6_mode<MODE>::cs>(pan, kb, row, cur);
+        float t = 0.f;
+        for (;;) {
+            int cn = c, kbn = kb, bn = bnd;
+            const bool more = pxq6_qp_next(cn, kbn, bn, c1, kslabs, nfix, kseg);
+            if (more) pxq6_qp_ld<POL, pxq6_mode<MODE>::cs>(pan, kbn, row, nxt);   // in flight over this slab's math
+            t += pxq6_dot32_qp<POL, MODE, VECX>(cur, anch, xs + (kb - kb0)*PXQ6_QK, tab, sub, plut, pb);
+            if (cn != c) {                            // chunk close: same slot, same value
+                wsj[(size_t)(c*PXQ4_MMV_KSEG + kseg)*R + p*PXQ6_BM + row] = t;
+                t = 0.f;
+            }
+            if (!more) break;
+            c = cn; kb = kbn; bnd = bn; cur = nxt;
+        }
+    }
+    if (counters == nullptr) return;                 // driver launches k_pxq_mmv_reduce_s instead
+    __threadfence();                                 // ws writes visible before the flag
+    __syncthreads();
+    __shared__ int lastblk;
+    if (threadIdx.x == 0) {
+        const int done = atomicAdd(&counters[iy*n_ids + j], 1) + 1;
+        lastblk = (done == (int)gridDim.x);
+        if (lastblk) counters[iy*n_ids + j] = 0;     // self-clean for the next node on the stream
+    }
+    __syncthreads();
+    if (!lastblk) return;
+    // final reduction, SAME canonical order as k_pxq_mmv_reduce_s => identical values
+    const float * wsj2 = wsj;
+    float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+    for (int grow = threadIdx.x; grow < R; grow += blockDim.x) {
+        float u = 0.f;
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) {
+            float sus = 0.f;
+            for (int c = 0; c < nfix; ++c) sus += wsj2[(size_t)(c*PXQ4_MMV_KSEG + s)*R + grow];
+            u += sus;
+        }
+        out[grow] = u;
+    }
+}
+
+// Q1 twin of k_pxq6_gateup_mmv_ksplit_gen: identical grid/smem/ws layout/FUSERED tail;
+// pipelined walk with a U+G state pair per stage (2x the single-weight prefetch registers —
+// that is why the env splits the families).
+template <class POLU, class POLG, int MODE, bool VECX>
+static __global__ void __launch_bounds__(256)
+k_pxq6_gateup_mmv_ksplit_gen_qp(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg,
+                                const char * __restrict__ x_base, const size_t x_tok_stride,
+                                float * __restrict__ ws,
+                                const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                                char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+                                const float * __restrict__ bias_u, const size_t bias_u_nb1,
+                                const float * __restrict__ bias_g, const size_t bias_g_nb1,
+                                int * __restrict__ counters,
+                                const int unary, const float alpha, const float limit,
+                                const int R, const int K, const int n_as, const int n_ids, const int S) {
+    const int pk = blockIdx.x;
+    const int p     = pk / S;
+    const int chunk = pk % S;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    const int kslabs = K / PXQ6_QK;
+    const int nfix = pxq6_canon_nfix(kslabs, PXQ6_GU_SPLIT_MAX);   // S divides nfix (driver-guaranteed)
+    const int cpb  = nfix/S;                                       // fixed chunks per block
+    const int c0 = chunk*cpb, c1 = c0 + cpb;
+    const int kb0 = (kslabs*c0)/nfix, kb1 = (kslabs*c1)/nfix;
+    const int Kc  = (kb1 - kb0)*PXQ6_QK;
+
+    extern __shared__ float pxq6_smem[];
+    float * xs  = pxq6_smem;                      // Kc floats (chunk slice only)
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride) + kb0*PXQ6_QK;
+    for (int idx = threadIdx.x; idx < Kc; idx += blockDim.x) xs[idx] = x[idx];
+
+    __shared__ float tabU[32], subU[16], tabG[32], subG[16];   // 32-entry tabs: P6R LM32
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
+    POLU::stage_tabs(tabU, subU, threadIdx.x);
+    POLG::stage_tabs(tabG, subG, threadIdx.x);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POLU>(plut, threadIdx.x, 256);
+    __syncthreads();
+    pxq6_prmt_book pbU{}, pbG{};
+    if constexpr (pxq6_mode<MODE>::prmt) { pxq6_prmt_build(tabU, pbU); pxq6_prmt_build(tabG, pbG); }
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM;
+    const uint8_t * panU = pxq6_panel<POLU>(Wu, e, panels, p, kslabs);
+    const uint8_t * panG = pxq6_panel<POLG>(Wg, e, panels, p, kslabs);
+    const float anchU = POLU::HDR ? POLU::anchor(panU, row) : 0.f;
+    const float anchG = POLG::HDR ? POLG::anchor(panG, row) : 0.f;
+
+    const size_t guslots = (size_t)(PXQ6_GU_SPLIT_MAX*PXQ4_MMV_KSEG);   // slots per half
+    float * wsj = ws + ((size_t)iy*n_ids + j)*2*guslots*R;
+    const int grow = p*PXQ6_BM + row;
+    {
+        int c = c0, kb = kb0 + kseg, bnd = (kslabs*(c0+1))/nfix;
+        pxq6_pfslab<POLU> curU, nxtU;
+        pxq6_pfslab<POLG> curG, nxtG;
+        pxq6_qp_ld<POLU, pxq6_mode<MODE>::cs>(panU, kb, row, curU);
+        pxq6_qp_ld<POLG, pxq6_mode<MODE>::cs>(panG, kb, row, curG);
+        float tu = 0.f, tg = 0.f;
+        for (;;) {
+            int cn = c, kbn = kb, bn = bnd;
+            const bool more = pxq6_qp_next(cn, kbn, bn, c1, kslabs, nfix, kseg);
+            if (more) {                               // both tensors' next slab in flight
+                pxq6_qp_ld<POLU, pxq6_mode<MODE>::cs>(panU, kbn, row, nxtU);
+                pxq6_qp_ld<POLG, pxq6_mode<MODE>::cs>(panG, kbn, row, nxtG);
+            }
+            const float * xk = xs + (kb - kb0)*PXQ6_QK;
+            tu += pxq6_dot32_qp<POLU, MODE, VECX>(curU, anchU, xk, tabU, subU, plut, pbU);
+            tg += pxq6_dot32_qp<POLG, MODE, VECX>(curG, anchG, xk, tabG, subG, plut, pbG);
+            if (cn != c) {                            // chunk close: same slots, same values
+                wsj[(size_t)(c*PXQ4_MMV_KSEG + kseg)*R + grow]             = tu;
+                wsj[(guslots + (size_t)(c*PXQ4_MMV_KSEG + kseg))*R + grow] = tg;
+                tu = 0.f; tg = 0.f;
+            }
+            if (!more) break;
+            c = cn; kb = kbn; bnd = bn; curU = nxtU; curG = nxtG;
+        }
     }
     if (counters == nullptr) return;                 // driver launches k_pxq6_gateup_reduce_gen instead
     __threadfence();
@@ -3074,6 +3485,12 @@ PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen, k_pxq6_gateup
 PXQ6_PICKM_FMT(pxq6_mmv_fn,        pxq6_pick_mmv_x2,               k_pxq6_mmv_x2)
 PXQ6_PICKM_FMT(pxq6_mmv_ksg_fn,    pxq6_pick_mmv_ksplit_gen_x2,    k_pxq6_mmv_ksplit_gen_x2)
 PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen_x2, k_pxq6_gateup_mmv_ksplit_gen_x2)
+
+// Q1 (PXA_PXQ6_QPF) one-slab-lookahead prefetch twins — full fmt/mode/vecx parity with the
+// incumbents (dot32_qp mirrors dot32 for every mode, incl. K2d SHFL and PAIRL3 sourcing)
+PXQ6_PICKM_FMT(pxq6_mmv_fn,        pxq6_pick_mmv_qp,               k_pxq6_mmv_qp)
+PXQ6_PICKM_FMT(pxq6_mmv_ksg_fn,    pxq6_pick_mmv_ksplit_gen_qp,    k_pxq6_mmv_ksplit_gen_qp)
+PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen_qp, k_pxq6_gateup_mmv_ksplit_gen_qp)
 
 // TOK-batched gateup gen-split picker (PXA_PXQ_TOKBATCH). Offered for the SHIPPED decode
 // sourcing only -- VECX=1 with MODE TAB, plus the P3-P3 PAIRL3 promotion (mirroring

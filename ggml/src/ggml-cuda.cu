@@ -4259,6 +4259,11 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         pxa_pxq6_rowx2_log(0, k2 != nullptr);
         if (k2) { kern = k2; nthr_mmv = 128; }
     }
+    if (nthr_mmv == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
+        auto * kq = pxq6_pick_mmv_qp(fmt, pair, vecx);
+        pxa_pxq6_qpf_log(0, kq != nullptr);
+        if (kq) kern = kq;
+    }
 
     cudaStream_t stream = ctx.stream();
 
@@ -4288,6 +4293,11 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 auto * k2 = pxq6_pick_mmv_ksplit_gen_x2(fmt, pair, vecx);
                 pxa_pxq6_rowx2_log(1, k2 != nullptr);
                 if (k2) { ksg = k2; nthr_ksg = 128; }
+            }
+            if (ksg && nthr_ksg == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
+                auto * kq = pxq6_pick_mmv_ksplit_gen_qp(fmt, pair, vecx);
+                pxa_pxq6_qpf_log(1, kq != nullptr);
+                if (kq) ksg = kq;
             }
             if (ksg) {
                 // PXQ_CANON_v1 workspace: raw per-(fixed-chunk, lane) partials
@@ -4703,6 +4713,11 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     pxa_pxq6_rowx2_log(2, k2 != nullptr);
                     if (k2) { ks = k2; nthr_gug = 128; }
                 }
+                if (ks && nthr_gug == 256 && (pxa_pxq6_qpf() & 2)) {   // Q1 yields to an engaged R2 twin
+                    auto * kq = pxq6_pick_gateup_ksplit_gen_qp(fmt, fmt_g, pair, vecx);
+                    pxa_pxq6_qpf_log(2, kq != nullptr);
+                    if (kq) ks = kq;
+                }
                 if (!gu_done && ks) {
                 int * ctrs = pxa_pxq_split_fusered()
                     ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
@@ -4845,6 +4860,11 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     pxa_pxq6_rowx2_log(4, k2 != nullptr);
                     if (k2) { ksg_d = k2; nthr_dks = 128; }
                 }
+                if (ksg_d && nthr_dks == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
+                    auto * kq = pxq6_pick_mmv_ksplit_gen_qp(fmt_d, pair, vecx);
+                    pxa_pxq6_qpf_log(4, kq != nullptr);
+                    if (kq) ksg_d = kq;
+                }
                 float * ws_d = nullptr;
                 if (ksg_d) {
                     const size_t need_d = (size_t)Ny*n_ids*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*(size_t)Rd;
@@ -4886,6 +4906,11 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 auto * k2 = pxq6_pick_mmv_x2(fmt_d, pair, vecx);
                 pxa_pxq6_rowx2_log(5, k2 != nullptr);
                 if (k2) { kern_d = k2; nthr_dmm = 128; }
+            }
+            if (nthr_dmm == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
+                auto * kq = pxq6_pick_mmv_qp(fmt_d, pair, vecx);
+                pxa_pxq6_qpf_log(5, kq != nullptr);
+                if (kq) kern_d = kq;
             }
             kern_d<<<gridd, nthr_dmm, smem_d, stream>>>(
                 (const uint8_t *)next->src[0]->data,
@@ -5985,6 +6010,11 @@ static int pxa_pxq_gateup_2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 auto * k2 = pxq6_pick_gateup_ksplit_gen_x2(fmt, fmt_g, pair, vecx);
                 pxa_pxq6_rowx2_log(3, k2 != nullptr);
                 if (k2) { ksg = k2; nthr_dgu = 128; }
+            }
+            if (ksg && nthr_dgu == 256 && (pxa_pxq6_qpf() & 2)) {   // Q1 yields to an engaged R2 twin
+                auto * kq = pxq6_pick_gateup_ksplit_gen_qp(fmt, fmt_g, pair, vecx);
+                pxa_pxq6_qpf_log(3, kq != nullptr);
+                if (kq) ksg = kq;
             }
             const int    kc_max  = ((kslabs + S - 1)/S)*PXQ6_QK;
             const size_t smem_s  = (size_t)kc_max*sizeof(float);
