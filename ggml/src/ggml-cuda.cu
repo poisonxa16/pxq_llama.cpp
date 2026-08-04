@@ -3135,6 +3135,47 @@ static bool ggml_cuda_small_gemv_f16(ggml_backend_cuda_context & ctx, const ggml
 }
 
 // Returns true if it fully handled the mul_mat (caller should return immediately).
+// Engagement counters. The RATIO is the assertion, not the banner: a one-shot bool cannot
+// distinguish "fired once" from "fires every token". On a clean np1 non-speculative run
+// expect fired ~ n_moe_layers * n_tokens. The router GEMV gate requires ne11==1, so any
+// drafter (mtp or ngram) submits 1+n_draft and declines here -- fired stalls while
+// declined_ne11 climbs. (NB: the PXQ codec paths carry tokens on ne[2] and are NOT affected.)
+static std::atomic<uint64_t> g_pxa_rf_fired{0};
+static std::atomic<uint64_t> g_pxa_rf_declined_ne11{0};
+static void pxa_rf_dbg(const char * what) {
+    static const bool dbg = getenv("PXA_ROUTER_FUSE_DBG") != nullptr;
+    if (!dbg) return;
+    const unsigned long long f = g_pxa_rf_fired.load(), d = g_pxa_rf_declined_ne11.load();
+    if (((f + d) % 512ULL) == 0ULL)
+        fprintf(stderr, "PXA_ROUTER_FUSE_DBG: %s fired=%llu declined_ne11=%llu\n", what, f, d);
+}
+static void pxa_rf_fired_banner(int mode, int ne00, int ne01) {
+    static std::atomic<bool> logged{false};
+    bool exp = false;
+    if (logged.compare_exchange_strong(exp, true))
+        fprintf(stderr, "PXA_ROUTER_FUSE: mode %d FIRING (%dx%d f32; PXA_ROUTER_FUSE=0 reverts to cuBLAS)\n",
+                mode, ne00, ne01);
+    g_pxa_rf_fired++; pxa_rf_dbg("fire");
+}
+
+// Reducer block shape. Both PXQ reducers are pure per-thread row maps, so this is
+// bit-identical at any block size; it only changes how many SMs the launch reaches.
+// Default 256 == today's behaviour byte-for-byte. 64 spreads the dense reduce from
+// 12 blocks to 48 on a 56-SM chip. Measure before flipping the default.
+static inline int pxa_pxq_reduce_blk() {
+    static const int b = [](){
+        const char * e = getenv("PXA_PXQ_REDUCE_BLK");
+        int v = e ? atoi(e) : 256;
+        if (v != 32 && v != 64 && v != 128 && v != 256) {
+            fprintf(stderr, "PXA: PXA_PXQ_REDUCE_BLK=%d invalid (want 32/64/128/256) -- using 256\n", v);
+            v = 256;
+        }
+        if (e) fprintf(stderr, "PXA_PXQ_REDUCE_BLK: reducer blockDim.x = %d\n", v);
+        return v;
+    }();
+    return b;
+}
+
 static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // Per-ARCH gate (resolver in pxa-enhance.cuh, INT8_PREFILL-pattern): ENHANCE auto-enables
     // on cc==700 ONLY (+5.1..7.0% decode measured sm_70; +1.6% KILL sm_60, Pascal stays off).
@@ -3161,6 +3202,7 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
         return false;
     }
     if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        if (src1->ne[1] != 1) { g_pxa_rf_declined_ne11++; pxa_rf_dbg("decline"); }
         return false;
     }
     // router shape family: many small output rows (experts), guard against ever matching a real
@@ -3173,16 +3215,13 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
     const int ne01 = (int) src0->ne[1];
     if (pxa_router_fuse_mode_resolve() == 3) {
         if (ne00 % 4 != 0 || (src0->nb[1] % 16) != 0) return false;   // float4 loads
-        static std::atomic<bool> logged{false};
-        bool exp = false;
-        if (logged.compare_exchange_strong(exp, true)) {
-            fprintf(stderr, "PXA_ROUTER_FUSE: mode 3 FIRING (128-thr float4 router GEMV, %dx%d f32; PXA_ROUTER_FUSE=0 reverts to cuBLAS)\n", ne00, ne01);
-        }
+        pxa_rf_fired_banner(3, ne00, ne01);
         k_pxa_router_gemv_f32_v2<<<ne01, 128, 0, ctx.stream()>>>(
             (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
             ne00, src0->nb[1]);
         return true;
     }
+    pxa_rf_fired_banner(pxa_router_fuse_mode_resolve(), ne00, ne01);
     k_pxa_router_gemv_f32<<<ne01, WARP_SIZE, 0, ctx.stream()>>>(
         (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
         ne00, src0->nb[1]);
@@ -3995,8 +4034,9 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                         (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1, S);
                     CUDA_CHECK(cudaGetLastError());
                     if (!ctrs) {
-                        dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
-                        k_pxq_mmv_reduce_s<<<gridr, 256, 0, stream>>>(ws,
+                        const int rblk = pxa_pxq_reduce_blk();
+                        dim3 gridr((unsigned)((R + rblk - 1)/rblk), 1u, (unsigned)ny);
+                        k_pxq_mmv_reduce_s<<<gridr, rblk, 0, stream>>>(ws,
                             (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
                             (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
                             (int)R, /* n_as */ 1, /* n_ids */ 1, kslabs);
@@ -4032,8 +4072,9 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
                     (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1);
                 CUDA_CHECK(cudaGetLastError());
-                dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
-                k_pxq_mmv_reduce<<<gridr, 256, 0, stream>>>(ws,
+                const int rblk = pxa_pxq_reduce_blk();
+                        dim3 gridr((unsigned)((R + rblk - 1)/rblk), 1u, (unsigned)ny);
+                k_pxq_mmv_reduce<<<gridr, rblk, 0, stream>>>(ws,
                     (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
                     (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
                     (int)R, /* n_as */ 1, /* n_ids */ 1);
@@ -4298,7 +4339,8 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const size_t need = (size_t)Ny*n_ids*2*(sgen_eff >= 2 ? PXQ6_GU_SPLIT_MAX*PXQ4_MMV_KSEG : PXQ4_MMV_KSEG)*R;
         float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
         if (ws) {
-            dim3 gridr((unsigned)((R + 255)/256), (unsigned)n_ids, (unsigned)Ny);
+            const int rblk = pxa_pxq_reduce_blk();
+                        dim3 gridr((unsigned)((R + rblk - 1)/rblk), (unsigned)n_ids, (unsigned)Ny);
             if (sgen_eff >= 2) {
                 const int kslabs = kslabs_gu;
                 const int kcmax  = ((kslabs + sgen_eff - 1)/sgen_eff)*PXQ4_QK;
@@ -4319,7 +4361,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     (int)R, (int)K, (int)n_as, (int)n_ids, sgen_eff);
                 CUDA_CHECK(cudaGetLastError());
                 if (!ctrs) {
-                    k_pxq6_gateup_reduce_gen<<<gridr, 256, 0, stream>>>(ws,
+                    k_pxq6_gateup_reduce_gen<<<gridr, rblk, 0, stream>>>(ws,
                         (char *)dst->data, dst->nb[2], dst->nb[1],
                         (const char *)ids->data, ids->nb[0], ids->nb[1],
                         bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
@@ -4355,7 +4397,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     CUDA_CHECK(cudaGetLastError());
                     return i + 1;
                 }
-                k_pxq6_gateup_reduce<<<gridr, 256, 0, stream>>>(ws,
+                k_pxq6_gateup_reduce<<<gridr, rblk, 0, stream>>>(ws,
                     (char *)dst->data, dst->nb[2], dst->nb[1],
                     (const char *)ids->data, ids->nb[0], ids->nb[1],
                     bu ? (const float *)bu->data : nullptr, bu ? bu->nb[1] : 0,
@@ -5512,8 +5554,9 @@ static int pxa_pxq_gateup_2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                         (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1, S);
                     CUDA_CHECK(cudaGetLastError());
                     if (!ctrs) {
-                        dim3 gridr((unsigned)((R + 255)/256), 1u, (unsigned)ny);
-                        k_pxq6_gateup_reduce_gen<<<gridr, 256, 0, stream>>>(ws,
+                        const int rblk = pxa_pxq_reduce_blk();
+                        dim3 gridr((unsigned)((R + rblk - 1)/rblk), 1u, (unsigned)ny);
+                        k_pxq6_gateup_reduce_gen<<<gridr, rblk, 0, stream>>>(ws,
                             (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
                             (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
                             /* bias_u */ nullptr, 0, /* bias_g */ nullptr, 0,
