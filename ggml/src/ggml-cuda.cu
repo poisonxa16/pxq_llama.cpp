@@ -3849,6 +3849,60 @@ static void pxa_pxq4_2d_split_log(int device, bool fired, int S, int panels, int
             pxa_pxq4_2d_split_target(device));
 }
 
+// MoE down split (2026-08-04). The decode fused down (the MUL_MAT_ID right after the gateup in
+// pxa_pxq4_moe_fast_tg) launches k_pxq6_mmv on panels*n_ids blocks -- 48*8 = 384 on the 122B
+// down (R=3072 K=1024 n_ids=8), ~1.14 waves at the fired variants' 6 blocks/SM on a 56-SM
+// P100: one nearly-full wave plus a 14% tail, 120 GB/s achieved -- the worst weight kernel in
+// the F1 profile, while every other big node is split to 2+ waves. This lever routes that node
+// through the split kernels the driver already owns (both take real ids/n_as/n_ids; only the
+// MUL_MAT_ID routing was missing):
+//   PXA_PXQ_MOE_DOWN_SPLIT=1     -> K1 kseg split: k_pxq6_mmv_ksplit (64-thr,
+//                                   panels*KSEG*n_ids blocks) + k_pxq_mmv_reduce. ws is
+//                                   KSEG*R per slot -- on the down shape ~786 KB/launch of
+//                                   round-trip (~11% of the node's bytes). Break-even needs
+//                                   only ~133 GB/s achieved vs today's 120.
+//   PXA_PXQ_MOE_DOWN_SPLIT=2/4/8 -> gen S-split: k_pxq6_mmv_ksplit_gen +
+//                                   k_pxq_mmv_reduce_s. ws is NFIX*KSEG*R RAW canonical
+//                                   partials per slot INDEPENDENT of S -- on the down shape
+//                                   (R=3072, nfix=8) ~6.0 MB/launch of round-trip, ~81% of
+//                                   the node's bytes: the wave-fill gain must beat that tax
+//                                   (break-even ~216 GB/s total, above the gateup family's
+//                                   measured 194). Measured before believed; kill on loss.
+// Default 0 = OFF, byte-identical dispatch. Both arms BIT-EXACT vs the unsplit kernel by
+// construction (PXQ_CANON_v1): k_pxq6_mmv, k_pxq6_mmv_ksplit, k_pxq6_mmv_ksplit_gen and
+// k_pxq_mmv_reduce_s ALL fold with nfix = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX). That
+// MMV cap (NOT the gateup family's PXQ6_GU_SPLIT_MAX) is load-bearing twice: at K >= 2048 the
+// GU cap changes the canonical fold (canon_nfix(64,8)=8 != canon_nfix(64,16)=16 => silent
+// bit-break), and the gen ws row stride is a fixed PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG slots, so
+// sizing the workspace with the GU cap would undersize it 2x => OOB writes.
+static inline int pxa_pxq_moe_down_split() {
+    static const int s = [](){
+        const char * e = getenv("PXA_PXQ_MOE_DOWN_SPLIT");
+        int v = e ? atoi(e) : 0;
+        if (v != 0 && v != 1 && v != 2 && v != 4 && v != 8) {
+            fprintf(stderr, "PXA: PXA_PXQ_MOE_DOWN_SPLIT=%d invalid (want 0/1/2/4/8) -- OFF\n", v);
+            v = 0;
+        }
+        if (v == 1) fprintf(stderr, "PXA_PXQ_MOE_DOWN_SPLIT: K1 kseg split armed (MoE fused down; bit-exact)\n");
+        if (v >= 2) fprintf(stderr, "PXA_PXQ_MOE_DOWN_SPLIT: gen S=%d armed (MoE fused down; bit-exact)\n", v);
+        return v;
+    }();
+    return s;
+}
+
+// First firing / first decline per device (phantom-lever discipline, same as the K8-2D log):
+// an armed lever that never prints FIRING did not engage -- the A/B is void, not null.
+static void pxa_pxq_moe_down_split_log(int device, bool fired, int S, int gx, int n_ids, int ny,
+                                       int R, int K, int nfix) {
+    static std::atomic<uint32_t> seen{0};
+    if (device < 0 || device >= 16) return;
+    const uint32_t bit = 1u << (2*device + (fired ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    fprintf(stderr, "PXA_PXQ_MOE_DOWN_SPLIT dev%d: %s (S=%d grid=%dx%dx%d=%d blocks R=%d K=%d nfix=%d)\n",
+            device, fired ? "FIRING" : "DECLINED -> unsplit fused down", S, gx, n_ids, ny,
+            gx*n_ids*ny, R, K, nfix);
+}
+
 // Persistent one-entry {0} ids buffer per device: every PXQ 2D node feeds the expert-stacked
 // kernels through the E==1 idiom, and a fresh pool alloc + cudaMemsetAsync per node was pure
 // per-call tax (200+ decode calls/token on a rev-2 backbone). cudaMalloc is illegal mid-capture:
@@ -4437,6 +4491,85 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const int64_t Rd = next->src[0]->ne[1], Kd = next->src[0]->ne[0];
         const size_t smem_d = (size_t)Kd*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
         if (smem_d <= 46*1024) {
+            // MoE down split (PXA_PXQ_MOE_DOWN_SPLIT, default OFF -- rationale + the ws-tax
+            // arithmetic live on the lever above). Bit-exact both arms; any decline (lever
+            // off, no instantiation, ws unavailable under graph capture) falls through to the
+            // unsplit launch below, which produces the same bytes.
+            const int sdn_req = pxa_pxq_moe_down_split();
+            if (sdn_req == 1) {
+                // K1 kseg split: 64-thr blocks, one of the KSEG lanes each; per-thread fp32
+                // chain byte-identical to k_pxq6_mmv's; k_pxq_mmv_reduce replays the red[]
+                // combination order. ws = KSEG*R floats per (iy, slot).
+                auto * ks_d = pxq6_pick_mmv_ksplit(fmt_d, pair, vecx);
+                float * ws_d = nullptr;
+                if (ks_d) {
+                    const size_t need_d = (size_t)Ny*n_ids*PXQ4_MMV_KSEG*(size_t)Rd;
+                    ws_d = pxq6_ksplit_workspace(ctx.device, stream, need_d);
+                }
+                pxa_pxq_moe_down_split_log(ctx.device, ws_d != nullptr, 1,
+                        (int)(Rd/PXQ4_BM)*PXQ4_MMV_KSEG, (int)n_ids, (int)Ny, (int)Rd, (int)Kd,
+                        pxq6_canon_nfix((int)(Kd/PXQ6_QK), PXQ6_MMV_SPLIT_MAX));
+                if (ws_d) {
+                    const size_t smem_ks = (size_t)Kd*sizeof(float);   // no red[] in the 64-thr form
+                    dim3 gridsd((unsigned)((Rd/PXQ4_BM)*PXQ4_MMV_KSEG), (unsigned)n_ids, (unsigned)Ny);
+                    ks_d<<<gridsd, 64, smem_ks, stream>>>(
+                        (const uint8_t *)next->src[0]->data,
+                        (const char *)dst->data, dst->nb[2], dst->nb[1],
+                        ws_d,
+                        (const char *)ids->data, ids->nb[0], ids->nb[1],
+                        (int)Rd, (int)Kd, (int)n_as, (int)n_ids);
+                    CUDA_CHECK(cudaGetLastError());
+                    const int rblk = pxa_pxq_reduce_blk();
+                    dim3 gridrd((unsigned)((Rd + rblk - 1)/rblk), (unsigned)n_ids, (unsigned)Ny);
+                    k_pxq_mmv_reduce<<<gridrd, rblk, 0, stream>>>(ws_d,
+                        (char *)next->data, next->nb[2], next->nb[1],
+                        (const char *)ids->data, ids->nb[0], ids->nb[1],
+                        (int)Rd, (int)n_as, (int)n_ids);
+                    CUDA_CHECK(cudaGetLastError());
+                    return i + 1;
+                }
+            } else if (sdn_req >= 2) {
+                // gen S-split: mirrors the K8-2D dispatch (ggml_cuda.cu K8-2D block) with the
+                // REAL ids strides. S clamped to divide nfix (both powers of two, S <= nfix
+                // => divides) so split == unsplit bit-for-bit; ws sized on the MMV cap (see
+                // the lever comment -- the GU cap would undersize the row stride 2x).
+                const int kslabs_d = (int)(Kd/PXQ6_QK);
+                const int nfix_d   = pxq6_canon_nfix(kslabs_d, PXQ6_MMV_SPLIT_MAX);
+                const int sdn      = sdn_req > nfix_d ? nfix_d : sdn_req;
+                auto * ksg_d = sdn >= 2 ? pxq6_pick_mmv_ksplit_gen(fmt_d, pair, vecx) : nullptr;
+                float * ws_d = nullptr;
+                if (ksg_d) {
+                    const size_t need_d = (size_t)Ny*n_ids*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*(size_t)Rd;
+                    ws_d = pxq6_ksplit_workspace(ctx.device, stream, need_d);
+                }
+                pxa_pxq_moe_down_split_log(ctx.device, ws_d != nullptr, sdn,
+                        (int)(Rd/PXQ4_BM)*sdn, (int)n_ids, (int)Ny, (int)Rd, (int)Kd, nfix_d);
+                if (ws_d) {
+                    int * ctrs_d = pxa_pxq_split_fusered()
+                        ? pxq6_ksplit_counters(ctx.device, stream) : nullptr;
+                    const int kc_max_d = (kslabs_d + sdn - 1)/sdn;
+                    const size_t smem_sd = (size_t)kc_max_d*PXQ6_QK*sizeof(float);
+                    dim3 gridsd((unsigned)((Rd/PXQ4_BM)*sdn), (unsigned)n_ids, (unsigned)Ny);
+                    ksg_d<<<gridsd, 256, smem_sd, stream>>>(
+                        (const uint8_t *)next->src[0]->data,
+                        (const char *)dst->data, dst->nb[2], dst->nb[1],
+                        ws_d,
+                        (const char *)ids->data, ids->nb[0], ids->nb[1],
+                        (char *)next->data, next->nb[2], next->nb[1], ctrs_d,
+                        (int)Rd, (int)Kd, (int)n_as, (int)n_ids, sdn);
+                    CUDA_CHECK(cudaGetLastError());
+                    if (!ctrs_d) {
+                        const int rblk = pxa_pxq_reduce_blk();
+                        dim3 gridrd((unsigned)((Rd + rblk - 1)/rblk), (unsigned)n_ids, (unsigned)Ny);
+                        k_pxq_mmv_reduce_s<<<gridrd, rblk, 0, stream>>>(ws_d,
+                            (char *)next->data, next->nb[2], next->nb[1],
+                            (const char *)ids->data, ids->nb[0], ids->nb[1],
+                            (int)Rd, (int)n_as, (int)n_ids, kslabs_d);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                    return i + 1;
+                }
+            }
             dim3 gridd((unsigned)(Rd/PXQ4_BM), (unsigned)n_ids, (unsigned)Ny);
             auto * kern_d = pxq6_pick_mmv(fmt_d, pair, vecx);
             if (!kern_d) return i;   // no kernel for this format combination — skip the fusion

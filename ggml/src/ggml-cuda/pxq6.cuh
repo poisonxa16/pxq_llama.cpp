@@ -1287,7 +1287,15 @@ static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
 #define PXQ_GU_MINBLK 0   // MEASURED NULL 2026-08-04: +0.14% median. Default OFF.
 #endif
 template <class POLU, class POLG, int MODE, bool VECX>
-static __global__ void __launch_bounds__(256, (VECX && PXQ_GU_MINBLK > 0) ? PXQ_GU_MINBLK : 1)
+#if PXQ_GU_MINBLK > 0
+static __global__ void __launch_bounds__(256, PXQ_GU_MINBLK)
+#else
+// No second argument: __launch_bounds__(256, 1) is NOT equivalent to __launch_bounds__(256).
+// Declaring minBlocksPerMultiprocessor=1 lifts the register ceiling and ptxas spends 121 regs
+// (2 blocks/SM) instead of the unhinted 64 (4 blocks/SM). Disabling the lever must restore the
+// original declaration exactly.
+static __global__ void __launch_bounds__(256)
+#endif
 k_pxq6_gateup_mmv_ksplit_gen(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg,
                              const char * __restrict__ x_base, const size_t x_tok_stride,
                              float * __restrict__ ws,
