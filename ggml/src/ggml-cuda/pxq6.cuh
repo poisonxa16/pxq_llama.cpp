@@ -141,6 +141,7 @@ PXA_PXQ6_GATE(pxa_g2_redfuse,    "PXA_G2_REDFUSE",    false, "G2-F1 absorb gateu
 PXA_PXQ6_GATE(pxa_g2_addfuse,    "PXA_G2_ADDFUSE",    true,  "G2-F4 residual-add fusion: ADD+FUSED_RMS_NORM pair + MUL_MULTI_ADD residual epilogue, bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_prmt,     "PXA_PXQ6_PRMT",     false, "K2c prmt register-LUT book decode (4-bit tiers, decode mmv), bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_ldcs,     "PXA_PXQ6_LDCS",     false, "K7 streaming (evict-last-priority) weight code loads in decode mmv, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq3_pairlut,  "PXA_PXQ3_PAIRLUT",  false, "K2b3 P3 64-entry bit-plane pair LUT, decode mmv family, bit-exact")
 
 // PXQ6R (GGML_TYPE_PXQ6 = 256, display "pxq6") master gate + host self-check. Default ON;
 // PXA_PXQ6R=0 disables (dequant->cublas fallback). Invariants of the frozen LM32 book:
@@ -454,25 +455,95 @@ static __device__ __forceinline__ void pxq6_stage_pairlut(float2 * plut, int tid
     for (int i = tid; i < 256; i += nthr) plut[i] = make_float2(POL::bookv(i & 0xf), POL::bookv(i >> 4));
 }
 
+// PAIRL3 staging (P3-only, PXA_PXQ3_PAIRLUT): 64 entries keyed by the PAIR's packed planes,
+//   key = lo4 | (hi2 << 4); lo4 = both codes' low-plane 2-bit fields, hi2 = both high bits
+//   => code0 = (key & 3) | ((key>>4 & 1) << 2), code1 = (key>>2 & 3) | ((key>>5 & 1) << 2)
+// Values go through POL::bookv == the SAME per-TU global table stage_tabs() stages into
+// tab[], so every float2 handed to pxq6_acc2 is bit-identical to the MODE_TAB gathers.
+// 64 x float2 = 512 B static smem per block.
+template <class POL>
+static __device__ __forceinline__ void pxq6_stage_pairlut3(float2 * plut, int tid, int nthr) {
+    for (int i = tid; i < 64; i += nthr) {
+        const int c0 = (i & 3)        | (((i >> 4) & 1) << 2);
+        const int c1 = ((i >> 2) & 3) | (((i >> 5) & 1) << 2);
+        plut[i] = make_float2(POL::bookv(c0), POL::bookv(c1));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // the scaled 32-elem dot product — the ONE routine every decode kernel shares.
 // NEFF=1 keeps the exact single-chain accumulation of the proven PXQ4/PXQ5 kernels
 // (su += d*t with one t chain); NEFF=2/4 is the PXQ6/PXQ6HQ reference form.
 // MODE/VECX only change operand SOURCING (never order) => bit-exact per variant:
 //   MODE 0 = smem tab, 1 = smem PAIRLUT, 2 = PRMT register book,
-//        3 = smem tab + ld.cs codes, 4 = PRMT + ld.cs codes.
+//        3 = smem tab + ld.cs codes, 4 = PRMT + ld.cs codes,
+//        5 = P3-only 64-entry bit-plane pair-LUT (PXA_PXQ3_PAIRLUT; smem, bit-exact).
 // ---------------------------------------------------------------------------------------------
 #define PXQ6_MODE_TAB     0
 #define PXQ6_MODE_PAIRL   1
 #define PXQ6_MODE_PRMT    2
 #define PXQ6_MODE_TAB_CS  3
 #define PXQ6_MODE_PRMT_CS 4
+#define PXQ6_MODE_PAIRL3  5   // P3-only (PXA_PXQ3_PAIRLUT): 64-entry bit-plane pair-LUT
 
 template <int MODE> struct pxq6_mode {
     static constexpr bool cs   = (MODE == PXQ6_MODE_TAB_CS) || (MODE == PXQ6_MODE_PRMT_CS);
     static constexpr bool prmt = (MODE == PXQ6_MODE_PRMT)   || (MODE == PXQ6_MODE_PRMT_CS);
     static constexpr bool pairl = (MODE == PXQ6_MODE_PAIRL);
+    static constexpr bool pairl3 = (MODE == PXQ6_MODE_PAIRL3);
 };
+
+// PXQ_CANON_v2 (2026-08-04) - accumulation SHAPE, not sourcing.
+//
+// The shipped inner loop writes  t += a0*x0 + a1*x1, which ptxas emits as FMUL + FFMA + FADD:
+// 3 float ops and 3 roundings per pair, 48 per 32 weights. This is SASS-verified on the
+// shipped sm_60 binary (16x FMUL.FTZ + 16x FFMA.FTZ + 16x FADD.FTZ per dot32), not inferred.
+// ptxas cannot fix it on its own: --fmad=true CONTRACTS but never REASSOCIATES, and nvcc never
+// sets LLVM reassoc - the same property that PXQ_CANON_v1 split==unsplit bit-exactness already
+// depends on.
+//
+// The chained form below is 2 FFMA: 2 roundings instead of 3, and BOTH products are computed
+// exactly (2-of-2 rather than 1-of-2). So this is a precision IMPROVEMENT, not a trade; the
+// expected perplexity delta is <= 0.
+//
+// It is also register-NEGATIVE: the def-use graph shrinks from 3 float defs per pair to 1.
+// That matters because k_pxq6_gateup_mmv_ksplit_gen sits at REG=80 with only ~5 registers of
+// slack before the 85-reg / 3-blocks-per-SM cliff - the same cliff that killed PRMT (-11%) and
+// full unroll (26.8 -> 18.6 t/s). A register-negative change cannot cross it.
+//
+// It DOES change the fp32 fold order, so it is a re-baselining event and therefore a BUILD
+// constant rather than an env flag: every variant flips together and split==unsplit stays true
+// by construction, exactly like PXQ6_CANON_CMAX. Default 0 = byte-identical to today.
+// Build with -DPXQ_CANON_V2=1 to engage. Regenerate all controls on the engaged binary before
+// comparing anything - pre-v2 numbers are not comparable.
+#ifndef PXQ_CANON_V2
+#define PXQ_CANON_V2 0
+#endif
+
+static __device__ __forceinline__ float pxq6_acc2(float acc, float a0, float x0, float a1, float x1) {
+#if PXQ_CANON_V2
+    return __fmaf_rn(a1, x1, __fmaf_rn(a0, x0, acc));
+#else
+    return acc + (a0*x0 + a1*x1);
+#endif
+}
+
+// MODE-dispatched pair sourcing. `if constexpr` keeps discarded branches UNINSTANTIATED,
+// so a policy only needs the members of the modes its pickers actually offer (pairl3()
+// exists on pxq6_pol_p3 ONLY — no other policy is ever instantiated at MODE PAIRL3).
+// For the pre-existing modes this inlines to exactly the calls the old ternary chain
+// made: sourcing identical, bit-exact by construction.
+template <class POL, int MODE>
+static __device__ __forceinline__ float2 pxq6_pairx(const uint32_t * __restrict__ q, int b,
+                                                    const float * __restrict__ tab,
+                                                    const float2 * __restrict__ plut,
+                                                    const pxq6_prmt_book & pb) {
+    using M = pxq6_mode<MODE>;
+    if constexpr (M::prmt)        return pxq6_prmt_pair(q, b, pb);
+    else if constexpr (M::pairl)  return POL::pairl(q, b, plut);
+    else if constexpr (M::pairl3) return POL::pairl3(q, b, plut);
+    else                          return POL::pair(q, b, tab);
+}
 
 template <class POL, int MODE, bool VECX>
 static __device__ __forceinline__ float pxq6_dot32(const uint8_t * __restrict__ slab, int row, float anch,
@@ -493,16 +564,16 @@ static __device__ __forceinline__ float pxq6_dot32(const uint8_t * __restrict__ 
         #pragma unroll
         for (int b = 0; b < 16; b += 2) {
             const float4 xv = *(const float4 *)&xk[2*b];
-            const float2 p0 = M::prmt ? pxq6_prmt_pair(q, b,   pb) : M::pairl ? POL::pairl(q, b,   plut) : POL::pair(q, b,   tab);
-            const float2 p1 = M::prmt ? pxq6_prmt_pair(q, b+1, pb) : M::pairl ? POL::pairl(q, b+1, plut) : POL::pair(q, b+1, tab);
-            t[(b*POL::NEFF) >> 4]     += p0.x*xv.x + p0.y*xv.y;
-            t[((b+1)*POL::NEFF) >> 4] += p1.x*xv.z + p1.y*xv.w;
+            const float2 p0 = pxq6_pairx<POL, MODE>(q, b,   tab, plut, pb);
+            const float2 p1 = pxq6_pairx<POL, MODE>(q, b+1, tab, plut, pb);
+            t[(b*POL::NEFF) >> 4]     = pxq6_acc2(t[(b*POL::NEFF) >> 4],     p0.x, xv.x, p0.y, xv.y);
+            t[((b+1)*POL::NEFF) >> 4] = pxq6_acc2(t[((b+1)*POL::NEFF) >> 4], p1.x, xv.z, p1.y, xv.w);
         }
     } else {
         #pragma unroll
         for (int b = 0; b < 16; ++b) {
-            const float2 p = M::prmt ? pxq6_prmt_pair(q, b, pb) : M::pairl ? POL::pairl(q, b, plut) : POL::pair(q, b, tab);
-            t[(b*POL::NEFF) >> 4] += p.x*xk[2*b] + p.y*xk[2*b+1];
+            const float2 p = pxq6_pairx<POL, MODE>(q, b, tab, plut, pb);
+            t[(b*POL::NEFF) >> 4] = pxq6_acc2(t[(b*POL::NEFF) >> 4], p.x, xk[2*b], p.y, xk[2*b+1]);
         }
     }
     if (POL::NEFF == 1) return eff[0]*t[0];
@@ -697,10 +768,11 @@ k_pxq6_gateup_mmv(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ 
     for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
 
     __shared__ float tabU[32], subU[16], tabG[32], subG[16];   // 32-entry tabs: P6R LM32
-    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
     POLU::stage_tabs(tabU, subU, threadIdx.x);
     POLG::stage_tabs(tabG, subG, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POLU>(plut, threadIdx.x, 256);
     __syncthreads();
     pxq6_prmt_book pbU{}, pbG{};
     if constexpr (pxq6_mode<MODE>::prmt) { pxq6_prmt_build(tabU, pbU); pxq6_prmt_build(tabG, pbG); }
@@ -769,9 +841,10 @@ k_pxq6_mmv(const uint8_t * __restrict__ W,
 
     __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
-    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
     POL::stage_tabs(tab, sub, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 256);
     __syncthreads();
     pxq6_prmt_book pb{};
     if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
@@ -852,9 +925,10 @@ k_pxq6_mmv_redfuse(const uint8_t * __restrict__ W,
 
     __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
-    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
     POL::stage_tabs(tab, sub, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 256);
     __syncthreads();
     pxq6_prmt_book pb{};
     if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
@@ -918,10 +992,11 @@ k_pxq6_gateup_mmv_ksplit(const uint8_t * __restrict__ Wu, const uint8_t * __rest
     for (int idx = threadIdx.x; idx < K; idx += blockDim.x) xs[idx] = x[idx];
 
     __shared__ float tabU[32], subU[16], tabG[32], subG[16];   // 32-entry tabs: P6R LM32
-    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
     POLU::stage_tabs(tabU, subU, threadIdx.x);
     POLG::stage_tabs(tabG, subG, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 64);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POLU>(plut, threadIdx.x, 64);
     __syncthreads();
     pxq6_prmt_book pbU{}, pbG{};
     if constexpr (pxq6_mode<MODE>::prmt) { pxq6_prmt_build(tabU, pbU); pxq6_prmt_build(tabG, pbG); }
@@ -1016,9 +1091,10 @@ k_pxq6_mmv_ksplit(const uint8_t * __restrict__ W,
 
     __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
-    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
     POL::stage_tabs(tab, sub, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 64);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 64);
     __syncthreads();
     pxq6_prmt_book pb{};
     if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
@@ -1119,9 +1195,10 @@ k_pxq6_mmv_ksplit_gen(const uint8_t * __restrict__ W,
 
     __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
-    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
     POL::stage_tabs(tab, sub, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 256);
     __syncthreads();
     pxq6_prmt_book pb{};
     if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
@@ -1199,8 +1276,18 @@ static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
 // vs the unsplit k_pxq6_gateup_mmv by construction, at any S, on any device.
 // FUSERED: non-null `counters` => the last block of each (iy,j) applies the canonical fold +
 // bias + GLU in-kernel (fence-and-flag) and the driver skips the standalone reduce launch.
+// R1 (2026-08-04): pin the FIRED instantiations to 4 blocks/SM.
+// The variants that actually launch in production are TAB (MODE 0) x VECX=1. canon_v2 pushed
+// them 64 -> 74/75 regs, crossing the 65-reg cliff (65536/(256*4) = 64 exactly) and costing
+// 25% of resident warps on 40 of 48 layers. Asking for min 4 blocks brings them back to <=64.
+// NOT the killed cap-forcing experiment: that forced 36/32 regs (10-45 below natural) and
+// spilled (-27.7%). This asks -10 from 74, and any LOCAL>0 in res-usage aborts the lane.
+// Only the fired shape is pinned; REFERENCE-only VECX=0 variants keep their natural allocation.
+#ifndef PXQ_GU_MINBLK
+#define PXQ_GU_MINBLK 0   // MEASURED NULL 2026-08-04: +0.14% median. Default OFF.
+#endif
 template <class POLU, class POLG, int MODE, bool VECX>
-static __global__ void __launch_bounds__(256)
+static __global__ void __launch_bounds__(256, (VECX && PXQ_GU_MINBLK > 0) ? PXQ_GU_MINBLK : 1)
 k_pxq6_gateup_mmv_ksplit_gen(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg,
                              const char * __restrict__ x_base, const size_t x_tok_stride,
                              float * __restrict__ ws,
@@ -1233,10 +1320,11 @@ k_pxq6_gateup_mmv_ksplit_gen(const uint8_t * __restrict__ Wu, const uint8_t * __
     for (int idx = threadIdx.x; idx < Kc; idx += blockDim.x) xs[idx] = x[idx];
 
     __shared__ float tabU[32], subU[16], tabG[32], subG[16];   // 32-entry tabs: P6R LM32
-    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
     POLU::stage_tabs(tabU, subU, threadIdx.x);
     POLG::stage_tabs(tabG, subG, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POLU>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POLU>(plut, threadIdx.x, 256);
     __syncthreads();
     pxq6_prmt_book pbU{}, pbG{};
     if constexpr (pxq6_mode<MODE>::prmt) { pxq6_prmt_build(tabU, pbU); pxq6_prmt_build(tabG, pbG); }
@@ -2300,12 +2388,18 @@ static inline int pxa_pxq6_decode_mode() {
     (((m) == PXQ6_MODE_TAB_CS || (m) == PXQ6_MODE_PRMT_CS) \
         ? ((vx) ? (K<POL, PXQ6_MODE_TAB_CS, true>) : (K<POL, PXQ6_MODE_TAB_CS, false>)) \
         : ((vx) ? (K<POL, PXQ6_MODE_TAB,    true>) : (K<POL, PXQ6_MODE_TAB,    false>)))
+// P3-only: PXA_PXQ3_PAIRLUT=1 promotes BOTH tab modes to the 64-entry bit-plane pair-LUT
+// (PAIRL3+LDCS not offered, mirroring PAIRL). Bit-exact sourcing => the A/B is env-clean.
+#define PXQ6_PICKM3(K, POL, m, vx) \
+    (pxa_pxq3_pairlut() \
+        ? ((vx) ? (K<POL, PXQ6_MODE_PAIRL3, true>) : (K<POL, PXQ6_MODE_PAIRL3, false>)) \
+        : PXQ6_PICKM23(K, POL, m, vx))
 #define PXQ6_PICKM_FMT(RET, NAME, K) \
     static inline RET NAME(int fmt, int m, bool vx) { \
         switch (fmt) { \
             case PXA_PXQ_FMT_P6: return PXQ6_PICKM(K, pxq6_pol_p6,   m, vx); \
             case PXA_PXQ_FMT_P2: return PXQ6_PICKM23(K, pxq6_pol_p2, m, vx); \
-            case PXA_PXQ_FMT_P3: return PXQ6_PICKM23(K, pxq6_pol_p3, m, vx); \
+            case PXA_PXQ_FMT_P3: return PXQ6_PICKM3(K, pxq6_pol_p3, m, vx); \
             case PXA_PXQ_FMT_P6R: return PXQ6_PICKM23(K, pxq6_pol_p6r, m, vx); \
             case PXA_PXQ_FMT_P1: return PXQ6_PICKM23(K, pxq6_pol_p1, m, vx); \
             default:             return PXQ6_PICKM(K, pxq6_pol_p6hq, m, vx); \
@@ -2322,12 +2416,16 @@ static inline int pxa_pxq6_decode_mode() {
     (((m) == PXQ6_MODE_TAB_CS || (m) == PXQ6_MODE_PRMT_CS) \
         ? ((vx) ? (K<PU, PG, PXQ6_MODE_TAB_CS, true>) : (K<PU, PG, PXQ6_MODE_TAB_CS, false>)) \
         : ((vx) ? (K<PU, PG, PXQ6_MODE_TAB,    true>) : (K<PU, PG, PXQ6_MODE_TAB,    false>)))
+#define PXQ6_PICKMU3(K, PU, PG, m, vx) /* P3 up+gate pair: see PXQ6_PICKM3 */ \
+    (pxa_pxq3_pairlut() \
+        ? ((vx) ? (K<PU, PG, PXQ6_MODE_PAIRL3, true>) : (K<PU, PG, PXQ6_MODE_PAIRL3, false>)) \
+        : PXQ6_PICKMU23(K, PU, PG, m, vx))
 #define PXQ6_PICKM_FMT_GU(RET, NAME, K) \
     static inline RET NAME(int fu, int fg, int m, bool vx) { \
         if (fu == fg) switch (fu) { \
             case PXA_PXQ_FMT_P6: return PXQ6_PICKMU(K, pxq6_pol_p6, pxq6_pol_p6, m, vx); \
             case PXA_PXQ_FMT_P2: return PXQ6_PICKMU23(K, pxq6_pol_p2, pxq6_pol_p2, m, vx); \
-            case PXA_PXQ_FMT_P3: return PXQ6_PICKMU23(K, pxq6_pol_p3, pxq6_pol_p3, m, vx); \
+            case PXA_PXQ_FMT_P3: return PXQ6_PICKMU3(K, pxq6_pol_p3, pxq6_pol_p3, m, vx); \
             case PXA_PXQ_FMT_P6R: return PXQ6_PICKMU23(K, pxq6_pol_p6r, pxq6_pol_p6r, m, vx); \
             case PXA_PXQ_FMT_P1: return PXQ6_PICKMU23(K, pxq6_pol_p1, pxq6_pol_p1, m, vx); \
             default:             return PXQ6_PICKMU(K, pxq6_pol_p6hq, pxq6_pol_p6hq, m, vx); \
