@@ -194,6 +194,12 @@ struct pxq6_pol_p1 {
         const uint32_t w = q[0];
         return make_float2(tab[(w >> (2*b)) & 1], tab[(w >> (2*b + 1)) & 1]);
     }
+    // K2d: identical bit extraction; the two gathers ride SHFL.IDX (lane l holds tab[l])
+    __device__ static float2 pair_shfl(const uint32_t * q, int b, float bv) {
+        const uint32_t w = q[0];
+        return make_float2(__shfl_sync(0xffffffffu, bv, (int)((w >> (2*b)) & 1)),
+                           __shfl_sync(0xffffffffu, bv, (int)((w >> (2*b + 1)) & 1)));
+    }
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
         (void)q; (void)b; (void)plut; return make_float2(0.f, 0.f);   // PAIR never offered for P1
     }
@@ -220,6 +226,13 @@ struct pxq6_pol_p2 {
         const uint32_t w  = q[b >> 3];
         const int      sh = 2 * ((2*b) & 15);
         return make_float2(tab[(w >> sh) & 3], tab[(w >> (sh + 2)) & 3]);
+    }
+    // K2d: identical field extraction; the two gathers ride SHFL.IDX (lane l holds tab[l])
+    __device__ static float2 pair_shfl(const uint32_t * q, int b, float bv) {
+        const uint32_t w  = q[b >> 3];
+        const int      sh = 2 * ((2*b) & 15);
+        return make_float2(__shfl_sync(0xffffffffu, bv, (int)((w >> sh) & 3)),
+                           __shfl_sync(0xffffffffu, bv, (int)((w >> (sh + 2)) & 3)));
     }
     // PAIRLUT is 4-bit-only; the pickers force PAIR=false for P2 — compile stub, never executed
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
@@ -252,6 +265,17 @@ struct pxq6_pol_p3 {
         const int c0 = (int)((lo >> (2*j0))     & 3) | (int)(((hi >> j0)       & 1) << 2);
         const int c1 = (int)((lo >> (2*j0 + 2)) & 3) | (int)(((hi >> (j0 + 1)) & 1) << 2);
         return make_float2(tab[c0], tab[c1]);
+    }
+    // K2d: identical plane reassembly; the two gathers ride SHFL.IDX (lane l holds tab[l])
+    __device__ static float2 pair_shfl(const uint32_t * q, int b, float bv) {
+        const int      h  = b >> 3;               // 16-elem half (0 or 1)
+        const int      j0 = (2*b) & 15;           // first elem within the half
+        const uint32_t lo = q[h];
+        const uint32_t hi = q[2] >> (16*h);       // this half's high plane in bits 0..15
+        const int c0 = (int)((lo >> (2*j0))     & 3) | (int)(((hi >> j0)       & 1) << 2);
+        const int c1 = (int)((lo >> (2*j0 + 2)) & 3) | (int)(((hi >> (j0 + 1)) & 1) << 2);
+        return make_float2(__shfl_sync(0xffffffffu, bv, c0),
+                           __shfl_sync(0xffffffffu, bv, c1));
     }
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
         (void)q; (void)b; (void)plut; return make_float2(0.f, 0.f);   // PAIR forced off for P3
