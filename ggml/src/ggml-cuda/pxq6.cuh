@@ -582,14 +582,16 @@ static __device__ __forceinline__ float pxq6_acc2(float acc, float a0, float x0,
 // exists on pxq6_pol_p3 ONLY — no other policy is ever instantiated at MODE PAIRL3).
 // For the pre-existing modes this inlines to exactly the calls the old ternary chain
 // made: sourcing identical, bit-exact by construction.
-// K2d rides a trailing DEFAULTED param (bv): non-SHFL instantiations discard it under
+// K2d rides a trailing param (bv): non-SHFL instantiations discard it under
 // `if constexpr`, so every pre-existing mode keeps its exact sourcing and codegen.
+// NO DEFAULT on bv (R2xK2d lesson): a defaulted 0.f let a bv-less caller compile
+// clean and decode a zero book at MODE SHFL. Every caller stages bv explicitly.
 template <class POL, int MODE>
 static __device__ __forceinline__ float2 pxq6_pairx(const uint32_t * __restrict__ q, int b,
                                                     const float * __restrict__ tab,
                                                     const float2 * __restrict__ plut,
                                                     const pxq6_prmt_book & pb,
-                                                    const float bv = 0.f) {
+                                                    const float bv) {
     using M = pxq6_mode<MODE>;
     if constexpr (M::prmt)        return pxq6_prmt_pair(q, b, pb);
     else if constexpr (M::pairl)  return POL::pairl(q, b, plut);
@@ -1489,6 +1491,15 @@ static __device__ __forceinline__ float2 pxq6_dot32x2(const uint8_t * __restrict
     uint32_t q0[POL::CODE_WORDS], q1[POL::CODE_WORDS];
     pxq6_ldcodes<POL, M::cs>(slab + POL::CODE_OFF + row0*POL::CODE_BYTES, q0);
     pxq6_ldcodes<POL, M::cs>(slab + POL::CODE_OFF + row1*POL::CODE_BYTES, q1);
+    // K2d (MODE SHFL) — R2xK2d bv plumb: lane l holds tab[l]; ONE loop-invariant LDS
+    // serves BOTH rows' sourcing (threadIdx.x & 31 is the lane id at any blockDim, so
+    // the lane->entry map is identical to pxq6_dot32's; all pair_shfl sites in the x2
+    // twins are warp-converged: kseg is per-warp constant, chunk bounds block-uniform).
+    // The first ROWX2 drop omitted this and pxq6_pairx's then-DEFAULTED bv silently
+    // decoded a zero book at MODE SHFL (NaN cascade -> the VOID stacked arm); the
+    // default is now removed so that miswire can never compile again.
+    float bv = 0.f;
+    if constexpr (M::shfl) bv = tab[threadIdx.x & 31];
     float t0[POL::NEFF], t1[POL::NEFF];
     #pragma unroll
     for (int i = 0; i < POL::NEFF; ++i) { t0[i] = 0.f; t1[i] = 0.f; }
@@ -1496,12 +1507,12 @@ static __device__ __forceinline__ float2 pxq6_dot32x2(const uint8_t * __restrict
         #pragma unroll
         for (int b = 0; b < 16; b += 2) {
             const float4 xv = *(const float4 *)&xk[2*b];        // ONE load, both rows
-            const float2 p00 = pxq6_pairx<POL, MODE>(q0, b,   tab, plut, pb);
-            const float2 p01 = pxq6_pairx<POL, MODE>(q0, b+1, tab, plut, pb);
+            const float2 p00 = pxq6_pairx<POL, MODE>(q0, b,   tab, plut, pb, bv);
+            const float2 p01 = pxq6_pairx<POL, MODE>(q0, b+1, tab, plut, pb, bv);
             t0[(b*POL::NEFF) >> 4]     = pxq6_acc2(t0[(b*POL::NEFF) >> 4],     p00.x, xv.x, p00.y, xv.y);
             t0[((b+1)*POL::NEFF) >> 4] = pxq6_acc2(t0[((b+1)*POL::NEFF) >> 4], p01.x, xv.z, p01.y, xv.w);
-            const float2 p10 = pxq6_pairx<POL, MODE>(q1, b,   tab, plut, pb);
-            const float2 p11 = pxq6_pairx<POL, MODE>(q1, b+1, tab, plut, pb);
+            const float2 p10 = pxq6_pairx<POL, MODE>(q1, b,   tab, plut, pb, bv);
+            const float2 p11 = pxq6_pairx<POL, MODE>(q1, b+1, tab, plut, pb, bv);
             t1[(b*POL::NEFF) >> 4]     = pxq6_acc2(t1[(b*POL::NEFF) >> 4],     p10.x, xv.x, p10.y, xv.y);
             t1[((b+1)*POL::NEFF) >> 4] = pxq6_acc2(t1[((b+1)*POL::NEFF) >> 4], p11.x, xv.z, p11.y, xv.w);
         }
@@ -1509,9 +1520,9 @@ static __device__ __forceinline__ float2 pxq6_dot32x2(const uint8_t * __restrict
         #pragma unroll
         for (int b = 0; b < 16; ++b) {
             const float xa = xk[2*b], xb = xk[2*b+1];           // ONE pair of loads, both rows
-            const float2 p0 = pxq6_pairx<POL, MODE>(q0, b, tab, plut, pb);
+            const float2 p0 = pxq6_pairx<POL, MODE>(q0, b, tab, plut, pb, bv);
             t0[(b*POL::NEFF) >> 4] = pxq6_acc2(t0[(b*POL::NEFF) >> 4], p0.x, xa, p0.y, xb);
-            const float2 p1 = pxq6_pairx<POL, MODE>(q1, b, tab, plut, pb);
+            const float2 p1 = pxq6_pairx<POL, MODE>(q1, b, tab, plut, pb, bv);
             t1[(b*POL::NEFF) >> 4] = pxq6_acc2(t1[(b*POL::NEFF) >> 4], p1.x, xa, p1.y, xb);
         }
     }
