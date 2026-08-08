@@ -636,10 +636,29 @@ static void dequantize_row_pxq6r_cuda(const void * vx, dst_t * y, const int64_t 
 // NOTE: this changes the canonical rounding vs pre-canon binaries (a one-time, documented
 // re-baselining — PPL-verified unchanged; see docs/LEVERS.md PXA_PXQ4_2D_SPLIT row).
 // =============================================================================================
+// PXQ6_CANON_CMAX (2026-08-03) — the canonical chunk count, which is ALSO the split workspace
+// width. NFIX is a shape-only function of kslabs (that is what makes split == unsplit on every
+// device), but it is capped, and the cap costs real bandwidth: every split node writes
+// NFIX*KSEG*R floats of raw partials and the reducer reads them all back, whatever S is.
+//
+// Decode profile, 122B PXQU48-core on 4x P100 at fill 8881 (128 tokens, nsys): the reduce
+// kernels alone are 1.87 ms/token (k_pxq_mmv_reduce_s 1.157 + k_pxq6_gateup_reduce_gen 0.708)
+// out of ~32.6, with a matching write side inside the mmv kernels -- and the driver never picks
+// S > 4 on ANY node of this model, so at CMAX 16 three quarters of every workspace row is
+// written and read for nothing.
+//
+// A cap of 4 leaves EVERY grid geometry of this model unchanged (the S the driver selects is
+// already <= 4 everywhere: attn_gate S=2, ssm_out/attn_output/ffn_down_shexp S=4, the MoE
+// gateup family S=4) while cutting the workspace 2-4x per node. It stays shape-only, so
+// split == unsplit still holds by construction. It does change the canonical fp32 fold (fewer,
+// longer chunks), so it is a build-time constant with a re-baselining cost, not an env flag.
+#ifndef PXQ6_CANON_CMAX
+#define PXQ6_CANON_CMAX 16
+#endif
 // fixed workspace row width for the K8-2D split (slots per (iy,j) row; S is capped at this)
-#define PXQ6_MMV_SPLIT_MAX 16
+#define PXQ6_MMV_SPLIT_MAX PXQ6_CANON_CMAX
 // gateup family S cap (PXA_PXQ6_KSPLIT_GEN allows 2/4/8)
-#define PXQ6_GU_SPLIT_MAX  8
+#define PXQ6_GU_SPLIT_MAX  (PXQ6_CANON_CMAX < 8 ? PXQ6_CANON_CMAX : 8)
 
 static __host__ __device__ __forceinline__ int pxq6_canon_nfix(int kslabs, int cmax) {
     int lim = kslabs / PXQ4_MMV_KSEG;   // >= KSEG slabs per chunk so every lane stays busy

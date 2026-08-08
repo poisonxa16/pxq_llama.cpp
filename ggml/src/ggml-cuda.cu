@@ -86,6 +86,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <condition_variable>
 #include <stdint.h>
 #include <stdio.h>
@@ -3043,6 +3044,37 @@ static __global__ void k_pxa_router_gemv_f32(
     }
 }
 
+// ROUTER_FUSE mode 3 (2026-08-03): the sm_60-shaped router GEMV. The mode-1/2 kernel above is
+// ONE WARP per expert row — on a P100 that is 256 lonely warps with a 96-step serial FMA chain
+// each, and it measured a 1.6% KILL vs cuBLAS on sm_60. That verdict was about the kernel
+// shape, not the idea: cuBLAS gemv2T still burns 25.7 us/call (48 calls/token profiled on the
+// qwen35moe 122B) for a 3 MB read whose BW floor is ~4 us. This form is 128 threads per row
+// with float4 loads and a warp/smem tree — the same shape the F16 small-R GEMV ships with.
+static __global__ void __launch_bounds__(128) k_pxa_router_gemv_f32_v2(
+        const float * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int ne00, const size_t nb01) {
+    const int row = blockIdx.x;
+    const float4 * w4 = (const float4 *)((const char *) w + (size_t) row * nb01);
+    const float4 * x4 = (const float4 *) x;
+    const int k4 = ne00/4;
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < k4; k += 128) {
+        const float4 a = w4[k];
+        const float4 b = x4[k];
+        sum += (a.x*b.x + a.y*b.y) + (a.z*b.z + a.w*b.w);
+    }
+    __shared__ float warpsum[4];
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, off);
+    }
+    if ((threadIdx.x & (WARP_SIZE-1)) == 0) warpsum[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        y[row] = (warpsum[0] + warpsum[1]) + (warpsum[2] + warpsum[3]);
+    }
+}
+
 // PXA_F16_GEMV (2026-07-26): small-R F16 GEMV for ne11==1 decode nodes. Motivation: the rev-2
 // backbone table promotes the per-head attn_gate (ne[1] = n_head, 48..64 on the Laguna family)
 // to F16, and an F16 x F32 ne11==1 GEMV misses every fast dispatch path (dmmv/mmvq need a
@@ -3140,6 +3172,18 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
     }
     const int ne00 = (int) src0->ne[0];
     const int ne01 = (int) src0->ne[1];
+    if (pxa_router_fuse_mode_resolve() == 3) {
+        if (ne00 % 4 != 0 || (src0->nb[1] % 16) != 0) return false;   // float4 loads
+        static std::atomic<bool> logged{false};
+        bool exp = false;
+        if (logged.compare_exchange_strong(exp, true)) {
+            fprintf(stderr, "PXA_ROUTER_FUSE: mode 3 FIRING (128-thr float4 router GEMV, %dx%d f32; PXA_ROUTER_FUSE=0 reverts to cuBLAS)\n", ne00, ne01);
+        }
+        k_pxa_router_gemv_f32_v2<<<ne01, 128, 0, ctx.stream()>>>(
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+            ne00, src0->nb[1]);
+        return true;
+    }
     k_pxa_router_gemv_f32<<<ne01, WARP_SIZE, 0, ctx.stream()>>>(
         (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
         ne00, src0->nb[1]);
@@ -3217,16 +3261,47 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // quantized backbone at spec-verify batch sizes (ne11 2..8) to the multi-column dequant-FMA
     // GEMV instead of emulated-dp4a MMVQ. See pxa-smalln.cuh. Default OFF (PXA_SPEC_SMALLN=1).
     static const bool pxa_spec_smalln = getenv("PXA_SPEC_SMALLN") && atoi(getenv("PXA_SPEC_SMALLN")) != 0;
-    if (pxa_spec_smalln && cc < CC_VOLTA && ggml_cuda_pxa_smalln_supported(src0->type)
-        && src1->ne[1] >= 2 && src1->ne[1] <= 8
+    // PXA_SMALLN_GEMV (2026-08-03): route the ne11==1 dense backbone GEMV through the same
+    // dequant-FMA kernel on sm_60. Profiled (nsys, 122B PXQU48, 4xP100, deep fill): the mxfp4
+    // dense matvecs on emulated-dp4a MMVQ were 14.2 ms/token (35% of decode wall), q8_0 (incl.
+    // the 248320-row head) another 3.0 ms. The legacy dmmv template was A/B'd first and LOST
+    // (24.97 -> 14.7 t/s deep decode: divergent global-table lookups + per-pair scale decode);
+    // k_pxa_smalln_* stages the table in smem and decodes the scale once per block.
+    // MEASURED (2026-08-03, 122B PXQU48 4xP100, banner-verified): the R=1 route is a LOSS too —
+    // deep decode 25.4 -> 18.4 t/s (b2048), 26.1 -> 19.0 (b512). Better than dmmv's 14.7 but
+    // still -28% vs emulated-dp4a MMVQ. Verdict: the sm_60 dense GEMV is INSTRUCTION-economy
+    // bound, not bandwidth bound — mmvq's packed-q8_1 integer form beats scalar dequant-FMA
+    // (2 loads + table + 2 FMA per weight pair) even with dp4a emulated. Default OFF everywhere;
+    // env-only for interleaved A/Bs. A winning replacement must cut instructions/weight
+    // (half2 __hfma2 math, packed nibble decode), not just avoid the int8 path.
+    static const int pxa_smalln_gemv = [](){
+        const char * e = getenv("PXA_SMALLN_GEMV");
+        return e ? atoi(e) : 0;
+    }();
+    const bool pxa_smalln_take_gemv = pxa_smalln_gemv == 1 && src1->ne[1] == 1;
+    if ((pxa_smalln_take_gemv || (pxa_spec_smalln && src1->ne[1] >= 2 && src1->ne[1] <= 8))
+        && cc < CC_VOLTA && ggml_cuda_pxa_smalln_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[2]*src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1
         && src0->ne[0] % 32 == 0 && !bad_padding_clear
         && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        if (pxa_smalln_take_gemv) {
+            static std::atomic<bool> logged{false};
+            bool exp = false;
+            if (logged.compare_exchange_strong(exp, true)) {
+                fprintf(stderr, "PXA_SMALLN_GEMV: FIRING (cc=%d, %s ne11=1 GEMV -> smalln dequant-FMA; PXA_SMALLN_GEMV=0 reverts)\n",
+                        cc, ggml_type_name(src0->type));
+            }
+        }
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_pxa_smalln, nullptr);
         return node_n;
     }
 
+    // PXA_PASCAL_DMMV stays ENV-ONLY (default OFF) — the sm_60 auto-arm was A/B'd 2026-08-03 on
+    // the 122B PXQU48 4xP100 rig and MEASURED A LOSS: deep decode 24.97 -> 14.7 t/s (-41%) with
+    // mxfp4+q8_0 dense GEMVs on the legacy dmmv template (divergent device-global kvalues
+    // lookups, per-pair E8M0 decode, 64-thread low-ILP blocks). The sm_60 GEMV fix that WON is
+    // candidate is PXA_SMALLN_GEMV above (its own A/B pending). Kept env-gated for experiments.
     static const bool pxa_pascal_dmmv = getenv("PXA_PASCAL_DMMV") && atoi(getenv("PXA_PASCAL_DMMV")) != 0;
     const bool pxa_dmmv_take = pxa_pascal_dmmv && cc < CC_VOLTA && use_dequantize_mul_mat_vec;
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1 && !pxa_dmmv_take) {
@@ -3282,6 +3357,17 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
         if (debug) printf("%s(%s, %s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_cublas)\n", __func__, dst->name, ggml_type_name(src0->type));
+        // PXA_GEMV_DBG=1: name every decode-time GEMV that lands on the cuBLAS fallback, once
+        // per tensor name. Profiling found 48 anonymous f32 GEMVs/token at 25.7us each here.
+        static const bool pxa_gemv_dbg = getenv("PXA_GEMV_DBG") && atoi(getenv("PXA_GEMV_DBG")) != 0;
+        if (pxa_gemv_dbg && src1->ne[1] == 1) {
+            static std::mutex mtx; static std::set<std::string> seen;
+            std::lock_guard<std::mutex> lk(mtx);
+            if (seen.insert(src0->name).second) {
+                fprintf(stderr, "PXA_GEMV_DBG: cublas GEMV src0=%s type=%s ne=[%ld,%ld] src1_ne1=%ld\n",
+                        src0->name, ggml_type_name(src0->type), (long)src0->ne[0], (long)src0->ne[1], (long)src1->ne[1]);
+            }
+        }
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
     return node_n;
