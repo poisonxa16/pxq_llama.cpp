@@ -200,6 +200,12 @@ struct common_params_model {
 
 struct common_ngram_mod;
 
+struct common_speculative_stage_params;
+// Parse one --spec-type SPEC[:k=v,...] value. Exposed (2026-08-03) so the PXA auto-spec
+// layer can arm a measured drafter through exactly the same path the CLI flag takes,
+// rather than constructing a stage by hand and drifting from the parser.
+common_speculative_stage_params common_speculative_stage_from_arg(const std::string & value);
+
 struct common_params_speculative {
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
 

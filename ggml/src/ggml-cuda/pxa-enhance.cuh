@@ -250,6 +250,11 @@ static inline int pxa_int8_prefill_mode_resolve() {
 // resolver now says so in the ledger instead of silently arming a dead lever.
 // Cached against the profile generation (see the model-layer comment above):
 // recomputes when the loader registers the model, stable afterwards.
+// Highest router-fuse mode this build implements. An env value above it must be REPORTED,
+// never silently folded into 0 -- that is what made a pre-mode-3 binary run two identical
+// A/B arms and report a result.
+#define PXA_ROUTER_FUSE_MAX_MODE 3
+
 static inline int pxa_router_fuse_mode_resolve() {
     static int cached_gen  = -1;
     static int cached_mode = 0;
@@ -259,7 +264,13 @@ static inline int pxa_router_fuse_mode_resolve() {
     const char * e = getenv("PXA_ROUTER_FUSE");
     if (e) {
         int m = atoi(e);
-        mode = (m < 0 || m > 3) ? 0 : m;   // 3 = sm_60-shaped 128-thr float4 GEMV (2026-08-03)
+        if (m < 0 || m > PXA_ROUTER_FUSE_MAX_MODE) {
+            fprintf(stderr, "PXA: PXA_ROUTER_FUSE=%d is out of range for this build "
+                            "(max %d) -- lever FORCED OFF (this is NOT a control arm)\n",
+                    m, PXA_ROUTER_FUSE_MAX_MODE);
+            m = 0;
+        }
+        mode = m;   // 3 = sm_60-shaped 128-thr float4 GEMV (2026-08-03)
     } else if (pxa_config_level() == 2 && g_pxa_topology.valid
                && g_pxa_topology.has_sm70 && !g_pxa_topology.mixed
                && (!pxa_model_known() || pxa_model_is_moe())) {
@@ -451,11 +462,11 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
             }
         } else if (cc == 610 && (i8 == 1 || i8 == 2)) {
             fprintf(stderr, " INT8_PREFILL ON [+182%% pf, G3]%s", pxa_fa_mask_skip_tile() ? " MASK_SKIP_TILE ON" : "");
-            if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [TEST all-arch]");
+            if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [mode %d]", pxa_router_fuse_mode_resolve());
         } else if (cc == 600) {
             fprintf(stderr, " FP16_GEMM %s [2:1 hgemm] MASK_SKIP_TILE %s [bit-exact]",
                     pxa_p100_fp16_gemm() ? "ON" : "off", pxa_fa_mask_skip_tile() ? "ON" : "off");
-            if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [TEST all-arch]");
+            if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [mode %d]", pxa_router_fuse_mode_resolve());
         } else if (i8 == 2) {
             fprintf(stderr, " INT8_PREFILL ON [TEST all-arch]");
         } else {

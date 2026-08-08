@@ -25,6 +25,9 @@
 //         bit j = elem j). code(j) = ((lo>>2*(j&15))&3) | (((w2>>j)&1)<<2). Branch-free.
 //   PAIRLUT (K2) is 4-bit-only: both policies decode via pair(); the host pickers force
 //   PAIR=false for these formats (pairl() below is a never-executed compile stub).
+//   EXCEPTION (2026-08-04): PXQ3 has its OWN pair-LUT mode — PAIRL3 (env PXA_PXQ3_PAIRLUT,
+//   default OFF), a 64-entry LUT keyed on the pair's packed bit-planes; see pairl3() below.
+//   K2a/PAIRLUT itself stays 4-bit-only.
 //   K6 WMMA is NOT extended to PXQ2/PXQ3 in v1 — the host driver masks wmma_mode for
 //   fmt >= PXA_PXQ_FMT_P2 (see APPLY-PLAN §5). The K1/K1b/K2-VECX/K3/K4/K5 family
 //   instantiates unmodified through the policies.
@@ -191,6 +194,12 @@ struct pxq6_pol_p1 {
         const uint32_t w = q[0];
         return make_float2(tab[(w >> (2*b)) & 1], tab[(w >> (2*b + 1)) & 1]);
     }
+    // K2d: identical bit extraction; the two gathers ride SHFL.IDX (lane l holds tab[l])
+    __device__ static float2 pair_shfl(const uint32_t * q, int b, float bv) {
+        const uint32_t w = q[0];
+        return make_float2(__shfl_sync(0xffffffffu, bv, (int)((w >> (2*b)) & 1)),
+                           __shfl_sync(0xffffffffu, bv, (int)((w >> (2*b + 1)) & 1)));
+    }
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
         (void)q; (void)b; (void)plut; return make_float2(0.f, 0.f);   // PAIR never offered for P1
     }
@@ -217,6 +226,13 @@ struct pxq6_pol_p2 {
         const uint32_t w  = q[b >> 3];
         const int      sh = 2 * ((2*b) & 15);
         return make_float2(tab[(w >> sh) & 3], tab[(w >> (sh + 2)) & 3]);
+    }
+    // K2d: identical field extraction; the two gathers ride SHFL.IDX (lane l holds tab[l])
+    __device__ static float2 pair_shfl(const uint32_t * q, int b, float bv) {
+        const uint32_t w  = q[b >> 3];
+        const int      sh = 2 * ((2*b) & 15);
+        return make_float2(__shfl_sync(0xffffffffu, bv, (int)((w >> sh) & 3)),
+                           __shfl_sync(0xffffffffu, bv, (int)((w >> (sh + 2)) & 3)));
     }
     // PAIRLUT is 4-bit-only; the pickers force PAIR=false for P2 — compile stub, never executed
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
@@ -250,8 +266,34 @@ struct pxq6_pol_p3 {
         const int c1 = (int)((lo >> (2*j0 + 2)) & 3) | (int)(((hi >> (j0 + 1)) & 1) << 2);
         return make_float2(tab[c0], tab[c1]);
     }
+    // K2d: identical plane reassembly; the two gathers ride SHFL.IDX (lane l holds tab[l])
+    __device__ static float2 pair_shfl(const uint32_t * q, int b, float bv) {
+        const int      h  = b >> 3;               // 16-elem half (0 or 1)
+        const int      j0 = (2*b) & 15;           // first elem within the half
+        const uint32_t lo = q[h];
+        const uint32_t hi = q[2] >> (16*h);       // this half's high plane in bits 0..15
+        const int c0 = (int)((lo >> (2*j0))     & 3) | (int)(((hi >> j0)       & 1) << 2);
+        const int c1 = (int)((lo >> (2*j0 + 2)) & 3) | (int)(((hi >> (j0 + 1)) & 1) << 2);
+        return make_float2(__shfl_sync(0xffffffffu, bv, c0),
+                           __shfl_sync(0xffffffffu, bv, c1));
+    }
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
         (void)q; (void)b; (void)plut; return make_float2(0.f, 0.f);   // PAIR forced off for P3
+    }
+    // PAIRL3 (PXA_PXQ3_PAIRLUT, MODE 5): the P3-specific instruction diet. pair() above
+    // reassembles two 3-bit codes from the planes (~10 int ops + 2 smem gathers per pair;
+    // the fired gateup loop measures 23% BFE). But the pair's 4 low-plane bits are
+    // CONTIGUOUS in q[h] (bits 2*j0..2*j0+3) and its 2 high-plane bits are CONTIGUOUS in
+    // q[2] (16*h + j0 == 2*b for BOTH halves, so bits 2b..2b+1). One 64-entry smem LUT
+    // keyed [hi2:lo4] makes the whole decode BFE + BFE + BFI + LDS.64. Same book values
+    // (the LUT is staged from the same pxq3_book_g via bookv), same FMA order — sourcing
+    // only, bit-exact vs pair(). Distinct from the 256-entry byte-keyed K2a PAIRLUT
+    // (4-bit tiers, +0.1%): K2a only fused the two gathers (the byte key was already one
+    // BFE); this removes the bit-plane reassembly itself (~7 instructions per pair).
+    __device__ static float2 pairl3(const uint32_t * q, int b, const float2 * plut) {
+        const uint32_t lo4 = (q[b >> 3] >> (2*((2*b) & 15))) & 0xfu;   // low planes: elems 2b, 2b+1
+        const uint32_t hi2 = (q[2]      >> (2*b))            & 0x3u;   // high plane: bits 2b, 2b+1
+        return plut[lo4 | (hi2 << 4)];
     }
 };
 

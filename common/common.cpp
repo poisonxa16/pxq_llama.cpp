@@ -1017,7 +1017,11 @@ static std::string common_speculative_stage_unescape_value(const std::string & v
     return result;
 }
 
-static common_speculative_stage_params common_speculative_stage_from_arg(const std::string & value) {
+}  // namespace -- everything above is internal to this TU.
+
+// PUBLIC (declared in common.h): the PXA auto-spec layer arms a drafter through the
+// exact parser --spec-type uses, so the auto path cannot drift from the flag path.
+common_speculative_stage_params common_speculative_stage_from_arg(const std::string & value) {
     const auto spec_pos = value.find(':');
     const std::string type_name = value.substr(0, spec_pos);
 
@@ -1041,7 +1045,6 @@ static common_speculative_stage_params common_speculative_stage_from_arg(const s
     }
 
     return stage;
-}
 }
 
 #define CHECK_ARG if (++i >= argc) { invalid_param = true; return true; }
