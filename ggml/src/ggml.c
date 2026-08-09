@@ -4461,9 +4461,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_SPLIT_SINKHORN",
     "DSV4_HC_WEIGHTED_SUM",
     "DSV4_HC_EXPAND",
+
+    "MASK_TO_IDX",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4585,9 +4587,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_split_sinkhorn(x)",
     "dsv4_hc_weighted_sum(x,w)",
     "dsv4_hc_expand(x,r,p,c)",
+
+    "mask_to_idx(m)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -9417,7 +9421,12 @@ static struct ggml_tensor * ggml_rope_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    // PXA_ROPE_FLIPPED_v1: op_params[15] is the "flipped" flag (rotate the
+    // TRAILING n_dims channels instead of the leading ones). It is written
+    // after construction by the caller, so zero it here explicitly rather than
+    // relying on ggml_new_tensor_impl's { 0 } initialiser - a stale 1 would
+    // silently rotate the wrong half of every rope in the graph.
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
@@ -9429,6 +9438,7 @@ static struct ggml_tensor * ggml_rope_impl(
     } else {
         memset(params + 11, 0,         sizeof(int32_t) * GGML_MROPE_SECTIONS);
     }
+    params[15] = 0; // GGML_ROPE_FLIPPED_PARAM
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ROPE;
@@ -9612,13 +9622,19 @@ struct ggml_tensor * ggml_rope_back(
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 
-    int32_t params[11] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    // params[11..14] are the mrope sections, params[15] is the flipped flag
+    // (PXA_ROPE_FLIPPED_v1). Both are read unconditionally by the forward
+    // implementations, so write them explicitly instead of leaning on the
+    // tensor allocator's zero-init.
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
     memcpy(params +  8, &attn_factor,  sizeof(float));
     memcpy(params +  9, &beta_fast,    sizeof(float));
     memcpy(params + 10, &beta_slow,    sizeof(float));
+    memset(params + 11, 0,             sizeof(int32_t) * GGML_MROPE_SECTIONS);
+    params[15] = 0; // GGML_ROPE_FLIPPED_PARAM
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op   = GGML_OP_ROPE_BACK;
@@ -10349,6 +10365,25 @@ struct ggml_tensor * ggml_dsv4_hc_expand(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_mask_to_index
+
+struct ggml_tensor * ggml_mask_to_index(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        int64_t               max_row_size) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(max_row_size > 0);
+
+    const int64_t ne0 = MIN(mask->ne[0], max_row_size);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne0, mask->ne[1], mask->ne[2], mask->ne[3]);
+
+    result->op     = GGML_OP_MASK_TO_IDX;
+    result->src[0] = mask;
 
     return result;
 }
@@ -20366,6 +20401,23 @@ static void ggml_compute_forward_rope_f32(
     // this essentially just switches the sign of sin.
     const float sin_sign = forward ? 1.0f : -1.0f;
 
+    // PXA_ROPE_FLIPPED_v1: rotate the TRAILING n_dims channels of each row and
+    // leave the leading (ne0 - n_dims) alone. Partial-RoPE architectures store
+    // rows as [nope | pe], so the flipped form removes the view/rope/concat
+    // triple: the row is roped in place and the nope half never moves.
+    //
+    // Deliberately stricter than upstream, which silently ignores the flag for
+    // mrope/vision: those layouts address the tail channels themselves, so a
+    // flipped request there is a caller bug and must be loud, not silent.
+    const bool is_flipped = dst->op_params[15] != 0;
+    GGML_ASSERT(!(is_flipped && (is_mrope || is_vision)) &&
+            "flipped RoPE is not defined for mrope/vision layouts");
+    const int64_t rope_offset = is_flipped ? ne0 - n_dims : 0;
+
+    // an in-place node shares src0's buffer, so the channels this op does not
+    // rotate are already in place and the passthrough copy below is a no-op.
+    const bool is_inplace = src0->data == dst->data;
+
     const int32_t * pos = (const int32_t *) src1->data;
 
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
@@ -20409,7 +20461,9 @@ static void ggml_compute_forward_rope_f32(
                         }
                     } else {
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
-                            const int64_t ic = i0/2;
+                            // rope_offset is 0 unless flipped; when flipped the
+                            // pair (ic, ic + n_dims/2) slides into the tail.
+                            const int64_t ic = i0/2 + rope_offset;
 
                             const float cos_theta = cache[i0 + 0];
                             const float sin_theta = cache[i0 + 1];
@@ -20426,11 +20480,13 @@ static void ggml_compute_forward_rope_f32(
                     }
                 } else {
                     for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+                        const int64_t ic = i0 + rope_offset;
+
                         const float cos_theta = cache[i0 + 0];
                         const float sin_theta = cache[i0 + 1];
 
-                        const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-                              float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
+                        const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
+                              float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + ic*nb0);
 
                         const float x0 = src[0];
                         const float x1 = src[1];
@@ -20438,6 +20494,16 @@ static void ggml_compute_forward_rope_f32(
                         dst_data[0] = x0*cos_theta - x1*sin_theta;
                         dst_data[1] = x0*sin_theta + x1*cos_theta;
                     }
+                }
+
+                if (is_flipped && is_inplace) {
+                    // nothing else to copy: dst IS src0.
+                    // Deliberately NOT applied to non-flipped in-place ropes -
+                    // the K-shift path (llama-build-context.cpp) uses those on
+                    // every arch with context shift, and leaving that case
+                    // exactly as it was keeps this port structurally inert
+                    // outside DeepSeek-V4 rather than inert-by-argument.
+                    continue;
                 }
 
                 if (is_vision) {
@@ -20457,8 +20523,12 @@ static void ggml_compute_forward_rope_f32(
                         dst_data[n_dims] = x0*sin_theta + x1*cos_theta;
                     }
                 } else {
-                    // fill the remain channels with data from src tensor
-                    for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
+                    // fill the remain channels with data from src tensor.
+                    // flipped ropes rotate [rope_offset, ne0) so the untouched
+                    // channels are the LEADING [0, rope_offset) instead.
+                    const int64_t pass0 = is_flipped ? 0           : n_dims;
+                    const int64_t pass1 = is_flipped ? rope_offset : ne0;
+                    for (int64_t i0 = pass0; i0 < pass1; i0 += 2) {
                         const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
 
@@ -20489,6 +20559,14 @@ static void ggml_compute_forward_rope_f16(
     const int mode       = ((int32_t *) dst->op_params)[2];
     //const int n_ctx      = ((int32_t *) dst->op_params)[3];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    // PXA_ROPE_FLIPPED_v1 is implemented for f32 (CPU) and f32/f16 (CUDA) only.
+    // Abort rather than silently rotating the leading channels: this path is
+    // never taken by any arch that sets the flag, and a wrong answer here would
+    // be invisible.
+    GGML_ASSERT(dst->op_params[15] == 0 &&
+            "flipped RoPE is not implemented for f16 on the CPU backend");
+
     memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
     memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
     memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
@@ -23551,6 +23629,57 @@ static void ggml_compute_forward_dsv4_hc_expand(
     }
 }
 
+// ggml_compute_forward_mask_to_idx
+
+static void ggml_compute_forward_mask_to_idx(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * mask = dst->src[0];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask->ne[1] == dst->ne[1] && mask->ne[2] == dst->ne[2] && mask->ne[3] == dst->ne[3]);
+    GGML_ASSERT(mask->ne[0] >= dst->ne[0]);
+    GGML_ASSERT(dst->nb[0] == sizeof(int32_t));
+
+    const int64_t ne00 = mask->ne[0];
+    const int64_t ne0  = dst->ne[0];
+
+    // Rows are independent; split them across threads.
+    const int64_t nr = ggml_nrows(dst);
+    const int64_t r0 = (nr * params->ith) / params->nth;
+    const int64_t r1 = (nr * (params->ith + 1)) / params->nth;
+
+    for (int64_t ir = r0; ir < r1; ++ir) {
+        const int64_t i1 = ir % dst->ne[1];
+        const int64_t i2 = (ir / dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = ir / (dst->ne[1] * dst->ne[2]);
+
+        const char    * mask_r = (const char *) mask->data + i1*mask->nb[1] + i2*mask->nb[2] + i3*mask->nb[3];
+              int32_t * idx_r  = (int32_t *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t j = 0; j < ne0; ++j) {
+            idx_r[j] = -1;
+        }
+
+        int64_t n = 0;
+        for (int64_t j = 0; j < ne00 && n < ne0; ++j) {
+            const float v = mask->type == GGML_TYPE_F16
+                ? GGML_FP16_TO_FP32(((const ggml_fp16_t *) mask_r)[j])
+                : ((const float *) mask_r)[j];
+            // Keep every row the mask does not hard-exclude. `!(v <= -inf)` is
+            // deliberately not `v == 0`: it also keeps finite-but-negative bias
+            // entries (ALiBi) and NaN, so the index list is always a SUPERSET of
+            // the visible set. A superset stays correct because the consumer
+            // re-applies the real mask value at each selected row; a subset would
+            // silently drop KV. See the contract note on ggml_mask_to_index().
+            if (!(v <= -INFINITY)) {
+                idx_r[n++] = (int32_t) j;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_win_part
 
 static void ggml_compute_forward_win_part_f32(
@@ -25297,6 +25426,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_dsv4_hc_expand(params, tensor);
             } break;
+        case GGML_OP_MASK_TO_IDX:
+            {
+                ggml_compute_forward_mask_to_idx(params, tensor);
+            } break;
         case GGML_OP_WIN_PART:
             {
                 ggml_compute_forward_win_part(params, tensor);
@@ -26360,6 +26493,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_MASK_TO_IDX:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -27097,6 +27231,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_MASK_TO_IDX:
             {
                 n_tasks = n_threads;
             } break;

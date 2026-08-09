@@ -650,6 +650,39 @@ MMVQ, CUDA-graphs-off, and 7-card topology are ALL exonerated for this symptom.
 |---|---|---|---|
 | `PXA_MTMD_STBIR` | **0 (off)** | `examples/mtmd/clip.cpp` (`img_tool` + the Qwen-VL preprocess case) | `=1` (value-tested; `=0` verified OFF) enables BOTH halves of the upstream image-preprocessing correction as one switch: (a) upstream #1967 (`574f22b3`) — `img_tool::resize_bilinear/resize_bicubic` route to the vendored `stb_image_resize2.h` v2.18 (`STBIR_FILTER_TRIANGLE` / `STBIR_FILTER_CATMULLROM`), which *filters the full support on downscale* where the legacy handwritten loops point-sample a 2×2/4×4 neighborhood and alias; (b) upstream #1969 (`19f08160`) — the QWEN2VL/QWEN25VL/QWEN3VL/GEMMA4V preprocess case selects bicubic instead of bilinear, matching the HF reference processors (PIL/torchvision bicubic = Catmull-Rom). Deliberately coupled: upstream's "bicubic" lands on the stbir filtered Catmull-Rom — #1969 alone on the legacy point-sampled bicubic would add aliasing+overshoot on downscale instead of matching the reference. When ON the resizer swap affects EVERY projector that resizes (minicpmv/idefics3/gemma3/internvl/…); the algo change affects only the Qwen-VL family + Gemma4V case. Gate OFF = byte-identical legacy behavior (legacy loop bodies untouched, algo falls back to bilinear). **Verification: gate-off bit-exact by construction; gate-on is a deliberate pixel change** — vision output is NOT byte-comparable across resizers, compare task success. Functional: Qwen2.5-VL-7B-Instruct Q4_K_M + f16 mmproj, `llama-mtmd-cli` temp 0, the bundled newspaper test image is read correctly in both gate states. **Measured cost (single-thread, in-process around the `clip_image_preprocess` resize; CPU-only static Release, example targets at default flags = SSE2 baseline, no `-mavx2` — upstream CMake parity; dual-Xeon host; RGB-noise BMP; target 532×364 via `--image-max-tokens 256` qwen25vl smart-resize):** 800×560 input → legacy 4.86 ms vs stbir **2.80 ms** (~1.7× faster with the heavier filter; ×2 runs); 6000×4000 input → legacy 5.60 ms vs stbir **140.9 ms** (median of 3). ⚠ Read the big-image number correctly: upstream bills this port as a SIMD *speedup*, but on heavy downscale stbir is ~25× SLOWER — legacy's flat ~5 ms is the aliasing bug itself (point-sampling reads <1% of input pixels at 11×; stbir reads all 24 MP, which is the correctness being bought). ~141 ms once per large image is noise against the vision-tower encode of the same image. `-mavx2` on the mtmd target is an unexplored follow-up lever (stbir carries AVX2 paths). Intended first consumer: the Qwen2.5-VL serving deployment — flip via its env only after a task-success (OCR/read) A/B on that service. Not in ENHANCE |
 
+### 2026-08-02 — DeepSeek-V4 DSA sparse attention (head-512 flash attention on sm_70)
+
+⚠ **NO MEASURED EFFECT YET. Both rows below are UNMEASURED and must not be quoted as a
+speedup.** They are recorded here because a shipping gated flag has to land with its row,
+and because leaving them undocumented is how `PXA_PXQ_KV` ended up with a fabricated
+measured effect for a string that existed nowhere in the source. Verification so far is
+compile + correctness only; the throughput A/B has not been run.
+
+**What the honest A/B has to answer, stated before the numbers exist.** DSA lives only on
+the `-fa on` path. Under `-fa on` on sm_70 every DeepSeek-V4 attention node that DSA does
+*not* take still runs on the CPU backend (head 512 has no other CUDA kernel), while
+`-fa off` already puts 100% of attention on the GPU densely and is measured 2.5x faster at
+prefill (114.83 -> 287.42) and +40% at decode (11.05 -> 15.50). So the baseline to beat is
+**`-fa off`, not `-fa on`**, and `-fa on` + DSA only has a route to winning if DSA covers
+essentially *every* attention layer. That is what `PXA_DSA_MIN_RATIO` controls. If DSA
+loses to `-fa off`, the correct outcome is to keep `-fa off` and say so.
+
+**Numerics.** `build_dsv4_attn_mha()` calls `ggml_flash_attn_ext_set_prec(GGML_PREC_F32)`
+on every DeepSeek-V4 attention node, and that request lives in `op_params[3]`. The
+upstream ik kernel never reads it: both of its GEMMs were `cublasHgemm` (F16 accumulate)
+and it stored the score matrix in F16 as well, so a PREC_F32 request was silently answered
+in F16 — a different answer, not a slower one, and worst exactly where the request was
+aimed (the QK contraction is 512 deep and the PV reduction grows with context). Here both
+GEMMs accumulate in F32 (`CUBLAS_COMPUTE_32F`, the same idiom `ggml-cuda.cu` uses for
+`GGML_PREC_F32` mul_mat), the score matrix is F32, and the PV GEMM writes `dst` directly
+in F32. This is unconditional — F32 accumulation also satisfies `GGML_PREC_DEFAULT`, which
+imposes no requirement — so there is no second numeric path to keep correct.
+
+| var | default | where | what it does |
+|---|---|---|---|
+| `PXA_DSA_ATTN` | **0 (OFF)** | `ggml-cuda/dsa_attn.cu` (`ggml_cuda_dsa_attn_supported`), mirrored in `build_deepseek4.cpp` | Master switch for the sparse attention path; set `=1` to enable, anything else leaves it off. A `FLASH_ATTN_EXT` node carrying an index list in `src[5]` (from `GGML_OP_MASK_TO_IDX`) attends only the KV rows each query can see, via cuBLAS GEMM + plain CUDA kernels — no wmma/mma/cp.async and no `__CUDA_ARCH__` branches, so it is the only CUDA attention path that accepts head dim 512 on Volta. Read through the single predicate that both the dispatcher and the scheduler gate call, so it cannot half-apply — which is what makes a same-binary A/B possible; the graph-builder mirror shares the same default so `off` reproduces the **pre-port graph**, not merely a disabled kernel. **⚠ DEFAULT OFF ON PURPOSE.** Where DSA engages it is not bit-identical to the path it replaces, and it has no end-to-end measurement — no perplexity, no KL against the pre-port binary, no throughput number. An opt-in switch is what an unmeasured behaviour change is allowed to be. **Effect: UNMEASURED.** Verification class: **G3 at best, not bit-exact.** ⚠ **An on-vs-off comparison at low fill is VACUOUS**: below the engagement threshold the compressed mask is narrower than the index list, `worth_it` is false, `src[5]` is never set, and both arms run the identical pre-port path — so they are byte-identical by construction and the comparison measures the engine against itself. Any A/B must prove engagement **in the same run** (`GGML_SCHED_DEBUG=2` showing `FLASH_ATTN` on CUDA) or it is not evidence. |
+| `PXA_DSA_MIN_RATIO` | **4** | `ggml-cuda/dsa_attn.cu`, mirrored in `build_deepseek4.cpp` | Minimum `n_kv : index-width` ratio before the sparse path is taken at prefill (batch > 16; decode only requires the list to be narrower than `n_kv`). ik hardcodes 4, measured on an RTX 3090. It is a throughput trade — gather cost against GEMM saved — not a correctness bound, and the crossover is hardware-specific, so it is exposed rather than inherited. **This is the knob that decides layer coverage.** At the default, on the 43-layer DS4-Flash checkpoint (`n_swa` 128, `indexer_top_k` 512, `compress_ratios` alternating 4/128 → 21 CSA + 20 HCA + 2 raw), prefill engagement is CSA-only and only above roughly 9k fill; decode engages far more readily. Lowering it toward 1 pulls HCA and raw layers in as well, which is the only configuration in which `-fa on` could plausibly beat `-fa off`. The graph builder mirrors the same value so it does not emit an index list the kernel would decline; **the kernel's copy is authoritative** and a disagreement wastes a node rather than miscomputing. **Effect: UNMEASURED at every value, including the default.** Moot unless `PXA_DSA_ATTN=1`. |
+
 ### 2026-07-30 — crash/correctness hygiene: nl-less-vocab sampling OOB, jinja for-loop scope leak, boolean-flag argv swallow (upstream #2188/#2018/#2129 port)
 
 | var | default | where | what it does |
@@ -657,3 +690,55 @@ MMVQ, CUDA-graphs-off, and 7-card topology are ALL exonerated for this symptom.
 | *(no env — always on)* nl-token OOB guard | — | `common/sampling.cpp` (`llama_sampling_prepare_impl`) | Port of upstream ik #2188 (`8be93884`). The repetition-penalty block read `logits[llama_token_nl(...)]` unconditionally; on a vocab whose tokenizer maps `"\n"` to zero tokens the loader's fallback chain (`src/llama-vocab.cpp`: `linefeed_id = special_pad_id`, itself `LLAMA_TOKEN_NULL` on Falcon3-class BPE) yields id −1, making that `logits[-1]` — an OOB read one float before the logit row, a configuration-dependent segfault. Reachable from every token sampled through `common_sampler_sample` → `llama_sampling_prepare` (the read fires whenever any prev tokens exist, even with all penalties at 1.0, and `PXA_REP_GUARD`/ENHANCE arms real penalties on PXQ1 content). Now the token is fetched once and both the read and the `penalize_nl` restore are skipped at `LLAMA_TOKEN_NULL`. **Cannot change output on a vocab with a real newline token** (byte-identical block; upstream additionally measured 26 greedy comparisons across 8 models unchanged, and reproduced segfault→HTTP-200 on 4×P100 `-ngl 99` — our hardware class). Ungated: the old path is UB, there is no legacy behavior worth keeping. Relevance here: PXQ-UNIVERSAL quantizes arbitrary community models — exactly the odd-vocab traffic that trips this. No local crash repro was re-run (no nl-less-vocab model staged on the box); verification class: **structural + suite-identical + upstream repro on our hardware class** |
 | `PXA_JINJA_LEGACY_LOOP_SCOPE` | **0 (fix active)** | `common/jinja/runtime.cpp` (`for_statement::execute_impl`) | Port of upstream ik #2018 (`997b289d`). Each `{% for %}` iteration now executes in a fresh child scope, so a conditionally-skipped `{% set %}` no longer leaks the previous iteration's value forward (upstream's field case: a tool-call turn with reasoning followed by one without duplicated the stale reasoning into the second turn — wrong prompt, degraded output; goes straight at the tool-calling-reliability hard requirement). Matches standard Jinja2; cross-iteration accumulation still works via `namespace()` (mutations ride the shared object, which is why correctly-authored Qwen-family templates are unaffected). `=1` restores the old shared-scope behavior (value-tested; unset or `=0` = fixed). **Verified 2026-07-30 (CPU-only Release, `pxq-build:tools` container, worktree @ `9d564d7`):** ported upstream unit test passes (test-jinja 306 tests / 1427 assertions / 0 failures); with `=1` exactly that one test fails, rendering `[a][a][c]` — the leak, byte-for-byte the legacy semantics — and the other 305 tests are byte-identical; with `=0` output is byte-identical to unset (value-test proven). `test-chat-template` and `test-chat-auto-parser` outputs are **byte-identical before/after the port** (their pre-existing failures at `9d564d7` — the GLM whitespace-trim assert, 12/57 auto-parser cases — are unchanged, i.e. not loop-scope-related). No perf claim: cost is one flat scope copy per loop iteration, template-render only |
 | *(no env — always on)* `--skip-chat-parsing` / `--no-prefill-assistant` argv fix | — | `common/common.cpp` (`gpt_params_find_arg`) | Port of upstream ik #2129 (`3e76852b`). Both boolean flags carried a stray `CHECK_ARG`, silently consuming the NEXT command-line argument (`--skip-chat-parsing --version` ate `--version` and fell through to loading the default model) and dying as `invalid parameter` when the flag was last on the line. Removed; the usage strings were already boolean-style so no help change. **Verified:** `--skip-chat-parsing --version` / `--no-prefill-assistant --version` now print the version and exit 0 (before: rc=1 default-model-load failure); each flag as the last argument is accepted (before: usage dump). Ungated: pure argv correctness |
+
+### 2026-08-02 — DeepSeek-V4 flipped in-place RoPE (`PXA_ROPE_FLIPPED_v1`, upstream ik #2198 port)
+
+DS4 stores every roped row as `[nope | pe]` and the classic ggml shape for that is
+`nope = view(x,0)`, `pe = view(x,off)`, `pe = rope(pe)`, `x = concat(nope, pe, 0)`. The
+concat reads a **non-contiguous** source and writes a full-width destination. At the
+checkpoint's real geometry (`attention.key_length` 512, `rope.dimension_count` 64,
+`n_head` 64, `nt` 383) the q and attn-derope concats are about **50 MB per layer each**,
+against roughly **1.1 MB** for the compressed-KV ring concat.
+
+⚠ **This corrects a claim in our own notes.** `brain-notes/DS4-QUANT-LADDER-2026-08-01.md`
+attributes the profiled `concat_f32_non_cont` cost (3.8% of prefill over 9295 calls) to
+"raw-ring ⊕ compressed-K assembly". By tensor bytes that is off by roughly 45x — the
+partial-RoPE concats dominate, not the ring.
+
+Flipped RoPE removes the triple outright: rotate the **trailing** `n_dims` channels where
+they already are. No view, no concat, no destination allocation. The rotation itself is
+untouched — theta is still derived from the index *within* the rotated block, so only the
+memory index moves.
+
+⚠ **NO MEASURED THROUGHPUT EFFECT YET. Do not quote a speedup.** Upstream's author reports
++2-3% prefill / 0 decode for this change on his hardware; that is **his** number, not ours,
+not reproduced here. What IS measured here is graph size (-636 nodes, -575 concats) and
+correctness (byte-identical temp-0 output). No throughput A/B has been run.
+
+| var | default | where | what it does |
+|---|---|---|---|
+| `PXA_DS4_ROPE_FLIPPED` | **1 (on)** | `src/graphs/build_deepseek4.cpp` (`dsv4_rope_flipped_enabled`) | Master switch for the six DS4 partial-RoPE sites: HCA compressed-KV, CSA/LID compressed-KV, indexer-q, attention q, attention kv, and the attention de-rope. On, each `view / rope / concat` triple collapses to a single flipped rope node that rotates the trailing `n_rot` channels and passes the leading ones through in the same kernel. `=0` rebuilds the **pre-port graph exactly**, so a same-binary A/B is possible and a rollback needs no rebuild. **Measured on DeepSeek-V4-Flash (43 layers, `-c 8192 -b 512 -ub 512`, one V100, `--n-cpu-moe 99`): graph 8229 -> 7593 nodes at `-fa on` and 8444 -> 7808 at `-fa off` (-636 either way, -7.7%); CONCAT nodes 1581 -> 1006 (-575).** Verification class: **bit-exact on CUDA**, confirmed at model level - temp-0 output is byte-identical to the `=0` arm for a 2600-token prompt with 320 generated tokens at `-fa off`, and for the short prompt at both `-fa` settings. ⚠ On the **CPU backend** the rope is not bit-reproducible between an in-place node and a fresh-destination node; that gap is PRE-EXISTING (reproduced bit-for-bit on the pre-port binary - see `tests/test-rope-flipped.cpp` arm 2b) and measures ~1e-6 % relative. **Throughput effect: UNMEASURED.** Upstream's author reports +2-3% prefill / 0 decode for the equivalent change on his hardware; that is his number, not ours. |
+| *(removed)* in-place form | - | - | ⚠ **Upstream (ik #2198) makes these ropes IN-PLACE, which additionally drops the destination allocation. That is unsafe on sm_70 and was reverted here after being measured, not reasoned about.** With in-place ropes, `-fa on` plus a 2600-token prompt aborts with `ggml_cuda_compute_forward: ROPE_BACK failed / an illegal memory access was encountered` (pinned with `CUDA_LAUNCH_BLOCKING=1`; without it the sticky error surfaces later inside `cublasSgemm` and names the wrong kernel). Cause, from `GGML_SCHED_DEBUG=2` at the same fill: head dim 512 has no CUDA flash-attention kernel on Volta, so **86 of the `FLASH_ATTN` nodes run on the CPU backend** while **all 129 `ROPE_BACK` nodes are assigned to CUDA0** - `ggml_backend_cuda_supports_op` returns true unconditionally for ROPE/ROPE_BACK, and an in-place node is a *view*, which cannot be satisfied by inserting a copy: it must write into its `view_src`'s actual buffer. So a CUDA kernel writes to host memory. Upstream does not hit this because their DS4 attention runs on the GPU (Ampere+). The fresh-destination form removes the concat either way - that is the part that showed up in the profile - so the win is kept and only the destination allocation is given up. |
+| *(no env — always on)* `op_params[15]` flipped flag | — | `ggml/src/ggml.c`, `ggml/src/ggml-cuda/rope.cu` | The ggml-level mechanism. `op_params[15] == 1` on a ROPE/ROPE_BACK node means "rotate `[ne0-n_dims, ne0)` instead of `[0, n_dims)`". Implemented for f32 on CPU and f32+f16 on CUDA. Nothing sets it except the DS4 builder, so on every other arch the flag is 0 and the code path is byte-unchanged. Both rope constructors now write slot 15 explicitly rather than relying on the tensor allocator's zero-init. |
+
+**Guards that ship with it — each is a place where a wrong answer would otherwise be silent:**
+
+- `ggml_cuda_op_rope_rope_impl` declines a flipped pair. This one is **live, not
+  defensive**: DS4 emits adjacent `GGML_OP_ROPE` nodes for q and kv, the CUDA dispatcher
+  fuses adjacent ROPE nodes, and the fused path's own eligibility check is
+  `memcmp(dst1->op_params, dst2->op_params, 15*sizeof(int))` — which stops one int short
+  of the flipped flag. Without the guard the fused kernel would accept the pair and rotate
+  the leading channels.
+- `ggml_cuda_op_rope_cache_impl`, `ggml_cuda_op_rope_fast`, `ggml_cuda_op_fused_rope_fast`
+  and `ggml_cuda_op_fused_rms_rope_fast` reject or decline flipped nodes.
+- mrope and vision layouts **assert** rather than silently ignoring the flag (upstream
+  ignores it); those layouts address the tail channels themselves, so a flipped request
+  there is a caller bug.
+- f16 on the CPU backend asserts (not implemented there; DS4 is f32).
+
+**One upstream defect was not ported.** ik's non-in-place flipped *neox* kernel derives the
+pair index as `i0/2 + rope_offset`, which walks past the end of the row for any
+`ne0 > n_dims` (e.g. `ne0=192, n_dims=64` addresses element 223 of a 192-wide row). It is
+unreachable in their build because DS4 always takes the in-place path, but it is wrong.
+Ours derives the index from the thread's position within the rotated block, and
+`tests/test-rope-flipped.cpp` exercises that path explicitly rather than trusting it.

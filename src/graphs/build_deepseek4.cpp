@@ -138,6 +138,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 // compression ratios that select the three per-layer attention regimes
 static constexpr int64_t DSV4_CSA_RATIO = 4;    // compressed sparse attn + lightning indexer
@@ -150,6 +151,103 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     }
 
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
+}
+
+// PXA_DS4_ROPE_FLIPPED (default on; set to 0 to restore the pre-port graph).
+//
+// DS4 stores every roped row as [nope | pe]. The classic shape is
+//   nope = view(x, 0)            pe = view(x, off)
+//   pe   = rope(pe)              x  = concat(nope, pe, 0)
+// The concat reads a NON-contiguous source and writes a full-width destination.
+// At n_embd_head=512 / n_head=64 / nt=383 the q and attn-derope concats are
+// ~50 MB per layer each -- that is the cost this removes.
+//
+// Flipped RoPE collapses the triple to one node: rotate the TRAILING n_dims
+// channels where they already sit and pass the nope half through in the same
+// kernel. Two views and the non-contiguous concat disappear. The rotation
+// itself is untouched -- only the memory index moves.
+//
+// ⚠ NOT in-place, deliberately, and this is a DEVIATION from upstream.
+//
+// Upstream uses ggml_rope_ext_inplace here, which also drops the destination
+// allocation. That is unsafe on this hardware, and it was measured, not
+// reasoned about: with in-place ropes, `-fa on` + a ~2600-token prompt aborts
+// inside cublasSgemm with "the function failed to launch" (a sticky fault
+// raised by an earlier kernel), while the same binary with the switch off, and
+// the same binary at `-fa off`, both complete.
+//
+// Cause: on sm_70 head dim 512 has no CUDA flash-attention kernel, so most DS4
+// attention nodes end up on the CPU backend and their outputs live in host
+// memory. Measured with GGML_SCHED_DEBUG=2 at this fill: FLASH_ATTN CUDA=43
+// CPU=86, while ROPE_BACK is CUDA=129 CPU=0 -- every de-rope assigned to CUDA0,
+// 86 of them viewing a host-resident tensor. An in-place rope is a VIEW, and
+// ggml_backend_cuda_supports_op returns true unconditionally for
+// ROPE/ROPE_BACK, so the scheduler is free to assign the view to CUDA. A view
+// cannot be satisfied by inserting a copy -- it must write into its view_src's
+// actual buffer -- so the kernel writes to a host pointer. Upstream does not
+// hit this because their DS4 attention runs on the GPU (Ampere+).
+//
+// The concat -- the part that actually showed up in the profile -- is removed
+// either way. What in-place would additionally save is one destination
+// allocation and the nope-half copy, and the classic path was copying that
+// same data through the concat anyway.
+static bool dsv4_rope_flipped_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_DS4_ROPE_FLIPPED");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
+// Rotate the trailing n_dims channels of `cur`, passing the leading channels
+// through. Fresh destination: no aliasing, so this is safe under any backend
+// split.
+static ggml_tensor * dsv4_rope_flipped(
+        ggml_context * ctx, ggml_tensor * cur, ggml_tensor * pos, int n_dims, int rope_type,
+        int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    GGML_ASSERT(ggml_is_contiguous(cur));
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_dims <= cur->ne[0]);
+
+    ggml_tensor * out = ggml_rope_ext(ctx, cur, pos, nullptr, n_dims, rope_type, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    out->op_params[15] = 1; // PXA_ROPE_FLIPPED_v1
+
+    // Structural guard, not decoration: an in-place rope here is a VIEW, and a
+    // view must write into its view_src's buffer, which the scheduler is free to
+    // put on another backend. That is exactly the sm_70 `-fa on` abort
+    // (ROPE_BACK -> illegal memory access). If anyone switches these back to the
+    // _inplace constructors, fail at graph build rather than at a random kernel.
+    GGML_ASSERT(out->view_src == nullptr &&
+            "DS4 flipped rope must own its destination");
+
+    return out;
+}
+
+// Inverse rotation, same layout. Uses ggml_rope_back directly, so there is no
+// need for upstream's trick of retyping a ROPE node to ROPE_BACK.
+static ggml_tensor * dsv4_rope_back_flipped(
+        ggml_context * ctx, ggml_tensor * cur, ggml_tensor * pos, int n_dims, int rope_type,
+        int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    GGML_ASSERT(ggml_is_contiguous(cur));
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_dims <= cur->ne[0]);
+
+    ggml_tensor * out = ggml_rope_back(ctx, cur, pos, nullptr, n_dims, rope_type, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    out->op_params[15] = 1; // PXA_ROPE_FLIPPED_v1
+
+    // Structural guard, not decoration: an in-place rope here is a VIEW, and a
+    // view must write into its view_src's buffer, which the scheduler is free to
+    // put on another backend. That is exactly the sm_70 `-fa on` abort
+    // (ROPE_BACK -> illegal memory access). If anyone switches these back to the
+    // _inplace constructors, fail at graph build rather than at a random kernel.
+    GGML_ASSERT(out->view_src == nullptr &&
+            "DS4 flipped rope must own its destination");
+
+    return out;
 }
 
 // upstream: dsv4_append_zero_row(). Adds one synthetic trailing row that
@@ -431,8 +529,14 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
         ggml_tensor * kq_mask,
         ggml_tensor * sinks,
         float         kq_scale,
-        int           il) const {
+        int           il,
+        int64_t       n_visible_max) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+
+    // Captured before the permutes: ggml_permute() returns a fresh view struct each
+    // call, so after permuting, k and v are never pointer-equal even when the caller
+    // passed the same tensor twice (all three DS4 regimes do).
+    const bool v_aliases_k = (v == k) && !v_trans;
 
     const int64_t n_stream = k->ne[3];
     GGML_ASSERT(n_stream == 1 && "DSV4 first cut is single-stream (-np 1)");
@@ -454,14 +558,69 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
-        if (v->type == GGML_TYPE_F32) {
+        if (v_aliases_k) {
+            // Keep V the *same tensor* as K rather than casting it a second time.
+            // Two ggml_cast() calls produce two distinct F16 buffers, which doubles the
+            // F16 conversion and defeats the DSA kernel's v_is_k_view fast path (it
+            // would then gather the value rows a second time).
+            v = k;
+        } else if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
+        // Sparse attention: when the mask is mostly -inf, hand the kernel the list of
+        // rows each query can actually see instead of a full-width score matrix.
+        // n_visible_max must bound the visible count for EVERY query row; the padded
+        // list is only built when it is genuinely narrower than the dense mask.
+        // PXA_DSA_ATTN=0 must reproduce the PRE-PORT graph exactly, not merely stop the
+        // kernel from firing. Measured: with the switch honoured only in the kernel, the
+        // off arm still built 43 mask_to_idx nodes per decode graph that nothing consumed
+        // -- dead work charged to the baseline, which would bias any A/B in DSA's favour.
+        // Mirrors the kernel-side switch in ggml-cuda/dsa_attn.cu, INCLUDING its default:
+        // off unless PXA_DSA_ATTN=1. If these two disagree the graph and the kernel
+        // disagree about which engine is running, which is worse than either default.
+        static const bool dsa_enabled = [] {
+            const char * v = getenv("PXA_DSA_ATTN");
+            return v && v[0] == '1';
+        }();
+
+        ggml_tensor * selected = nullptr;
+        if (dsa_enabled && n_visible_max > 0) {
+            // The 256-round-up is required by the kernel's launch geometry, and it
+            // doubles as slack: up to 255 rows more than the caller's bound still fit.
+            const int64_t n_sel = GGML_PAD(n_visible_max, 256);
+            const int64_t n_kv  = kq_mask->ne[0];
+            const int64_t nt    = q->ne[1];   // post-permute: q is [n_embd_head, n_tokens, n_head]
+
+            // Mirror of the "worth it?" block in ggml_cuda_dsa_attn_supported(). The
+            // gather costs n_sel rows per query, so a barely-narrower list is a loss.
+            // Applying the same rule here means we never spend a mask_to_idx node
+            // building a list the kernel would then decline to use. The kernel's copy
+            // is authoritative; disagreeing here only wastes a node, never miscomputes.
+            const int64_t min_ratio = [] {
+                const char * v = getenv("PXA_DSA_MIN_RATIO");
+                const int r = v ? atoi(v) : 4;
+                return (int64_t) (r > 0 ? r : 4);
+            }();
+            const bool worth_it = nt <= 16 ? n_sel < n_kv : n_kv >= min_ratio*n_sel;
+
+            if (worth_it) {
+                selected = ggml_mask_to_index(ctx0, kq_mask, n_sel);
+                cb(selected, "dsa_mask_to_idx", il);
+                ggml_build_forward_expand(gf, selected);
+            }
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        if (selected) {
+            // Backends that do not implement the sparse path ignore src[5] and compute
+            // the dense result, so this stays correct everywhere; it only ever changes
+            // which kernel runs.
+            cur->src[5] = selected;
+        }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
@@ -535,22 +694,33 @@ ggml_tensor * llm_build_context::build_dsv4_hca_compressed_kv_from_state(
     comp = llm_build_norm(ctx0, comp, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(comp, name, il);
 
-    ggml_tensor * comp_nope = ggml_view_3d(ctx0, comp, n_embd_head_nope, 1, n_blocks,
-            ggml_row_size(comp->type, n_embd_head),
-            ggml_row_size(comp->type, n_embd_head),
-            0);
-    ggml_tensor * comp_pe = ggml_view_3d(ctx0, comp, n_embd_head_rope, 1, n_blocks,
-            ggml_row_size(comp->type, n_embd_head),
-            ggml_row_size(comp->type, n_embd_head),
-            ggml_row_size(comp->type, n_embd_head_nope));
+    if (dsv4_rope_flipped_enabled()) {
+        // comp is already [n_embd_head, 1, n_blocks] here (sum_rows -> permute ->
+        // cont -> norm), which is exactly the shape the rope needs: ne[2] must
+        // equal comp_pos->ne[0]. Assert instead of inserting a no-op reshape.
+        GGML_ASSERT(comp->ne[0] == n_embd_head && comp->ne[1] == 1 && comp->ne[2] == n_blocks);
+        comp = dsv4_rope_flipped(ctx0, comp, comp_pos, n_embd_head_rope, rope_type, n_ctx_orig,
+                hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+                dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+        cb(comp, name, il);
+    } else {
+        ggml_tensor * comp_nope = ggml_view_3d(ctx0, comp, n_embd_head_nope, 1, n_blocks,
+                ggml_row_size(comp->type, n_embd_head),
+                ggml_row_size(comp->type, n_embd_head),
+                0);
+        ggml_tensor * comp_pe = ggml_view_3d(ctx0, comp, n_embd_head_rope, 1, n_blocks,
+                ggml_row_size(comp->type, n_embd_head),
+                ggml_row_size(comp->type, n_embd_head),
+                ggml_row_size(comp->type, n_embd_head_nope));
 
-    comp_pe = ggml_rope_ext(ctx0, comp_pe, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
-            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
-            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
-    cb(comp_pe, name, il);
+        comp_pe = ggml_rope_ext(ctx0, comp_pe, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
+                hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+                dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+        cb(comp_pe, name, il);
 
-    comp = ggml_concat(ctx0, comp_nope, comp_pe, 0);
-    cb(comp, name, il);
+        comp = ggml_concat(ctx0, comp_nope, comp_pe, 0);
+        cb(comp, name, il);
+    }
 
     return comp;
 }
@@ -621,22 +791,33 @@ ggml_tensor * llm_build_context::build_dsv4_overlap_compressed_kv_from_state(
     comp = llm_build_norm(ctx0, comp, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(comp, name, il);
 
-    ggml_tensor * comp_nope = ggml_view_3d(ctx0, comp, n_embd_head_nope, 1, n_blocks,
-            ggml_row_size(comp->type, n_embd_head),
-            ggml_row_size(comp->type, n_embd_head),
-            0);
-    ggml_tensor * comp_pe = ggml_view_3d(ctx0, comp, n_embd_head_rope, 1, n_blocks,
-            ggml_row_size(comp->type, n_embd_head),
-            ggml_row_size(comp->type, n_embd_head),
-            ggml_row_size(comp->type, n_embd_head_nope));
+    if (dsv4_rope_flipped_enabled()) {
+        // comp is already [n_embd_head, 1, n_blocks] here (sum_rows -> permute ->
+        // cont -> norm), which is exactly the shape the rope needs: ne[2] must
+        // equal comp_pos->ne[0]. Assert instead of inserting a no-op reshape.
+        GGML_ASSERT(comp->ne[0] == n_embd_head && comp->ne[1] == 1 && comp->ne[2] == n_blocks);
+        comp = dsv4_rope_flipped(ctx0, comp, comp_pos, n_embd_head_rope, rope_type, n_ctx_orig,
+                hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+                dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+        cb(comp, name, il);
+    } else {
+        ggml_tensor * comp_nope = ggml_view_3d(ctx0, comp, n_embd_head_nope, 1, n_blocks,
+                ggml_row_size(comp->type, n_embd_head),
+                ggml_row_size(comp->type, n_embd_head),
+                0);
+        ggml_tensor * comp_pe = ggml_view_3d(ctx0, comp, n_embd_head_rope, 1, n_blocks,
+                ggml_row_size(comp->type, n_embd_head),
+                ggml_row_size(comp->type, n_embd_head),
+                ggml_row_size(comp->type, n_embd_head_nope));
 
-    comp_pe = ggml_rope_ext(ctx0, comp_pe, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
-            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
-            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
-    cb(comp_pe, name, il);
+        comp_pe = ggml_rope_ext(ctx0, comp_pe, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
+                hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+                dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+        cb(comp_pe, name, il);
 
-    comp = ggml_concat(ctx0, comp_nope, comp_pe, 0);
-    cb(comp, name, il);
+        comp = ggml_concat(ctx0, comp_nope, comp_pe, 0);
+        cb(comp, name, il);
+    }
 
     return comp;
 }
@@ -667,21 +848,28 @@ ggml_tensor * llm_build_context::build_dsv4_lid_top_k(
     indexer_q = ggml_reshape_3d(ctx0, indexer_q, n_embd_indexer_head, n_indexer_head, nt);
     cb(indexer_q, "lid_q", il);
 
-    ggml_tensor * indexer_q_nope = ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_nope, n_indexer_head, nt,
-            ggml_row_size(indexer_q->type, n_embd_indexer_head),
-            ggml_row_size(indexer_q->type, n_embd_indexer_head)*n_indexer_head,
-            0);
-    ggml_tensor * indexer_q_pe = ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_rope, n_indexer_head, nt,
-            ggml_row_size(indexer_q->type, n_embd_indexer_head),
-            ggml_row_size(indexer_q->type, n_embd_indexer_head)*n_indexer_head,
-            ggml_row_size(indexer_q->type, n_embd_indexer_head_nope));
+    if (dsv4_rope_flipped_enabled()) {
+        indexer_q = dsv4_rope_flipped(ctx0, indexer_q, inp_pos, n_embd_indexer_head_rope,
+                rope_type, n_ctx_orig, hparams.dsv4_compress_rope_base, freq_scale,
+                ext_factor, dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+        cb(indexer_q, "lid_q_pe", il);
+    } else {
+        ggml_tensor * indexer_q_nope = ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_nope, n_indexer_head, nt,
+                ggml_row_size(indexer_q->type, n_embd_indexer_head),
+                ggml_row_size(indexer_q->type, n_embd_indexer_head)*n_indexer_head,
+                0);
+        ggml_tensor * indexer_q_pe = ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_rope, n_indexer_head, nt,
+                ggml_row_size(indexer_q->type, n_embd_indexer_head),
+                ggml_row_size(indexer_q->type, n_embd_indexer_head)*n_indexer_head,
+                ggml_row_size(indexer_q->type, n_embd_indexer_head_nope));
 
-    indexer_q_pe = ggml_rope_ext(ctx0, indexer_q_pe, inp_pos, nullptr, n_embd_indexer_head_rope,
-            rope_type, n_ctx_orig, hparams.dsv4_compress_rope_base, freq_scale,
-            ext_factor, dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
-    cb(indexer_q_pe, "lid_q_pe", il);
+        indexer_q_pe = ggml_rope_ext(ctx0, indexer_q_pe, inp_pos, nullptr, n_embd_indexer_head_rope,
+                rope_type, n_ctx_orig, hparams.dsv4_compress_rope_base, freq_scale,
+                ext_factor, dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+        cb(indexer_q_pe, "lid_q_pe", il);
 
-    indexer_q = ggml_concat(ctx0, indexer_q_nope, indexer_q_pe, 0);
+        indexer_q = ggml_concat(ctx0, indexer_q_nope, indexer_q_pe, 0);
+    }
     if (inp_lid.k_rot) {
         indexer_q = dsv4_mul_mat_rot(ctx0, indexer_q, inp_lid.k_rot);
         cb(indexer_q, "lid_q_rot", il);
@@ -837,7 +1025,18 @@ ggml_tensor * llm_build_context::build_dsv4_csa_lid_attention(
     kq_mask = dsv4_finalize_kq_mask(ctx0, kq_mask, cparams.flash_attn);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
-    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il);
+    // Visible-row bound for the sparse path. kq_mask is [raw | csa]:
+    //   raw  - the ring/window mask admits a key only when 0 <= p - pos < n_swa
+    //          (llama-kv-cache-dsv4.cpp), so at most n_swa rows per query, however
+    //          wide the padded ring is;
+    //   csa  - build_dsv4_top_k_mask() starts all -inf and zeroes exactly the
+    //          top_k->ne[0] selected rows before adding the base mask, so at most
+    //          top_k->ne[0] rows.
+    // Their sum is therefore a true upper bound, and it does not grow with context
+    // while the dense mask does -- which is where the win comes from.
+    const int64_t n_visible_max = (int64_t) llama_dsv4_get_raw_swa(lctx) + top_k->ne[0];
+
+    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il, n_visible_max);
     if (k_rot) {
         out = dsv4_mul_mat_rot(ctx0, out, k_rot);
     }
@@ -894,7 +1093,13 @@ ggml_tensor * llm_build_context::build_dsv4_hca_attention(
     kq_mask = dsv4_finalize_kq_mask(ctx0, kq_mask, cparams.flash_attn);
     cb(kq_mask, "hca_kq_mask", il);
 
-    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il);
+    // As in the CSA regime, but HCA applies no top-k sparsity: every one of the n_hca
+    // compressed rows may be visible. The bound is still below the dense mask width
+    // whenever the padded raw ring is wider than n_swa, which it always is here
+    // (raw_size = PAD(n_ubatch + n_swa + 1, 256)).
+    const int64_t n_visible_max = (int64_t) llama_dsv4_get_raw_swa(lctx) + n_hca;
+
+    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k_all, k_all, kq_mask, sinks, kq_scale, il, n_visible_max);
     if (k_rot) {
         out = dsv4_mul_mat_rot(ctx0, out, k_rot);
     }
@@ -931,7 +1136,16 @@ ggml_tensor * llm_build_context::build_dsv4_raw_attention(
 
     ggml_tensor * kq_mask = dsv4_finalize_kq_mask(ctx0, inp.raw_kq_mask, cparams.flash_attn);
 
-    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k, k, kq_mask, sinks, kq_scale, il);
+    // Same n_swa bound as the raw half of the other two regimes. There is no compressed
+    // stream here, so this only pays when the padded ring is much wider than the window
+    // -- which is exactly the ring-mode decode case, where raw_size is
+    // PAD(n_ubatch + n_swa + 1, 256) but a query still sees at most n_swa rows.
+    // In window mode the raw view is already tight and the worth-it test declines.
+    // (ik passes -1 here because their raw path is per-ubatch and already narrow; ours
+    // is a modular ring, so the same argument does not carry over.)
+    const int64_t n_visible_max = (int64_t) llama_dsv4_get_raw_swa(lctx);
+
+    ggml_tensor * out = build_dsv4_attn_mha(gf, q, k, k, kq_mask, sinks, kq_scale, il, n_visible_max);
     if (k_rot) {
         out = dsv4_mul_mat_rot(ctx0, out, k_rot);
     }
@@ -986,38 +1200,50 @@ ggml_tensor * llm_build_context::build_dsv4_attention(
     q = ggml_rms_norm(ctx0, q, norm_rms_eps);
     cb(q, "q_norm", il);
 
-    ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_nope, n_head, nt,
-            ggml_row_size(q->type, n_embd_head),
-            ggml_row_size(q->type, n_embd_head)*n_head,
-            0);
-    ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_rope, n_head, nt,
-            ggml_row_size(q->type, n_embd_head),
-            ggml_row_size(q->type, n_embd_head)*n_head,
-            ggml_row_size(q->type, n_embd_head_nope));
-    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
-            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
-    cb(q_pe, "q_pe", il);
-    q = ggml_concat(ctx0, q_nope, q_pe, 0);
-    cb(q, "q", il);
+    if (dsv4_rope_flipped_enabled()) {
+        q = dsv4_rope_flipped(ctx0, q, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        cb(q, "q", il);
+    } else {
+        ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_nope, n_head, nt,
+                ggml_row_size(q->type, n_embd_head),
+                ggml_row_size(q->type, n_embd_head)*n_head,
+                0);
+        ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_rope, n_head, nt,
+                ggml_row_size(q->type, n_embd_head),
+                ggml_row_size(q->type, n_embd_head)*n_head,
+                ggml_row_size(q->type, n_embd_head_nope));
+        q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        cb(q_pe, "q_pe", il);
+        q = ggml_concat(ctx0, q_nope, q_pe, 0);
+        cb(q, "q", il);
+    }
 
     ggml_tensor * kv = llm_build_lora_mm(lctx, ctx0, layer.wkv, cur);
     kv = llm_build_norm(ctx0, kv, hparams, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, cb, il);
     kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
     cb(kv, "kv_norm", il);
 
-    ggml_tensor * kv_nope = ggml_view_3d(ctx0, kv, n_embd_head_nope, 1, nt,
-            ggml_row_size(kv->type, n_embd_head),
-            ggml_row_size(kv->type, n_embd_head),
-            0);
-    ggml_tensor * kv_pe = ggml_view_3d(ctx0, kv, n_embd_head_rope, 1, nt,
-            ggml_row_size(kv->type, n_embd_head),
-            ggml_row_size(kv->type, n_embd_head),
-            ggml_row_size(kv->type, n_embd_head_nope));
-    kv_pe = ggml_rope_ext(ctx0, kv_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
-            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
-    cb(kv_pe, "kv_pe", il);
-    kv = ggml_concat(ctx0, kv_nope, kv_pe, 0);
-    cb(kv, "kv", il);
+    if (dsv4_rope_flipped_enabled()) {
+        kv = dsv4_rope_flipped(ctx0, kv, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        cb(kv, "kv", il);
+    } else {
+        ggml_tensor * kv_nope = ggml_view_3d(ctx0, kv, n_embd_head_nope, 1, nt,
+                ggml_row_size(kv->type, n_embd_head),
+                ggml_row_size(kv->type, n_embd_head),
+                0);
+        ggml_tensor * kv_pe = ggml_view_3d(ctx0, kv, n_embd_head_rope, 1, nt,
+                ggml_row_size(kv->type, n_embd_head),
+                ggml_row_size(kv->type, n_embd_head),
+                ggml_row_size(kv->type, n_embd_head_nope));
+        kv_pe = ggml_rope_ext(ctx0, kv_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        cb(kv_pe, "kv_pe", il);
+        kv = ggml_concat(ctx0, kv_nope, kv_pe, 0);
+        cb(kv, "kv", il);
+    }
 
     auto & inp_csa = inp.comp[LLAMA_DSV4_CSA];
     auto & inp_hca = inp.comp[LLAMA_DSV4_HCA];
@@ -1215,21 +1441,27 @@ ggml_tensor * llm_build_context::build_dsv4_attention(
 
     // ---- de-rope, then the grouped output LoRA ----
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
-    ggml_tensor * out_nope = ggml_view_3d(ctx0, out, n_embd_head_nope, n_head, nt,
-            ggml_row_size(out->type, n_embd_head),
-            ggml_row_size(out->type, n_embd_head)*n_head,
-            0);
-    ggml_tensor * out_pe = ggml_view_3d(ctx0, out, n_embd_head_rope, n_head, nt,
-            ggml_row_size(out->type, n_embd_head),
-            ggml_row_size(out->type, n_embd_head)*n_head,
-            ggml_row_size(out->type, n_embd_head_nope));
+    if (dsv4_rope_flipped_enabled()) {
+        out = dsv4_rope_back_flipped(ctx0, out, inp_pos, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        cb(out, "attn_derope", il);
+    } else {
+        ggml_tensor * out_nope = ggml_view_3d(ctx0, out, n_embd_head_nope, n_head, nt,
+                ggml_row_size(out->type, n_embd_head),
+                ggml_row_size(out->type, n_embd_head)*n_head,
+                0);
+        ggml_tensor * out_pe = ggml_view_3d(ctx0, out, n_embd_head_rope, n_head, nt,
+                ggml_row_size(out->type, n_embd_head),
+                ggml_row_size(out->type, n_embd_head)*n_head,
+                ggml_row_size(out->type, n_embd_head_nope));
 
-    // upstream calls this ggml_rope_ext_back; this tree still has the original
-    // name ggml_rope_back with a byte-identical parameter list.
-    out_pe = ggml_rope_back(ctx0, out_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
-            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
-    out = ggml_concat(ctx0, out_nope, out_pe, 0);
-    cb(out, "attn_derope", il);
+        // upstream calls this ggml_rope_ext_back; this tree still has the original
+        // name ggml_rope_back with a byte-identical parameter list.
+        out_pe = ggml_rope_back(ctx0, out_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        out = ggml_concat(ctx0, out_nope, out_pe, 0);
+        cb(out, "attn_derope", il);
+    }
 
     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
     out = ggml_permute(ctx0, out, 0, 2, 1, 3);

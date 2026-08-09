@@ -14,6 +14,7 @@
 #include "fattn-new-mma.cuh"
 #include "fattn.cuh"
 #include "convert.cuh"
+#include "dsa_attn.cuh"
 
 #include <cstdint>
 #include <cstdlib>
@@ -72,6 +73,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+
+    // DSA sparse attention. A node carrying an index list in src[5] attends only the
+    // listed KV rows; this is the only CUDA attention path that accepts head dim 512,
+    // so on sm_70 it is what keeps DeepSeek-V4 attention off the CPU backend.
+    // ggml_cuda_fattn_is_supported() consults the same predicate -- keep them paired.
+    if (ggml_cuda_dsa_attn_supported(dst, cc)) {
+        ggml_cuda_dsa_attn_ext(ctx, dst);
+        return;
+    }
 
     ggml_tensor local_dst, Kl, Vl, Ml;
     if (n_swa > 0) {
@@ -212,6 +222,16 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+
+    // Must mirror the first branch of ggml_cuda_flash_attn_ext() exactly: same
+    // predicate, same position (before every head-dim check), so the scheduler never
+    // routes a DSA node to a backend that cannot run it -- and never rejects one the
+    // dispatcher would have accepted. Nodes WITHOUT src[5] fall through unchanged and
+    // are still rejected at head 512 on pre-Ampere, as before.
+    if (ggml_cuda_dsa_attn_supported(dst, cc)) {
+        return true;
+    }
+
     if (cc >= CC_OFFSET_AMD) {
         return precision == GGML_PREC_DEFAULT ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
                                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);

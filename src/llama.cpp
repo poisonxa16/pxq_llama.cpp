@@ -7440,6 +7440,26 @@ struct llama_context * llama_init_from_model(
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",     __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",     __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: flash_attn    = %d\n",     __func__, cparams.flash_attn);
+    // PXA_FATTN_UNSUPPORTED_WARN: `flash_attn = 1` does NOT mean a CUDA FA kernel will run.
+    // The CUDA predicates accept only these head dims; 512/576/320 need Ampere+ (new_mma).
+    // Outside that set on a pre-Ampere card, supports_op() is false and the scheduler places
+    // every FLASH_ATTN_EXT on the CPU backend, silently. Say so once, at init.
+    if (cparams.flash_attn) {
+        const int64_t hd = model->hparams.n_embd_head_k(0);
+        const bool wmma_ok = hd == 64 || hd == 80 || hd == 96 || hd == 112 || hd == 128 || hd == 256;
+        if (!wmma_ok) {
+            LLAMA_LOG_WARN("%s: ================================================================\n", __func__);
+            LLAMA_LOG_WARN("%s: WARNING: flash_attn is ENABLED but n_embd_head_k = %lld is outside\n",
+                    __func__, (long long) hd);
+            LLAMA_LOG_WARN("%s:          the CUDA flash-attention head-dim set {64,80,96,112,128,256}.\n", __func__);
+            LLAMA_LOG_WARN("%s:          Head dims 320/512/576 require Ampere or newer (mma path).\n", __func__);
+            LLAMA_LOG_WARN("%s:          On a pre-Ampere GPU no CUDA FA kernel can run for this model and\n", __func__);
+            LLAMA_LOG_WARN("%s:          attention is placed on the CPU backend -- often much SLOWER.\n", __func__);
+            LLAMA_LOG_WARN("%s:          Try -fa off to keep attention on the GPU (mul_mat + soft_max).\n", __func__);
+            LLAMA_LOG_WARN("%s:          NOTE: -fa off changes temp-0 output; re-baseline before comparing.\n", __func__);
+            LLAMA_LOG_WARN("%s: ================================================================\n", __func__);
+        }
+    }
     if (model->is_mla_model()) {
     LLAMA_LOG_INFO("%s: mla_attn      = %d\n",     __func__, cparams.mla_attn);
     }
