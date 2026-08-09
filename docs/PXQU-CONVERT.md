@@ -10,16 +10,24 @@ budget by spending bits where they matter (high-importance experts) and squeezin
 ```
 llama-quantize --allow-requantize \
   --imatrix <model>.imatrix \
-  --override-kv <arch>.expert_used_count=int:<top_k> \
   --pxq-universal <map>.tiers \
   <source-q8>.gguf  <out>.gguf  PXQ_UNIVERSAL  <threads>
 ```
 
 - `--pxq-universal <map>.tiers` — path to the tier map (format below).
 - `--imatrix` — importance matrix for the source model; PXQU leans on it to place bits well.
-- `--override-kv …expert_used_count=int:N` — pin the routing to the model's real top-k so the calibration
-  matches how the model actually runs.
 - Source should be a near-lossless **Q8_0** gguf.
+
+> ⚠ **Do not pass `--override-kv <arch>.expert_used_count=int:N` at quantize time.** Earlier
+> revisions of this page suggested it, to pin routing to the model's real top-k. It bakes the key
+> into the output GGUF as **INT32**, while the loader reads that key as **UINT32** — so the file
+> quantizes without complaint and then fails at load with
+> `key <arch>.expert_used_count has wrong type i32 but expected type u32`.
+>
+> Every normally-converted source already carries the correct value and type, so **no override is
+> needed**. If you genuinely must set it, spell the type `uint:`. The failure is invisible until
+> load because a *runtime* `--override-kv` goes through a different code path that never consults
+> GGUF types — only a baked one is type-checked.
 
 Files containing the `pxq1` (1-bit) tier require a build with the PXQ1 codec (this release); other tiers
 (`pxq2/pxq3/pxq4/pxq6`) run on any current build.
