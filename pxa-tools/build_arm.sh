@@ -18,7 +18,7 @@ ENVARGS=""
 CQARGS=()
 [ -n "$ARM_CUSTOMQ" ] && CQARGS=(--custom-q "$ARM_CUSTOMQ")
 echo "[arm $TAG] quantize $TIER backbone='${ARM_BACKBONE:-rev2-default}' customq='${ARM_CUSTOMQ:-none}'"
-docker run --rm --name pxq-arm-$TAG --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=${ARM_GPU:-6} \
+docker run --rm --name pxq-arm-$TAG --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=${ARM_GPU:-0} \
   -e LD_LIBRARY_PATH=/build/bin:/build/src:/build/ggml/src $ENVARGS \
   -v $BUILD:/build:ro -v $(dirname $SRC):/src:ro -v $OUTDIR:/out \
   nvidia/cuda:12.8.1-devel-ubuntu24.04 \

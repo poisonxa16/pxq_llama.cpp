@@ -2,7 +2,7 @@
 // Clone of pxq6_ref.cpp for the PXQ-UNIVERSAL low-bit types (build gate Q-G1/Q-G2).
 //
 // Compiles src/pxq2-quantize.inc.cpp + src/pxq3-quantize.inc.cpp standalone (fp16 via F16C —
-// the same IEEE RN conversion ggml uses on this box, GGML_F16C=ON). Used by:
+// the same IEEE RN conversion ggml uses when built with GGML_F16C=ON). Used by:
 //   Q-G1  pxqu_golden.py — byte-parity vs the numpy reference on random + edge-case slabs
 //   Q-G2  pxqu_wrel.py   — wrel reproduction on the frozen 36-slice rng-42 lab protocol
 //

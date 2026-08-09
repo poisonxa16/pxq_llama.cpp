@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Graft the 35B MTP layer (ALL blk.<N>.* incl nextn.*) from a donor GGUF onto a base GGUF.
-# Parameterized version of the proven graft_mtp_35b_sft.py. block_count N -> N+1,
+# Parameterized MTP graft. block_count N -> N+1,
 # nextn_predict_layers=1. Usage: graft_mtp_generic.py BASE DONOR OUT [mtp_blk=40]
 import os
 import sys
