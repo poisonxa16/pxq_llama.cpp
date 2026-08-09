@@ -1978,12 +1978,14 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         gguf_set_arr_data(ctx_out, "pxa.pxq6.sub",  GGUF_TYPE_FLOAT32, pxq6r_sub_q(), 16);
     }
     if (pxq2_out || pxqu_out) {
-        gguf_set_val_u32(ctx_out, "pxa.pxq2.version", 1);
+        // version 2 == quantized with the PXA_PXQ_CEIL_V2 v2 book (the book KV below carries the
+        // actual table either way; the version KV is what the loader's mismatch guard reads)
+        gguf_set_val_u32(ctx_out, "pxa.pxq2.version", pxq_ceil_v2_enabled() ? 2u : 1u);
         gguf_set_arr_data(ctx_out, "pxa.pxq2.book", GGUF_TYPE_FLOAT32, pxq2_book_q(), 4);
         gguf_set_arr_data(ctx_out, "pxa.pxq2.sub",  GGUF_TYPE_FLOAT32, pxq2_sub_q(), 16);
     }
     if (pxq3_out || pxqu_out) {
-        gguf_set_val_u32(ctx_out, "pxa.pxq3.version", 1);
+        gguf_set_val_u32(ctx_out, "pxa.pxq3.version", pxq_ceil_v2_enabled() ? 2u : 1u);
         gguf_set_arr_data(ctx_out, "pxa.pxq3.book", GGUF_TYPE_FLOAT32, pxq3_book_q(), 8);
         gguf_set_arr_data(ctx_out, "pxa.pxq3.sub",  GGUF_TYPE_FLOAT32, pxq3_sub_q(), 16);
     }

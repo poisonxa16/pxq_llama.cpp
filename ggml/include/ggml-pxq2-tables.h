@@ -38,3 +38,19 @@
 // fp16-snapped, strictly ascending: -0.70556640625, -0.1876220703125, 0.186767578125, 0.70263671875
 #define PXQ2_BOOK_INIT { \
     -0x1.6940000000000p-1f, -0x1.8040000000000p-3f, 0x1.7e80000000000p-3f, 0x1.67c0000000000p-1f }
+
+// ---------------------------------------------------------------------------------------------
+// v2 book (PXA_PXQ_CEIL_V2, 2026-08-09) -- THE CEILING FIX. The frozen LM4 book rescaled by
+// 1/max|book| = 1/0.70556640625 so max|book| == 1.0 exactly, then fp16-snapped. A pure rescale:
+// same Lloyd grid shape, same ZIDX (2), same sign straddle -- only the constant that was
+// silently LOST between the SUB16 ceiling (frozen for a max-1.0 book) and this book's 0.7056
+// absmax moves into the book itself. Restores the representable ceiling from 0.697*anchor
+// (a row's own absmax unrepresentable at ANY sub-scale) to 0.987793*anchor = PXQ4/PXQ6 parity.
+// Provenance: files quantized with it bake pxa.pxq2.version = 2 and these values in
+// pxa.pxq2.book. v1 files keep decoding with the v1 table above; this table is active ONLY
+// when PXA_PXQ_CEIL_V2=1 is set on BOTH quantizer and runtime (an older/shipped build can
+// decode v2 files via its existing PXA_PXQ2_BOOK override with these exact values).
+// fp16-snapped, strictly ascending: -1.0, -0.265869140625, 0.2646484375, 0.99560546875
+#define PXQ2_BOOK_V2_INIT { \
+    -0x1.0000000000000p+0f, -0x1.1040000000000p-2f, 0x1.0f00000000000p-2f, 0x1.fdc0000000000p-1f }
+

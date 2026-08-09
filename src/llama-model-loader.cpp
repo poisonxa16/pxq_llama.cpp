@@ -386,6 +386,28 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
+    // PXQ v2-table provenance guard (PXA_PXQ_CEIL_V2, 2026-08-09): a file quantized with the v2
+    // PXQ2/PXQ3 books (pxa.pxq{2,3}.version >= 2) decodes WRONG on a runtime holding the v1
+    // tables, and a v1 file decodes WRONG under an armed runtime. The tables are env-armed, so
+    // warn as loudly as possible on either mismatch; loading proceeds (operator fixes the env).
+    {
+        const char * ce = getenv("PXA_PXQ_CEIL_V2");
+        const bool ceil_v2 = ce && atoi(ce) != 0;
+        static const char * pxq_vkeys[2] = { "pxa.pxq2.version", "pxa.pxq3.version" };
+        for (int vi = 0; vi < 2; ++vi) {
+            const int ki = gguf_find_key(meta, pxq_vkeys[vi]);
+            if (ki < 0 || gguf_get_kv_type(meta, ki) != GGUF_TYPE_UINT32) continue;
+            const uint32_t fv = gguf_get_val_u32(meta, ki);
+            if (fv >= 2 && !ceil_v2) {
+                LLAMA_LOG_WARN("%s: ============================ PXQ TABLE MISMATCH ============================\n", __func__);
+                LLAMA_LOG_WARN("%s: %s = %u: this file was quantized with the v2 (ceiling-fix) books but PXA_PXQ_CEIL_V2 is NOT set -- PXQ2/PXQ3 tensors WILL DECODE WRONG. Set PXA_PXQ_CEIL_V2=1 and reload.\n", __func__, pxq_vkeys[vi], fv);
+            } else if (fv <= 1 && ceil_v2) {
+                LLAMA_LOG_WARN("%s: ============================ PXQ TABLE MISMATCH ============================\n", __func__);
+                LLAMA_LOG_WARN("%s: %s = %u but PXA_PXQ_CEIL_V2=1: v1 file under v2 runtime tables -- PXQ2/PXQ3 tensors WILL DECODE WRONG. Unset PXA_PXQ_CEIL_V2 and reload.\n", __func__, pxq_vkeys[vi], fv);
+            }
+        }
+    }
+
     files.emplace_back(new llama_file(fname.c_str(), "rb"));
     contexts.emplace_back(ctx);
 
