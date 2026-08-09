@@ -445,13 +445,12 @@ PXA_FUSE_DELTANET=3 PXA_G2_ADDFUSE=1 \
 # pure tier (one uniform bit-width — "pick your quality"):
 ./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQ3.gguf PXQ3
 
-# PXQU — PXQ-Universal ("pick your card"): a knapsack mix of PXQ2/3/4 per expert tensor,
-# sized so the model runs FULL ub2048 prefill on one card. Presets are BAKED IN — this
-# works from a bare clone, no side files.
+# PXQU — PXQ-Universal ("pick your card"): a per-expert-tensor mix of PXQ1/2/3/4/6 sized
+# so the model runs FULL ub2048 prefill on one card. Takes a tier map you supply — a
+# '#'-commented list of regex=type lines, one per expert tensor (docs/PXQU-CONVERT.md).
 # NOTE: --pxq-universal is a flag; it must come BEFORE the positional in/out/type args
 # (put it after them and you get "invalid ftype '--pxq-universal'"). See docs/KNOWN-ISSUES.md.
-./build/bin/llama-quantize --imatrix your.imatrix --pxq-universal 16g model-bf16.gguf out-PXQU-16.gguf PXQ_UNIVERSAL    # 14.0 GB -> fills a 16 GB card (P100/V100)
-./build/bin/llama-quantize --imatrix your.imatrix --pxq-universal 12g model-bf16.gguf out-PXQU-12.gguf PXQ_UNIVERSAL    # 11.6 GB -> fills a 12 GB card
+./build/bin/llama-quantize --imatrix your.imatrix --pxq-universal my-16gb.tiers model-bf16.gguf out-PXQU-16.gguf PXQ_UNIVERSAL
 ```
 > Running under an `nvidia/cuda` container? A few `ERROR: ... init ... result=11` lines print first —
 > that's the NVIDIA runtime's own driver probe, not `llama-quantize`. Harmless; quantization continues.
@@ -464,15 +463,15 @@ that fits your card *entirely*, VRAM headroom included:
 - **11 GB** (1080 Ti): **PXQ2** (10.7 GB) — PXQU-12 does *not* fit an 11 GB card. With
   `PXA_PXQ_INT8_PREFILL=1` the 1080 Ti gets 709 t/s prefill / 71 t/s decode on PXQ2.
 
-**How PXQU works:** the preset is a per-tensor tier map (`pxa-bench/pxq-universal/*.tiers`,
-also compiled into the binary) produced by a Lagrangian-relaxation knapsack over measured
-per-tensor quantization sensitivity: each expert tensor gets the lowest-cost tier (PXQ2/
-PXQ3/PXQ4) such that total size hits the card budget with minimum weighted error. The
-backbone follows the standard PXQ recipe (MXFP4 attention — measured faster than a q6
-backbone on Pascal/Volta at equal size, see `bench/HEAD-TO-HEAD.md`). The shipped presets
-are computed for the Fusion2-35B (qwen35moe, 40-layer/256-expert) layout; for another
-architecture, generate your own map with `pxa-bench/pxq-universal/` tooling and pass the
-file path: `--pxq-universal /path/to/map.tiers`.
+**How PXQU works:** you hand it a per-tensor tier map — one `regex=type` line per expert
+tensor — and each expert is quantized to the tier its line names. The published PXQU GGUFs
+were produced from maps computed by a Lagrangian-relaxation knapsack over measured
+per-tensor quantization sensitivity: give every expert the lowest-cost tier such that total
+size hits the card budget with minimum weighted error. Any allocator that emits the map
+format works; the format is deliberately trivial so you can hand-author or script one for
+your own tensor names and VRAM budget (`docs/PXQU-CONVERT.md`). The backbone follows the
+standard PXQ recipe (MXFP4 attention — measured faster than a q6 backbone on Pascal/Volta
+at equal size, see `bench/HEAD-TO-HEAD.md`).
 
 Per-tensor overrides (`--attn-qkv-type`, `--attn-output-type`, `--output-tensor-type`,
 `--token-embedding-type`, ...) now work with PXQ tiers (the override matching bug is
