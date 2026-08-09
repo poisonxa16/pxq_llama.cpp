@@ -37,6 +37,29 @@ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const 
 #endif // GGML_CUDA_F16
 }
 
+static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    // E8M0 scale decoded exactly as dequantize_block_mxfp4 (convert.cu): the fp4 table carries
+    // 2x the E2M1 values, compensated by d = 2^(e-128); e < 2 is the denormal special case.
+    constexpr uint32_t uval[2] = { 0x00200000, 0x00400000 };
+    union { float f; uint32_t u; } helper;
+    helper.u = x[ib].e >= 2 ? uint32_t(x[ib].e - 1) << 23u : uval[x[ib].e];
+    const dfloat d = helper.f;
+
+    const int vui = x[ib].qs[iqs];
+
+    v.x = kvalues_mxfp4[vui & 0xF];
+    v.y = kvalues_mxfp4[vui >>  4];
+
+#ifdef GGML_CUDA_F16
+    v = __hmul2(v, {d, d});
+#else
+    v.x = v.x * d;
+    v.y = v.y * d;
+#endif // GGML_CUDA_F16
+}
+
 static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
     const block_q4_1 * x = (const block_q4_1 *) vx;
 

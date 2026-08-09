@@ -134,7 +134,20 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
                 dst->type == GGML_TYPE_Q8_0 || dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(nhave >= 2 && nhave <= nreduce);
+    // PXA_RDBG: per-reduce diagnostic (env-gated, first N calls)
+    static const long _rdbg_n = getenv("PXA_RDBG") ? atol(getenv("PXA_RDBG")) : 0;
+    static long _rdbg_i = 0;
+    const bool _rdbg = _rdbg_i < _rdbg_n;
+    if (_rdbg) {
+        fprintf(stderr, "PXA_RDBG[%ld] %s ne=%ldx%ld nreduce=%d nhave=%d op3=%d op4=%d ctxdev=%d p2p=%d dstdata_is_src%d\n",
+            _rdbg_i, dst->name, (long)dst->ne[0], (long)dst->ne[1], nreduce, nhave,
+            dst->op_params[3], dst->op_params[4], ctx.device, (int)ctx.p2p_enabled,
+            (dst->src[ctx.device] && dst->data == dst->src[ctx.device]->data) ? ctx.device : -1);
+        for (int _j = 0; _j < nreduce; ++_j) fprintf(stderr, "PXA_RDBG[%ld]   src[%d]=%s\n", _rdbg_i, _j, dst->src[_j] ? dst->src[_j]->name : "(null)");
+        ++_rdbg_i;
+    }
     if (dst->op_params[3] == 1) {
+        if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH reduce-OFF\n");
         // The dst tensor is just a container for the sources and the reduce op is turned off
         return;
     }
@@ -150,7 +163,16 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
 #else
     constexpr bool bf16_supported = false;
 #endif
-    if (info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
+    // PXA_REDUCE_NCCL_v1 (route selector, default = stock ON). Which branch a reduce takes is not
+    // obvious from the source and it MATTERS when debugging -sm graph: GGML_NCCL defaults to ON, so
+    // on a 4-GPU box every reduce with nhave == nreduce (the delta-net and MoE reduces) is served by
+    // NCCL and returns above all the in-tree peer paths, while a reduce with nhave != nreduce (the
+    // standard-attention one, nhave=2) falls through to them. Set PXA_REDUCE_NCCL=0 to force the
+    // in-tree paths and A/B the two implementations. MEASURED 2026-08-04 (qwen35moe-122B, 4x P100,
+    // -sm graph): NCCL=0 and NCCL=1 are BOTH degenerate and byte-identical, so the graph-split
+    // corruption on this arch is NOT the NCCL route -- do not re-chase it. See PXA_RDBG above.
+    static const bool _pxa_nccl_ok = getenv("PXA_REDUCE_NCCL") ? atoi(getenv("PXA_REDUCE_NCCL")) != 0 : true;
+    if (_pxa_nccl_ok && info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
        (dst->type != GGML_TYPE_BF16 || bf16_supported)) {
         GGML_ASSERT(info.have_nccl);
         GGML_ASSERT(info.device_count == nreduce);
@@ -273,6 +295,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     //   etc.
     //
     if (dst->ne[1] >= 32) {
+        if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH ring(ne1>=32)\n");
         auto nelem = ggml_nelements(dst);
         auto tt = ggml_internal_get_type_traits(dst->type);
         GGML_ASSERT(nelem % tt.blck_size == 0);
@@ -443,6 +466,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         return;
     }
     if (dst->ne[1] < 32 && ctx.p2p_enabled) {
+        if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH p2p-direct\n");
         GGML_ASSERT(dst->type != GGML_TYPE_Q8_0);
         // PXA_REDUCE_CAPTURE: make this cross-device direct-peer reduce CUDA-graph-capturable.
         static const bool _pxa_rc = getenv("PXA_REDUCE_CAPTURE") != nullptr;
@@ -559,6 +583,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         }
         return;
     }
+    if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH staged-copy(no-p2p)\n");
     auto required_size = nbytes*(nhave-1);
     if (required_size > ctx.copy_size) {
         if (ctx.copy_buffer) {

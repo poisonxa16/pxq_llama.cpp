@@ -3519,6 +3519,42 @@ static bool llm_load_tensors(
             LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
             LLAMA_LOG_WARN("=======================================================\n\n");
             split_mode = LLAMA_SPLIT_MODE_LAYER;
+        } else if ((model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35) &&
+                   !(getenv("PXA_ALLOW_GRAPH_SPLIT_HYBRID") && atoi(getenv("PXA_ALLOW_GRAPH_SPLIT_HYBRID")) != 0)) {
+            // MEASURED DEFECT (2026-08-03, qwen35moe 122B, 4xP100): split mode 'graph' produces
+            // fully degenerate output ('!!!!...' at temp 0) for the DeltaNet hybrid-recurrent
+            // arches — reproduced with the FA/GEMV levers disabled, so it is the graph-split
+            // handling of the recurrent conv/ssm state itself, not a kernel. qwen3next/qwen35
+            // share the delta_net machinery and are guarded by construction (unverified).
+            //
+            // 2026-08-04 CORRECTION -- the cause is NOT the recurrent conv/ssm state. Traced with
+            // llama-eval-callback under both split modes: the DeltaNet head split is arithmetically
+            // EXACT (at layer 0 the four per-device linear_attn_out partials sum to -1.679119 vs the
+            // -sm layer reference -1.679118). What fails is that the cross-device all-reduce never
+            // reaches the consumers: right after the delta layer each device's MoE normalises its OWN
+            // 1/n partial (inp_normed -112.73/-81.31/-71.09/-39.01 vs the -101.66 reference), so every
+            // device computes different router logits and picks a different top-8. The model dies
+            // inside the FIRST forward pass (NaN by layer 3) -- the first generated token is already
+            // '!', which a recurrent-state carry bug could not produce. The MoE l_out reduce takes the
+            // same route; the only reduce that stays correct is the standard-attention one, whose sole
+            // distinguishing property is nhave=2 != nreduce=4. Layer 0 merely happens to be a DeltaNet
+            // layer, which is why the damage first shows there. Ruled out by measurement:
+            // PXA_REDUCE_NCCL=0 (the non-NCCL reduce route) and PXA_REPLICATE_RECURRENT=1 are BOTH
+            // byte-identically degenerate. Also measured, and why this is not worth a week: on 4x P100
+            // -sm graph is +64% PREFILL (255.6 -> 419.0 t/s) but -17% DECODE (26.73 -> 22.17 t/s, n=3
+            // medians, 14259-token prompt, one binary/one session) -- consistent with 2x V100 (-31%)
+            // and the DGX 8x V100 (-4.6x decode). Fixing it buys prefill only, and only if the engine
+            // ever gains a per-phase split mode. brain-notes/DELTANET-GRAPH-SPLIT-2026-08-04.md.
+            //
+            // Until it is fixed, silently emitting garbage is not an option:
+            // fall back to 'layer'. PXA_ALLOW_GRAPH_SPLIT_HYBRID=1 bypasses (debugging only).
+            LLAMA_LOG_WARN("\n==================================================================\n");
+            LLAMA_LOG_WARN("Split mode 'graph' degenerates on this arch (cross-device reduce delivery)\n");
+            LLAMA_LOG_WARN("(measured: degenerate output at temp 0)\n");
+            LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
+            LLAMA_LOG_WARN("  (PXA_ALLOW_GRAPH_SPLIT_HYBRID=1 overrides, for debugging only)\n");
+            LLAMA_LOG_WARN("==================================================================\n\n");
+            split_mode = LLAMA_SPLIT_MODE_LAYER;
         } else {
             if (model.arch == LLM_ARCH_MIMO2 && model.devices.size() > 4 && (max_gpu == 0 || max_gpu > 4)) {
                 LLAMA_LOG_WARN("\n================================================================\n");

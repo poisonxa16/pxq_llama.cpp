@@ -942,6 +942,82 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // PXA AUTO-SPEC (2026-08-03): arm the measured-best SELF-speculation drafter per model
+    // family, so ENHANCE users get it without knowing the flag exists.
+    //
+    // MEASURED BASIS -- 4x P100, Qwen3.5-122B-A10B (community "heretic" abliteration) PXQU48, -c 32768 -b 512 -ub 512 -fa on,
+    // ~14-15k fill, control taken in the same session. FIRST-REQUEST (cold n-gram cache):
+    //   ngram-mod:n_max=4,n_min=2   code  prompt  24.44 -> 30.05 t/s  (+23.0%)
+    //                               prose prompt  23.69 -> 24.78 t/s  (+4.6%)
+    // Prefill is untouched in both (262.63 -> 259.16, ~1%): this is a decode-side lever only.
+    //
+    // ⚠ DO NOT QUOTE THE MEDIAN-OF-3 FIGURES (+38.8% / +35.7%). The bench replays the SAME
+    // prompt three times against one server, so reps 2-3 regenerate a continuation already in
+    // the n-gram cache -- prose acceptance hit 1.000 (100/100), which is the tell. Only rep1 is
+    // a first-request number. Warm figures are not fiction (multi-turn chat resends history,
+    // agentic loops reread the same files) but they are an upper bound, not the default case.
+    //
+    // ⚠ WHY ONLY qwen35moe, AND WHY NOT mtp:
+    // On the SAME model, MTP is a TAX -- 27.10 -> 24.78 (-8.6%) at n_max=1 and -29.8% at
+    // n_max=2, despite 0.800 acceptance. A drafter that costs a transformer forward per cycle
+    // cannot pay for itself on bandwidth-bound sparse-MoE decode, where a k-token verify batch
+    // routes to up to k*8 distinct experts and so reads ~k* the expert bytes. ngram-mod's
+    // drafter is a table lookup and costs nothing, which is why the same verify economics leave
+    // it profitable and MTP not. Do NOT generalise "speculation helps" from this row.
+    //
+    // ⚠ THE GAIN IS WORKLOAD-DEPENDENT. Acceptance tracks how repetitive the generated text is:
+    // code repeats n-grams hard (identifiers, indentation already in context) and scores ~0.96;
+    // prose is far lower. The same effect on the dense 27B with MTP measured +23.4% on code but
+    // only +3.4% on prose (acceptance 0.841 vs 0.556). This arms the drafter, not a promise.
+    //
+    // Gate: PXA_AUTO_SPEC=0 forces off, =1 forces on at any level; unset -> engages only under
+    // PXA_ENHANCE=1, and never under PXA_REFERENCE=1, so DEFAULT-level behaviour is unchanged.
+    // An explicit --spec-type or a draft model (-md) always wins -- user intent is never
+    // overridden, only absence is filled.
+    {
+        const char * sp  = getenv("PXA_AUTO_SPEC");
+        const char * rr3 = getenv("PXA_REFERENCE");
+        const bool   ref3 = rr3 && atoi(rr3) != 0;
+        const char * en3 = getenv("PXA_ENHANCE");
+        const bool   enh3 = !ref3 && en3 && atoi(en3) != 0;
+        const bool   active = sp ? (atoi(sp) != 0 && !ref3) : enh3;
+
+        const bool spec_explicit  = pxa_argv_has(argc, argv, {"--spec-type", "--spec-stage"})
+                                    || !params.speculative.stages.empty();
+        const bool draft_explicit = pxa_argv_has(argc, argv, {"-md", "--model-draft"});
+
+        if (active && !spec_explicit && !draft_explicit) {
+            const std::string arch = pxa_gguf_arch(params.model);
+            struct pxa_spec_row { const char * arch; const char * stage; const char * why; };
+            static const pxa_spec_row spec_tab[] = {
+                { "qwen35moe", "ngram-mod:n_max=4,n_min=2",
+                  "measured +23.0% first-request decode on code traffic (24.44->30.05 t/s, 4xP100 122B "
+                  "PXQU48-core), +4.6% on prose, prefill-neutral; drafts only on an n-gram match so it "
+                  "costs ~nothing when it cannot predict, unlike mtp which drafts unconditionally and "
+                  "measured -8.6% on this model" },
+            };
+            const pxa_spec_row * srow = nullptr;
+            for (const auto & r : spec_tab) {
+                if (arch == r.arch) { srow = &r; break; }
+            }
+            if (srow) {
+                params.speculative.stages.push_back(common_speculative_stage_from_arg(srow->stage));
+                const auto resolved = params.speculative.get_resolved_stages();
+                params.speculative.type = resolved.empty()
+                                        ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+                params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+                fprintf(stderr, "PXA_AUTO: spec arch=%s -> --spec-type %s (%s; gain scales with how "
+                                "repetitive the OUTPUT is -- high on code/tool traffic, much lower on "
+                                "prose; override --spec-type or PXA_AUTO_SPEC=0)\n",
+                        arch.c_str(), srow->stage, srow->why);
+            } else if (!arch.empty()) {
+                fprintf(stderr, "PXA_AUTO: spec arch=%s -> no measured row, speculation left off "
+                                "(only families with a measured win are armed; --spec-type to force)\n",
+                        arch.c_str());
+            }
+        }
+    }
+
     LOG_INFO("build info", {
         {"build",  LLAMA_BUILD_NUMBER},
         {"commit", LLAMA_COMMIT}
