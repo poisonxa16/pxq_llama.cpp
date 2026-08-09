@@ -12,7 +12,7 @@
 // TYPE: 2 = PXQ2 (LM4, 2-bit), 3 = PXQ3 (LM8, 3-bit bit-plane).
 // sig = K float32 imatrix column weights or '-'.
 //
-// Build (on the box):
+// Build:
 //   g++ -O2 -mf16c -std=c++17 -o pxqu_ref pxa-bench/pxqu_ref.cpp -pthread
 #include <cstdio>
 #include <cstdlib>

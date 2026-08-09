@@ -1988,12 +1988,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         gguf_set_arr_data(ctx_out, "pxa.pxq3.sub",  GGUF_TYPE_FLOAT32, pxq3_sub_q(), 16);
     }
     if (pxqu_out) {
-        // NOTE (apply-plan deviation): the plan's optional pxa.pxqu.preset KV needs a new
-        // `pxqu_preset` field threaded through llama_model_quantize_params (llama.h) and its
-        // default-params initializer. Skipped to avoid touching the public C API struct for a
-        // cosmetic provenance string -- the tier map is fully recoverable from the per-tensor
-        // gguf types (pxa.pxq2/pxq3/pxq6.* + each tensor's own ggml_type), so this KV is not
-        // load-bearing. Re-add if the human wants the human-readable preset name embedded.
+        // No pxa.pxqu.preset provenance KV: it would need a new `pxqu_preset` field threaded
+        // through llama_model_quantize_params (llama.h) and its default-params initializer, i.e.
+        // a public C API struct change for a cosmetic string. The tier map is fully recoverable
+        // from the per-tensor gguf types (pxa.pxq2/pxq3/pxq6.* + each tensor's own ggml_type),
+        // so the KV is not load-bearing.
         gguf_set_val_u32(ctx_out, "pxa.pxqu.version", 1);
         gguf_set_arr_data(ctx_out, "pxa.pxq6.book", GGUF_TYPE_FLOAT32, pxq6_book_q(), 16);   // 4-bit tier rides PXQ6
         gguf_set_arr_data(ctx_out, "pxa.pxq6.sub",  GGUF_TYPE_FLOAT32, pxq6_sub_q(0), 16);

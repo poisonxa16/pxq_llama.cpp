@@ -44,6 +44,23 @@ static inline bool pxq_use_sm60_vec_f32(const int cc, const ggml_tensor * Q) {
     return cc == CC_PASCAL && Q->ne[1] <= 8 && pxq_sm60_fa_vec_f32_enabled();
 }
 
+// PXA_FA_TILE256 (2026-08-03): on pre-Volta cards the D=256 head had NO tile/mma prefill kernel,
+// so `Q->ne[0] == 256` forced the single-column VEC kernel at ANY batch size. Profiled on the
+// 122B-A10B (qwen35moe, head 256) 4xP100 rig at 8881-token fill: flash_attn_vec_ext_f16 was 52.7%
+// of prefill GPU time (60 launches x 281 ms avg) — every query column re-streams the whole KV
+// extent with no tile reuse. The D=256 tile-f16 (ncols=16) restores KQ-tile data reuse.
+// Default ON; PXA_FA_TILE256=0 restores the vec route. Decode (ne1 <= 8) is untouched.
+static bool pxa_fa_tile256_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("PXA_FA_TILE256");
+        const bool on = !(v && v[0] == '0');
+        fprintf(stderr, "PXA_FA_TILE256: %s (pre-Volta D=256 batch>8 attention -> tile-f16 ncols=16; PXA_FA_TILE256=0 reverts to vec)\n",
+                on ? "ON" : "OFF");
+        return on;
+    }();
+    return enabled;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
@@ -98,7 +115,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     if (!fp16_mma_available(cc)) {
         if (precision == GGML_PREC_DEFAULT) {
-            if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+            // PXA_FA_TILE256: D=256 no longer forces the vec kernel for batch > 8 — the tile-f16
+            // kernel now carries a ncols=16 D=256 variant (see fattn-tile-f16.cu).
+            if (Q->ne[1] <= 8 || (Q->ne[0] == 256 && !pxa_fa_tile256_enabled())) {
                 if (pxq_use_sm60_vec_f32(cc, Q)) { // PR #2144: sm_60 decode -> fp32 accumulation
                     ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
                 } else {
@@ -208,7 +227,7 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
 
     if (!fp16_mma_available(cc)) {
         if (precision == GGML_PREC_DEFAULT) {
-            if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
+            if (Q->ne[1] <= 8 || (Q->ne[0] == 256 && !pxa_fa_tile256_enabled())) {
                 if (pxq_use_sm60_vec_f32(cc, Q)) { // PR #2144: keep supported-check in lockstep
                     return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
                 }

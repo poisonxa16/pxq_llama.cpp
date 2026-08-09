@@ -19,8 +19,9 @@ normally. Ignore it. (It also appears on a plain `--help`, and on any other quan
 specific to `--pxq-universal`.)
 
 **2. `--pxq-universal` is a flag — put it before the positional filenames.** `llama-quantize`
-parses option flags only until the first positional argument. If `--pxq-universal 16g` comes
-*after* the input/output paths, `--pxq-universal` lands in the positional `type` slot and you get:
+parses option flags only until the first positional argument. If `--pxq-universal <map>.tiers`
+comes *after* the input/output paths, `--pxq-universal` lands in the positional `type` slot and
+you get:
 
 ```
 main: invalid ftype '--pxq-universal'
@@ -29,11 +30,11 @@ main: invalid ftype '--pxq-universal'
 Correct order (flag first, then `in out PXQ_UNIVERSAL`):
 
 ```bash
-llama-quantize --imatrix model.imatrix --pxq-universal 16g \
+llama-quantize --imatrix model.imatrix --pxq-universal my-16gb.tiers \
   model-bf16.gguf model-PXQU16.gguf PXQ_UNIVERSAL
 ```
 
-Presets: `12g`, `16g`, `16g-hq`, or a path to a `.tiers` map. See `docs/COOKBOOK.md`.
+The argument is a path to a `.tiers` map; see `docs/PXQU-CONVERT.md` for the format.
 
 ## llama-imatrix crashes on CPU / partial-offload configs (pre-existing; fix pending)
 

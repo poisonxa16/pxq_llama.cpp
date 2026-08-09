@@ -15570,6 +15570,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I2_S:
             // nothing to validate
             break;
+        case GGML_TYPE_PXQ1:
+        case GGML_TYPE_PXQ2:
+        case GGML_TYPE_PXQ3:
+        case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ:
+        case GGML_TYPE_PXQ6:
+            // PXA slab codecs: code bytes + baked tables, no fp fields to scan. Without these
+            // cases a same-type COPY during --allow-requantize (e.g. dense-backbone-only
+            // requant of a PXQU file, 2026-08-03) aborted with "invalid type 254".
+            break;
         default:
             {
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);
