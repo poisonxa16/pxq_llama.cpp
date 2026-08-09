@@ -76,6 +76,6 @@ roll = sh("docker logs %s 2>&1 | grep -cE 'restored HYBRID context checkpoint'" 
 reset = sh("docker logs %s 2>&1 | grep -cE 'forcing full prompt re-processing'" % NAME).stdout.strip()
 sh("docker rm -f %s" % NAME)
 json.dump({"tag": TAG, "ckpts": CKPTS, "ok": ok_all, "hybrid_restores": roll, "full_resets": reset,
-           "seq": results}, open("<local-path>%s.json" % TAG, "w"), indent=1)
+           "seq": results}, open(os.environ.get("CKPT_OUT", "ckpt_repro2_%s.json") % TAG, "w"), indent=1)
 print("hybrid_restores=%s full_resets=%s" % (roll, reset))
 print("CKPT_REPRO2 %s: %s" % (TAG, "CLEAN (repeats byte-identical)" if ok_all else "CONTAMINATED (repeat mismatch)"))

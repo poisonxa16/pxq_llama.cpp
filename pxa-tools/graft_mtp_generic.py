@@ -3,7 +3,7 @@
 # Parameterized version of the proven graft_mtp_35b_sft.py. block_count N -> N+1,
 # nextn_predict_layers=1. Usage: graft_mtp_generic.py BASE DONOR OUT [mtp_blk=40]
 import sys
-sys.path.insert(0, "<local-path>")
+sys.path.insert(0, os.environ.get("GGUF_PY", "gguf-py"))
 from gguf import GGUFReader, GGUFWriter, GGUFValueType
 
 BASE, DONOR, OUT = sys.argv[1], sys.argv[2], sys.argv[3]

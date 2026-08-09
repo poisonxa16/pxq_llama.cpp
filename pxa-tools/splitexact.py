@@ -95,5 +95,5 @@ ref = out["V0_all_unsplit"]["hashes"]
 verdict = {v: out[v]["hashes"] == ref for v in out}
 print(json.dumps(verdict, indent=1))
 json.dump({"tag": TAG, "verdict": verdict, "detail": out},
-          open("<local-path>%s.json" % TAG, "w"), indent=1)
+          open("./work/splitexact_%s.json" % TAG, "w"), indent=1)
 print("SPLITEXACT %s: %s" % (TAG, "BIT-EXACT across all variants" if all(verdict.values()) else "MISMATCH"))

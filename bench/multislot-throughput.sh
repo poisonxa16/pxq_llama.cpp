@@ -18,7 +18,7 @@ set -uo pipefail
 GPUS="${GPUS:?set GPUS=GPU-uuid[,GPU-uuid]}"
 MODEL="${MODEL:?set MODEL=/abs/path/to/pxq.gguf}"
 TS="${TS:-}"; NGL="${NGL:-99}"; PORT="${PORT:-8299}"
-BUILD="${BUILD:-<local-path>}"
+BUILD="${BUILD:-./build}"
 IMG="${IMG:-nvidia/cuda:12.8.1-devel-ubuntu24.04}"
 OUT="${OUT:-/root/squeeze-window/multislot.txt}"
 NGEN="${NGEN:-160}"

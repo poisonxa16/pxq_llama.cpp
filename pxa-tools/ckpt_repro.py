@@ -78,5 +78,5 @@ for i, (tq, p, n) in enumerate(seq):
     print("[seq %d %s] match=%s %s vs truth %s %r" % (i, tq, match, h(out), h(truth[tq]), out[:60]), flush=True)
 sh("docker rm -f %s" % NAME)
 json.dump({"tag": TAG, "ckpts": CKPTS, "ok": ok_all, "truth": {k: h(v) for k, v in truth.items()},
-           "seq": results}, open("<local-path>%s.json" % TAG, "w"), indent=1)
+           "seq": results}, open(os.environ.get("CKPT_OUT", "ckpt_repro_%s.json") % TAG, "w"), indent=1)
 print("CKPT_REPRO %s: %s" % (TAG, "CLEAN (all match)" if ok_all else "CONTAMINATED (mismatch)"))

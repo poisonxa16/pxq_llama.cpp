@@ -945,7 +945,7 @@ int main(int argc, char ** argv) {
     // PXA AUTO-SPEC (2026-08-03): arm the measured-best SELF-speculation drafter per model
     // family, so ENHANCE users get it without knowing the flag exists.
     //
-    // MEASURED BASIS -- 4x P100, Qwen122B-heretic-PXQU48-core, -c 32768 -b 512 -ub 512 -fa on,
+    // MEASURED BASIS -- 4x P100, Qwen3.5-122B-A10B (community "heretic" abliteration) PXQU48, -c 32768 -b 512 -ub 512 -fa on,
     // ~14-15k fill, control taken in the same session. FIRST-REQUEST (cold n-gram cache):
     //   ngram-mod:n_max=4,n_min=2   code  prompt  24.44 -> 30.05 t/s  (+23.0%)
     //                               prose prompt  23.69 -> 24.78 t/s  (+4.6%)

@@ -12,7 +12,7 @@ one name, in the `llama.cpp` -> `ik_llama.cpp` -> `pxq_llama.cpp` lineage. Conta
 - All correctness ports (WMMA-K6, dmmv-OOB, fused-MoE indices, norm-BF16, graph-v2, + 26 upstream)
 - Release packaging, docs, community credits (bradrlaw, Last-Guitar-5924)
 
-**Box working tree:** `<local-path>` (the only pxq tree on the cache).
+**Box working tree:** the working tree (one pxq tree per machine).
 **Branch:** `main`. **Binary:** `build-unified`. Everything — dev, bench, serve, gauntlet — runs
 from this one build. Build with `--runtime=nvidia` (needs libcuda for the CUDA-driver-API link).
 
@@ -32,11 +32,11 @@ force-added. One tree -> two remotes: `origin` = public clean, `private` = dirty
 
 - **`poisonxa16/ik_llama.cpp` (the old fork) — DELETED 2026-07-24.** Content fully folded into
   `pxq_llama.cpp`. Its campaign branches are bundled at
-  `<local-path>`.
-- **Local box `<local-path>`** — kept ONLY because the live brains still
+  `ik_llama-campaign-branches.bundle` in the offline archive.
+- **A local legacy ik_llama tree** — kept ONLY because the live brains still
   run its `build-mmfast`. It retires the day the brains move onto the `pxq_llama.cpp` unified build
   (a validated brain-engine swap; owner go required). After that, one engine, period.
-- **Historical builds** live on the array: `<local-path>`
+- **Historical builds** live on the array: `<archive>/`
   (old worktrees, experiment binaries, the campaign bundle, MANIFEST.md). Never on the cards' cache.
 
 ## The law

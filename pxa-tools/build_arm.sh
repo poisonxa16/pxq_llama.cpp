@@ -6,9 +6,9 @@
 #   ARM_TIER      -> tier positional (default PXQ4)
 #   ARM_SRC       -> source gguf (default the fusion4 bf16)
 set -o pipefail
-TAG=$1; OUTDIR=${2:-<local-path>}
-BUILD=<local-path>
-SRC=${ARM_SRC:-<local-path>}
+TAG=$1; OUTDIR=${2:-./arms}
+BUILD=${BUILD:-./build}
+SRC=${ARM_SRC:-./model-bf16.gguf}
 TIER=${ARM_TIER:-PXQ4}
 mkdir -p $OUTDIR
 OUT=$OUTDIR/F4-$TAG.gguf

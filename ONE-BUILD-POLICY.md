@@ -9,7 +9,7 @@ There is exactly **one** working tree and **one** build. Everything runs from it
 - The unified build already contains everything: Laguna / Cohere2-MoE / Gemma-4 archs, PXQ1/2/4/6 + PXQU
   codecs, all speed levers, the correctness ports, and community credits.
 - Superseded/experimental builds are **archived to the array**
-  (`<local-path>`), never kept live on the cards.
+  (an offline archive directory), never kept live on the cards.
 
 **Why**: an 8+ worktree sprawl on divergent bases was the root cause of a painful cross-history merge.
 "Latest" must mean exactly one thing. Archive, don't fork.
