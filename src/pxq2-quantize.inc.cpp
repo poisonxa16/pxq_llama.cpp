@@ -285,7 +285,7 @@ static void pxq2_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     // tie-break and make the artifact differ across thread counts.
     const int64_t panels      = R/64;
     const int64_t panel_bytes = panels > 0 ? exp_bytes/panels : 0;
-    // Job granularity: fixed CHUNK=8 leaves the box idle on wide-and-short tensors --
+    // Job granularity: fixed CHUNK=8 leaves cores idle on wide-and-short tensors --
     // a dense R=5120 gives 80 panels = 10 jobs, so 10 of 72 cores work. Size it so there
     // are ~4 jobs per thread, clamped to [1,8] panels (a 64-row panel x K is already
     // substantial work, so CHUNK=1 costs nothing in scheduling overhead).

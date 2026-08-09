@@ -3543,8 +3543,8 @@ static bool llm_load_tensors(
             // byte-identically degenerate. Also measured, and why this is not worth a week: on 4x P100
             // -sm graph is +64% PREFILL (255.6 -> 419.0 t/s) but -17% DECODE (26.73 -> 22.17 t/s, n=3
             // medians, 14259-token prompt, one binary/one session) -- consistent with 2x V100 (-31%)
-            // and the DGX 8x V100 (-4.6x decode). Fixing it buys prefill only, and only if the engine
-            // ever gains a per-phase split mode. brain-notes/DELTANET-GRAPH-SPLIT-2026-08-04.md.
+            // and with an 8x V100 node (-4.6x decode). Fixing it buys prefill only, and only if the
+            // engine ever gains a per-phase split mode.
             //
             // Until it is fixed, silently emitting garbage is not an option:
             // fall back to 'layer'. PXA_ALLOW_GRAPH_SPLIT_HYBRID=1 bypasses (debugging only).
