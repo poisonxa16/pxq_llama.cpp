@@ -1427,6 +1427,17 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
              : tier == PXA_TIER_PXQ4HQ ? GGML_TYPE_PXQ4HQ
                                        : GGML_TYPE_PXQ4;
     }
+    // Same rule for the sub-4-bit tiers on dense models (2026-08-10, first user: muse-glimmer
+    // 30B). Without this, tier PXQ3 on a dense model routed the whole GEMM backbone to the
+    // MoE table's PXQ4HQ promotion -- a 4.52 bpw file named PXQ3 with ZERO bytes of pxq3,
+    // which the composition assertion then refuses to write (same failure the Qwen3-0.6B
+    // note above records for PXQ6). The named tier governs; attn_k/v (q8_0), token_embd
+    // (q6_k), the per-head gate (f16) and the output head keep their pins above. An explicit
+    // PXA_PXQ_BACKBONE=core/hq/pxq6 still wins below.
+    if (!model_has_experts && (tier == PXA_TIER_PXQ2 || tier == PXA_TIER_PXQ3)
+        && !cfg.core && !cfg.hq && !cfg.pxq6) {
+        return tier == PXA_TIER_PXQ2 ? GGML_TYPE_PXQ2 : GGML_TYPE_PXQ3;
+    }
 
     if (cfg.core) {
         return GGML_TYPE_PXQ4;
