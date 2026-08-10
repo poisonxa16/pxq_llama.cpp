@@ -6097,6 +6097,44 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         && pxa_pxq_mmvq_on(ggml_cuda_info().devices[ctx.device].cc)
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1
         && src0_1->ne[2] == 1 && src0_1->ne[3] == 1 && src1->type == GGML_TYPE_F32;
+    // PXA_PXQ_MMVQ_FUGSPLIT (2026-08-10, default OFF): run the dense PXQ up/gate decode as TWO
+    // plain MMVQ launches + the fused GLU epilogue instead of the fused_mul_mat_vec_q twin.
+    // WHY: on sm_70 the fused twin doubles the per-thread state (two weight streams x ROWS
+    // anchors/scales/accumulators) -> 92 regs + 64 B stack spills at the ROWS=4 shape the plain
+    // kernel wants -> 31%% occupancy, measured 248 us/call where Q4_K's fused twin (48 regs, one
+    // superblock scale) runs 175 us. The plain PXQ4 kernel (63 regs, no spills) is at per-byte
+    // parity with Q4_K's plain kernel, so two plain launches beat one crippled fused launch.
+    // The two streams share the q8_1 sidecar; the GLU epilogue is the existing fused_mul_unary.
+    // Numerics: same vec_dot, same per-stream fold shape, same GLU arithmetic -> expected
+    // bit-identical to the fused twin; gated by hash before any default flip.
+    static const bool pxq_fugsplit = [](){
+        const char * e = getenv("PXA_PXQ_MMVQ_FUGSPLIT");
+        const bool v = e && atoi(e) != 0;
+        if (v) fprintf(stderr, "PXA_PXQ_MMVQ_FUGSPLIT ARMED: dense PXQ up/gate decode = 2x plain MMVQ + GLU epilogue (fused twin bypassed)\n");
+        return v;
+    }();
+    if (pxq_mmvq_fug && pxq_fugsplit) {
+        // limit sanitize EXACTLY as ggml_cuda_op_mul_mat_vec_q_impl does (limit<=1e-6 -> INF):
+        // with INF the elementwise SILU takes its limit variant, whose op order matches the
+        // fused kernel epilogue bit-for-bit (min/max with INF are identities). The raw 0.0
+        // would select the no-limit variant, (g*u)/(1+e) vs the fused u*(g/(1+e)) -- one
+        // rounding difference per element, caught by the hash gate on 2026-08-10.
+        float limit_fs = *(const float *)(dst->op_params + 1);
+        limit_fs = limit_fs > 1e-6f ? limit_fs : INFINITY;
+        const ggml_unary_op uop_fs = (ggml_unary_op)dst->op_params[0];
+        ggml_cuda_pool_alloc<float> dst_up_fs(ctx.pool(), ggml_nelements(dst));
+        auto local_dst = *dst;
+        local_dst.data = dst_up_fs.get();
+        local_dst.op_params[0] = GGML_PREC_DEFAULT;
+        auto gate_dst = *dst;                 // same data pointer: the result still lands in dst
+        gate_dst.op_params[0] = GGML_PREC_DEFAULT;
+        ggml_cuda_mul_mat(ctx, src0_1, src1, &local_dst, nullptr, 0);
+        ggml_cuda_mul_mat(ctx, src0_2, src1, &gate_dst, nullptr, 0);
+        ggml_fused_mul_unary(ctx, uop_fs, ggml_nelements(dst),
+                        (const float *)dst->data, dst_up_fs.get(), (float *)dst->data, limit_fs);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (!pxq_mmvq_fug && (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type))) {
         // Fused single-launch decode form first; it declines to the split path below for any
         // shape/op/geometry it cannot serve.
