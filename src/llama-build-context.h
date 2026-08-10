@@ -240,6 +240,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_gemma3();
 
+    ggml_cgraph * build_muse_glimmer();
+
     ggml_cgraph * build_gemma4();
 
     ggml_cgraph * build_gemma4_mtp();

@@ -35,6 +35,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "ggml.h"   // ggml_pxa_model_profile — the MODEL half of the adaptive decisions
 
@@ -210,12 +211,29 @@ static inline int pxa_fuse_deltanet_default() {
 // quantized GEMMs with ne11 >= N to fp16 cuBLAS. REFERENCE -> 0 (MMQ-always);
 // DEFAULT/ENHANCE -> 64 (+9.4% prefill measured, single V100, public PXQ2; decode untouched).
 // Explicit env wins (0 = off, other values retune the threshold).
+// MODEL-AWARE (muse-glimmer): the fp16-cuBLAS route is a measured LOSS on muse-glimmer
+// (pp2048 411 vs 619 t/s with MMQ, 2x V100, Q4_K_XL — every dense GEMM pays the dequant
+// temporaries, and the 52-layer 6656x19968 shapes ride ik-MMQ better than HMMA+dequant),
+// so the auto default is 0 for that arch. Env still wins. Cached against the model-profile
+// generation: the profile can land after ggml_cuda_init (see the model-layer comment above).
 static inline int pxa_volta_cublas_ne11() {
-    static const int v = [](){
-        const char * e = getenv("PXA_VOLTA_CUBLAS_NE11");
-        if (e) return atoi(e);
-        return pxa_config_level() == 0 ? 0 : 64;
-    }();
+    static int cached_gen = -1;
+    static int cached_v   = 0;
+    const int gen = ggml_pxa_model_profile_generation();
+    if (cached_gen == gen) return cached_v;
+    int v;
+    const char * e = getenv("PXA_VOLTA_CUBLAS_NE11");
+    if (e) {
+        v = atoi(e);
+    } else if (pxa_config_level() == 0) {
+        v = 0;
+    } else if (pxa_model_known() && strcmp(pxa_model().arch_name, "muse-glimmer") == 0) {
+        v = 0;  // measured -34% prefill on this arch; see comment above
+    } else {
+        v = 64;
+    }
+    cached_v   = v;
+    cached_gen = gen;
     return v;
 }
 
@@ -562,8 +580,10 @@ static inline void pxa_enhance_log_model_decisions() {
     // The device-only levers, restated with model context so ONE ledger holds every decision.
     fprintf(stderr, "PXA_AUTO: VOLTA_CUBLAS_NE11=%d (%s; override PXA_VOLTA_CUBLAS_NE11)\n",
             pxa_volta_cublas_ne11(),
-            t.has_sm70 ? "sm_70 present: dense-GEMM fp16-cuBLAS route at ne11>=threshold (+9.4% pf single V100; +6.5% 35B np2)"
-                       : "INERT: no sm_70 device");
+            !t.has_sm70 ? "INERT: no sm_70 device" :
+            (pxa_model_known() && strcmp(m.arch_name, "muse-glimmer") == 0)
+                ? "OFF: muse-glimmer dense GEMMs measured faster on MMQ (pp2048 619 vs 411 t/s, 2x V100)"
+                : "sm_70 present: dense-GEMM fp16-cuBLAS route at ne11>=threshold (+9.4% pf single V100; +6.5% 35B np2)");
     fprintf(stderr, "PXA_AUTO: P100_FP16_GEMM=%s (%s; override PXA_P100_FP16_GEMM)\n",
             pxa_p100_fp16_gemm() ? "on" : "off",
             t.has_sm60 ? "sm_60 present: GP100 2:1 fp16 hgemm on dense GEMMs (+51% gpt-oss prefill measured); sm_61 excluded (1:64 fp16)"
