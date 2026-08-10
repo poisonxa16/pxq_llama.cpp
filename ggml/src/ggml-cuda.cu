@@ -2092,9 +2092,25 @@ static void ggml_cuda_op_mul_mat_cublas(
     // sm_61 (1080Ti) stays excluded. Env PXA_P100_FP16_GEMM=0 rolls back to the old fp32 path.
     // PXA 0a hygiene (2026-07-22): level-aware resolver (pxa-enhance.cuh) — REFERENCE -> false so
     // PXA_REFERENCE=1 baselines on sm_60 really run the pure fp32 SGEMM reference path. Env wins.
+    // PXA_F32PREC_F16GEMM (2026-08-10, default OFF): a GGML_PREC_F32 matmul over an f16/quantized
+    // src0 falls through this function to dequant-to-FP32 + cublasSgemm — volta_sgemm at ~15.7
+    // TFLOPS, measured 20.1 ms/call x 408 calls = 50.7%% of the Muse-Glimmer Q4_K_XL prefill wall
+    // on 2x V100. Mainline serves the IDENTICAL ops with f16 INPUTS and CUBLAS_COMPUTE_32F
+    // (cutlass s884gemm_f16): tensor cores, fp32 ACCUMULATION — the precision the graph asked
+    // for is honored in the accumulator; only the operand load rounds to f16, which is the same
+    // numeric class mainline ships for this model. Armed: PREC_F32 ops take the f16-input branch
+    // below with a per-op fp32 compute type. G3-class (not bit-exact vs the fp32-operand SGEMM);
+    // quality-gated before any default flip.
+    static const bool pxa_f32prec_f16gemm = [](){
+        const char * e = getenv("PXA_F32PREC_F16GEMM");
+        const bool v = e && atoi(e) != 0;
+        if (v) fprintf(stderr, "PXA_F32PREC_F16GEMM ARMED: PREC_F32 dense GEMMs run f16-input + CUBLAS_COMPUTE_32F (tensor cores, fp32 accumulate) instead of dequant-f32 + SGEMM\n");
+        return v;
+    }();
+    const bool pxa_f32prec_take = pxa_f32prec_f16gemm && dst->op_params[0] != GGML_PREC_DEFAULT;
     const bool pxa_fp16_gemm_ok = compute_capability >= CC_VOLTA ||
         (pxa_p100_fp16_gemm() && compute_capability < CC_VOLTA && fast_fp16_available(compute_capability));
-    if (pxa_fp16_gemm_ok && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+    if (pxa_fp16_gemm_ok && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && (dst->op_params[0] == GGML_PREC_DEFAULT || pxa_f32prec_take)) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
@@ -2116,12 +2132,28 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        if (pxa_f32prec_take) {
+            // PREC_F32, armed: fp32 accumulate + F32 output straight into dst (no round-trip).
+            const float alpha_f32 = 1.0f;
+            const float beta_f32  = 0.0f;
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32, src0_ptr, CUDA_R_16F, ne00,
+                                    src1_ptr, CUDA_R_16F, ne10,
+                        &beta_f32,  dst_dd_i, CUDA_R_32F, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            GGML_UNUSED(dst);
+            GGML_UNUSED(src1_ddq_i);
+            return;
+        }
         ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
         const half alpha_f16 = 1.0f;
         const half beta_f16 = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
