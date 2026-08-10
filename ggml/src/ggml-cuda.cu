@@ -6257,8 +6257,28 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         } else {
             auto local_dst = *dst;
             local_dst.data = dst_up.get();
+            // PXA_DENSE_FUG_PREC_KQ (2026-08-10, default OFF): THIRD instance of the
+            // op_params[0] alias defect. On a FUSED_UP_GATE node op_params[0] is the UNARY
+            // OP id (SILU == 10), not a ggml_prec; ggml_cuda_op_mul_mat_cublas reads it as
+            // a precision and vetoes the fp16 GemmEx branch -> dequant-to-FP32 + volta_sgemm
+            // (20.1 ms/call measured, 50.7% of the Muse Q4_K_XL prefill wall on 2x V100).
+            // The PXQ dense branch above sanitizes its dst copies (PXA_DENSE_FUG_PREC_v1);
+            // this generic k-quant branch never got the fix. Armed: hand both GEMMs clean
+            // PREC_DEFAULT copies, exactly as the PXQ branch does. G3-class numerics
+            // (fp16-accumulate h884 vs the fp32 SGEMM the alias forced).
+            static const bool pxa_fug_prec_kq = [](){
+                const char * e = getenv("PXA_DENSE_FUG_PREC_KQ");
+                const bool v = e && atoi(e) != 0;
+                if (v) fprintf(stderr, "PXA_DENSE_FUG_PREC_KQ ARMED: generic dense up/gate GEMMs run with sanitized PREC_DEFAULT (fp16 GemmEx path)\n");
+                return v;
+            }();
+            auto gate_dst = *dst;
+            if (pxa_fug_prec_kq) {
+                local_dst.op_params[0] = GGML_PREC_DEFAULT;
+                gate_dst.op_params[0]  = GGML_PREC_DEFAULT;
+            }
             ggml_cuda_mul_mat(ctx, src0_1, src1, &local_dst, nullptr, 0);
-            ggml_cuda_mul_mat(ctx, src0_2, src1, dst, nullptr, 0);
+            ggml_cuda_mul_mat(ctx, src0_2, src1, pxa_fug_prec_kq ? &gate_dst : dst, nullptr, 0);
         }
     }
 
