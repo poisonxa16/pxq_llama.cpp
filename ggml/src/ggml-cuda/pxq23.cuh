@@ -153,6 +153,17 @@ static inline void pxq23_maybe_upload_books(int device) {
         };
         if (const char * e = getenv("PXA_PXQ2_BOOK")) { have_b2 = parse_n(e, eb2, 4); fprintf(stderr, "PXA_PXQ2_BOOK: %s\n", have_b2 ? "custom book active" : "parse FAILED — ignored"); }
         if (const char * e = getenv("PXA_PXQ3_BOOK")) { have_b3 = parse_n(e, eb3, 8); fprintf(stderr, "PXA_PXQ3_BOOK: %s\n", have_b3 ? "custom book active" : "parse FAILED — ignored"); }
+        // PXA_PXQ2_V3 (2026-08-10): decode-side arm of the PXQ2 v3 refit book (PXQ2 only).
+        // Runs BEFORE the CEIL_V2 block so it wins for PXQ2 (CEIL_V2 only fills eb2 when
+        // have_b2 is still false); an explicit PXA_PXQ2_BOOK override (above) already set
+        // have_b2 and still wins. Default OFF: stock decode is byte-identical.
+        if (const char * e = getenv("PXA_PXQ2_V3")) {
+            if (atoi(e) != 0) {
+                static const float v3b2[4] = PXQ2_BOOK_V3_INIT;
+                if (!have_b2) { memcpy(eb2, v3b2, sizeof(eb2)); have_b2 = true; }
+                fprintf(stderr, "PXA_PXQ2_V3 ARMED (CUDA decode): PXQ2 v3 refit book\n");
+            }
+        }
         // PXA_PXQ_CEIL_V2 (2026-08-09): decode-side arm of the PXQ2/PXQ3 ceiling fix -- upload
         // the v2 (max|book| == 1.0) LM4/LM8 books. An explicit PXA_PXQn_BOOK override (above)
         // still wins. Default OFF: stock decode is byte-identical (v1 tables untouched).

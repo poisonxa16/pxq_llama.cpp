@@ -148,6 +148,27 @@ static inline const float * pxq_kqw_row_weights(const float * x, const float * i
 }
 #endif
 
+#ifndef PXQ2_V3_GATE_DEFINED
+#define PXQ2_V3_GATE_DEFINED
+// ---------------------------------------------------------------------------------------------
+// PXA_PXQ2_V3=1 (2026-08-10): PXQ2 v3 model-family refit book (LM4R), default OFF
+// (byte-identical when unset). PXQ2-only -- PXQ3/PXQ4/PXQ6 are untouched. Wins over
+// PXA_PXQ_CEIL_V2 for PXQ2; an explicit PXA_PXQ2_BOOK override still wins over both. Files
+// bake pxa.pxq2.version=3 + the v3 values in pxa.pxq2.book; decode needs PXA_PXQ2_V3=1 on the
+// runtime (or PXA_PXQ2_BOOK with the exact v3 values on an older build). Self-guarded OUTSIDE
+// the shared PXQ_FIX_GATES_DEFINED block: pxq6-quantize.inc.cpp's copy of that block wins the
+// include order in llama-quantize.cpp, so a pxq2-specific gate cannot live inside it.
+static inline bool pxq2_v3_enabled() {
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ2_V3");
+        const bool v = e && atoi(e) != 0;
+        if (v) fprintf(stderr, "PXA_PXQ2_V3 ARMED: PXQ2 v3 refit book; baking pxa.pxq2.version=3\n");
+        return v;
+    }();
+    return on;
+}
+#endif
+
 static inline bool pxq2_parse_n(const char * e, float * out, int want) {
     int n = 0; float v[16];
     char * dup = strdup(e);
@@ -169,12 +190,31 @@ static inline const float * pxq2_book_q() {
             memcpy(book, v2, sizeof(book));
             fprintf(stderr, "PXQ2 quantize: v2 book (PXA_PXQ_CEIL_V2 ceiling fix)\n");
         }
+        if (pxq2_v3_enabled()) {       // v3 refit book (wins over CEIL_V2 for PXQ2; PXA_PXQ2_BOOK below still wins)
+            static const float v3[4] = PXQ2_BOOK_V3_INIT;
+            memcpy(book, v3, sizeof(book));
+            fprintf(stderr, "PXQ2 quantize: v3 refit book (PXA_PXQ2_V3)\n");
+        }
         if (const char * e = getenv("PXA_PXQ2_BOOK")) {
             if (pxq2_parse_n(e, book, 4)) fprintf(stderr, "PXQ2 quantize: custom codebook from PXA_PXQ2_BOOK\n");
             else fprintf(stderr, "PXA_PXQ2_BOOK: expected 4 floats — IGNORED\n");
         }
     }
     return book;
+}
+
+static inline uint8_t pxq2_zidx_q() {
+    // argmin |book| of the ACTIVE book -- the code written for exactly-zero rows/blocks.
+    // Index 2 for the v1, v2 AND v3 books (so stock output stays byte-identical); derived
+    // dynamically so a PXA_PXQ2_BOOK override or a future book with a different min-|v|
+    // index stays correct without touching this file.
+    static const uint8_t zi = [](){
+        const float * b = pxq2_book_q();
+        int best = 0;
+        for (int i = 1; i < 4; ++i) if (fabsf(b[i]) < fabsf(b[best])) best = i;
+        return (uint8_t)best;
+    }();
+    return zi;
 }
 
 static inline const float * pxq2_sub_q() {
@@ -230,7 +270,8 @@ static inline double pxq2_quant_subblock(const float * x, const float * w, float
     for (int i = 0; i < 16; ++i) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     if (!(amax > 0.f) || !(anchor > 0.f)) {
         *s4_out = 0;
-        for (int i = 0; i < 16; ++i) codes_out[i] = PXQ2_ZIDX;   // min-|book| (no exact zero in LM4)
+        const uint8_t zi = pxq2_zidx_q();   // argmin |book| of the ACTIVE book (== PXQ2_ZIDX for every shipped book)
+        for (int i = 0; i < 16; ++i) codes_out[i] = zi;
         return 0.0;
     }
     double best = 1e300;

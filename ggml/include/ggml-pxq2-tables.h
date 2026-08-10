@@ -54,3 +54,32 @@
 #define PXQ2_BOOK_V2_INIT { \
     -0x1.0000000000000p+0f, -0x1.1040000000000p-2f, 0x1.0f00000000000p-2f, 0x1.fdc0000000000p-1f }
 
+// ---------------------------------------------------------------------------------------------
+// v3 book (PXA_PXQ2_V3, 2026-08-10) -- THE MODEL-FAMILY REFIT BOOK (LM4R). The frozen LM4 was
+// co-fit on a different lab distribution (books.json b2_e16); this is a fresh Lloyd refit of
+// the 4 entries on the target family's own pxq2-tier expert weights (122B-A10B qwopus Q8),
+// with the EXACT quantizer search inside the Lloyd loop (joint s+c re-derived every iteration,
+// uniform weights == the imatrix-free path). The fit moves the small-positive entry hard
+// toward zero (0.187 -> 0.1007, 58%% code usage): pxq2-tier experts carry near-zero mass the
+// frozen LM4 cannot represent (26.9%% of held-out elements reconstruct better as 0 than as
+// their nearest v1 entry), and a near-zero entry also frees the sub-scale search upward for
+// the peaks (s=0-pinned groups 27.6 -> 25.8%%, clipped groups 75.3 -> 71.0%%).
+// HELD-OUT EVAL (10 pxq2 tensors x 4 experts, disjoint from the 8x4 fit set; plain E2 --
+// the error family that predicted the ppl sign in both controlled A/Bs of this campaign):
+// pooled -7.9%% raw / -9.3%% population-weighted (tier map: 45 down / 16 gate-up tensors);
+// down-class -11.5%%, gate/up +4.2%%; uniform across |w| bands (bulk -6.3%%, mid -8.7%%,
+// top99-99.9 -15.8%%, peak99.9+ -16.7%%) -- an ERROR REDUCTION, not a band redistribution.
+// The PINNED-EXACT-ZERO variant (one entry forced to 0.0) was fit and evaluated by the same
+// machinery and FAILED its pre-registered gate (-4.5%% population-weighted but gate/up class
+// +18.2%% and non-robust): a 4-entry book cannot afford to spend an entry on exact 0; 0.1007
+// at 58%% usage is the data's compromise. (Campaign record 2026-08-10, zbook-fit.)
+// The quantizer derives the zero-fill code dynamically (argmin |book|, pxq2_zidx_q): index 2
+// for v1/v2 AND v3, so stock output stays byte-identical and the constant above stays true.
+// Provenance: files quantized with it bake pxa.pxq2.version = 3 and these values in
+// pxa.pxq2.book. Active ONLY when PXA_PXQ2_V3=1 on BOTH quantizer and runtime (or
+// PXA_PXQ2_BOOK with these exact values on an older build). PXQ2-only: PXQ3 books are not
+// touched by this gate. Wins over PXA_PXQ_CEIL_V2 for PXQ2; PXA_PXQ2_BOOK still wins over both.
+// fp16-snapped, strictly ascending: -0.791015625, -0.2712402344, 0.1007080078, 0.6655273438
+#define PXQ2_BOOK_V3_INIT { \
+    -0x1.9500000000000p-1f, -0x1.15c0000000000p-2f, 0x1.9c80000000000p-4f, 0x1.54c0000000000p-1f }
+
