@@ -1427,6 +1427,17 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
              : tier == PXA_TIER_PXQ4HQ ? GGML_TYPE_PXQ4HQ
                                        : GGML_TYPE_PXQ4;
     }
+    // Same rule for the sub-4-bit tiers on dense models (2026-08-10, first user: muse-glimmer
+    // 30B). Without this, tier PXQ3 on a dense model routed the whole GEMM backbone to the
+    // MoE table's PXQ4HQ promotion -- a 4.52 bpw file named PXQ3 with ZERO bytes of pxq3,
+    // which the composition assertion then refuses to write (same failure the Qwen3-0.6B
+    // note above records for PXQ6). The named tier governs; attn_k/v (q8_0), token_embd
+    // (q6_k), the per-head gate (f16) and the output head keep their pins above. An explicit
+    // PXA_PXQ_BACKBONE=core/hq/pxq6 still wins below.
+    if (!model_has_experts && (tier == PXA_TIER_PXQ2 || tier == PXA_TIER_PXQ3)
+        && !cfg.core && !cfg.hq && !cfg.pxq6) {
+        return tier == PXA_TIER_PXQ2 ? GGML_TYPE_PXQ2 : GGML_TYPE_PXQ3;
+    }
 
     if (cfg.core) {
         return GGML_TYPE_PXQ4;
@@ -1978,22 +1989,24 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         gguf_set_arr_data(ctx_out, "pxa.pxq6.sub",  GGUF_TYPE_FLOAT32, pxq6r_sub_q(), 16);
     }
     if (pxq2_out || pxqu_out) {
-        gguf_set_val_u32(ctx_out, "pxa.pxq2.version", 1);
+        // version 3 == PXA_PXQ2_V3 refit book; version 2 == PXA_PXQ_CEIL_V2 v2 book (the book
+        // KV below carries the actual table either way; the version KV is what the loader's
+        // mismatch guard reads)
+        gguf_set_val_u32(ctx_out, "pxa.pxq2.version", pxq2_v3_enabled() ? 3u : (pxq_ceil_v2_enabled() ? 2u : 1u));
         gguf_set_arr_data(ctx_out, "pxa.pxq2.book", GGUF_TYPE_FLOAT32, pxq2_book_q(), 4);
         gguf_set_arr_data(ctx_out, "pxa.pxq2.sub",  GGUF_TYPE_FLOAT32, pxq2_sub_q(), 16);
     }
     if (pxq3_out || pxqu_out) {
-        gguf_set_val_u32(ctx_out, "pxa.pxq3.version", 1);
+        gguf_set_val_u32(ctx_out, "pxa.pxq3.version", pxq_ceil_v2_enabled() ? 2u : 1u);
         gguf_set_arr_data(ctx_out, "pxa.pxq3.book", GGUF_TYPE_FLOAT32, pxq3_book_q(), 8);
         gguf_set_arr_data(ctx_out, "pxa.pxq3.sub",  GGUF_TYPE_FLOAT32, pxq3_sub_q(), 16);
     }
     if (pxqu_out) {
-        // NOTE (apply-plan deviation): the plan's optional pxa.pxqu.preset KV needs a new
-        // `pxqu_preset` field threaded through llama_model_quantize_params (llama.h) and its
-        // default-params initializer. Skipped to avoid touching the public C API struct for a
-        // cosmetic provenance string -- the tier map is fully recoverable from the per-tensor
-        // gguf types (pxa.pxq2/pxq3/pxq6.* + each tensor's own ggml_type), so this KV is not
-        // load-bearing. Re-add if the human wants the human-readable preset name embedded.
+        // No pxa.pxqu.preset provenance KV: it would need a new `pxqu_preset` field threaded
+        // through llama_model_quantize_params (llama.h) and its default-params initializer, i.e.
+        // a public C API struct change for a cosmetic string. The tier map is fully recoverable
+        // from the per-tensor gguf types (pxa.pxq2/pxq3/pxq6.* + each tensor's own ggml_type),
+        // so the KV is not load-bearing.
         gguf_set_val_u32(ctx_out, "pxa.pxqu.version", 1);
         gguf_set_arr_data(ctx_out, "pxa.pxq6.book", GGUF_TYPE_FLOAT32, pxq6_book_q(), 16);   // 4-bit tier rides PXQ6
         gguf_set_arr_data(ctx_out, "pxa.pxq6.sub",  GGUF_TYPE_FLOAT32, pxq6_sub_q(0), 16);

@@ -55,12 +55,11 @@ Raw logs: `kld-{PXQ6,PXQ3,PXQ2}-pxqu.log` + the `base.log` bf16 dump from the `k
 
 ## Incumbent comparison
 
-**Pending.** A matched-size incumbent (e.g. a bartowski/unsloth Qwen3.x IQ3/Q3 at ~14 GB) was not
-downloadable during this window — the box's download lane is in its daily degraded period (~5 PM–
-midnight ET, ~0–2 MB/s). Note: a true *KLD* against an incumbent isn't meaningful anyway (KLD
+**Pending — a matched-size incumbent (e.g. a bartowski/unsloth Qwen3.x IQ3/Q3 at ~14 GB) was not
+available for this run.** Note: a true *KLD* against an incumbent isn't meaningful anyway (KLD
 requires the **same** base model's logits, and the incumbent is a different base) — the honest
 incumbent comparison is a **perplexity-at-matched-size** run on the same wikitext protocol, which
-`bench/ppl-ladder.sh` supports for any GGUF. This is a fast-follow once the WAN recovers.
+`bench/ppl-ladder.sh` supports for any GGUF. This is a fast-follow.
 
 ## Reproduce
 

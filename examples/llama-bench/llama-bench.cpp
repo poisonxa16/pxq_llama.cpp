@@ -2231,8 +2231,15 @@ int main(int argc, char ** argv) {
         // warmup run
         if (params.warmup) {
             if (t.n_prompt > 0) {
-                //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                test_prompt(ctx, 1, 0, t.n_batch, t.n_threads.second);
+                // FULL-prompt warmup (2026-08-10): the old 1-token warmup left every
+                // batch-size-dependent one-time cost (pool growth for ub-sized activations
+                // and dequant temporaries, cuBLAS workspace + algo init for the large
+                // shapes) inside rep 1 of the timed region: measured rep trains like
+                // [802, 1234, 1221, 1243, ...] t/s -> a fake 22-28% stdev on a workload
+                // whose warm spread is ~1%. Mainline warms with the full prompt and
+                // measures +-0.15% on the same cards. Match it.
+                test_prompt(ctx, t.n_prompt, 0, t.n_batch, t.n_threads.second);
+                llama_kv_cache_clear(ctx);
             }
             if (t.n_gen > 0) {
                 test_gen(ctx, 1, 0, t.n_threads.first);

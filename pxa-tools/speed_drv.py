@@ -3,6 +3,7 @@
 Protocol: per round, per arm: fresh server, coherence gate, 1 discarded warm rep, then N_REPS
 reps of fill-5739 cold prefill + 256-token temp-0 decode (cache_prompt false). Rotates arm
 order each round. Reports per-rep prefill/decode from server timings."""
+import os
 import json, os, sys, time, subprocess, urllib.request, itertools
 
 OUTJ = sys.argv[1]
@@ -18,12 +19,12 @@ for a in sys.argv[5:]:
     env = dict(kv.split("=", 1) for kv in parts[2].split(",")) if len(parts) > 2 and parts[2] else {}
     ARMS.append((tag, path, env))
 
-BUILD = os.environ.get("SPEED_BUILD", "./build")
+BUILD = os.environ.get("SPEED_BUILD", os.environ.get("PXQ_BUILD", "./build"))
 IMG = "nvidia/cuda:12.8.1-devel-ubuntu24.04"
 PORT = 8461
 NAME = "pxq-speeddrv"
 N_REPS = 3   # per round per arm; rounds*reps >= 8 total
-PROMPT = open(os.environ.get("PROMPT_FILE", "bench_fill_prompt.txt")).read()
+PROMPT = open((os.environ.get("PXQ_WORK", "./work") + "/scripts/bench_fill_prompt.txt")).read()
 
 def sh(c):
     return subprocess.run(c, shell=True, capture_output=True, text=True)

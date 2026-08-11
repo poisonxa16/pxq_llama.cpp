@@ -386,6 +386,33 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
+    // PXQ table provenance guard (PXA_PXQ_CEIL_V2 2026-08-09; PXA_PXQ2_V3 2026-08-10): a file
+    // quantized with non-v1 PXQ2/PXQ3 books decodes WRONG on a runtime holding different
+    // tables, and vice versa. The tables are env-armed, so compute the version this runtime's
+    // env selects per tier and warn as loudly as possible on ANY mismatch; loading proceeds
+    // (operator fixes the env). PXQ2: v3 = PXA_PXQ2_V3 (refit book, wins), v2 =
+    // PXA_PXQ_CEIL_V2, v1 = neither. PXQ3: v2 = PXA_PXQ_CEIL_V2, v1 = unset.
+    {
+        const char * ce = getenv("PXA_PXQ_CEIL_V2");
+        const bool ceil_v2 = ce && atoi(ce) != 0;
+        const char * ve = getenv("PXA_PXQ2_V3");
+        const bool p2v3 = ve && atoi(ve) != 0;
+        static const char * pxq_vkeys[2] = { "pxa.pxq2.version", "pxa.pxq3.version" };
+        const uint32_t rt_v[2] = { p2v3 ? 3u : (ceil_v2 ? 2u : 1u), ceil_v2 ? 2u : 1u };
+        static const char * pxq_fix[2] = {
+            "match the file: v3 -> PXA_PXQ2_V3=1, v2 -> PXA_PXQ_CEIL_V2=1, v1 -> neither",
+            "match the file: v2 -> PXA_PXQ_CEIL_V2=1, v1 -> unset PXA_PXQ_CEIL_V2" };
+        for (int vi = 0; vi < 2; ++vi) {
+            const int ki = gguf_find_key(meta, pxq_vkeys[vi]);
+            if (ki < 0 || gguf_get_kv_type(meta, ki) != GGUF_TYPE_UINT32) continue;
+            const uint32_t fv = gguf_get_val_u32(meta, ki);
+            if (fv != rt_v[vi]) {
+                LLAMA_LOG_WARN("%s: ============================ PXQ TABLE MISMATCH ============================\n", __func__);
+                LLAMA_LOG_WARN("%s: %s = %u but this runtime's env selects v%u tables -- these tensors WILL DECODE WRONG. %s, then reload.\n", __func__, pxq_vkeys[vi], fv, rt_v[vi], pxq_fix[vi]);
+            }
+        }
+    }
+
     files.emplace_back(new llama_file(fname.c_str(), "rb"));
     contexts.emplace_back(ctx);
 

@@ -96,8 +96,8 @@ Same command shape as PXQU-16 with `fusion2-35b-U12.gguf`. Measured on the 16 GB
 
 ## Quantizing your own model
 
-See the README "Quantize your own" section — pure tiers (`PXQ4`, `PXQ3`, `PXQ2`) or the
-PXQU knapsack presets (`--pxq-universal {12g|16g|16g-hq}`), plus:
+See the README "Quantize your own" section — pure tiers (`PXQ4`, `PXQ3`, `PXQ2`) or a
+mixed-tier PXQU map (`--pxq-universal <map>.tiers`, `docs/PXQU-CONVERT.md`), plus:
 - **`--output-tensor-type q8_0`** (recommended): +5.2% decode on P100 for +123 MB.
 - **Imatrix doctrine:** quantizing a merged model? Recompute the imatrix ON the merge
   (activation statistics are anchor-specific), full-GPU-resident (the CPU/partial-offload

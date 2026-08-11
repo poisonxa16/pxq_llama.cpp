@@ -1,6 +1,6 @@
 #include "common.cuh"
 
-// PXA_SPEC_SMALLN (B4 SPEC_VERIFY_ENGINE, 2026-07-22, run synthesis window):
+// PXA_SPEC_SMALLN (B4 SPEC_VERIFY_ENGINE, 2026-07-22):
 // multi-column dequant-FMA GEMV for the dense quantized backbone at ne11 = 2..8 on
 // pre-Volta cards (P100 sm_60 has NO dp4a; 1080Ti sm_61 emulates poorly at tiny N).
 //

@@ -160,6 +160,7 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     bool create_step35_tensors(const LLM_TN & tn);
 
     bool create_laguna_tensors(const LLM_TN & tn);
+    bool create_muse_glimmer_tensors(const LLM_TN & tn);
 
     bool create_hy3_tensors(const LLM_TN & tn);
 
@@ -1283,6 +1284,55 @@ bool create_tensors_helper::create_laguna_tensors(const LLM_TN & tn) {
             layer.ffn_up_shexp    = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
             layer.ffn_down_shexp  = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {hparams.n_ff_shexp, n_embd}, 0);
         }
+    }
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_muse_glimmer_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    model.tok_embd    = create_tensor(ctx_input,  tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+    model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+                                      llama_model_loader::TENSOR_NOT_REQUIRED);
+    if (!model.output) {
+        // tied embeddings fallback
+        model.output  = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab},
+                                      llama_model_loader::TENSOR_DUPLICATED);
+    }
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+        auto & layer = model.layers[i];
+
+        layer.attn_norm      = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
+        layer.attn_post_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
+
+        // Separate q/k/v projections (GQA 32/2, head_dim 128).
+        layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+        layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_head_k * n_head_kv}, 0);
+        layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_head_v * n_head_kv}, 0);
+        layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_v * n_head, n_embd}, 0);
+
+        // Per-head RMS QK-norm; q_norm carries the folded qk_scale_factor from
+        // conversion, k_norm is identity on released checkpoints.
+        layer.attn_q_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+        layer.attn_k_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
+        // FULL-WIDTH sigmoid attention output gate [n_embd, n_head*head_dim],
+        // computed from the pre-attention normed hidden state. NOT the per-head
+        // scalar gate that build_std_attention assumes for wqkv_gate -- the
+        // muse-glimmer graph applies this gate itself and never routes through
+        // build_std_attention.
+        layer.wqkv_gate = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+
+        layer.ffn_norm      = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,      "weight", i), {n_embd}, 0);
+        layer.ffn_post_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
+
+        layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+        layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+        layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
     }
     return use_mmap_buffer;
 }
@@ -4666,6 +4716,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_laguna_tensors(tn); break;
         case LLM_ARCH_HY_V3:
             use_mmap_buffer = create_hy3_tensors(tn); break;
+        case LLM_ARCH_MUSE_GLIMMER:
+            use_mmap_buffer = create_muse_glimmer_tensors(tn); break;
         default:
             throw std::runtime_error("unknown architecture");
     }

@@ -2,7 +2,7 @@
 # Verification for PXA_CONTAINER_AWARE_v1 / PXA_PORT_GUARD_v1 / PXA_UTF8_FINAL_v1 /
 # PXA_TYPEARG_STRICT_v1 / PXA_BT_NOFORK_v1 — CPU-only, no brain GPUs touched.
 # Run INSIDE the build container: docker run --rm --runtime=nvidia --network host \
-#   -v .:/src -v ./models:/models ...
+#   -v ${PXQ_SRC:-.}:/src -v ${PXQ_WORK:-./work}:/models ...
 set -u
 B=/src/build-unified/bin
 export LD_LIBRARY_PATH=/src/build-unified/bin:/src/build-unified/src:/src/build-unified/ggml/src:/src/build-unified/examples/mtmd

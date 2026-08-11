@@ -6,6 +6,7 @@ native-PXQ 2D + MoE tensors.
 Usage: splitexact.py <model> <gpus> <ts> <build> <tag>
 Variants: V0 split-off, V1 default split, V2 forced-max split, V3 K1 re-grid, V4 gateup gen off.
 """
+import os
 import json, sys, time, subprocess, urllib.request, hashlib, os
 
 MODEL, GPUS, TS, BUILD, TAG = sys.argv[1:6]
@@ -95,5 +96,5 @@ ref = out["V0_all_unsplit"]["hashes"]
 verdict = {v: out[v]["hashes"] == ref for v in out}
 print(json.dumps(verdict, indent=1))
 json.dump({"tag": TAG, "verdict": verdict, "detail": out},
-          open("./work/splitexact_%s.json" % TAG, "w"), indent=1)
+          open((os.environ.get("PXQ_WORK", "./work") + "/splitexact_%s.json") % TAG, "w"), indent=1)
 print("SPLITEXACT %s: %s" % (TAG, "BIT-EXACT across all variants" if all(verdict.values()) else "MISMATCH"))

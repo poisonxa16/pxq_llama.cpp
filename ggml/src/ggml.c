@@ -230,8 +230,9 @@ static void ggml_print_backtrace(void) {
     //      atexit handlers / library destructors in a fork child of a heavily multithreaded
     //      CUDA process whose driver mutexes were held by other threads at fork time — the
     //      child deadlocks FOREVER, wearing the parent's argv in ps and holding dups of every
-    //      fd including the HTTP listening socket. Observed live (bare-metal DGX, 2026-07-30):
-    //      a second "llama-server" with PPID = the real server, port fights, dead /health.
+    //      fd including the HTTP listening socket. Observed live on a multi-GPU bare-metal
+    //      server (2026-07-30): a second "llama-server" with PPID = the real server, port
+    //      fights, dead /health.
     //   2. the parent blocked in waitpid() with no deadline — the aborting thread never
     //      reached abort(), so the half-dead parent kept serving alongside its stuck child.
     // Fixes: honor GGML_NO_BACKTRACE (skip the fork entirely), child uses _exit(), parent
@@ -5467,7 +5468,7 @@ static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml
     if (cur_end + size_needed + GGML_OBJECT_SIZE > ctx->mem_size) {
         // PXA_ARENA_HARD_FAIL: the plain assert() below compiles out in release builds, so an
         // exhausted meta arena returned NULL and the caller segfaulted with zero context
-        // (np>=8 + MTP on the 122B died exactly here, 2026-06-12). Abort loudly with the
+        // (reproduced under np>=8 with MTP enabled). Abort loudly with the
         // numbers instead — a clean post-mortem beats silent memory corruption.
         GGML_PRINT("%s: not enough space in the context's memory pool (needed %zu, available %zu, no_alloc=%d)\n",
             __func__, cur_end + size_needed + GGML_OBJECT_SIZE, ctx->mem_size, ctx->no_alloc ? 1 : 0);

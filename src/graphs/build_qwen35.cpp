@@ -3,14 +3,14 @@
 #include "../llama-context.h"
 #include "../llama-delta-net.h"
 
-// PXA_MTP_LAZY_WARMUP_v1 (see src/llama.cpp + common/speculative.cpp): with lazy warmup on,
-// nothing consumes all-token MTP hidden rows on prompt-sized batches (the companion warmup is
-// skipped), so the out_ids row-slice can be re-enabled — restoring "last layer + output norm +
+// PXA_MTP_LAZY_WARMUP_v1 (level resolved by llama_pxa_mtp_lazy_warmup(), include/llama.h):
+// with lazy warmup on, nothing consumes all-token MTP hidden rows on prompt-sized batches (the
+// companion warmup is skipped), so the out_ids row-slice can be re-enabled — restoring "last layer + output norm +
 // lm_head compute output rows only" on prefill. That full-vocab lm_head over every prompt token
 // was the dominant structural MTP prefill tax. Gen/verify batches (n_tokens <= 64) keep full
-// rows for the accept path, exactly as before. Eager mode (env unset) is byte-unchanged.
+// rows for the accept path, exactly as before. Eager mode (lazy resolved off) is byte-unchanged.
 static bool pxa_mtp_lazy_out_ids(int64_t n_tokens) {
-    static const bool lazy = getenv("PXA_MTP_LAZY_WARMUP") && atoi(getenv("PXA_MTP_LAZY_WARMUP")) == 1;
+    const bool lazy = llama_pxa_mtp_lazy_warmup();
     if (lazy && n_tokens > 64) {
         static bool logged = false;
         if (!logged) { fprintf(stderr, "PXA_MTP_LAZY_OUT_IDS: active (n_tokens=%lld)\n", (long long) n_tokens); logged = true; }

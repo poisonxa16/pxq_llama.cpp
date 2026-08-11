@@ -50,6 +50,18 @@ static inline bool pxq_use_sm60_vec_f32(const int cc, const ggml_tensor * Q) {
 // of prefill GPU time (60 launches x 281 ms avg) — every query column re-streams the whole KV
 // extent with no tile reuse. The D=256 tile-f16 (ncols=16) restores KQ-tile data reuse.
 // Default ON; PXA_FA_TILE256=0 restores the vec route. Decode (ne1 <= 8) is untouched.
+static bool pxa_fa_tile_volta_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("PXA_FA_TILE_VOLTA");
+        const bool on = v && v[0] == '1';
+        if (on) {
+            fprintf(stderr, "PXA_FA_TILE_VOLTA: ON (sm_70 flash-attention -> tile kernel instead of WMMA; experimental A/B lever)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 static bool pxa_fa_tile256_enabled() {
     static const bool enabled = [] {
         const char * v = getenv("PXA_FA_TILE256");
@@ -102,6 +114,24 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
         }
         return;
+    }
+
+    // PXA_FA_TILE_VOLTA (experimental, default OFF). sm_70 HAS working WMMA, so the selector below
+    // sends Volta to the WMMA kernel and the tile kernels only ever serve the no-mma cards (sm_60
+    // P100). That makes tile-vs-WMMA on Volta untestable. This lever routes sm_70 -- and only sm_70
+    // (fp16 mma present, Turing+ mma absent) -- down the same tile path the P100s take, so both can
+    // be A/B'd inside ONE binary. If tile cannot handle the shape we fall through to the normal
+    // selector rather than failing. With the env unset this file behaves exactly as before, so the
+    // WMMA path and PXA_FA_FA_MASK_SKIP_v1 remain the default untouched.
+    if (pxa_fa_tile_volta_enabled() && fp16_mma_available(cc) && !new_mma_available(cc)) {
+        if (precision == GGML_PREC_DEFAULT && ggml_cuda_fattn_tile_f16_is_supported(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
+            return;
+        }
+        if (ggml_cuda_fattn_tile_f32_is_supported(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_tile_f32(ctx, dst);
+            return;
+        }
     }
 
     if (!fast_fp16_available(cc)) {

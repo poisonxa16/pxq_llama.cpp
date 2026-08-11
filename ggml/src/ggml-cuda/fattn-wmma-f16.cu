@@ -2,6 +2,25 @@
 #include "fattn-wmma-f16-interface.cuh"
 
 void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // PXA_FA_WMMA_MASK_STRIDE_FIX detector: report (once) when the half-accumulate branch would
+    // have used a WRONG mask stride under the old code (nb31/sizeof(half) != ne11). PREC_F32
+    // (float branch) was always correct; this fires only for the exposed default-precision path.
+    {
+        const ggml_tensor * m = dst->src[3];
+        const ggml_tensor * K = dst->src[1];
+        const int32_t prec = dst->op_params[3];
+        if (m && K && prec == GGML_PREC_DEFAULT) {
+            const int64_t stride_h = (int64_t)m->nb[1] / (int64_t)sizeof(half);
+            if (stride_h != K->ne[1]) {
+                static bool warned = false;
+                if (!warned) { warned = true;
+                    fprintf(stderr, "PXA_FA_WMMA_MASK_STRIDE: bug-active shape seen (mask row stride %lld half != K->ne[1] %lld); the ne11 stride was WRONG here, now corrected\n",
+                            (long long)stride_h, (long long)K->ne[1]);
+                }
+            }
+        }
+    }
+
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
     const ggml_tensor * V   = dst->src[2];

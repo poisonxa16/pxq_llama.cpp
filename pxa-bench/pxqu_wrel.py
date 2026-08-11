@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pxqu_wrel.py — Q-G2 gate: the C PXQ2/PXQ3 quantizers must reproduce the numpy lab's wrel
-# on the frozen 36-slice rng-42 eval protocol (PXQ-UNIVERSAL-2026-07-17.md, build step B1).
+# on the frozen 36-slice rng-42 eval protocol.
 #
 # Protocol = pxqu_lab.py stage_eval conditions: EVAL_LAYERS [5,16,25,35] x 3 proj x 3 experts,
 # production imatrix (ornith-maxquality), map_gate=True, no subsample. For each slice the C

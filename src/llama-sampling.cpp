@@ -759,7 +759,7 @@ llama_token llama_sample_token_with_rng_impl(struct llama_sampling * smpl, llama
     if (iter == probs.end()) {
         // PXA_SAMPLE_SOFTFAIL_v1 (2026-07-30): landing here means the cumulative-probability
         // vector was unsampleable — in practice a NaN cascade from garbage logits (observed
-        // live on the DGX teacher: an hy_v3 checkpoint-restore/full-reprocess handed the
+        // live on a multi-GPU server: an hy_v3 checkpoint-restore/full-reprocess handed the
         // sampler an invalid buffer and this site's GGML_ABORT killed the WHOLE np2 server —
         // then the abort-path backtrace fork hung it as a zombie pair; see PXA_BT_NOFORK_v1).
         // One poisoned slot killing every co-resident generation is the same blast-radius

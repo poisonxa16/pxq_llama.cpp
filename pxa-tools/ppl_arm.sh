@@ -2,14 +2,14 @@
 # Paired-protocol perplexity for one arm. usage: ppl_arm.sh <model> <tag> <gpus> <ts> [chunks]
 set -o pipefail
 MODEL=$1; TAG=$2; GPUS=$3; TS=$4; CHUNKS=${5:-1000}
-BUILD=${PPL_BUILD:-./build}
-OUTDIR=${OUTDIR:-./ppl-out}
+BUILD=${PPL_BUILD:-${PXQ_BUILD:-./build}}
+OUTDIR=${PXQ_WORK:-./work}/ppl
 mkdir -p $OUTDIR
 LOG=$OUTDIR/ppl-$TAG.log
 [ -s $OUTDIR/nll-$TAG.txt ] && { echo "[ppl $TAG] exists"; exit 0; }
 docker run --rm --name pxq-ppl-$TAG --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=$GPUS \
   -e LD_LIBRARY_PATH=/build/bin:/build/src:/build/ggml/src \
-  -v $BUILD:/build:ro -v $(dirname $MODEL):/mdir:ro -v ${CORPUS_DIR:-./corpus}:/corp:ro \
+  -v $BUILD:/build:ro -v $(dirname $MODEL):/mdir:ro -v ${PXQ_IMATRIX:-./imatrix}:/corp:ro \
   nvidia/cuda:12.8.1-devel-ubuntu24.04 \
   /build/bin/llama-perplexity -m /mdir/$(basename $MODEL) -f /corp/ppl-eval-half.txt \
   --chunks $CHUNKS -c 512 -b 512 -ub 512 --ppl-output-type 1 --seed 1 \

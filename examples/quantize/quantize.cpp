@@ -7,7 +7,6 @@
 
 #include "common.h"
 #include "llama.h"
-#include "pxqu-presets.h"
 
 #include <cstdio>
 #include <cstring>
@@ -182,10 +181,10 @@ static void usage(const char * executable) {
     printf("  --extra-output-tensor ggml_type: requantize and add output tensor of that type.\n");
     printf("  --ffn-gate-inp-type ggml_type: use this ggml_type for the ffn_gate_inp tensors.\n\n");
     printf("  --custom-q regex1=type1,regex2=type2...: use this to specify custom quantization type rules.\n\n");
-    printf("  --pxq-universal {12g|16g|16g-hq|/path/to/map.tiers}: PXQ-UNIVERSAL per-tensor tier map.\n");
+    printf("  --pxq-universal /path/to/map.tiers: PXQ-UNIVERSAL per-tensor tier map.\n");
     printf("  --pxq-composition-override: keep a PXQ-target output that FAILS the composition assertion\n");
     printf("        (PXQ family < 50%% of bytes, or zero bytes of the named tier). Default: abort + remove.\n");
-    printf("        Presets resolve to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
+    printf("        A bare <name> resolves to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
     printf("        The file is '#'-commented lines of regex=type (pxq1|pxq2|pxq3|pxq4; pxq6 = the 5-bit tier since 2026-07-21), fed through --custom-q.\n\n");
     printf("  --repack Repack all tensors to the corresponding _r4/8 variant if available.\n\n");
     printf("  --repack-pattern Comma separated list of regexs to use for matching tensor names to be repacked.\n\n");
@@ -647,13 +646,10 @@ int main(int argc, char ** argv) {
                 joined += line;
             }
         } else {
-            // baked-in preset fallback: works from any cwd on a bare clone
-            const char * baked = pxqu_arg == "12g" ? pxqu_preset_12g
-                               : pxqu_arg == "16g" ? pxqu_preset_16g
-                               : pxqu_arg == "16g-hq" ? pxqu_preset_16g_hq : nullptr;
-            if (!baked) { fprintf(stderr, "--pxq-universal: cannot open tier map %s (and no baked preset for '%s')\n", path.c_str(), pxqu_arg.c_str()); return 1; }
-            joined = baked;
-            path = pxqu_arg + " (baked-in preset)";
+            fprintf(stderr, "--pxq-universal: cannot open tier map %s\n", path.c_str());
+            fprintf(stderr, "--pxq-universal takes a path to a .tiers map ('#'-commented lines of "
+                            "regex=type, one per expert tensor). See docs/PXQU-CONVERT.md.\n");
+            return 1;
         }
         if (joined.empty() || !parse_custom_quants(joined, custom_quants)) {
             fprintf(stderr, "--pxq-universal: bad tier map %s\n", path.c_str());

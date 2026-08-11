@@ -10,36 +10,63 @@ budget by spending bits where they matter (high-importance experts) and squeezin
 ```
 llama-quantize --allow-requantize \
   --imatrix <model>.imatrix \
-  --override-kv <arch>.expert_used_count=int:<top_k> \
   --pxq-universal <map>.tiers \
   <source-q8>.gguf  <out>.gguf  PXQ_UNIVERSAL  <threads>
 ```
 
-- `--pxq-universal <map>.tiers` — the tier map (see below). Also accepts the presets `12g` / `16g` / `16g-hq`.
+- `--pxq-universal <map>.tiers` — path to the tier map (format below).
 - `--imatrix` — importance matrix for the source model; PXQU leans on it to place bits well.
-- `--override-kv …expert_used_count=int:N` — pin the routing to the model's real top-k so the calibration
-  matches how the model actually runs.
 - Source should be a near-lossless **Q8_0** gguf.
+
+> ⚠ **Do not pass `--override-kv <arch>.expert_used_count=int:N` at quantize time.** Earlier
+> revisions of this page suggested it, to pin routing to the model's real top-k. It bakes the key
+> into the output GGUF as **INT32**, while the loader reads that key as **UINT32** — so the file
+> quantizes without complaint and then fails at load with
+> `key <arch>.expert_used_count has wrong type i32 but expected type u32`.
+>
+> Every normally-converted source already carries the correct value and type, so **no override is
+> needed**. If you genuinely must set it, spell the type `uint:`. The failure is invisible until
+> load because a *runtime* `--override-kv` goes through a different code path that never consults
+> GGUF types — only a baked one is type-checked.
 
 Files containing the `pxq1` (1-bit) tier require a build with the PXQ1 codec (this release); other tiers
 (`pxq2/pxq3/pxq4/pxq6`) run on any current build.
 
-## The tier maps (example: 122B-A5B, in `pxa-bench/pxq-universal/recipes/`)
+## The tier map format
 
-A tier map is `#`-commented lines of `regex=type`, one per expert tensor. Three reference budgets ship:
+A tier map is a text file of `#`-commented lines, one `regex=type` rule per expert tensor:
 
-| Map | Target card | Composition (experts) | ~Resident |
-|---|---|---|---|
-| `pxqu24-122b-a5b.tiers` | 24 GB | 126× pxq1 · 18× pxq2 | ~23.5 GiB |
-| `pxqu32-122b-a5b.tiers` | 32 GB | 61× pxq1 · 57× pxq2 · 26× pxq3 | ~31.7 GiB |
-| `pxqu48-122b-a5b.tiers` | 48 GB | 61× pxq2 · 57× pxq3 · 26× pxq6 | ~45.8 GiB |
+```
+# <budget> tier map — one rule per expert tensor
+^blk\.0\.ffn_gate_exps\.weight$=pxq2
+^blk\.0\.ffn_up_exps\.weight$=pxq2
+^blk\.0\.ffn_down_exps\.weight$=pxq3
+...
+```
 
-These are keyed to the 122B-A5B tensor names (48 layers × 256 experts) — use them as templates. For a
-different model, generate a map for your own tensor names and VRAM budget; the tighter the budget, the more
-experts drop to `pxq1`, and the more the aggressive tiers benefit from a no-think serving posture.
+- The regex is matched against the GGUF tensor name; the type is one of
+  `pxq1` / `pxq2` / `pxq3` / `pxq4` / `pxq6`.
+- Blank lines and `#` comments are ignored. Tensors with no matching rule fall through to the
+  backbone recipe for the requested ftype.
+- A bare filename is resolved relative to `$PXA_PXQU_DIR` (default `pxa-bench/pxq-universal/`);
+  an absolute or relative path is used as-is.
 
-> The 24 GB map is the aggressive edge (mostly 1-bit). Always live-validate after quantizing — coherence is
-> the gate, and heavily-1-bit maps do best served no-think.
+Write one for your own tensor names and VRAM budget: total the per-tensor byte cost at each tier
+(bpw × elements), then spend the budget on the tensors your imatrix says matter most. As reference
+points, these are the budget/composition splits behind our published 122B-A5B (48 layers × 256
+experts) builds:
+
+| Budget | Composition (experts) | ~Resident |
+|---|---|---|
+| 24 GB | 126× pxq1 · 18× pxq2 | ~23.5 GiB |
+| 32 GB | 61× pxq1 · 57× pxq2 · 26× pxq3 | ~31.7 GiB |
+| 48 GB | 61× pxq2 · 57× pxq3 · 26× pxq6 | ~45.8 GiB |
+
+The tighter the budget, the more experts drop to `pxq1`, and the more the aggressive tiers benefit
+from a no-think serving posture.
+
+> A mostly-1-bit map is the aggressive edge. Always live-validate after quantizing — coherence is
+> the gate.
 
 ## Building for 30-series / 40-series (Ampere / Ada)
 

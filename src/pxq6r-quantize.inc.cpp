@@ -60,6 +60,90 @@ static inline bool pxq_tie_take_hi(int64_t row, int64_t blk) {
 }
 #endif
 
+#ifndef PXQ_FIX_GATES_DEFINED
+#define PXQ_FIX_GATES_DEFINED
+// ---------------------------------------------------------------------------------------------
+// PXQ codec-fix gates (2026-08-09). ALL default OFF: with none of these env vars set every
+// quantizer below is byte-identical to the release tree. Shared by the whole PXQ family
+// (guarded like PXQ_TIE_BREAK_DEFINED so any single .inc still compiles standalone).
+//   PXA_PXQ_CEIL_V2=1  PXQ2/PXQ3 ceiling fix: quantize against the v2 books (the frozen LM4/LM8
+//                      rescaled so max|book| == 1.0), restoring the representable ceiling to
+//                      anchor*0.987793 = exact PXQ4/PXQ6 parity (v1: 0.697/0.896 * anchor).
+//                      Files bake pxa.pxq{2,3}.version=2 + the v2 values in pxa.pxq{2,3}.book;
+//                      decode needs the same env on the runtime (or PXA_PXQ2_BOOK/PXA_PXQ3_BOOK
+//                      on an older build -- the books are runtime-uploaded tables everywhere).
+//   PXA_PXQ_SMIN=1     hard representability floor in the sub-scale search: sub candidates that
+//                      cannot represent the block peak within half a top book step are excluded
+//                      (search [s_min,15] instead of [0,15]).
+//   PXA_PXQ_KQW=1      k-quant error weighting on the IMATRIX PATH ONLY:
+//                      w_i = imx_i * sqrt(mean(x_row^2) + x_i^2). No imatrix => w = 1 exactly,
+//                      so imatrix-free artifacts do not move.
+// ---------------------------------------------------------------------------------------------
+static inline bool pxq_fix_env_on(const char * name) {
+    const char * e = getenv(name);
+    return e && atoi(e) != 0;
+}
+static inline bool pxq_ceil_v2_enabled() {
+    static const bool on = [](){
+        const bool v = pxq_fix_env_on("PXA_PXQ_CEIL_V2");
+        if (v) fprintf(stderr, "PXA_PXQ_CEIL_V2 ARMED: PXQ2/PXQ3 v2 books (max|book|=1 ceiling restore); baking pxa.pxq{2,3}.version=2\n");
+        return v;
+    }();
+    return on;
+}
+static inline bool pxq_smin_enabled() {
+    static const bool on = [](){
+        const bool v = pxq_fix_env_on("PXA_PXQ_SMIN");
+        if (v) fprintf(stderr, "PXA_PXQ_SMIN ARMED: representability floor in the sub-scale search\n");
+        return v;
+    }();
+    return on;
+}
+static inline bool pxq_kqw_enabled() {
+    static const bool on = [](){
+        const bool v = pxq_fix_env_on("PXA_PXQ_KQW");
+        if (v) fprintf(stderr, "PXA_PXQ_KQW ARMED: k-quant imatrix weighting w = imx * sqrt(sigma2_row + x^2)\n");
+        return v;
+    }();
+    return on;
+}
+// PXA_PXQ_SMIN: smallest sub index whose ceiling covers the block peak within half a top step,
+// sign-aware (the peak's own side of the book sets the cap and the top gap):
+//     anchor*sub[j]*(bcap + gap/2) >= |peak|
+// Returns 0 when the gate is off (search unchanged). If even sub[15] cannot satisfy it, the
+// floor clamps to 15 (the best available ceiling). Degenerates gracefully for the sign book
+// (nbook==2: bcap=1, gap=2 -> d >= |peak|/2, the natural sign-quantizer bound).
+static inline int pxq_sub_floor(const float * x, int bs, float anchor,
+                                const float * book, int nbook, const float * sub) {
+    if (!pxq_smin_enabled() || !(anchor > 0.f)) return 0;
+    float apk = 0.f, xpk = 0.f;
+    for (int i = 0; i < bs; ++i) { const float a = fabsf(x[i]); if (a > apk) { apk = a; xpk = x[i]; } }
+    if (!(apk > 0.f)) return 0;
+    const double bcap = xpk >= 0.f ?  (double)book[nbook-1] : -(double)book[0];
+    const double gap  = xpk >= 0.f ?  (double)book[nbook-1] - (double)book[nbook-2]
+                                   :  (double)book[1]       - (double)book[0];
+    if (!(bcap > 0.0)) return 0;   // degenerate book side: keep the full search
+    const double need = (double)apk / ((double)anchor * (bcap + 0.5*gap));
+    int j = 0;
+    while (j < 15 && (double)sub[j] < need) ++j;
+    return j;
+}
+// PXA_PXQ_KQW: build the k-quant row weights into buf and return them. Returns imx (or null)
+// unchanged when the gate is off or there is no imatrix -- the unweighted path NEVER moves.
+static inline const float * pxq_kqw_row_weights(const float * x, const float * imx, int64_t K,
+                                                std::vector<float> & buf) {
+    if (!imx || !pxq_kqw_enabled()) return imx;
+    double s2 = 0.0;
+    for (int64_t i = 0; i < K; ++i) s2 += (double)x[i]*(double)x[i];
+    s2 /= (double)K;
+    buf.resize((size_t)K);
+    for (int64_t i = 0; i < K; ++i) {
+        buf[(size_t)i] = (float)((double)imx[i] * sqrt(s2 + (double)x[i]*(double)x[i]));
+    }
+    return buf.data();
+}
+#endif
+
 // n-wide parser (the existing pxq6_parse16 is 16-only; the LM32 book needs 32)
 static inline bool pxq6r_parse_n(const char * e, float * out, int want) {
     int n = 0; float v[32];
@@ -141,7 +225,8 @@ static inline double pxq6r_quant_subblock(const float * x, const float * w, floa
     }
     double best = 1e300;
     uint8_t codes[16];
-    for (int j = 0; j < 16; ++j) {
+    const int j0 = pxq_sub_floor(x, 16, anchor, book, 32, sub);   // PXA_PXQ_SMIN (0 when off)
+    for (int j = j0; j < 16; ++j) {
         const float d = (float)((double)anchor * (double)sub[j]);   // == fp32 anchor*sub (exact-product, single round)
         const double err = pxq6r_block_err(x, w, d, book, mids, codes);
         if (err < best || (err == best && pxq_tie_take_hi(row, blk))) {   // deterministic tie-break for reproducible quantization
@@ -224,15 +309,17 @@ static void pxq6r_quantize_expert(const float * src, uint8_t * dst, int64_t R, i
     const int64_t nsub = K / 16;
 
     std::vector<uint8_t> s4(nsub), codes(K);
+    std::vector<float> kqw;
     for (int64_t p = 0; p < P; ++p) {
         uint8_t * panel = dst + p*panel_bytes;
         ggml_fp16_t * anchors = (ggml_fp16_t *)panel;      // 64 x fp16 header
         for (int64_t r = 0; r < 64; ++r) {
             const float * x = src + (p*64 + r)*K;
             const int64_t row = row0 + p*64 + r;
-            const float anchor = pxq6r_pick_anchor(x, imx, K, book, mids, sub, s4.data(), codes.data(), row);
+            const float * wq = pxq_kqw_row_weights(x, imx, K, kqw);   // PXA_PXQ_KQW (== imx when off)
+            const float anchor = pxq6r_pick_anchor(x, wq, K, book, mids, sub, s4.data(), codes.data(), row);
             anchors[r] = ggml_fp32_to_fp16(anchor);
-            pxq6r_quant_row(x, imx, K, anchor, book, mids, sub, s4.data(), codes.data(), row);
+            pxq6r_quant_row(x, wq, K, anchor, book, mids, sub, s4.data(), codes.data(), row);
             for (int64_t kb = 0; kb < KB; ++kb) {
                 uint8_t * slab = panel + PXQ6R_HDR_BYTES + kb*PXQ6R_SLAB_BYTES;
                 const uint8_t * s = &s4[kb*2];             // 2 subs per 32 elems: lo nibble = elems 0-15
@@ -294,7 +381,7 @@ static void pxq6r_quantize_tensor(const float * src, uint8_t * dst, int64_t R, i
     // tie-break and make the artifact differ across thread counts.
     const int64_t panels      = R/64;
     const int64_t panel_bytes = panels > 0 ? exp_bytes/panels : 0;
-    // Job granularity: fixed CHUNK=8 leaves the box idle on wide-and-short tensors --
+    // Job granularity: fixed CHUNK=8 leaves cores idle on wide-and-short tensors --
     // a dense R=5120 gives 80 panels = 10 jobs, so 10 of 72 cores work. Size it so there
     // are ~4 jobs per thread, clamped to [1,8] panels (a 64-row panel x K is already
     // substantial work, so CHUNK=1 costs nothing in scheduling overhead).

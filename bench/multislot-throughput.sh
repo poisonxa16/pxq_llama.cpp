@@ -14,13 +14,16 @@
 #   GPUS=<uuid> MODEL=/path/PXA-Fusion2-35B-PXQ2.gguf ./multislot-throughput.sh   (use a 16GB card; an 11GB 1080Ti OOMs a 10.7GB model once context is added)
 #
 # Usage: GPUS=<uuid[,uuid]> MODEL=/path.gguf [TS=1,1] [BUILD=/path] [PORT=8299] ./multislot-throughput.sh
+#   BUILD defaults to <repo>/build (the tree this script lives in); OUT defaults to ./multislot.txt.
 set -uo pipefail
 GPUS="${GPUS:?set GPUS=GPU-uuid[,GPU-uuid]}"
 MODEL="${MODEL:?set MODEL=/abs/path/to/pxq.gguf}"
 TS="${TS:-}"; NGL="${NGL:-99}"; PORT="${PORT:-8299}"
-BUILD="${BUILD:-./build}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || dirname "$HERE")"
+BUILD="${BUILD:-$REPO/build}"
 IMG="${IMG:-nvidia/cuda:12.8.1-devel-ubuntu24.04}"
-OUT="${OUT:-/root/squeeze-window/multislot.txt}"
+OUT="${OUT:-./multislot.txt}"
 NGEN="${NGEN:-160}"
 mkdir -p "$(dirname "$OUT")"
 MDIR="$(dirname "$MODEL")"; MBASE="$(basename "$MODEL")"

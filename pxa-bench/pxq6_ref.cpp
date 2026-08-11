@@ -1,7 +1,7 @@
 // pxq6_ref.cpp — standalone PXQ6 reference quantizer/dequantizer (CPU, bit-parity contract).
 //
 // Compiles src/pxq6-quantize.inc.cpp standalone (fp16 via F16C — the same IEEE RN conversion
-// ggml uses on this box, GGML_F16C=ON). Used by:
+// ggml uses when built with GGML_F16C=ON). Used by:
 //   Q-G1  pxq6_golden.py  — byte-parity vs the numpy reference on random + edge-case slabs
 //   Q-G2  pxq6_wrel.py    — wrel reproduction on the frozen 36-slice rng-42 lab protocol
 //

@@ -186,8 +186,8 @@ static __global__ void flash_attn_ext_f16(
         // so skipping them is bit-identical to computing them. They dominate two real cases on this
         // stack: (a) causal prefill — every query block scans the FULL KV extent, so all
         // strictly-future tiles are -inf (about half the FA work of an np1 prompt); (b) np>1 slots —
-        // a prompt in one slot scans the other slots resident KV (100% -inf; measured 2.7x FA wall
-        // on the 35B second np2 request: 29.8 -> 80.5 ms/call). The mask tile scan reads
+        // a prompt in one slot scans the other slots resident KV (100% -inf; measured 2.7x FA wall on a
+        // co-resident np2 slot scanning another slot's resident KV: 29.8 -> 80.5 ms/call). The mask tile scan reads
         // ncols*FATTN_KQ_STRIDE halves = ~6% of the K/V bytes the tile would otherwise move.
         if (mask) {
             const half2 * pxa_m2   = (const half2 *) maskh; // maskh is already offset to query row ic0
@@ -315,7 +315,19 @@ static __global__ void flash_attn_ext_f16(
                 for (int k0 = 0; k0 < FATTN_KQ_STRIDE/2; k0 += WARP_SIZE) {
                     const int k = k0 + threadIdx.x;
 
+                    // PXA_FA_WMMA_MASK_STRIDE_FIX (2026-08-10): the half-accumulate branch used
+                    // ne11 for the mask query-row stride where the float-accumulate branch (above)
+                    // and the mask pointer setup (maskh/mask2 init) correctly use nb31/sizeof(half).
+                    // These differ whenever the mask row stride (in half elements) != K->ne[1], i.e.
+                    // a KV-padded or windowed-SWA-sliced mask. Same defect class as the 2026-06-26
+                    // gpt-oss ne11->nb31 tile-kernel fix; that fix never reached this half branch.
+                    // Compile-time legacy switch (PXA_FA_WMMA_MASK_STRIDE_LEGACY=1 at build) restores
+                    // the old expression for A/B; default is the corrected stride.
+#ifdef PXA_FA_WMMA_MASK_STRIDE_LEGACY
                     KQ2_tmp[k0/WARP_SIZE] += mask ? slope2*mask2[(j*ne11 + k_VKQ_0)/2 + k] : make_half2(0.0f, 0.0f);
+#else
+                    KQ2_tmp[k0/WARP_SIZE] += mask ? slope2*mask2[(j*(nb31/sizeof(half)) + k_VKQ_0)/2 + k] : make_half2(0.0f, 0.0f);
+#endif
                     KQ_max_new = ggml_cuda_hmax2(KQ_max_new, KQ2_tmp[k0/WARP_SIZE]);
                 }
                 KQ_max_new = __half2half2(warp_reduce_max(ggml_cuda_hmax(__low2half(KQ_max_new), __high2half(KQ_max_new))));
