@@ -40,3 +40,16 @@
 #define PXQ3_BOOK_INIT { \
     -0x1.d040000000000p-1f, -0x1.1880000000000p-1f, -0x1.3100000000000p-2f, -0x1.7d80000000000p-4f, \
     0x1.7880000000000p-4f, 0x1.2ec0000000000p-2f, 0x1.1740000000000p-1f, 0x1.cfc0000000000p-1f }
+
+// ---------------------------------------------------------------------------------------------
+// v2 book (PXA_PXQ_CEIL_V2, 2026-08-09) -- THE CEILING FIX. The frozen LM8 book rescaled by
+// 1/max|book| = 1/0.90673828125 so max|book| == 1.0 exactly, then fp16-snapped. A pure rescale:
+// same Lloyd grid shape, same ZIDX (4), same sign straddle. Restores the representable ceiling
+// from 0.896*anchor to 0.987793*anchor = PXQ4/PXQ6 parity. Provenance: pxa.pxq3.version = 2 +
+// these values in pxa.pxq3.book. Active ONLY under PXA_PXQ_CEIL_V2=1 on BOTH quantizer and
+// runtime (older builds can decode v2 files via PXA_PXQ3_BOOK with these exact values).
+// fp16-snapped, strictly ascending: -1.0, -0.60400390625, -0.328369140625, -0.1027221679688,
+// 0.1013793945312, 0.326171875, 0.6015625, 0.9990234375
+#define PXQ3_BOOK_V2_INIT { \
+    -0x1.0000000000000p+0f, -0x1.3540000000000p-1f, -0x1.5040000000000p-2f, -0x1.a4c0000000000p-4f, \
+    0x1.9f40000000000p-4f, 0x1.4e00000000000p-2f, 0x1.3400000000000p-1f, 0x1.ff80000000000p-1f }

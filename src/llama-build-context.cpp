@@ -2452,6 +2452,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_gemma3();
             } break;
+        case LLM_ARCH_MUSE_GLIMMER:
+            {
+                result = llm.build_muse_glimmer();
+            } break;
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_MTP:
             {

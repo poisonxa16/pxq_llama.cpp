@@ -2092,9 +2092,25 @@ static void ggml_cuda_op_mul_mat_cublas(
     // sm_61 (1080Ti) stays excluded. Env PXA_P100_FP16_GEMM=0 rolls back to the old fp32 path.
     // PXA 0a hygiene (2026-07-22): level-aware resolver (pxa-enhance.cuh) — REFERENCE -> false so
     // PXA_REFERENCE=1 baselines on sm_60 really run the pure fp32 SGEMM reference path. Env wins.
+    // PXA_F32PREC_F16GEMM (2026-08-10, default OFF): a GGML_PREC_F32 matmul over an f16/quantized
+    // src0 falls through this function to dequant-to-FP32 + cublasSgemm — volta_sgemm at ~15.7
+    // TFLOPS, measured 20.1 ms/call x 408 calls = 50.7%% of the Muse-Glimmer Q4_K_XL prefill wall
+    // on 2x V100. Mainline serves the IDENTICAL ops with f16 INPUTS and CUBLAS_COMPUTE_32F
+    // (cutlass s884gemm_f16): tensor cores, fp32 ACCUMULATION — the precision the graph asked
+    // for is honored in the accumulator; only the operand load rounds to f16, which is the same
+    // numeric class mainline ships for this model. Armed: PREC_F32 ops take the f16-input branch
+    // below with a per-op fp32 compute type. G3-class (not bit-exact vs the fp32-operand SGEMM);
+    // quality-gated before any default flip.
+    static const bool pxa_f32prec_f16gemm = [](){
+        const char * e = getenv("PXA_F32PREC_F16GEMM");
+        const bool v = e && atoi(e) != 0;
+        if (v) fprintf(stderr, "PXA_F32PREC_F16GEMM ARMED: PREC_F32 dense GEMMs run f16-input + CUBLAS_COMPUTE_32F (tensor cores, fp32 accumulate) instead of dequant-f32 + SGEMM\n");
+        return v;
+    }();
+    const bool pxa_f32prec_take = pxa_f32prec_f16gemm && dst->op_params[0] != GGML_PREC_DEFAULT;
     const bool pxa_fp16_gemm_ok = compute_capability >= CC_VOLTA ||
         (pxa_p100_fp16_gemm() && compute_capability < CC_VOLTA && fast_fp16_available(compute_capability));
-    if (pxa_fp16_gemm_ok && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+    if (pxa_fp16_gemm_ok && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && (dst->op_params[0] == GGML_PREC_DEFAULT || pxa_f32prec_take)) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
@@ -2116,12 +2132,28 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        if (pxa_f32prec_take) {
+            // PREC_F32, armed: fp32 accumulate + F32 output straight into dst (no round-trip).
+            const float alpha_f32 = 1.0f;
+            const float beta_f32  = 0.0f;
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32, src0_ptr, CUDA_R_16F, ne00,
+                                    src1_ptr, CUDA_R_16F, ne10,
+                        &beta_f32,  dst_dd_i, CUDA_R_32F, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            GGML_UNUSED(dst);
+            GGML_UNUSED(src1_ddq_i);
+            return;
+        }
         ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
         const half alpha_f16 = 1.0f;
         const half beta_f16 = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -6097,6 +6129,44 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         && pxa_pxq_mmvq_on(ggml_cuda_info().devices[ctx.device].cc)
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1
         && src0_1->ne[2] == 1 && src0_1->ne[3] == 1 && src1->type == GGML_TYPE_F32;
+    // PXA_PXQ_MMVQ_FUGSPLIT (2026-08-10, default OFF): run the dense PXQ up/gate decode as TWO
+    // plain MMVQ launches + the fused GLU epilogue instead of the fused_mul_mat_vec_q twin.
+    // WHY: on sm_70 the fused twin doubles the per-thread state (two weight streams x ROWS
+    // anchors/scales/accumulators) -> 92 regs + 64 B stack spills at the ROWS=4 shape the plain
+    // kernel wants -> 31%% occupancy, measured 248 us/call where Q4_K's fused twin (48 regs, one
+    // superblock scale) runs 175 us. The plain PXQ4 kernel (63 regs, no spills) is at per-byte
+    // parity with Q4_K's plain kernel, so two plain launches beat one crippled fused launch.
+    // The two streams share the q8_1 sidecar; the GLU epilogue is the existing fused_mul_unary.
+    // Numerics: same vec_dot, same per-stream fold shape, same GLU arithmetic -> expected
+    // bit-identical to the fused twin; gated by hash before any default flip.
+    static const bool pxq_fugsplit = [](){
+        const char * e = getenv("PXA_PXQ_MMVQ_FUGSPLIT");
+        const bool v = e && atoi(e) != 0;
+        if (v) fprintf(stderr, "PXA_PXQ_MMVQ_FUGSPLIT ARMED: dense PXQ up/gate decode = 2x plain MMVQ + GLU epilogue (fused twin bypassed)\n");
+        return v;
+    }();
+    if (pxq_mmvq_fug && pxq_fugsplit) {
+        // limit sanitize EXACTLY as ggml_cuda_op_mul_mat_vec_q_impl does (limit<=1e-6 -> INF):
+        // with INF the elementwise SILU takes its limit variant, whose op order matches the
+        // fused kernel epilogue bit-for-bit (min/max with INF are identities). The raw 0.0
+        // would select the no-limit variant, (g*u)/(1+e) vs the fused u*(g/(1+e)) -- one
+        // rounding difference per element, caught by the hash gate on 2026-08-10.
+        float limit_fs = *(const float *)(dst->op_params + 1);
+        limit_fs = limit_fs > 1e-6f ? limit_fs : INFINITY;
+        const ggml_unary_op uop_fs = (ggml_unary_op)dst->op_params[0];
+        ggml_cuda_pool_alloc<float> dst_up_fs(ctx.pool(), ggml_nelements(dst));
+        auto local_dst = *dst;
+        local_dst.data = dst_up_fs.get();
+        local_dst.op_params[0] = GGML_PREC_DEFAULT;
+        auto gate_dst = *dst;                 // same data pointer: the result still lands in dst
+        gate_dst.op_params[0] = GGML_PREC_DEFAULT;
+        ggml_cuda_mul_mat(ctx, src0_1, src1, &local_dst, nullptr, 0);
+        ggml_cuda_mul_mat(ctx, src0_2, src1, &gate_dst, nullptr, 0);
+        ggml_fused_mul_unary(ctx, uop_fs, ggml_nelements(dst),
+                        (const float *)dst->data, dst_up_fs.get(), (float *)dst->data, limit_fs);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (!pxq_mmvq_fug && (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type))) {
         // Fused single-launch decode form first; it declines to the split path below for any
         // shape/op/geometry it cannot serve.
@@ -6187,8 +6257,28 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         } else {
             auto local_dst = *dst;
             local_dst.data = dst_up.get();
+            // PXA_DENSE_FUG_PREC_KQ (2026-08-10, default OFF): THIRD instance of the
+            // op_params[0] alias defect. On a FUSED_UP_GATE node op_params[0] is the UNARY
+            // OP id (SILU == 10), not a ggml_prec; ggml_cuda_op_mul_mat_cublas reads it as
+            // a precision and vetoes the fp16 GemmEx branch -> dequant-to-FP32 + volta_sgemm
+            // (20.1 ms/call measured, 50.7% of the Muse Q4_K_XL prefill wall on 2x V100).
+            // The PXQ dense branch above sanitizes its dst copies (PXA_DENSE_FUG_PREC_v1);
+            // this generic k-quant branch never got the fix. Armed: hand both GEMMs clean
+            // PREC_DEFAULT copies, exactly as the PXQ branch does. G3-class numerics
+            // (fp16-accumulate h884 vs the fp32 SGEMM the alias forced).
+            static const bool pxa_fug_prec_kq = [](){
+                const char * e = getenv("PXA_DENSE_FUG_PREC_KQ");
+                const bool v = e && atoi(e) != 0;
+                if (v) fprintf(stderr, "PXA_DENSE_FUG_PREC_KQ ARMED: generic dense up/gate GEMMs run with sanitized PREC_DEFAULT (fp16 GemmEx path)\n");
+                return v;
+            }();
+            auto gate_dst = *dst;
+            if (pxa_fug_prec_kq) {
+                local_dst.op_params[0] = GGML_PREC_DEFAULT;
+                gate_dst.op_params[0]  = GGML_PREC_DEFAULT;
+            }
             ggml_cuda_mul_mat(ctx, src0_1, src1, &local_dst, nullptr, 0);
-            ggml_cuda_mul_mat(ctx, src0_2, src1, dst, nullptr, 0);
+            ggml_cuda_mul_mat(ctx, src0_2, src1, pxa_fug_prec_kq ? &gate_dst : dst, nullptr, 0);
         }
     }
 

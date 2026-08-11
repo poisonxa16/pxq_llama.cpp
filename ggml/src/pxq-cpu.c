@@ -80,6 +80,24 @@ static void pxa_pxq_ensure_tables(void) {
     if ((e = getenv("PXA_PXQ6_BOOK"))   && pxa_parse_n(e, t, 16)) memcpy(pxa_tab_px16_book, t, sizeof(pxa_tab_px16_book));
     if ((e = getenv("PXA_PXQ6_SUB"))    && pxa_parse_n(e, t, 16)) memcpy(pxa_tab_sub16,     t, sizeof(pxa_tab_sub16));
     if ((e = getenv("PXA_PXQ6_SUB_HQ")) && pxa_parse_n(e, t, 16)) memcpy(pxa_tab_sub8,      t, sizeof(pxa_tab_sub8));
+    // PXA_PXQ_CEIL_V2 (2026-08-09): decode-side arm of the PXQ2/PXQ3 ceiling fix -- load the
+    // v2 (max|book| == 1.0) LM4/LM8 books. Applied BEFORE the explicit PXA_PXQn_BOOK overrides
+    // below so an explicit env table still wins. Default OFF: stock decode is byte-identical.
+    if ((e = getenv("PXA_PXQ_CEIL_V2")) && atoi(e) != 0) {
+        static const float pxa_lm4_v2[4] = PXQ2_BOOK_V2_INIT;
+        static const float pxa_lm8_v2[8] = PXQ3_BOOK_V2_INIT;
+        memcpy(pxa_tab_lm4, pxa_lm4_v2, sizeof(pxa_tab_lm4));
+        memcpy(pxa_tab_lm8, pxa_lm8_v2, sizeof(pxa_tab_lm8));
+        fprintf(stderr, "PXA_PXQ_CEIL_V2 ARMED (CPU decode): PXQ2/PXQ3 v2 books\n");
+    }
+    // PXA_PXQ2_V3 (2026-08-10): decode-side arm of the PXQ2 v3 refit book. PXQ2-only (PXQ3
+    // keeps whatever the lines above chose); wins over CEIL_V2 for PXQ2; the explicit
+    // PXA_PXQ2_BOOK override below still wins. Default OFF: stock decode is byte-identical.
+    if ((e = getenv("PXA_PXQ2_V3")) && atoi(e) != 0) {
+        static const float pxa_lm4_v3[4] = PXQ2_BOOK_V3_INIT;
+        memcpy(pxa_tab_lm4, pxa_lm4_v3, sizeof(pxa_tab_lm4));
+        fprintf(stderr, "PXA_PXQ2_V3 ARMED (CPU decode): PXQ2 v3 refit book\n");
+    }
     if ((e = getenv("PXA_PXQ2_BOOK"))   && pxa_parse_n(e, t,  4)) memcpy(pxa_tab_lm4,       t, sizeof(pxa_tab_lm4));
     if ((e = getenv("PXA_PXQ3_BOOK"))   && pxa_parse_n(e, t,  8)) memcpy(pxa_tab_lm8,       t, sizeof(pxa_tab_lm8));
     // PXA_PXQ2_SUB / PXA_PXQ3_SUB alias the shared SUB16 (the quantizers keep separate copies

@@ -771,6 +771,45 @@ void llm_load_hparams(
                     ? 1.0f / std::sqrt(float(hparams.n_embd / hparams.n_head(0)))
                     : 1.0f / std::sqrt(float(hparams.n_embd_head_k_full));
             } break;
+        case LLM_ARCH_MUSE_GLIMMER:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+                ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
+                ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale);
+
+                // Local (SWA) layers run RoPE at the class freq base (a dedicated
+                // swa base overrides when present); full-attention layers are NoPE
+                // (handled in the graph builder).
+                hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+
+                // sliding_window_pattern is a scalar period (4 = local,local,local,global)
+                // on released GGUFs, or a per-layer array. NOTE: get_key_or_arr on the
+                // array target would broadcast a scalar period into every layer (all-SWA),
+                // so the scalar must be read first.
+                uint32_t swa_period = 0;
+                bool have_period = false;
+                try {
+                    have_period = ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false);
+                } catch (...) {
+                    have_period = false;
+                }
+                if (have_period && swa_period > 0) {
+                    hparams.n_swa_pattern = swa_period;
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.swa_layers[i] = ((i + 1) % swa_period != 0);
+                    }
+                } else {
+                    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+                }
+
+                switch (hparams.n_layer) {
+                    case 52: model.type = e_model::MODEL_30B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_GEMMA4:
             {
                 //hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
