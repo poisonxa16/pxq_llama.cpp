@@ -57,7 +57,7 @@
 // ---------------------------------------------------------------------------------------------
 // v3 book (PXA_PXQ2_V3, 2026-08-10) -- THE MODEL-FAMILY REFIT BOOK (LM4R). The frozen LM4 was
 // co-fit on a different lab distribution (books.json b2_e16); this is a fresh Lloyd refit of
-// the 4 entries on the target family's own pxq2-tier expert weights (122B-A10B qwopus Q8),
+// the 4 entries on the target family's own pxq2-tier expert weights (a 122B-A10B qwen35moe Q8 reference),
 // with the EXACT quantizer search inside the Lloyd loop (joint s+c re-derived every iteration,
 // uniform weights == the imatrix-free path). The fit moves the small-positive entry hard
 // toward zero (0.187 -> 0.1007, 58%% code usage): pxq2-tier experts carry near-zero mass the
