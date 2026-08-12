@@ -4017,6 +4017,13 @@ static float ggml_vec_softcap_max_f32(const int n, float * x, float s_before, fl
     return max;
 }
 
+inline static void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x) {
+    for (int i = 0; i < n; ++i) {
+        const float xi = x[i];
+        y[i] = 0.5f*xi*(1.0f + erff(xi*0.70710678118654752440f));
+    }
+}
+
 inline static void ggml_vec_gelu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     const uint16_t * i16 = (const uint16_t *) x;
     for (int i = 0; i < n; ++i) {
@@ -15693,6 +15700,56 @@ static void ggml_compute_forward_gelu(
     }
 }
 
+// ggml_compute_forward_gelu_erf
+
+static void ggml_compute_forward_gelu_erf_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        ggml_vec_gelu_erf_f32(nc,
+                (float *) ((char *) dst->data  + i1*( dst->nb[1])),
+                (float *) ((char *) src0->data + i1*(src0->nb[1])));
+    }
+}
+
+static void ggml_compute_forward_gelu_erf(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gelu_erf_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_fill
 
 static void ggml_compute_forward_fill_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
@@ -23371,6 +23428,10 @@ static void ggml_compute_forward_unary(
             {
                 ggml_compute_forward_gelu(params, dst);
             } break;
+        case GGML_UNARY_OP_GELU_ERF:
+            {
+                ggml_compute_forward_gelu_erf(params, dst);
+            } break;
         case GGML_UNARY_OP_GELU_QUICK:
             {
                 ggml_compute_forward_gelu_quick(params, dst);
@@ -26678,6 +26739,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_GELU_ERF:
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_EXP:

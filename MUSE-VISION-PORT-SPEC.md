@@ -6,13 +6,13 @@ meaningful. BUILD INTO A FRESH DIR (build-fugv), NEVER build-fug (serves the liv
 
 ## Status
 - [x] enum PROJECTOR_TYPE_MUSE_GLIMMER + name "muse-glimmer" added to clip-impl.h (registration).
-- [ ] hparams fields + hparams load branch
-- [ ] tensor loading (mm_0/1/2 + vision tower + patch_embed; model struct already has mm_0/1/2_w)
-- [ ] graph builder (reuse our build_vit windowing — see REUSE MAP)
-- [ ] set_input branch (verbatim transplant below — the error-prone perm/mask math)
-- [ ] preprocessor (adapt to our mtmd-image API — drift, see note)
-- [ ] dispatch switch cases (graph build, image-token count, n_patches)
-- [ ] build build-fugv, Gate 1 (image read via our server), Gate 2 (text byte-identical vs build-fug)
+- [x] hparams field muse_glimmer_sparse_factor + load branch (n_merge=2, rope 10000, sf=4, limit 1..4096 tok, warmup 32x32)
+- [x] tensor loading (mm_0/1/2_w via TN_LLAVA_PROJ; tower is a plain biased ViT - no qk-norms, no ls)
+- [x] graph builder build_muse_glimmer() - inline windowed loop in the build_qwen2vl idiom (2D RoPE W|H, sp_mask on sparse layers, global = last OR every 4th, pixel-shuffle via ds_perm, mm0-erfGELU-mm1-erfGELU-mm2)
+- [x] set_input branch (VERBATIM transplant of the perm/mask math)
+- [x] preprocessor (muse_glimmer_grid_size transplant + stretch resize; bicubic in lieu of Lanczos - our img_tool has no Lanczos)
+- [x] dispatch, n_output_tokens x/y/n, clip_n_mmproj_embd (mm_2_w->ne[1]), mtmd.cpp img markers <|image_start|>/<|image_end|>
+- [~] build build-fugv IN PROGRESS (cmake configured OK; clip.cpp+mtmd.cpp pass standalone -fsyntax-only); Gate 1 (image read) + Gate 2 (text byte-identical vs build-fug) NEED a 2-card window - coordinator arranges
 
 ## ⭐ REUSE MAP (why this is ~80% infra we already have)
 Our clip_graph (examples/mtmd/clip.cpp) ALREADY has, and muse needs:

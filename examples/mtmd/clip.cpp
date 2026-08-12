@@ -213,6 +213,7 @@ struct clip_hparams {
     std::unordered_set<int32_t> vision_feature_layer;
     int32_t attn_window_size = 0;
     int32_t n_wa_pattern = 0;
+    int32_t muse_glimmer_sparse_factor = 0; // muse-glimmer: 3 sparse + 1 global layers, repeating
     std::vector<int32_t> deepstack_layers; // qwen3vl multi-level feature fusion
 
     // audio
@@ -463,7 +464,9 @@ struct clip_ctx {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
 
-    int max_nodes = 8192;
+    // 16384: the muse-glimmer 50-layer windowed ViT builds ~7.5k nodes on this tree's
+    // attention path, which + ~800 leafs overflows the old 8192 sched hash at warmup
+    int max_nodes = 16384;
     ggml_backend_sched_ptr sched;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     ggml_type kq_type = GGML_TYPE_F32;
@@ -521,7 +524,7 @@ struct clip_ctx {
 
         sched.reset(
             //ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false)
+            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false)
         );
     }
 
@@ -946,6 +949,161 @@ struct clip_graph {
         // build the graph
         ggml_build_forward_expand(gf, embeddings);
 
+        return gf;
+    }
+
+    // Muse Glimmer vision encoder: 50-layer ViT with 2D RoPE, sparse block-diagonal
+    // window attention (every 4th + last layer global), pixel-shuffle downsample,
+    // then a 3-linear adapter (fc -> erf-GELU -> proj -> erf-GELU -> vision_proj
+    // into the LLM residual dim).
+    //
+    // Host-side named inputs (filled in clip_image_batch_encode):
+    //   muse_glimmer_pos_w/_h [n_tok] i32       : 1-indexed RoPE positions (sparse-permuted order)
+    //   muse_glimmer_sp_perm  [n_tok] i32       : window grouping permutation (applied after pos-emb)
+    //   muse_glimmer_inv_perm [n_tok] i32       : inverse of sp_perm (applied after the blocks)
+    //   muse_glimmer_ds_perm  [n_tok] i32       : pixel-shuffle gather (original order)
+    //   muse_glimmer_sp_mask  [n_tok, n_tok] f32: block-diagonal window mask (sparse layers)
+    ggml_cgraph * build_muse_glimmer() {
+        GGML_ASSERT(model.class_embedding == nullptr);
+        GGML_ASSERT(model.position_embeddings != nullptr);
+
+        const int ds    = hparams.n_merge;                    // pixel-shuffle factor (2)
+        const int sf    = hparams.muse_glimmer_sparse_factor; // 4
+        const int n_tok = n_patches;
+        const int n_out = (n_patches_x / ds) * (n_patches_y / ds);
+        const float rope_base = hparams.rope_theta;           // 10000
+
+        auto inp_i32 = [&](const char * name, int64_t n) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
+            ggml_set_name(t, name);
+            ggml_set_input(t);
+            return t;
+        };
+
+        ggml_tensor * pos_w    = inp_i32("muse_glimmer_pos_w",    n_tok);
+        ggml_tensor * pos_h    = inp_i32("muse_glimmer_pos_h",    n_tok);
+        ggml_tensor * sp_perm  = inp_i32("muse_glimmer_sp_perm",  n_tok);
+        ggml_tensor * inv_perm = inp_i32("muse_glimmer_inv_perm", n_tok);
+        ggml_tensor * ds_perm  = inp_i32("muse_glimmer_ds_perm",  n_tok);
+
+        ggml_tensor * sp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tok, n_tok);
+        ggml_set_name(sp_mask, "muse_glimmer_sp_mask");
+        ggml_set_input(sp_mask);
+
+        // if flash attn is used, pad the mask and cast to f16 (same as build_qwen2vl)
+        if (ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
+            int n_pad = GGML_PAD(sp_mask->ne[1], GGML_KQ_MASK_PAD) - sp_mask->ne[1];
+            if (n_pad > 0) {
+                sp_mask = ggml_pad(ctx0, sp_mask, 0, n_pad, 0, 0);
+            }
+            sp_mask = ggml_cast(ctx0, sp_mask, GGML_TYPE_F16);
+        }
+
+        // patchify (conv2d over raw pixels) + bilinear-resized learned pos-emb
+        // (plain bilinear, NO align-corners — matches the reference)
+        ggml_tensor * cur = build_inp();
+        cur = ggml_add(ctx0, cur, resize_position_embeddings((uint32_t) GGML_SCALE_MODE_BILINEAR));
+        cb(cur, "after_posemb", -1);
+
+        // group patches into windows (sparse-attention order)
+        cur = ggml_get_rows(ctx0, cur, sp_perm);
+        cb(cur, "after_sp_perm", -1);
+
+        ggml_tensor * inpL = cur;
+
+        // pre-layernorm
+        if (model.pre_ln_w) {
+            inpL = build_norm(inpL, model.pre_ln_w, model.pre_ln_b, NORM_TYPE_NORMAL, eps, -1);
+        }
+
+        for (int il = 0; il < n_layer; il++) {
+            auto & layer = model.layers[il];
+            // every sf-th layer and the last layer attend globally; the rest see the window mask
+            const bool is_global = (il == n_layer - 1) || ((il + 1) % sf == 0);
+
+            cur = inpL;
+
+            cur = build_norm(cur, layer.ln_1_w, layer.ln_1_b, NORM_TYPE_NORMAL, eps, il);
+            cb(cur, "ln1", il);
+
+            // self-attention with 2D RoPE (first half of head dim = W position, second half = H)
+            {
+                ggml_tensor * Qcur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.q_w, cur), layer.q_b);
+                ggml_tensor * Kcur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.k_w, cur), layer.k_b);
+                ggml_tensor * Vcur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.v_w, cur), layer.v_b);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_tok);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_tok);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_tok);
+
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = build_rope_2d(ctx0, Qcur, pos_w, pos_h, rope_base, false);
+                Kcur = build_rope_2d(ctx0, Kcur, pos_w, pos_h, rope_base, false);
+
+                cb(Qcur, "Qcur_rope", il);
+                cb(Kcur, "Kcur_rope", il);
+
+                ggml_tensor * attn_mask = is_global ? nullptr : sp_mask;
+
+                cur = build_attn(layer.o_w, layer.o_b,
+                    Qcur, Kcur, Vcur, attn_mask, kq_scale, il);
+                cb(cur, "attn_out", il);
+            }
+
+            // residual 1
+            cur = ggml_add(ctx0, cur, inpL);
+            inpL = cur;
+            cb(cur, "ffn_inp", il);
+
+            cur = build_norm(cur, layer.ln_2_w, layer.ln_2_b, NORM_TYPE_NORMAL, eps, il);
+            cb(cur, "ffn_inp_normed", il);
+
+            // ffn (exact/erf GELU in the reference)
+            cur = build_ffn(cur,
+                layer.ff_up_w, layer.ff_up_b,
+                layer.ff_gate_w, layer.ff_gate_b,
+                layer.ff_down_w, layer.ff_down_b,
+                FFN_GELU_ERF, il);
+            cb(cur, "ffn_out", il);
+
+            // residual 2
+            cur = ggml_add(ctx0, inpL, cur);
+            cb(cur, "layer_out", il);
+
+            inpL = cur;
+        }
+
+        // post-layernorm
+        if (model.post_ln_w) {
+            inpL = build_norm(inpL, model.post_ln_w, model.post_ln_b, NORM_TYPE_NORMAL, eps, n_layer);
+        }
+
+        // un-permute back to the original grid order
+        cur = ggml_get_rows(ctx0, inpL, inv_perm);
+        cb(cur, "after_inv_perm", -1);
+
+        // pixel-shuffle downsample: gather ds*ds spatial neighbours, then concat channel-outer
+        // out[c*(ds*ds)+s, o] = cur[ds_perm gathered][o*(ds*ds)+s, c]
+        cur = ggml_get_rows(ctx0, cur, ds_perm);
+        cur = ggml_reshape_3d(ctx0, cur, n_embd, ds * ds, n_out); // [c, s, o]
+        cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);                // [s, c, o]
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_reshape_2d(ctx0, cur, n_embd * ds * ds, n_out);
+        cb(cur, "encoder_out", -1);
+
+        // 3-linear adapter (erf GELU between), the last linear lands on the LLM residual dim
+        cur = ggml_mul_mat(ctx0, model.mm_0_w, cur);
+        cur = ggml_gelu_erf(ctx0, cur);
+        cur = ggml_mul_mat(ctx0, model.mm_1_w, cur);
+        cur = ggml_gelu_erf(ctx0, cur);
+        cur = ggml_mul_mat(ctx0, model.mm_2_w, cur);
+        cb(cur, "projected", -1);
+
+        ggml_build_forward_expand(gf, cur);
+        LOG_INF("%s: graph nodes = %d, n_tok = %d, n_out = %d\n", __func__, ggml_graph_n_nodes(gf), n_tok, n_out);
         return gf;
     }
 
@@ -2878,6 +3036,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 res = graph.build_qwen3vl();
             } break;
+        case PROJECTOR_TYPE_MUSE_GLIMMER:
+            {
+                res = graph.build_muse_glimmer();
+            } break;
         case PROJECTOR_TYPE_GEMMA4V:
             {
                 res = graph.build_gemma4();
@@ -3242,6 +3404,15 @@ struct clip_model_loader {
                             LOG_WRN("%s: more info: https://github.com/ggml-org/llama.cpp/issues/16842\n\n", __func__);
                         }
                     } break;
+                case PROJECTOR_TYPE_MUSE_GLIMMER:
+                    {
+                        hparams.n_merge = 2; // pixel-shuffle downsample after the ViT
+                        hparams.rope_theta = 10000.0f;
+                        hparams.muse_glimmer_sparse_factor = 4; // 3 sparse layers + 1 global, repeating
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        hparams.set_limit_image_tokens(1, 4096);
+                        hparams.set_warmup_n_tokens(32*32);
+                    } break;
                 case PROJECTOR_TYPE_GEMMA4V:
                     {
                         hparams.rope_theta = 100.0f;
@@ -3576,6 +3747,13 @@ struct clip_model_loader {
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_MUSE_GLIMMER:
+                {
+                    // 3-linear MLP: fc -> erf-GELU -> proj -> erf-GELU -> vision_proj (LLM residual dim)
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                 } break;
             case PROJECTOR_TYPE_GEMMA3:
                 {
@@ -4722,6 +4900,46 @@ private:
 
 // returns the normalized float tensor for llava-1.5, for spatial_unpad with anyres processing for llava-1.6 it returns the normalized image patch tensors as a vector
 // res_imgs memory is being allocated here, previous allocations will be freed if found
+// muse-glimmer: replicates transformers' get_aspect_ratio_preserving_size — pick the patch grid
+// (from the floor/ceil candidates under the token cap) that best preserves the aspect ratio
+static clip_image_size muse_glimmer_grid_size(int img_w, int img_h, int patch_hw, int max_tokens) {
+    double i_nph = (double) img_h / patch_hw;
+    double i_npw = (double) img_w / patch_hw;
+    const double ratio = i_nph > 0.0 ? i_npw / i_nph : 1.0;
+    if (i_nph * i_npw > (double) max_tokens) {
+        i_nph = std::sqrt((double) max_tokens / ratio);
+        i_npw = i_nph * ratio;
+    }
+    const int hs[2] = { (int) std::floor(i_nph), (int) std::ceil(i_nph) };
+    const int ws[2] = { (int) std::floor(i_npw), (int) std::ceil(i_npw) };
+    const double target_ar = (double) img_h / (double) img_w;
+    int    best_nph = -1;
+    int    best_npw = -1;
+    double best_d   = 0.0;
+    for (int a = 0; a < 2; ++a) {
+        for (int b = 0; b < 2; ++b) {
+            const int nph = hs[a];
+            const int npw = ws[b];
+            if (nph < 1 || npw < 1 || nph * npw > max_tokens) {
+                continue;
+            }
+            const double d = std::fabs((double) nph / (double) npw - target_ar);
+            const int n_tokens      = nph * npw;
+            const int best_n_tokens = best_nph * best_npw;
+            if (best_nph < 0 || d < best_d || (d == best_d && n_tokens > best_n_tokens)) {
+                best_nph = nph;
+                best_npw = npw;
+                best_d   = d;
+            }
+        }
+    }
+    if (best_nph < 0) { // no candidate fit under the cap: round and clamp
+        best_nph = std::max(1, (int) std::lround(i_nph));
+        best_npw = std::max(1, (int) std::lround(i_npw));
+    }
+    return clip_image_size{ best_npw * patch_hw, best_nph * patch_hw };
+}
+
 bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, struct clip_image_f32_batch * res_imgs) {
     clip_image_size original_size{img->nx, img->ny};
     auto & params = ctx->model.hparams;
@@ -4768,6 +4986,27 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 // clip_image_f32_ptr res(clip_image_f32_init());
                 normalize_image_u8_to_f32(resized, *img_f32, params.image_mean, params.image_std);
                 // res_imgs->data[0] = *res;
+                res_imgs->entries.push_back(std::move(img_f32));
+            } break;
+
+        case PROJECTOR_TYPE_MUSE_GLIMMER:
+            {
+                // aspect-ratio-preserving grid under the token cap, then a direct stretch
+                // resize (no padding) — the HF reference resamples with PIL (Lanczos); our
+                // img_tool has no Lanczos, bicubic (stbir Catmull-Rom) is the closest
+                GGML_ASSERT(params.image_max_pixels > 0);
+                const int cur_merge  = params.n_merge == 0 ? 1 : params.n_merge;
+                const int patch_hw   = params.patch_size * cur_merge;
+                const int patch_area = patch_hw * patch_hw;
+                const int max_tokens = params.image_max_pixels / patch_area;
+                const clip_image_size target = muse_glimmer_grid_size(
+                    original_size.width, original_size.height, patch_hw, max_tokens);
+                clip_image_u8 resized;
+                img_tool::resize(*img, resized, target,
+                        pxa_mtmd_stbir_enabled() ? img_tool::RESIZE_ALGO_BICUBIC
+                                                 : img_tool::RESIZE_ALGO_BILINEAR, false);
+                clip_image_f32_ptr img_f32(clip_image_f32_init());
+                normalize_image_u8_to_f32(resized, *img_f32, params.image_mean, params.image_std);
                 res_imgs->entries.push_back(std::move(img_f32));
             } break;
 
@@ -5012,7 +5251,7 @@ const char * clip_patch_merge_type(const struct clip_ctx * ctx) {
 int clip_n_output_tokens_x(const struct clip_ctx * ctx, struct clip_image_f32 * img) {
     const auto & params = ctx->model.hparams;
     const int n_total = clip_n_output_tokens(ctx, img);
-    if (ctx->proj_type() == PROJECTOR_TYPE_QWEN2VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN25VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL) {
+    if (ctx->proj_type() == PROJECTOR_TYPE_QWEN2VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN25VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL || ctx->proj_type() == PROJECTOR_TYPE_MUSE_GLIMMER) {
         return img->nx / (params.patch_size * 2);
     }
     return n_total;
@@ -5020,7 +5259,7 @@ int clip_n_output_tokens_x(const struct clip_ctx * ctx, struct clip_image_f32 * 
 
 int clip_n_output_tokens_y(const struct clip_ctx * ctx, struct clip_image_f32 * img) {
     const auto & params = ctx->model.hparams;
-    if (ctx->proj_type() == PROJECTOR_TYPE_QWEN2VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN25VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL) {
+    if (ctx->proj_type() == PROJECTOR_TYPE_QWEN2VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN25VL || ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL || ctx->proj_type() == PROJECTOR_TYPE_MUSE_GLIMMER) {
         return img->ny / (params.patch_size * 2);
     }
     return 1;
@@ -5078,8 +5317,9 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
-                // dynamic size (2 conv, so double patch size)
+                // dynamic size (qwen: 2 conv, so double patch size; muse: 2x2 pixel-shuffle)
                 int x_patch = img->nx / (params.patch_size * 2);
                 int y_patch = img->ny / (params.patch_size * 2);
                 n_patches = x_patch * y_patch;
@@ -5507,6 +5747,72 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
                 set_input_i32("positions", positions);
             } break;
+        case PROJECTOR_TYPE_MUSE_GLIMMER:
+            {
+                // transplanted VERBATIM from the reference implementation — a wrong permutation
+                // here loads fine and silently emits garbage
+                const int grid_w = pos_w;            // image_size_width  / patch_size
+                const int grid_h = pos_h;            // image_size_height / patch_size
+                const int n_tok  = grid_w * grid_h;
+                const int pgrid  = (int) std::sqrt((double) model.position_embeddings->ne[1]); // 32
+                const int f      = hparams.n_merge;  // downsample 2
+
+                // pixel patchify runs inside the graph via build_inp() (ggml_conv_2d);
+                // pos-emb bilinear interp via resize_position_embeddings().
+
+                // --- sparse window grouping (pgrid x pgrid windows) ---
+                const int win = pgrid;
+                const int nwin_h = (grid_h + win - 1) / win;
+                const int nwin_w = (grid_w + win - 1) / win;
+                std::vector<int32_t> sp_perm; sp_perm.reserve(n_tok);
+                std::vector<int>     sp_slens;
+                for (int wy = 0; wy < nwin_h; wy++) {
+                    for (int wx = 0; wx < nwin_w; wx++) {
+                        int cnt = 0;
+                        for (int hh = 0; hh < win; hh++) {
+                            for (int ww = 0; ww < win; ww++) {
+                                const int gy = wy * win + hh;
+                                const int gx = wx * win + ww;
+                                if (gy < grid_h && gx < grid_w) { sp_perm.push_back(gy * grid_w + gx); cnt++; }
+                            }
+                        }
+                        if (cnt > 0) sp_slens.push_back(cnt);
+                    }
+                }
+                std::vector<int32_t> rpos_w(n_tok), rpos_h(n_tok), inv_perm(n_tok);
+                for (int i = 0; i < n_tok; i++) {
+                    const int orig = sp_perm[i];
+                    rpos_w[i] = (orig % grid_w) + 1; // 1-indexed
+                    rpos_h[i] = (orig / grid_w) + 1;
+                    inv_perm[orig] = i;
+                }
+                set_input_i32("muse_glimmer_sp_perm",  sp_perm);
+                set_input_i32("muse_glimmer_inv_perm", inv_perm);
+                set_input_i32("muse_glimmer_pos_w",    rpos_w);
+                set_input_i32("muse_glimmer_pos_h",    rpos_h);
+
+                // block-diagonal window mask (permuted order)
+                std::vector<float> sp_mask((size_t) n_tok * n_tok, -INFINITY);
+                {
+                    int off = 0;
+                    for (int s : sp_slens) {
+                        for (int a = 0; a < s; a++)
+                            for (int b = 0; b < s; b++)
+                                sp_mask[(size_t) (off + a) * n_tok + (off + b)] = 0.0f;
+                        off += s;
+                    }
+                }
+                set_input_f32("muse_glimmer_sp_mask", sp_mask);
+
+                // pixel-shuffle gather (original order): f*f spatial neighbours grouped
+                std::vector<int32_t> dsp; dsp.reserve(n_tok);
+                for (int oy = 0; oy < grid_h / f; oy++)
+                    for (int ox = 0; ox < grid_w / f; ox++)
+                        for (int ry = 0; ry < f; ry++)
+                            for (int rx = 0; rx < f; rx++)
+                                dsp.push_back((oy * f + ry) * grid_w + (ox * f + rx));
+                set_input_i32("muse_glimmer_ds_perm", dsp);
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
@@ -5651,6 +5957,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN3VL:
             // main path + deepstack paths
             return ctx->model.mm_1_b->ne[0] * (1 + ctx->model.n_deepstack_layers);
+        case PROJECTOR_TYPE_MUSE_GLIMMER:
+            return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_GEMMA3:
             return ctx->model.mm_input_proj_w->ne[0];
         case PROJECTOR_TYPE_GEMMA4V:
