@@ -74,24 +74,54 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int32_t n_swa = KQV->op_params[4];
 
     ggml_tensor local_dst, Kl, Vl, Ml;
+    // PXA_NANFIX_SWA_SLICE (2026-08-16): the windowed SWA slice below assumed KV-cache cell
+    // INDEX order matches POSITION order, so that the last pad(max(ntokens,256)+n_swa) cells of
+    // the unified cache contain every in-window cell. That holds only for a single sequence laid
+    // down into an empty cache. With np>1 or any slot reuse, a request's cells can sit at LOW
+    // cell indices while another sequence's long state raises K->ne[1]; once
+    // first = K->ne[1] - nton > 0 the slice cuts the query's own cells OUT of the view, every
+    // sliced mask row is all -inf, and the fully-masked flash-attention output is NaN -> ALL
+    // logits non-finite (the Alina NaN cascade). Lab repro: any truncating-reuse/short decode
+    // while any sequence holds more than n_swa+256 cells; single-ubatch vs multi-ubatch and
+    // n_ctx are irrelevant. The slice is therefore DISABLED by default; PXA_FA_SWA_SLICE=1
+    // restores the old behavior for single-sequence benchmarking only.
+    // In its place op_params[4] now KEEPS n_swa (it used to be zeroed here in all cases), so the
+    // kernels' mask-driven KV_min_max scan — which reads the actual mask and is correct for any
+    // cell layout — bounds the KV iteration for SWA decode instead. PXA_FA_SWA_KEEP=0 zeroes it
+    // again (old dispatch behavior, full-range iteration) as a fallback lever.
     if (n_swa > 0) {
-        int ntokens = std::max(FATTN_KQ_STRIDE, int(Q->ne[1]));
-        int nton = FATTN_KQ_STRIDE*((ntokens + n_swa + FATTN_KQ_STRIDE - 1)/FATTN_KQ_STRIDE);
-        int first = K->ne[1] - nton;
-        local_dst = *dst;
-        local_dst.op_params[4] = 0;
-        if (first > 0) { // PXA: windowed SWA slice RE-ENABLED (tile nb31 stride fix makes it correct + fast)
+        static const bool pxa_swa_slice_on = []() {
+            const char * e = getenv("PXA_FA_SWA_SLICE");
+            return e && e[0] == '1';
+        }();
+        static const bool pxa_swa_keep_on = []() {
+            const char * e = getenv("PXA_FA_SWA_KEEP");
+            return !(e && e[0] == '0');
+        }();
+        if (pxa_swa_slice_on) {
+            int ntokens = std::max(FATTN_KQ_STRIDE, int(Q->ne[1]));
+            int nton = FATTN_KQ_STRIDE*((ntokens + n_swa + FATTN_KQ_STRIDE - 1)/FATTN_KQ_STRIDE);
+            int first = K->ne[1] - nton;
             local_dst = *dst;
-            Kl = *K; Kl.ne[1] = nton; Kl.data = (char *)K->data + K->nb[1]*first;
-            Vl = *V; Vl.ne[1] = nton; Vl.data = (char *)V->data + V->nb[1]*first;
-            Ml = *mask; Ml.ne[0] = nton; Ml.data = (char *)mask->data + mask->nb[0]*first;
-            local_dst.src[1] = &Kl;
-            local_dst.src[2] = &Vl;
-            local_dst.src[3] = &Ml;
+            local_dst.op_params[4] = 0;
+            if (first > 0) { // UNSOUND with np>1 / slot reuse — see PXA_NANFIX_SWA_SLICE above
+                local_dst = *dst;
+                Kl = *K; Kl.ne[1] = nton; Kl.data = (char *)K->data + K->nb[1]*first;
+                Vl = *V; Vl.ne[1] = nton; Vl.data = (char *)V->data + V->nb[1]*first;
+                Ml = *mask; Ml.ne[0] = nton; Ml.data = (char *)mask->data + mask->nb[0]*first;
+                local_dst.src[1] = &Kl;
+                local_dst.src[2] = &Vl;
+                local_dst.src[3] = &Ml;
+                local_dst.op_params[4] = 0;
+                dst = &local_dst;
+            }
+            dst = &local_dst;
+        } else if (!pxa_swa_keep_on) {
+            local_dst = *dst;
             local_dst.op_params[4] = 0;
             dst = &local_dst;
         }
-        dst = &local_dst;
+        // else: dst untouched — n_swa flows through to the mask-driven KV_min_max scan.
     }
 
     // On AMD the tile kernels perform poorly, use the vec kernel instead:
