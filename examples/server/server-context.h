@@ -62,6 +62,7 @@ struct server_slot {
     int32_t n_remaining = -1;
     int32_t n_discarded_prompt = 0;
     int32_t n_kept_prompt = 0;
+    int32_t n_softfail_consecutive = 0; // PXA_SOFTFAIL_BREAKER_v1
 
     int32_t i_batch = -1;
     int32_t n_predict = -1; // TODO: disambiguate from params.n_predict

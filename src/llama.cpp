@@ -11259,6 +11259,23 @@ llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_
     return llama_sample_token_with_rng_impl(&ctx->sampling, candidates, rng);
 }
 
+// PXA_SOFTFAIL_BREAKER_v1: expose whether the most recent rng token-sample degraded to the
+// unsampleable-distribution fallback, so the server can bound a degenerate request per-slot.
+bool llama_get_last_sample_softfailed(struct llama_context * ctx) {
+    // Read-AND-CLEAR: only the temp>0 rng path clears the flag at entry; greedy (temp==0),
+    // temp<0, mirostat and adaptive-p paths do not touch it. Without clearing on read, one
+    // softfail would leave the flag stale-true and falsely accumulate consecutive counts on
+    // healthy slots using those paths. The server reads once per sampled token, so clear here.
+    const bool v = ctx->sampling.last_softfailed;
+    ctx->sampling.last_softfailed = false;
+    return v;
+}
+
+// PXA_SWA_TRUNCATE_GUARD_v1: sliding-window attention size (0 on non-SWA arches).
+uint32_t llama_model_n_swa(const struct llama_model * model) {
+    return model->hparams.n_swa;
+}
+
 llama_token llama_sample_token(struct llama_context * ctx, llama_token_data_array * candidates) {
     return llama_sample_token_with_rng_impl(&ctx->sampling, candidates, ctx->sampling.rng);
 }

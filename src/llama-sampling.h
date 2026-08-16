@@ -12,6 +12,11 @@ struct llama_sampling {
     mutable int64_t t_sample_us = 0;
     mutable int32_t n_sample = 0;
 
+    // PXA_SOFTFAIL_BREAKER_v1: transient flag, set true when the most recent rng token-sample
+    // degraded to the unsampleable-distribution fallback (all-non-finite logits). Reset at the
+    // top of every rng sample; read by the server immediately after each synchronous slot sample.
+    mutable bool last_softfailed = false;
+
     void reset_timings() const {
         t_sample_us = 0;
         n_sample = 0;

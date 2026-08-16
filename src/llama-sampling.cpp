@@ -720,6 +720,13 @@ llama_token llama_sample_token_greedy_impl(struct llama_sampling * smpl, llama_t
 
     llama_token result = max_iter->id;
     if (smpl) {
+        // PXA_SOFTFAIL_BREAKER_v1: greedy has no fallback path — with all-non-finite logits
+        // max_element silently returns a garbage token. Surface it so the server breaker
+        // can bound the degenerate request just like on the rng path.
+        smpl->last_softfailed = !std::isfinite(max_iter->logit);
+        if (smpl->last_softfailed) {
+            LLAMA_LOG_ERROR("PXA_SAMPLE_SOFTFAIL_v1: greedy argmax logit is non-finite — token %d unreliable\n", (int) result);
+        }
         smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
         smpl->n_sample++;
     }
@@ -730,6 +737,7 @@ llama_token llama_sample_token_with_rng_impl(struct llama_sampling * smpl, llama
     GGML_ASSERT(smpl);
 
     const int64_t t_start_sample_us = ggml_time_us();
+    smpl->last_softfailed = false; // PXA_SOFTFAIL_BREAKER_v1
 
     if (candidates->size < 2) {
         smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
@@ -788,6 +796,7 @@ llama_token llama_sample_token_with_rng_impl(struct llama_sampling * smpl, llama
             LLAMA_LOG_ERROR("\n\nCrashing now (PXA_SAMPLE_ABORT=1)\n");
             GGML_ABORT("Fatal error");
         }
+        smpl->last_softfailed = true; // PXA_SOFTFAIL_BREAKER_v1: surface the unsampleable fallback
         int best = -1;
         float best_logit = -std::numeric_limits<float>::infinity();
         for (int j = 0; j < (int) candidates->size; ++j) {

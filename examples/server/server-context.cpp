@@ -695,6 +695,7 @@ void server_slot::reset() {
     stopped_word = false;
     stopped_limit = false;
     stopping_word = "";
+    n_softfail_consecutive = 0; // PXA_SOFTFAIL_BREAKER_v1
     n_past = 0;
     n_past_prompt = 0;
     n_discarded_prompt = 0;
@@ -2347,6 +2348,17 @@ bool server_context::has_next_token(const completion_token_output& result,  serv
     if (slot.n_decoded > 0 && !slot.has_budget(params_base)) {
         next = false;
     }
+    // PXA_SOFTFAIL_BREAKER_v1 (keep in sync with process_token)
+    {
+        static const int32_t softfail_max_consec = []() {
+            const char * e = getenv("PXA_SOFTFAIL_MAX_CONSEC");
+            const int v = e ? atoi(e) : 16;
+            return v > 0 ? v : 16;
+        }();
+        if (slot.n_softfail_consecutive >= softfail_max_consec) {
+            next = false;
+        }
+    }
     if (llama_token_is_eog(model, result.tok)) {
         next = false;
     }
@@ -2427,6 +2439,28 @@ bool server_context::process_token(completion_token_output& result, server_slot&
             {"n_decoded", slot.n_decoded},
             {"n_predict", slot.params.n_predict},
             });
+    }
+
+    // PXA_SOFTFAIL_BREAKER_v1: stop a generation stuck emitting the unsampleable-fallback token
+    // before it runs to the context limit and starves co-resident slots under -sm layer. The
+    // sampler surfaces the event per token; the count is maintained per slot at the sample site.
+    {
+        static const int32_t softfail_max_consec = []() {
+            const char * e = getenv("PXA_SOFTFAIL_MAX_CONSEC");
+            const int v = e ? atoi(e) : 16;
+            return v > 0 ? v : 16;
+        }();
+        if (slot.has_next_token && slot.n_softfail_consecutive >= softfail_max_consec) {
+            slot.truncated = true;
+            slot.stopped_limit = true;
+            slot.has_next_token = false;
+            LOG_WARNING("PXA_SOFTFAIL_BREAKER: stopping degenerate generation", {
+                { "id_slot", slot.id },
+                { "id_task", slot.id_task },
+                { "n_softfail_consecutive", slot.n_softfail_consecutive },
+                { "n_decoded", slot.n_decoded },
+            });
+        }
     }
 
     if (llama_token_is_eog(model, result.tok)) {
@@ -4437,6 +4471,47 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past_prompt = prefix.second;
                             slot.n_past_offset = slot.n_past_prompt - slot.n_past;
 
+                            // PXA_SWA_TRUNCATE_GUARD_v1 (2026-08-16): on a masked-SWA arch, reusing
+                            // a small prefix of a much larger restored/cached state hands llama_decode
+                            // a KV state whose bookkeeping is inconsistent -> an all-non-finite logit
+                            // distribution on the very next decode (the Alina NaN cascade). -cram 0
+                            // and cache_prompt:false do NOT prevent it: the slot's own cache_tokens
+                            // feed the same near-total truncation. When the reuse would discard a
+                            // large fraction of a large cached state, force a clean full re-process
+                            // (upstream's own SWA answer, PR #13194). Pure continuation (n_past ==
+                            // cache size) never triggers, so the growing-conversation fast path is
+                            // preserved; the forced reprocess only re-decodes the shared prefix
+                            // (~chat template), since the diverging tail was going to be re-decoded
+                            // regardless. Thresholds are env-tunable for live sweeps without a rebuild.
+                            if (llama_model_n_swa(model) > 0 && !slot.cache_tokens.empty()) {
+                                const int32_t cache_sz  = (int32_t) slot.cache_tokens.size();
+                                const int32_t discarded = cache_sz - slot.n_past;
+                                static const int32_t swa_guard_min_discard = []() {
+                                    const char * e = getenv("PXA_SWA_TRUNCATE_MIN_DISCARD");
+                                    const int v = e ? atoi(e) : 256;
+                                    return v > 0 ? v : 256;
+                                }();
+                                static const double swa_guard_max_keep_frac = []() {
+                                    const char * e = getenv("PXA_SWA_TRUNCATE_MAX_KEEP_FRAC");
+                                    const double v = e ? atof(e) : 0.5;
+                                    return (v > 0.0 && v < 1.0) ? v : 0.5;
+                                }();
+                                if (discarded > swa_guard_min_discard &&
+                                    slot.n_past < (int32_t)(swa_guard_max_keep_frac * cache_sz)) {
+                                    LLAMA_LOG_WARN("PXA_SWA_TRUNCATE_GUARD: forcing full re-process "
+                                        "(cache=%d, keep=%d, discard=%d) to avoid restore-then-truncate NaN\n",
+                                        cache_sz, (int32_t) slot.n_past, discarded);
+                                    slot.n_past = 0;
+                                    slot.n_past_prompt = 0;
+                                    slot.n_past_offset = 0;
+                                    slot.n_discarded_prompt = 0;
+                                    slot.n_kept_prompt = 0;
+                                    slot.n_prompt_tokens_cache = 0;
+                                    slot.server_cached_prompt.checkpoints.clear();
+                                    common_sampler_reset(slot.ctx_sampling);
+                                }
+                            }
+
                             //if (slot.n_past != slot.n_past_prompt) {
                             //    LLAMA_LOG_INFO("Mistokenization found and handled successfully.\n");
                             //}
@@ -5573,6 +5648,17 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             try {
                 id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
                 common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+                // PXA_SOFTFAIL_BREAKER_v1: the sampler cannot end a request — on an all-non-finite
+                // (unsampleable) distribution it can only return a deterministic fallback token and
+                // let generation continue. With n_predict=-1 that degenerates into an unbounded run
+                // that fills the context, holds the slot, and under -sm layer starves every
+                // co-resident generation (the "healthy /health, HTTP=000" outage). Count consecutive
+                // fallbacks per slot; process_token stops the slot once the cap is reached.
+                if (llama_get_last_sample_softfailed(ctx)) {
+                    slot.n_softfail_consecutive++;
+                } else {
+                    slot.n_softfail_consecutive = 0;
+                }
             } catch (const std::exception & e) {
                 LOG_ERROR("sampling failed, releasing slot", {
                     {"id_slot", slot.id},

@@ -939,6 +939,13 @@ extern "C" {
         struct llama_context * ctx,
         llama_seq_id   seq_id);
 
+    // PXA_SOFTFAIL_BREAKER_v1: true if the most recent rng token-sample degraded to the
+    // unsampleable-distribution fallback (all-non-finite logits).
+    LLAMA_API bool llama_get_last_sample_softfailed(struct llama_context * ctx);
+
+    // PXA_SWA_TRUNCATE_GUARD_v1: sliding-window attention size (0 on non-SWA arches).
+    LLAMA_API uint32_t llama_model_n_swa(const struct llama_model * model);
+
     // Defragment the KV cache
     // This will be applied:
     //   - lazily on next llama_decode()
