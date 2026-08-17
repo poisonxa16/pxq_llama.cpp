@@ -929,3 +929,77 @@ Not applied — a context reduction is a capability trade for the owner, not a t
 - **`PXA_FA_GQA_PACK` can only ever take NH=2 on this cell.** The gate needs NH to divide both the
   head count (24) and the gqa_ratio (**6**); neither 4 nor 8 divides 6, so the record's NH=4/NH=8
   rows are unreproducible here in principle.
+
+## Updates — 2026-08-17 — the sm_60 FAST_FP16 carve-out: BUILT, MEASURED, REJECTED
+
+Upstream llama.cpp issue #25593 reports that on sm_60 an fp16 fast path truncates fp32 math, and
+that carving cc 600 out of `fast_fp16_available()` costs nothing. **Both halves of that fail here.**
+
+### What the gate actually controls in THIS tree (read this before touching it again)
+There are **two** sites, not three (`ggml/src/ggml-cuda/common.cuh:151` macro, `:207` function).
+The pattern `ggml_cuda_highest_compiled_arch(cc) != 600` that upstream discussions cite **does not
+exist in this fork.**
+- The `FAST_FP16_AVAILABLE` **macro** is consumed in only two places (`mmq.cuh:1207`,
+  `mmq_id_common.cuh:1624`) and both are the **Q2_K scale unpack** — irrelevant to PXQ-tier weights.
+- The `fast_fp16_available(cc)` **function** is the real gate: it picks the f16 vs f32 FA kernels.
+- **sm_60 decode is ALREADY fp32** via `pxq_use_sm60_vec_f32()` (`fattn.cu:41`, the PR #2144 port),
+  whose own comment says "Prefill and the D=256 vec path stay on vec_f16".
+  **=> the carve-out is a PREFILL-ONLY change on this fleet.** Gate it with a batched KL run; a
+  temp-0 generated-token run is the wrong instrument and would return a clean meaningless number.
+
+### Why it is a large REGRESSION here and not a free fix
+`fattn-tile-f32.cu` supports **only head sizes 64 and 128** (`..._is_supported` → `K->ne[0] == 64 ||
+== 128`). Both seats on this tree are **D=256**, so with the carve-out the `!fast_fp16_available`
+branch sends D=256 prefill to the **single-column `vec_f32`** kernel — precisely the route
+`PXA_FA_TILE256` exists to escape (its comment records that kernel at **52.7% of prefill GPU time**
+on a pre-Volta D=256 rig). Carving out 600 also makes `PXA_FA_MASK_SKIP_TILE` (default ON) a
+**phantom lever fleet-wide**, since sm_60 was the only arch still reaching tile-f16.
+
+**MEASURED (fill 8192, n=3/arm, interleaved repeated baselines, ON/OFF selected per-arm by swapping
+an archived `libggml.so` via `LD_LIBRARY_PATH`, so the arms are interleaved rather than split
+across a rebuild):**
+
+| cell | sm_60 share | baseline pf | carve-out pf | Δ prefill | Δ decode | pf band |
+|---|---|---|---|---|---|---|
+| single P100, 9B-class | 100% | 719.8 | 379.9 | **−47.2%** | no effect (inside 4.25% band) | 0.54% |
+| V100+P100, 27B-class | ~48% | 388.2 | 236.1 | **−39.2%** | no effect (inside 1.6% band) | 0.03% |
+
+Loss scales with sm_60 exposure — a coherence check on the mechanism. **Decode is untouched on both,
+because this tree already fixed sm_60 decode; the upstream "+1.4-1.5% token generation" gain is
+unreachable here for that same reason.** Engagement proof for a compile-time change with no banner:
+the effect itself, at 87x and 1300x the respective prefill bands.
+
+**Status: REJECTED, source reverted, nothing shipped.** The built artifact is archived off-tree at
+`<local-path>` (ONE-BUILD-POLICY: archive, don't fork) purely as
+evidence and as the reference binary for the quality run below.
+
+### The RIGHT fix, scoped but NOT built (do not re-derive this)
+A D=256 **tile-f32** variant will not fit: the f16 D=256 tile is already 43KB static smem at
+ncols=16 and the f32 staging arrays are twice as wide (~84KB) — over the 48KB/block limit. That is
+why the fallback goes to `vec_f32` by design.
+The tractable fix is the PR #2144 pattern applied to the **tile** kernel: in
+`flash_attn_tile_ext_f16` the staging arrays (`KV_tmp`, `Q_h2`) are **shared** and stay half2, while
+`kqmax` / `kqsum` / `VKQ` (`fattn-tile-f16.cu:87,92,94`, plus the rescale block at `:230-246`) are
+**register** accumulators in fp16. Promoting only those to float/float2 gives fp32 accumulation with
+**shared memory unchanged**, keeps D=256 prefill tiled, and keeps `PXA_FA_MASK_SKIP_TILE` alive.
+Cost is registers (VKQ 8 → 16 at D=256/ncols=16) under `__launch_bounds__(..., 1)` — must be
+occupancy-measured. Not attempted: it is a real kernel change in a tree two live seats boot from.
+
+### ⚠ QUALITY — and a warning about the `Same top token` threshold itself
+Batched KL, single-P100 cell, 40 chunks x 512 tok, reference = carve-out OFF (the shipped binary),
+corpus `<local-path>`, perplexity ignored:
+**Same top token 94.127 ± 0.233 %**, median KLD 0.004603, median Δp **0.000%**, mean Δp −0.073%.
+
+**This is statistically indistinguishable from the `PXA_P100_FP16_GEMM` figure (94.088 ± 0.234%,
+median KLD 0.004266) measured on the SAME cell and corpus** — despite being a completely different
+and independent code path (flash attention vs dense cuBLAS GEMM; neither gates the other).
+Two unrelated perturbations landing on the same number, with **median Δp exactly 0.000%**, points at
+**near-tie coin-flips in this model/corpus** rather than at either lever doing equal damage.
+**Consequence: ~94% appears to be the floor for ANY sm_60 numeric change on this cell — including
+the higher-precision one, since the carve-out arm IS the fp32 side and still scores 94.1%.**
+A gate that rejects the more-accurate implementation is measuring the wrong thing. Treat
+`Same top token` as a tripwire here, not a verdict, and **re-read the earlier "REJECT at 94.088%"
+for `PXA_P100_FP16_GEMM` in that light — it is probably overstated.**
+Confound in the 94.127% itself, stated plainly: the two arms differ by kernel (tiled vs
+single-column) as well as by precision, so summation-order noise is included; this **bounds** the
+fp16 leak from above rather than isolating it. Isolating it needs the surgical fix above.
