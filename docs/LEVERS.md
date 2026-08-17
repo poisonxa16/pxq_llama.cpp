@@ -1003,3 +1003,27 @@ for `PXA_P100_FP16_GEMM` in that light — it is probably overstated.**
 Confound in the 94.127% itself, stated plainly: the two arms differ by kernel (tiled vs
 single-column) as well as by precision, so summation-order noise is included; this **bounds** the
 fp16 leak from above rather than isolating it. Isolating it needs the surgical fix above.
+
+### ⚠ 2026-08-17 — `PXA_P100_FP16_GEMM=0` HANGS THE CHAT ENDPOINT on the single-P100 MTP seat
+Disarming this lever was applied to both seats on this tree and **reverted on the single-P100 seat
+the same night.** Measured cost of OFF was benign (−3.7% prefill there, −3.1% on the 2-card seat),
+but the cost was measured on `POST /completion` and the seats serve `POST /v1/chat/completions`:
+
+| endpoint | that seat with `PXA_P100_FP16_GEMM=0` |
+|---|---|
+| `/completion` | works, returns the expected answer |
+| `/v1/chat/completions` | **hangs, empty body**, while `/health` reports `{"status":"ok","slots_idle":2}` |
+
+The server loads clean (MTP context initialised, slots idle, no log errors) and simply never answers
+a chat request, so the keeper's gen-probe failed on every recreate and the keeper went into a
+**recreate loop**. Recreating without the env fixed it on the first try — causal, not correlated.
+VRAM contention and the binary were both ruled out.
+**The 2-card seat KEEPS the disarm and is fine** — it passes the same chat probe. Seat-specific.
+Untested hypothesis for the morning: that seat is the only one running **MTP**, and the chat path
+adds the jinja template + `reasoning_effort`; the dense-GEMM change plausibly interacts with
+draft/verify on a templated prompt. **Test on a bench container before ever re-applying.**
+
+**Standing lesson for this box, wider than this lever:** a lever can measure clean on `/completion`
+and still break the endpoint production uses. Benchmark harnesses here drive `/completion`; the
+seats serve `/v1/chat/completions`. **Treat a passing keeper `verify_seat` — not a passing
+benchmark — as the gate before any live config change.**
