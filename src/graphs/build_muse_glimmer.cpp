@@ -101,7 +101,18 @@ ggml_cgraph * llm_build_context::build_muse_glimmer() {
             // Suppress the hint when the layer is served by the sliding cache. Nothing is lost
             // correctness-wise (the mask still carries the window) and little is lost in work,
             // because that cache IS the window: there is no long tail left to skip.
-            const int n_swa_hint = (is_swa && !lctx.swa_kv_active) ? (int) hparams.n_swa : 0;
+            // 2026-08-17 (run10): the hint is passed again for sliding-cache layers. The reason
+            // it was suppressed -- the CPU iqk path slicing K/V/mask by INDEX -- is gone: that
+            // slice is now mask-driven (PXA_NANFIX_SWA_SLICE_CPU in iqk_flash_attn.cpp) and is
+            // correct for a floating/wrapping band. Passing it again restores the CUDA
+            // mask-driven KV_min_max bound that 16d5c1a8 deliberately kept, which the suppression
+            // had also switched off for these layers.
+            // PXA_SWA_HINT=0 restores the suppression without a rebuild, as a fallback lever.
+            static const bool pxa_swa_hint_on = []() {
+                const char * e = getenv("PXA_SWA_HINT");
+                return !(e && e[0] == '0');
+            }();
+            const int n_swa_hint = is_swa ? ((lctx.swa_kv_active && !pxa_swa_hint_on) ? 0 : (int) hparams.n_swa) : 0;
 
             cur = llm_build_kv(ctx0, lctx, kv_l, gf, nullptr, nullptr,
                     Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, khead_l, nkv_l, kq_scale, cb, il,
