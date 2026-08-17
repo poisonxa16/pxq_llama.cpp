@@ -188,16 +188,62 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
         GGML_ABORT("Fatal error");
     }
 
-    if (n_swa > 0 && mask) {
-        constexpr int kMinBatch = 256;
-        int ntokens = std::max(kMinBatch, neq1);
-        int nblock  = (ntokens + n_swa + kMinBatch - 1)/kMinBatch;
-        int first   = nek1 - nblock*kMinBatch;
-        if (first > 0) {
-            k = (const char *)k + int64_t(first)*stride_k;
-            v = (const char *)v + int64_t(first)*stride_v;
-            mask = (const uint16_t *)mask + first;
-            nek1 -= first;
+    // PXA_NANFIX_SWA_SLICE_CPU (2026-08-17): the windowed SWA slice is now MASK-DRIVEN.
+    //
+    // What was here before sliced K/V/mask to the LAST pad(max(neq1,256) + n_swa) cells BY INDEX:
+    //     int first = nek1 - kMinBatch*((max(neq1,256) + n_swa + kMinBatch - 1)/kMinBatch);
+    // That assumes KV-cache cell INDEX order equals POSITION order. It is the identical assumption
+    // commit 16d5c1a8 removed from the CUDA dispatch (ggml/src/ggml-cuda/fattn.cu) -- and did not
+    // remove here, so the CPU path kept carrying it. It holds only for a single sequence laid down
+    // into an empty cache and appended to in position order. Under np>1, slot reuse, or a
+    // window-sized cache whose live band floats and wraps, a query's own cells can sit BELOW
+    // `first`; the slice then drops every cell that query can see, the sliced mask row is all
+    // -inf, and the softmax denominator S is zero -- NaN flash-attention output and non-finite
+    // logits on CUDA, GGML_ASSERT(S > 0) in iqk_fa_templates.h on the CPU.
+    //
+    // Replacement mirrors what the CUDA kernels do (flash_attn_mask_to_KV_min_max in
+    // fattn-vec-common.cuh / fattn-mma-f16.cuh): derive the live band FROM THE MASK by walking
+    // 256-cell blocks inward from both ends and keeping the first and last block that is not
+    // all -inf across EVERY query row. A block masked for every row cannot contribute to any
+    // row's output, so dropping it is exactly value-preserving for any cell layout. n_swa no
+    // longer takes part in computing the bound; it only says "this is a windowed layer, the scan
+    // is worth doing".
+    //
+    // Cost: at most one pass over the mask (2 B per cell per row) against attention work of
+    // O(neq1*nek1*Dk) per head, i.e. well under 1% at Dk=128; decode (neq1 == 1 or 2) is trivial.
+    // Never larger than the mask read the kernel would itself do if nothing were sliced.
+    constexpr int kMinBatchSwa = 256;
+    if (n_swa > 0 && mask && nek1 > kMinBatchSwa && neq1 > 0) {
+        const uint16_t * umask = (const uint16_t *)mask;
+        const int  mrow = stride_m/(int)sizeof(uint16_t);
+        const int  nblk = (nek1 + kMinBatchSwa - 1)/kMinBatchSwa;
+        // A cell is VISIBLE unless its mask entry is +/-inf. Testing for inf rather than for
+        // "== 0" is the conservative direction: anything unexpected counts as visible and is
+        // kept, so a surprising mask encoding can never cause a live cell to be sliced away.
+        auto block_live = [&](int b) {
+            const int c0 = b*kMinBatchSwa;
+            const int c1 = std::min(nek1, c0 + kMinBatchSwa);
+            for (int j = 0; j < neq1; ++j) {
+                const uint16_t * row = umask + (size_t)j*mrow;
+                int any = 0;
+                for (int c = c0; c < c1; ++c) any |= ((row[c] & 0x7fffu) != 0x7c00u);
+                if (any) return true;
+            }
+            return false;
+        };
+        int blk_lo = 0;
+        while (blk_lo < nblk && !block_live(blk_lo)) ++blk_lo;
+        if (blk_lo < nblk) {   // blk_lo == nblk means every row is fully masked: slice nothing and
+            int blk_hi = nblk; // let the kernel take the same path it would have taken anyway.
+            while (blk_hi > blk_lo && !block_live(blk_hi - 1)) --blk_hi;
+            const int first = blk_lo*kMinBatchSwa;
+            const int last  = std::min(nek1, blk_hi*kMinBatchSwa);
+            if (first > 0 || last < nek1) {
+                k    = (const char *)k + int64_t(first)*stride_k;
+                v    = (const char *)v + int64_t(first)*stride_v;
+                mask = (const uint16_t *)mask + first;
+                nek1 = last - first;
+            }
         }
     }
 
