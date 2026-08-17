@@ -936,6 +936,78 @@ static void llama_kv_swa_evict(llama_context & lctx, const llama_batch & batch, 
     }
 }
 
+// Place a ubatch in the sliding cache.
+//
+// NOT the searching allocator kv_self uses. That one hunts for a contiguous run of free cells, and
+// for this cache it cannot find one: eviction is per sequence and by position threshold while
+// allocation interleaves sequences, so the free space ends up cut into runs one cell short of a
+// ubatch. Measured directly - `free=5122 max_contig_free=511` for a 512-token ubatch. More slack
+// does not fix a run-length cap.
+//
+// Instead allocate strictly in ring order. `head` only ever moves forward (wrapping), so the cells
+// AHEAD of head are exactly the cells written longest ago, which are exactly the first to fall out
+// of every window. Contiguity is then a property of the allocation order rather than something we
+// have to search for.
+//
+// This is a ring, and it is worth being precise about why it is not the ring that was ruled out.
+// The unsafe construction was mapping cell index to row modulo a window INSIDE the cache shared by
+// all layers, so two live cells whose indices differ by a multiple of the window landed on one row
+// and one sequence silently overwrote the other. Here the sliding cache has its own index space,
+// and a cell is reused only after it has been checked to be DEAD. If a target cell is still live we
+// refuse the decode loudly rather than overwrite it, so no two live cells can ever share a row.
+static bool llama_kv_swa_find_slot(llama_kv_cache & cache, const llama_batch & batch) {
+    const uint32_t n = batch.n_tokens;
+
+    if (n > cache.size) {
+        return false;
+    }
+
+    // step over the cells the previous ubatch wrote, so head lands just past them
+    uint32_t skipped = 0;
+    while (skipped < cache.size && cache.cells[cache.head].pos >= 0) {
+        cache.head = (cache.head + 1) % cache.size;
+        ++skipped;
+    }
+    if (skipped >= cache.size) {
+        return false; // every cell live: the cache is genuinely too small
+    }
+
+    // never split a ubatch across the wrap - the write path is a single view at one offset
+    if (cache.head + n > cache.size) {
+        cache.head = 0;
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        if (cache.cells[cache.head + i].pos >= 0) {
+            return false; // a still-live cell in the target range: refuse, never overwrite
+        }
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        cache.cells[cache.head + i].pos = batch.pos[i];
+        for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+            cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
+        }
+    }
+    cache.used += n;
+
+    return true;
+}
+
+// Undo a placement, so a failure later in the same decode cannot leave the two caches disagreeing
+// about which tokens exist.
+static void llama_kv_swa_release_slot(llama_kv_cache & cache, uint32_t head, uint32_t n) {
+    for (uint32_t i = 0; i < n && head + i < cache.size; ++i) {
+        auto & cell = cache.cells[head + i];
+        if (cell.pos >= 0) {
+            cell.pos = -1;
+            cell.delta = 0;
+            cell.seq_id.clear();
+            cache.used--;
+        }
+    }
+}
+
 // After a truncation, does the sliding cache still hold EVERY position the window can still read
 // for this sequence? If not, the sequence's SWA state is a hole, and continuing from it would
 // silently produce wrong tokens rather than a detectable failure.
@@ -5951,49 +6023,33 @@ static int llama_decode_internal(
                 kv_self.head = 0;
             }
 
-            if (!llama_kv_cache_find_slot(kv_self, u_batch)) {
-                return 1;
-            }
-
-            if (!kv_self.recurrent) {
-                // a heuristic, to avoid attending the full cache if it is not yet utilized
-                // after enough generations, the benefit from this heuristic disappears
-                // if we start defragmenting the cache, the benefit from this will be more important
-                const uint32_t pad = llama_kv_cache_get_padding(cparams);
-                auto max_cell = llama_kv_cache_cell_max(kv_self, pad);
-                kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell, pad)));
-            }
-
-            // PXA_SWA_KV: the sliding cache is allocated independently, in its own index space.
+            // PXA_SWA_KV: place the sliding cache FIRST. If it cannot take the ubatch we must not
+            // have already committed the tokens to kv_self - the two caches disagreeing about which
+            // tokens exist is far worse than a refused decode: the full-attention layers would hold
+            // cells the sliding layers never got, and a later query would find nothing visible in
+            // its window at all. That is precisely how a refused decode turned into
+            // GGML_ASSERT(S > 0) several requests later.
+            uint32_t swa_head_alloc = 0;
             if (lctx.swa_kv_active) {
                 auto & kv_swa = lctx.kv_swa;
 
                 // retire everything the window can no longer reach, then allocate
                 llama_kv_swa_evict(lctx, u_batch, lctx.swa_kv_guard);
 
-                if (kv_swa.head > kv_swa.used + 2*n_tokens) {
-                    kv_swa.head = 0;
-                }
-
-                if (!llama_kv_cache_find_slot(kv_swa, u_batch)) {
-                    // find_slot needs a CONTIGUOUS run. Two sequences decoding at different rates
-                    // can leave the freed cells interleaved, so a near-miss is possible even with
-                    // space available. Retry once having given up the guard band - that is still
-                    // the exact window bound, so it costs robustness against a later rewind (which
-                    // the coverage check catches) rather than correctness.
+                if (!llama_kv_swa_find_slot(kv_swa, u_batch)) {
+                    // Retry having given up the guard band. That is still the exact window bound,
+                    // so it costs tolerance of a later rewind (which the coverage check catches),
+                    // not correctness.
                     llama_kv_swa_evict(lctx, u_batch, 0);
-                    kv_swa.head = 0;
 
-                    if (!llama_kv_cache_find_slot(kv_swa, u_batch)) {
-                        // Hard, loud failure: the decode is refused. Never a silent overwrite.
+                    if (!llama_kv_swa_find_slot(kv_swa, u_batch)) {
                         LLAMA_LOG_ERROR("%s: PXA_SWA_KV: no slot in the sliding cache for %u tokens "
                                 "(size=%u used=%u head=%u)\n", __func__, n_tokens,
                                 kv_swa.size, kv_swa.used, kv_swa.head);
                         return 1;
                     }
-                    LLAMA_LOG_WARN("%s: PXA_SWA_KV: sliding cache needed a guard-band drop to place "
-                            "%u tokens (size=%u used=%u)\n", __func__, n_tokens, kv_swa.size, kv_swa.used);
                 }
+                swa_head_alloc = kv_swa.head;
 
                 const uint32_t pad = llama_kv_cache_get_padding(cparams);
                 // NOTE: the EXACT cell_max, not the padded sampling variant used for kv_self.
@@ -6007,6 +6063,23 @@ static int llama_decode_internal(
                 auto max_cell_swa = llama_kv_cache_cell_max(kv_swa);
                 kv_swa.n = std::min(kv_swa.size, std::max(pad, GGML_PAD(max_cell_swa, pad)));
             }
+
+            if (!llama_kv_cache_find_slot(kv_self, u_batch)) {
+                if (lctx.swa_kv_active) {
+                    llama_kv_swa_release_slot(lctx.kv_swa, swa_head_alloc, n_tokens);
+                }
+                return 1;
+            }
+
+            if (!kv_self.recurrent) {
+                // a heuristic, to avoid attending the full cache if it is not yet utilized
+                // after enough generations, the benefit from this heuristic disappears
+                // if we start defragmenting the cache, the benefit from this will be more important
+                const uint32_t pad = llama_kv_cache_get_padding(cparams);
+                auto max_cell = llama_kv_cache_cell_max(kv_self, pad);
+                kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell, pad)));
+            }
+
         }
 
 #if IK_PRINT_TIMING
