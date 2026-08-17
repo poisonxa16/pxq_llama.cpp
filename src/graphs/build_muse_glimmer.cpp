@@ -90,9 +90,22 @@ ggml_cgraph * llm_build_context::build_muse_glimmer() {
             const int32_t          nkv_l  = is_swa ? n_kv_swa    : n_kv;
             const int32_t          khead_l= is_swa ? kv_head_swa : kv_head;
 
+            //
+            // The n_swa passed to the attention op is a KERNEL HINT, and one of its consumers --
+            // the CPU iqk flash-attention path -- still slices K/V/mask to the LAST
+            // pad(n_tokens + n_swa) cells BY INDEX, which assumes cell-index order matches position
+            // order. That is the same assumption 16d5c1a8 removed from the CUDA path and did not
+            // remove here. It happens to hold for a cache that is appended to in position order; it
+            // does NOT hold for the sliding cache, whose live band floats and wraps, so the slice
+            // can drop every cell a query can see and leave an all -inf mask row.
+            // Suppress the hint when the layer is served by the sliding cache. Nothing is lost
+            // correctness-wise (the mask still carries the window) and little is lost in work,
+            // because that cache IS the window: there is no long tail left to skip.
+            const int n_swa_hint = (is_swa && !lctx.swa_kv_active) ? (int) hparams.n_swa : 0;
+
             cur = llm_build_kv(ctx0, lctx, kv_l, gf, nullptr, nullptr,
                     Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, khead_l, nkv_l, kq_scale, cb, il,
-                    nullptr, is_swa ? (int) hparams.n_swa : 0);
+                    nullptr, n_swa_hint);
             cb(cur, "attn_out", il);
 
             gate = ggml_sigmoid(ctx0, gate);
