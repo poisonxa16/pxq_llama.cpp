@@ -962,25 +962,34 @@ static bool llama_kv_swa_find_slot(llama_kv_cache & cache, const llama_batch & b
         return false;
     }
 
-    // step over the cells the previous ubatch wrote, so head lands just past them
-    uint32_t skipped = 0;
-    while (skipped < cache.size && cache.cells[cache.head].pos >= 0) {
-        cache.head = (cache.head + 1) % cache.size;
-        ++skipped;
-    }
-    if (skipped >= cache.size) {
-        return false; // every cell live: the cache is genuinely too small
-    }
-
-    // never split a ubatch across the wrap - the write path is a single view at one offset
-    if (cache.head + n > cache.size) {
-        cache.head = 0;
-    }
-
-    for (uint32_t i = 0; i < n; ++i) {
-        if (cache.cells[cache.head + i].pos >= 0) {
-            return false; // a still-live cell in the target range: refuse, never overwrite
+    // Ring-ordered scan for a run of n dead cells, starting from head and wrapping once.
+    //
+    // The scan must step OVER a live cell it meets inside the candidate range, not stop in front of
+    // it. An earlier version advanced only past a leading run of live cells and then required the
+    // next n to be free; when the cell immediately after a dead one was live it refused and head
+    // never moved, so the cache wedged at head=0 and refused even a 2-token ubatch with 7000 cells
+    // free. Stepping past the blocker is what makes the scan terminate at a real run.
+    uint32_t tested = 0;
+    while (true) {
+        if (cache.head + n > cache.size) {
+            // never split a ubatch across the wrap: the write path is one view at one offset
+            tested    += cache.size - cache.head;
+            cache.head = 0;
+            if (tested >= cache.size) return false;
+            continue;
         }
+
+        bool found = true;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (cache.cells[cache.head + i].pos >= 0) {
+                cache.head += i + 1;
+                tested     += i + 1;
+                found = false;
+                break;
+            }
+        }
+        if (found) break;
+        if (tested >= cache.size) return false;
     }
 
     for (uint32_t i = 0; i < n; ++i) {
