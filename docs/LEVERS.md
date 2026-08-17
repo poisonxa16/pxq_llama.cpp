@@ -868,3 +868,64 @@ the line the issue names.
 - CUDA graphs: already default for batch-1; upstream's headline is H100-class small models. Not our bottleneck.
 - NCCL tensor-parallel needs NVLink; our topology is **PHB on every pair** (`nvidia-smi topo -m`, all 7 GPUs). Consistent with our own record of `-sm graph` losing decode. Build already initialises NCCL communicators.
 - Community FA v2 WMMA for Pascal/Volta: <https://github.com/sirCamp/flash-attention-legacy> — a port, not a flag. Noted as a known option; NOT attempted.
+
+## Updates — 2026-08-17 — the reviewer seat on cards 2,0 measured for the first time
+
+This seat had **never been benchmarked**. Cell: build-srv, PXQ4 + vision, cards 2,0
+(dev0 = card 2 V100 sm_70, dev1 = card 0 P100 sm_60), `-ngl 99 -sm layer -ts 52,48 -c 131072
+-b/-ub 2048 -np 1 -fa on`, fill 8192, n_predict 128, 3 reps/arm, temp 0, fresh server per arm,
+`PXA_ENHANCE=1`, **3 interleaved repeated baselines**.
+
+Geometry from the startup ledger: `arch=qwen35, n_layer 65, n_head 24, n_head_kv 4 (gqa 6),
+n_embd_head_k = n_embd_head_v = 256, n_swa = 0`.
+
+**BASELINE = 388.8 t/s prefill / 21.90 t/s decode** (mean of the 3 interleaved baseline medians;
+baseline-to-baseline band **0.31% prefill / 0.10% decode**).
+
+⚠ **The previously circulated baseline for this seat (~395 pf / ~23.4 tg) does not reproduce on
+decode: 21.90 vs 23.4 is −6.4%, ~64x the baseline band.** Prefill agrees. Use 388.8 / 21.90.
+
+⚠ Within-arm rep spread on prefill is ~3% and it is **systematic, not random** — rep 1 is the
+slowest in every arm on this cell (cold effect). Medians of >=3 absorb it; a single-rep campaign
+on this seat is worthless.
+
+| arm | ts | ctx | prefill | decode | vs base pf | vs base tg | output |
+|---|---|---|---|---|---|---|---|
+| baseline (x3) | 52,48 | 131072 | 388.8 | 21.90 | — | — | sha `e60d5aa9…` |
+| `PXA_P100_FP16_GEMM=0` | 52,48 | 131072 | 376.7 | 21.83 | **−3.1%** | −0.3% | byte-identical |
+| **2-card push to V100** | **58,42** | **65536** | **432.0** | **23.00** | **+11.1%** | **+5.0%** | byte-identical |
+| ts 58,42 @ full ctx | 58,42 | 131072 | — | — | **OOM (real)** | | `cudaMalloc 884.62 MiB on device 0` |
+| ts 64,36 @ 65536 | 64,36 | 65536 | — | — | loads, **dies on first prefill** | | see caveat |
+
+### `PXA_P100_FP16_GEMM` costs this seat only −3.1% prefill — the banner's "+51%" is not this cell
+Engagement proven both ways (`PXA_AUTO: P100_FP16_GEMM=on` / `=off` in the two arms' ledgers).
+The startup banner advertises "+51% gpt-oss prefill measured" — **a different model**. On this
+seat turning the lever OFF costs **3.1% prefill and 0.3% decode**, ~16x smaller than the banner
+implies. Anyone reasoning about this lever from the banner is reasoning about someone else's cell.
+(Its fidelity cost is the separate 94.088% same-top-token reject already recorded above.)
+
+### Shifting layers onto the V100 wins here too, but full context is the price
+`-ts 58,42 @ ctx 65536` is **+11.1% prefill / +5.0% decode with byte-identical output** (3 reps
+x 128 tok) — same direction as the 3-card→2-card result on the other seat, smaller because this
+seat already starts V100-weighted at 52,48. **Cost: max context halves, 131072 → 65536.**
+Not applied — a context reduction is a capability trade for the owner, not a tuning change.
+
+### The `-ts` ceiling on this cell, and where it actually is
+- At **ctx 131072 the seat is already AT dev0's VRAM ceiling**: 58,42 OOMs for real
+  (`allocating 884.62 MiB on device 0: cudaMalloc failed`, exit 139) *after* the per-arm VRAM gate
+  confirmed both cards >=13000 MiB free — so it is a structural verdict, not the environment fault
+  that voided an earlier campaign on this box.
+- At ctx 65536, `64,36` **loads but cannot serve** — it dies on the first real prefill, i.e. the
+  weights fit and the compute buffer does not. ⚠ Not re-run clean after an earlier exit-139 arm,
+  so treat as probable-not-certain. Usable ceiling is **between 58 and 64**; 58,42 is the best
+  measured point and the true optimum was not found.
+
+### Nulls by construction on this seat — recorded so nobody re-chases them
+- **`PXA_FA_SWA_KEEP` is INERT here: `n_swa = 0`.** It cannot engage on this arch. (It remains the
+  +19% decode win on the sliding-window seat — that is a different arch, not a fleet-wide lever.)
+- **MTP is not armed and has no measured row for this arch** — the ledger prints
+  `PXA_AUTO: spec arch=qwen35 -> no measured row, speculation left off`. Any "−1.7% MTP here"
+  claim does not describe this seat as configured.
+- **`PXA_FA_GQA_PACK` can only ever take NH=2 on this cell.** The gate needs NH to divide both the
+  head count (24) and the gqa_ratio (**6**); neither 4 nor 8 divides 6, so the record's NH=4/NH=8
+  rows are unreproducible here in principle.
