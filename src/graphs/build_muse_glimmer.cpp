@@ -81,8 +81,17 @@ ggml_cgraph * llm_build_context::build_muse_glimmer() {
             }
 
             // SDPA with wo deferred: the gate applies between attn out and o_proj
-            cur = llm_build_kv(ctx0, lctx, kv_self, gf, nullptr, nullptr,
-                    Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv, kq_scale, cb, il,
+            //
+            // PXA_SWA_KV: the sliding layers read and write a SEPARATE cache object with its own
+            // cells/head/size — a distinct index space, not a remapping of this one. When the
+            // feature is off, kv_swa/n_kv_swa/kv_head_swa alias the unified cache and this is
+            // exactly the original call.
+            const llama_kv_cache & kv_l   = is_swa ? kv_swa      : kv_self;
+            const int32_t          nkv_l  = is_swa ? n_kv_swa    : n_kv;
+            const int32_t          khead_l= is_swa ? kv_head_swa : kv_head;
+
+            cur = llm_build_kv(ctx0, lctx, kv_l, gf, nullptr, nullptr,
+                    Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, khead_l, nkv_l, kq_scale, cb, il,
                     nullptr, is_swa ? (int) hparams.n_swa : 0);
             cb(cur, "attn_out", il);
 

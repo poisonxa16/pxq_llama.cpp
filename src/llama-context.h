@@ -244,6 +244,32 @@ struct llama_context {
     struct llama_cparams        cparams;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
+
+    // PXA_SWA_KV: interleaved-SWA KV allocation (opt-in, env PXA_SWA_KV=1).
+    //
+    // When armed, the model's sliding-window layers get their OWN cache object with its own
+    // cells/head/size/n/slot-allocator, sized to the attention window instead of the full context.
+    // kv_self then allocates K/V only for the full-attention layers and kv_swa only for the sliding
+    // ones (the other layers' k_l/v_l entries are nullptr in each). Two SEPARATE index spaces is the
+    // point: it removes the cell-index aliasing that a per-layer ring inside the single shared index
+    // space would introduce, rather than trying to mask it.
+    //
+    // swa_kv_active == false reproduces the original single-cache behaviour exactly.
+    bool                        swa_kv_active = false;
+    uint32_t                    swa_kv_guard  = 0; // eviction guard band, in positions
+    struct llama_kv_cache       kv_swa;
+
+    // true if layer il's K/V lives in kv_swa rather than kv_self
+    bool swa_kv_layer(int il) const;
+
+    // the cache that owns layer il
+    const struct llama_kv_cache & kv_for_layer(int il) const {
+        return swa_kv_layer(il) ? kv_swa : kv_self;
+    }
+    struct llama_kv_cache & kv_for_layer(int il) {
+        return swa_kv_layer(il) ? kv_swa : kv_self;
+    }
+
     struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 
@@ -322,6 +348,7 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
+    struct ggml_tensor * inp_K_shift_swa; // I32 [kv_swa.size]  (PXA_SWA_KV)
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;         // I32 [n_batch]
     struct ggml_tensor * inp_s_copy;      // I32 [kv_size]

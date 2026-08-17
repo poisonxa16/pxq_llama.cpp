@@ -44,6 +44,9 @@ struct llm_build_context {
     const llama_cparams  & cparams;
     const llama_batch    & batch;
     const llama_kv_cache & kv_self;
+    // PXA_SWA_KV: cache backing the sliding-window layers. Aliases kv_self when the feature is off,
+    // so every call site can use it unconditionally.
+    const llama_kv_cache & kv_swa;
 
     const int64_t n_embd;
     const int64_t n_layer;
@@ -72,6 +75,8 @@ struct llm_build_context {
     const int32_t n_outputs;
     const int32_t n_outputs_enc;
     const int32_t kv_head;  // index of where we store new KV data in the cache
+    const int32_t n_kv_swa;   // PXA_SWA_KV: same two quantities for the sliding cache
+    const int32_t kv_head_swa;
     const int32_t n_ctx_orig;
 
     const bool flash_attn;

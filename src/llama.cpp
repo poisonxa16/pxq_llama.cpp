@@ -563,6 +563,11 @@ struct llama_context::Prev {
     llama_mtp_op_type mtp_op_type;
     ggml_cgraph * graph;
     uint64_t seq_sig; // PXA_LLAMA_FIX_v1: signature of the per-token seq_id mapping baked into this graph
+    // PXA_SWA_KV: the sliding cache's extent is baked into the graph too (sliding mask width and the
+    // K/V view extent of every sliding layer). It moves independently of kv_self.n, so it is part of
+    // the reuse signature in its own right - otherwise a reused graph would be fed a mask built at a
+    // different width.
+    int n_kv_swa;
 };
 
 void llama_context::reset_scheduler() {
@@ -607,6 +612,7 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
         the_prev->per_step_max_allocated != kv_self.ckpt.per_step_max_allocated) return false;
     // PXA_LLAMA_FIX_v1: recurrent/hybrid graphs encode the per-token seq->state-row mapping; reuse only if unchanged.
     if ((llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch)) && pxa_seq_sig(u_batch) != the_prev->seq_sig) return false;
+    if (swa_kv_active && ((int) kv_swa.n != the_prev->n_kv_swa || kv_swa.head == 0)) return false;
     return u_batch.all_seq_id == the_prev->all_seq_id &&
            kv_self.head > 0 &&
            kv_self.n == the_prev->n_kv &&
@@ -646,15 +652,20 @@ bool llama_context::update_cache_copies() {
         return false;
     }
     for (int il = 0; il < n_layer; ++il) {
-        if (!layer_has_attention_kv(il) || kv_self.k_l[il] == nullptr) {
+        // PXA_SWA_KV: each layer's write offset comes from the head of the cache that OWNS it.
+        // kv_self and kv_swa advance independently, so a single global head is not enough here.
+        const llama_kv_cache & kvl = kv_for_layer(il);
+        const uint32_t kv_head_l = kvl.head;
+
+        if (!layer_has_attention_kv(il) || il >= (int) kvl.k_l.size() || kvl.k_l[il] == nullptr) {
             continue;
         }
-        auto kl = (ggml_split_tensor_t *)kv_self.k_l[il]->extra;
+        auto kl = (ggml_split_tensor_t *)kvl.k_l[il]->extra;
         if (kl) {
             GGML_ASSERT(model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN);
             GGML_ASSERT(model.splits.size() > 1);
-            auto vl = !kv_self.v_l.empty() && kv_self.v_l[il] ? (ggml_split_tensor_t *)kv_self.v_l[il]->extra : nullptr;
-            GGML_ASSERT(kl && (kv_self.v_l.empty() || !kv_self.v_l[il] || vl));
+            auto vl = !kvl.v_l.empty() && kvl.v_l[il] ? (ggml_split_tensor_t *)kvl.v_l[il]->extra : nullptr;
+            GGML_ASSERT(kl && (kvl.v_l.empty() || !kvl.v_l[il] || vl));
             if (vl) {
                 GGML_ASSERT(kl->n_device == vl->n_device);
             }
@@ -665,7 +676,7 @@ bool llama_context::update_cache_copies() {
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kl->splits[id]) {
                     return false;
                 }
-                c.cpy->view_offs = kv_self.head*c.step;
+                c.cpy->view_offs = kv_head_l*c.step;
                 c.cpy->src[1]->data = (char *)kl->splits[id]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
@@ -676,25 +687,25 @@ bool llama_context::update_cache_copies() {
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != vl->splits[id]) {
                     return false;
                 }
-                c.cpy->view_offs = kv_self.head*c.step;
+                c.cpy->view_offs = kv_head_l*c.step;
                 c.cpy->src[1]->data = (char *)vl->splits[id]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
         } else {
             auto& c = cache_copies[2*il+0];
-            if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.k_l[il]) {
+            if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kvl.k_l[il]) {
                 return false;
             }
-            c.cpy->view_offs = kv_self.head*c.step;
-            c.cpy->src[1]->data = (char *)kv_self.k_l[il]->data + c.cpy->view_offs;
+            c.cpy->view_offs = kv_head_l*c.step;
+            c.cpy->src[1]->data = (char *)kvl.k_l[il]->data + c.cpy->view_offs;
             c.cpy->data = c.cpy->src[1]->data;
-            if (!kv_self.v_l.empty() && kv_self.v_l[il]) {
+            if (!kvl.v_l.empty() && kvl.v_l[il]) {
                 auto& c = cache_copies[2*il+1];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.v_l[il]) {
+                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kvl.v_l[il]) {
                     return false;
                 }
-                c.cpy->view_offs = kv_self.head*c.step;
-                c.cpy->src[1]->data = (char *)kv_self.v_l[il]->data + c.cpy->view_offs;
+                c.cpy->view_offs = kv_head_l*c.step;
+                c.cpy->src[1]->data = (char *)kvl.v_l[il]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
         }
@@ -812,6 +823,133 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
 }
 
+//
+// PXA_SWA_KV — interleaved sliding-window KV allocation.
+//
+// The sliding-window layers keep their K/V in lctx.kv_swa, a SEPARATE cache object with its own
+// cells / head / size / n / slot allocator, sized to the attention window rather than the context.
+// The full-attention layers stay in lctx.kv_self. Because the two caches are separate INDEX SPACES,
+// a cell index in one has no relationship to a cell index in the other, and there is no modular
+// (ring) mapping anywhere: cell index still means "the physical row this token was written to" in
+// whichever cache owns the layer. That is what removes the np>1 aliasing failure mode structurally.
+//
+// What makes the small cache legal is EVICTION, not wrapping. See llama_kv_swa_evict.
+//
+
+bool llama_context::swa_kv_layer(int il) const {
+    if (!swa_kv_active) {
+        return false;
+    }
+    const auto & sl = model.hparams.swa_layers;
+    return il >= 0 && (size_t) il < sl.size() && sl[il];
+}
+
+// Highest position currently held by seq_id in `cache` (-1 if none).
+static llama_pos llama_kv_swa_seq_pos_max(const llama_kv_cache & cache, llama_seq_id seq_id) {
+    llama_pos res = -1;
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        if (cache.cells[i].pos >= 0 && cache.cells[i].has_seq_id(seq_id)) {
+            res = std::max(res, cache.cells[i].pos);
+        }
+    }
+    return res;
+}
+
+// Drop every cell that can never again be inside any sequence's attention window.
+//
+// Correctness argument (this is the whole safety case for a bounded cache, so it is spelled out):
+// the SWA mask masks cell c out for query position p exactly when `p - c.pos >= n_swa`. Every future
+// query for a sequence has p >= that sequence's current maximum position. So once
+// `pos_max[seq] - c.pos >= n_swa` holds, c is masked for that sequence for the rest of time. A cell
+// shared by several sequences is dropped only when that holds for ALL of them. Dropping at
+// `>= n_swa + guard` is therefore strictly conservative: it keeps `guard` positions more than the
+// window can ever read, which is what absorbs small backwards rewinds.
+//
+// This is a physical eviction of a cell, not a remapping of an index — the freed row is returned to
+// the same allocator that every other row comes from.
+static void llama_kv_swa_evict(llama_context & lctx, const llama_batch & batch) {
+    if (!lctx.swa_kv_active) {
+        return;
+    }
+
+    auto & cache = lctx.kv_swa;
+    const llama_pos n_keep = (llama_pos) lctx.model.hparams.n_swa + (llama_pos) lctx.swa_kv_guard;
+
+    // pos_max per sequence, taking the incoming ubatch into account: the batch positions are about
+    // to become live, so they must not be able to be evicted by their own arrival.
+    std::map<llama_seq_id, llama_pos> pos_max;
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        const auto & cell = cache.cells[i];
+        if (cell.pos < 0) continue;
+        for (auto s : cell.seq_id) {
+            auto it = pos_max.find(s);
+            if (it == pos_max.end() || it->second < cell.pos) pos_max[s] = cell.pos;
+        }
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+            const llama_seq_id s = batch.seq_id[i][j];
+            auto it = pos_max.find(s);
+            if (it == pos_max.end() || it->second < batch.pos[i]) pos_max[s] = batch.pos[i];
+        }
+    }
+
+    uint32_t new_head = cache.size;
+    uint32_t n_evicted = 0;
+
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        auto & cell = cache.cells[i];
+        if (cell.pos < 0 || cell.is_empty()) continue;
+
+        bool live = false;
+        for (auto s : cell.seq_id) {
+            auto it = pos_max.find(s);
+            // A sequence we have never seen a position for cannot be advanced past this cell.
+            if (it == pos_max.end() || it->second - cell.pos < n_keep) { live = true; break; }
+        }
+        if (live) continue;
+
+        cell.seq_id.clear();
+        cell.pos = -1;
+        cell.delta = 0;
+        cache.used--;
+        ++n_evicted;
+        if (new_head == cache.size) new_head = i;
+    }
+
+    if (n_evicted > 0 && new_head < cache.head) {
+        cache.head = new_head;
+    }
+}
+
+// After a truncation, does the sliding cache still hold EVERY position the window can still read
+// for this sequence? If not, the sequence's SWA state is a hole, and continuing from it would
+// silently produce wrong tokens rather than a detectable failure.
+static bool llama_kv_swa_coverage_ok(const llama_context & lctx, llama_seq_id seq_id) {
+    if (!lctx.swa_kv_active) {
+        return true;
+    }
+    const auto & cache = lctx.kv_swa;
+
+    const llama_pos pmax = llama_kv_swa_seq_pos_max(cache, seq_id);
+    if (pmax < 0) {
+        return true; // sequence holds nothing here; nothing to be inconsistent with
+    }
+    const llama_pos lo = std::max<llama_pos>(0, pmax - (llama_pos) lctx.model.hparams.n_swa + 1);
+
+    std::vector<bool> seen((size_t) (pmax - lo + 1), false);
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        const auto & cell = cache.cells[i];
+        if (cell.pos >= lo && cell.pos <= pmax && cell.has_seq_id(seq_id)) {
+            seen[(size_t) (cell.pos - lo)] = true;
+        }
+    }
+    for (bool b : seen) {
+        if (!b) return false;
+    }
+    return true;
+}
+
 static bool llama_kv_cache_init(
              struct llama_kv_cache & cache,
                const llama_context * ctx,
@@ -826,7 +964,12 @@ static bool llama_kv_cache_init(
                           int32_t    n_k_first,
                           int32_t    n_k_last,
                           int32_t    n_v_first,
-                          int32_t    n_v_last) {
+                          int32_t    n_v_last,
+                    // PXA_SWA_KV layer ownership filter:
+                    //   0 = this cache owns every layer (original behaviour)
+                    //   1 = owns only full-attention layers  (kv_self when SWA-KV is armed)
+                    //   2 = owns only sliding-window layers  (kv_swa)
+                          int        swa_sel) {
     const llama_model & model = ctx->model;
     const llama_cparams & cparams = ctx->cparams;
 
@@ -971,7 +1114,23 @@ static bool llama_kv_cache_init(
     int n_mla = 0;
     int n_kv_active_layers = 0;
     const int64_t n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
+    // PXA_SWA_KV: does this cache own layer i?
+    auto swa_owns = [&](int i) {
+        if (swa_sel == 0) return true;
+        const bool is_swa = i < (int) hparams.swa_layers.size() && hparams.swa_layers[i];
+        return swa_sel == 2 ? is_swa : !is_swa;
+    };
+
     for (int i = 0; i < (int) n_layer; i++) {
+        // PXA_SWA_KV: layers owned by the *other* cache get a null K/V here. Every consumer that
+        // walks k_l/v_l already has to tolerate nullptr (MTP-only contexts below do exactly this).
+        if (!swa_owns(i)) {
+            cache.k_l.push_back(nullptr);
+            if (!is_mla_attn || !cparams.mla_attn || (cparams.mla_attn == 1 && !cparams.flash_attn)) {
+                cache.v_l.push_back(nullptr);
+            }
+            continue;
+        }
         // For MTP-only context, skip KV allocation for non-MTP layers
         if (cparams.mtp_op_type != MTP_OP_NONE && i < (int)n_mtp_first_layer) {
             cache.k_l.push_back(nullptr);
@@ -4431,6 +4590,85 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 // llm_build
 //
 
+// PXA_SWA_KV: fill the sliding-window mask over the SLIDING cache's cells and extent.
+//
+// With the feature off, the sliding mask is a second view of the same cell array as the full mask
+// and the two are filled together in one pass. With it on they are different index spaces of
+// different widths, so the sliding mask gets its own pass. The per-element rule is deliberately
+// identical to the fused path (same seq/causality test, same "pos - cell.pos >= n_swa" cut), so the
+// SET of contributing K/V rows is unchanged - only where those rows physically live.
+static void llama_set_inp_KQ_mask_swa(llama_context & lctx, const llama_batch & batch) {
+    const auto & hparams = lctx.model.hparams;
+    const auto & cparams = lctx.cparams;
+    const auto & kv      = lctx.kv_swa;
+
+    if (!lctx.inp_KQ_mask_swa) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask_swa->buffer));
+
+    const int64_t n_kv     = kv.n;
+    const int64_t n_tokens = batch.n_tokens;
+
+    GGML_ASSERT(lctx.inp_KQ_mask_swa->ne[0] == n_kv);
+
+    float     * data     = cparams.flash_attn ? nullptr : (float *)     lctx.inp_KQ_mask_swa->data;
+    ggml_half * data_f16 = cparams.flash_attn ? (ggml_half *) lctx.inp_KQ_mask_swa->data : nullptr;
+
+    const ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
+    const int32_t   n_swa  = (int32_t) hparams.n_swa;
+
+    auto fill_range = [&](int first, int last) {
+        for (int j = 0; j < n_tokens; ++j) {
+            const llama_pos    pos    = batch.pos[j];
+            const llama_seq_id seq_id = batch.seq_id[j][0];
+
+            for (int i = first; i < last; ++i) {
+                const auto & cell = kv.cells[i];
+
+                float f;
+                if (!cell.has_seq_id(seq_id) || cell.pos > pos || cell.pos < 0) {
+                    f = -INFINITY;
+                } else if (hparams.use_alibi) {
+                    f = -std::abs(cell.pos - pos);
+                } else {
+                    f = 0.0f;
+                }
+
+                if (f > -INFINITY && pos - cell.pos >= n_swa) {
+                    f = -INFINITY;
+                }
+
+                if (data)     data[j*n_kv + i]     = f;
+                if (data_f16) data_f16[j*n_kv + i] = ggml_fp32_to_fp16(f);
+            }
+        }
+    };
+
+    if (n_kv >= 1024 && n_tokens >= 32) {
+        const int n_thread = std::max(1, int(std::thread::hardware_concurrency()/2));
+        const int npt = (int)((n_kv + n_thread - 1)/n_thread);
+        auto worker = [&](int ith) {
+            const int first = ith * npt;
+            const int last  = std::min((int) n_kv, first + npt);
+            if (last > first) fill_range(first, last);
+        };
+        std::vector<std::thread> workers(n_thread - 1);
+        int it = 0;
+        for (auto & w : workers) w = std::thread(worker, it++);
+        worker(it);
+        for (auto & w : workers) w.join();
+    } else {
+        fill_range(0, (int) n_kv);
+    }
+
+    const int64_t n_tokens_padded = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
+    if (n_tokens_padded > n_tokens) {
+        if (data)     std::fill(data     + n_tokens*n_kv, data     + n_tokens_padded*n_kv, -INFINITY);
+        if (data_f16) std::fill(data_f16 + n_tokens*n_kv, data_f16 + n_tokens_padded*n_kv, h_inf);
+    }
+}
+
 static void llama_set_k_shift(llama_context & lctx) {
     const int64_t kv_size = lctx.kv_self.size;
 
@@ -4440,6 +4678,15 @@ static void llama_set_k_shift(llama_context & lctx) {
 
     for (int i = 0; i < kv_size; ++i) {
         data[i] = lctx.kv_self.cells[i].delta;
+    }
+
+    // PXA_SWA_KV: the sliding cache carries its own per-cell deltas.
+    if (lctx.swa_kv_active && lctx.inp_K_shift_swa) {
+        assert(ggml_backend_buffer_is_host(lctx.inp_K_shift_swa->buffer));
+        int32_t * data_swa = (int32_t *) lctx.inp_K_shift_swa->data;
+        for (uint32_t i = 0; i < lctx.kv_swa.size; ++i) {
+            data_swa[i] = lctx.kv_swa.cells[i].delta;
+        }
     }
 }
 
@@ -4638,6 +4885,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 } else {
                     data_swa = (float *) lctx.inp_KQ_mask_swa->data;
                 }
+            }
+
+            // PXA_SWA_KV: the sliding mask no longer shares this cell array or this width.
+            if (lctx.swa_kv_active) {
+                data_swa     = nullptr;
+                data_swa_f16 = nullptr;
+                llama_set_inp_KQ_mask_swa(lctx, batch);
             }
 
             auto noalibi_f16 = [&mask_kv_self, &hparams, n_kv, data_f16, data_swa_f16] (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
@@ -4854,6 +5108,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     data_swa = (float *) lctx.inp_KQ_mask_swa->data;
                 }
             }
+
+            // PXA_SWA_KV: this non-causal path writes an n_tokens-wide mask; the sliding mask is
+            // sized to the sliding cache instead. The feature requires cparams.causal_attn, so this
+            // is unreachable while armed - assert rather than silently write the wrong extent.
+            GGML_ASSERT(!lctx.swa_kv_active);
 
             for (int h = 0; h < 1; ++h) {
                 for (int j = 0; j < n_tokens; ++j) {
@@ -5690,6 +5949,32 @@ static int llama_decode_internal(
                 auto max_cell = llama_kv_cache_cell_max(kv_self, pad);
                 kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell, pad)));
             }
+
+            // PXA_SWA_KV: the sliding cache is allocated independently, in its own index space.
+            if (lctx.swa_kv_active) {
+                auto & kv_swa = lctx.kv_swa;
+
+                // retire everything the window can no longer reach, then allocate
+                llama_kv_swa_evict(lctx, u_batch);
+
+                if (kv_swa.head > kv_swa.used + 2*n_tokens) {
+                    kv_swa.head = 0;
+                }
+
+                if (!llama_kv_cache_find_slot(kv_swa, u_batch)) {
+                    // No contiguous run for this ubatch. This is a hard, loud failure (the decode
+                    // is refused) - never a silent overwrite. Sizing carries a full ubatch of
+                    // headroom per sequence precisely so this stays unreachable in practice.
+                    LLAMA_LOG_ERROR("%s: PXA_SWA_KV: no slot in the sliding cache for %u tokens "
+                            "(size=%u used=%u head=%u)\n", __func__, n_tokens,
+                            kv_swa.size, kv_swa.used, kv_swa.head);
+                    return 1;
+                }
+
+                const uint32_t pad = llama_kv_cache_get_padding(cparams);
+                auto max_cell_swa = llama_kv_cache_cell_max(kv_swa, pad);
+                kv_swa.n = std::min(kv_swa.size, std::max(pad, GGML_PAD(max_cell_swa, pad)));
+            }
         }
 
 #if IK_PRINT_TIMING
@@ -5752,7 +6037,8 @@ static int llama_decode_internal(
                         (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n,
                         (int)u_batch.n_tokens,
                         lctx.kv_self.save_per_step_ssm, lctx.kv_self.ckpt.per_step_max_allocated,
-                        cparams.mtp_op_type, gf, pxa_seq_sig(u_batch)});
+                        cparams.mtp_op_type, gf, pxa_seq_sig(u_batch),
+                        (int) lctx.kv_swa.n});
             }
         } else {
             //printf("Reusing graph with n_kv = %d, n_tokens = %d\n", (int)prev->n_kv, (int)prev->n_tokens);
@@ -6347,6 +6633,12 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     std::vector<uint8_t> buf_v;
 
     for (uint32_t il = 0; il < n_layer; ++il) {
+        // PXA_SWA_KV: layers owned by the sliding cache have no tensors here. The sliding cache is
+        // never defragmented - eviction already keeps it compact, and its index space is its own.
+        if (il >= kv_self.k_l.size() || kv_self.k_l[il] == nullptr ||
+            il >= kv_self.v_l.size() || kv_self.v_l[il] == nullptr) {
+            continue;
+        }
         const size_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
         const size_t k_size     = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*kv_size);
 
@@ -6430,7 +6722,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
     bool need_reserve = false;
 
     // apply K-shift if needed
-    if (lctx.model.hparams.rope_type != LLAMA_ROPE_TYPE_NONE && lctx.kv_self.has_shift) {
+    if (lctx.model.hparams.rope_type != LLAMA_ROPE_TYPE_NONE &&
+        (lctx.kv_self.has_shift || (lctx.swa_kv_active && lctx.kv_swa.has_shift))) {
         if (!get_can_shift(lctx)) {
             return 1;
         }
@@ -6456,6 +6749,14 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
             for (uint32_t i = 0; i < kv_self.size; ++i) {
                 kv_self.cells[i].delta = 0;
+            }
+
+            if (lctx.swa_kv_active) {
+                auto & kv_swa = lctx.kv_swa;
+                kv_swa.has_shift = false;
+                for (uint32_t i = 0; i < kv_swa.size; ++i) {
+                    kv_swa.cells[i].delta = 0;
+                }
             }
         }
     }
@@ -7615,12 +7916,94 @@ struct llama_context * llama_init_from_model(
         }
         ctx->backends.push_back(ctx->backend_cpu);
 
+        // PXA_SWA_KV: decide whether the sliding-window layers get their own, window-sized cache.
+        uint32_t kv_size_swa = 0;
+        {
+            const auto & hp = model->hparams;
+            int n_swa_layers  = 0;
+            int n_full_layers = 0;
+            for (uint32_t il = 0; il < hp.n_layer && il < hp.swa_layers.size(); ++il) {
+                (hp.swa_layers[il] ? n_swa_layers : n_full_layers)++;
+            }
+
+            const char * env = getenv("PXA_SWA_KV");
+            const bool want = env && atoi(env) != 0;
+
+            // Requirements. Each is a structural precondition, not a preference:
+            //  - a genuine mix of sliding and full layers (otherwise there is nothing to split)
+            //  - a real window
+            //  - plain attention: recurrent/hybrid/MLA caches have their own cell semantics
+            //  - causal + no chunked attention (the eviction proof below assumes the plain
+            //    "pos - cell.pos >= n_swa" window that the mask actually applies)
+            // Only architectures whose graph builder actually routes the sliding cache may arm this.
+            // Every other interleaved-SWA graph still hands kv_self to its sliding layers, whose
+            // tensors would be null here — so they must stay on the unified cache until ported.
+            static const std::set<llm_arch> swa_kv_ported = {
+                LLM_ARCH_MUSE_GLIMMER,
+            };
+            const bool arch_ported = swa_kv_ported.count(model->arch) > 0;
+
+            const bool eligible =
+                arch_ported &&
+                n_swa_layers > 0 && n_full_layers > 0 &&
+                hp.n_swa > 0 && hp.n_attn_chunk == 0 &&
+                !llm_arch_is_recurrent(model->arch) && !llm_arch_is_hybrid(model->arch) &&
+                !model->is_mla_model() &&
+                cparams.causal_attn && cparams.mtp_op_type == MTP_OP_NONE;
+
+            if (want && !eligible) {
+                LLAMA_LOG_WARN("%s: PXA_SWA_KV requested but this model/config is not eligible "
+                        "(swa_layers=%d full_layers=%d n_swa=%u n_attn_chunk=%u) - using the single unified cache\n",
+                        __func__, n_swa_layers, n_full_layers, hp.n_swa, hp.n_attn_chunk);
+            }
+
+            if (want && eligible) {
+                const uint32_t pad = llama_kv_cache_get_padding(cparams);
+                // Guard band: cells stay resident for this many positions BEYOND the window, so a
+                // short backwards rewind (speculative rejection, sampler rewind) cannot uncover a
+                // position the window still needs. See the coverage check in llama_kv_cache_seq_rm.
+                const uint32_t guard   = std::max<uint32_t>(cparams.n_ubatch, 256u);
+                const uint32_t n_seq   = std::max<uint32_t>(1, cparams.n_seq_max);
+                // Per sequence we must simultaneously hold: the window, the guard band, and the
+                // ubatch currently being written. Sized per sequence because the two index spaces
+                // are separate but the SWA cache is still shared by all sequences.
+                const uint64_t per_seq = GGML_PAD((uint64_t) hp.n_swa + guard + cparams.n_ubatch, pad);
+                kv_size_swa = (uint32_t) std::min<uint64_t>(kv_size, per_seq * n_seq);
+                kv_size_swa = GGML_PAD(kv_size_swa, pad);
+
+                if (kv_size_swa >= kv_size) {
+                    LLAMA_LOG_INFO("%s: PXA_SWA_KV: window cache (%u) would be no smaller than the "
+                            "context (%u) - staying on the single unified cache\n", __func__, kv_size_swa, kv_size);
+                    kv_size_swa = 0;
+                } else {
+                    ctx->swa_kv_active = true;
+                    ctx->swa_kv_guard  = guard;
+                    LLAMA_LOG_INFO("%s: PXA_SWA_KV armed: %d sliding layers -> %u cells, "
+                            "%d full layers -> %u cells (n_swa=%u guard=%u n_ubatch=%u n_seq_max=%u)\n",
+                            __func__, n_swa_layers, kv_size_swa, n_full_layers, kv_size,
+                            hp.n_swa, guard, cparams.n_ubatch, n_seq);
+                }
+            }
+        }
+
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
-                    params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
+                    params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last,
+                    ctx->swa_kv_active ? 1 : 0)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
+        }
+
+        if (ctx->swa_kv_active) {
+            if (!llama_kv_cache_init(ctx->kv_swa, ctx, type_k, type_v, kv_size_swa, cparams.offload_kqv,
+                        params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
+                        params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last,
+                        2)) {
+                LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for the sliding-window cache\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
         }
 
         {
@@ -7637,6 +8020,18 @@ struct llama_context * llama_init_from_model(
                 if (v) {
                     memory_size_v += ggml_nbytes(v);
                 }
+            }
+
+            if (ctx->swa_kv_active) {
+                size_t swa_k = 0, swa_v = 0;
+                for (auto & k : ctx->kv_swa.k_l) { if (k) swa_k += ggml_nbytes(k); }
+                for (auto & v : ctx->kv_swa.v_l) { if (v) swa_v += ggml_nbytes(v); }
+                LLAMA_LOG_INFO("%s: KV full-attn  = %7.2f MiB (%u cells), KV sliding = %7.2f MiB (%u cells)\n",
+                        __func__,
+                        (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), ctx->kv_self.size,
+                        (float)(swa_k + swa_v) / (1024.0f * 1024.0f), ctx->kv_swa.size);
+                memory_size_k += swa_k;
+                memory_size_v += swa_v;
             }
 
             if (memory_size_k + memory_size_v > 0) {
@@ -8326,6 +8721,9 @@ int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
 
 void llama_kv_cache_clear(struct llama_context * ctx) {
     llama_kv_cache_clear(ctx->kv_self);
+    if (ctx->swa_kv_active) {
+        llama_kv_cache_clear(ctx->kv_swa);
+    }
 }
 
 // Unified speculative-checkpoint
@@ -8635,7 +9033,48 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    return llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+    const bool ok = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+
+    if (!ctx->swa_kv_active) {
+        return ok;
+    }
+
+    const bool ok_swa = llama_kv_cache_seq_rm(ctx->kv_swa, seq_id, p0, p1);
+
+    // PXA_SWA_KV: a removal that moves a sequence's maximum position BACKWARDS can ask the window
+    // to read positions that eviction already retired. Detect that exactly, rather than hoping the
+    // guard band covered it: if the window is no longer fully resident, refuse the partial removal
+    // and wipe the sequence from BOTH caches so no half-covered state can be decoded from.
+    // The caller contract for `false` is "could not partially delete" - server-context.cpp already
+    // responds by full-wiping the slot and resetting n_past, which is the correct recovery.
+    auto check = [&](llama_seq_id s) {
+        if (llama_kv_swa_coverage_ok(*ctx, s)) {
+            return true;
+        }
+        LLAMA_LOG_WARN("%s: PXA_SWA_KV: seq %d no longer holds a complete %u-position window after "
+                "truncation to [%d,%d) - clearing the sequence so it is reprocessed\n",
+                __func__, s, ctx->model.hparams.n_swa, p0, p1);
+        llama_kv_cache_seq_rm(ctx->kv_swa,  s, -1, -1);
+        llama_kv_cache_seq_rm(ctx->kv_self, s, -1, -1);
+        return false;
+    };
+
+    if (seq_id >= 0) {
+        if (!check(seq_id)) return false;
+    } else {
+        // a negative seq_id targets every sequence
+        std::set<llama_seq_id> seqs;
+        for (uint32_t i = 0; i < ctx->kv_swa.size; ++i) {
+            for (auto s : ctx->kv_swa.cells[i].seq_id) seqs.insert(s);
+        }
+        bool all_ok = true;
+        for (auto s : seqs) {
+            if (!check(s)) all_ok = false;
+        }
+        if (!all_ok) return false;
+    }
+
+    return ok && ok_swa;
 }
 
 void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -8643,10 +9082,16 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
         return;
     }
     llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
+    if (ctx->swa_kv_active) {
+        llama_kv_cache_seq_cp(ctx->kv_swa, seq_id_src, seq_id_dst, p0, p1);
+    }
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
     llama_kv_cache_seq_keep(ctx->kv_self, seq_id);
+    if (ctx->swa_kv_active) {
+        llama_kv_cache_seq_keep(ctx->kv_swa, seq_id);
+    }
 }
 
 void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
@@ -8655,6 +9100,9 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
     }
 
     llama_kv_cache_seq_add(ctx->kv_self, seq_id, p0, p1, delta);
+    if (ctx->swa_kv_active) {
+        llama_kv_cache_seq_add(ctx->kv_swa, seq_id, p0, p1, delta);
+    }
 }
 
 void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -8663,6 +9111,9 @@ void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, lla
     }
 
     llama_kv_cache_seq_div(ctx->kv_self, seq_id, p0, p1, d);
+    if (ctx->swa_kv_active) {
+        llama_kv_cache_seq_div(ctx->kv_swa, seq_id, p0, p1, d);
+    }
 }
 
 llama_pos llama_kv_cache_seq_pos_min(struct llama_context * ctx, llama_seq_id seq_id) {
@@ -9795,6 +10246,15 @@ static size_t llama_state_get_data_internal(struct llama_context * ctx, llama_da
 }
 
 size_t llama_state_get_data(struct llama_context * ctx, uint8_t * dst, size_t size) {
+    // PXA_SWA_KV: the serialised format walks kv_self's cells and layer tensors only. With the
+    // sliding cache armed, the sliding layers live in a second cache with an independent index
+    // space and would be silently omitted, producing a state blob that restores a hole in the
+    // attention window. Refuse explicitly instead of writing a plausible-looking broken file.
+    if (ctx->swa_kv_active) {
+        LLAMA_LOG_ERROR("%s: not supported while PXA_SWA_KV is armed\n", __func__);
+        return 0;
+    }
+
     llama_data_write_buffer data_ctx(dst, size, ctx->model);
     try {
         return llama_state_get_data_internal(ctx, data_ctx);
@@ -9836,6 +10296,15 @@ static size_t llama_state_set_data_internal(struct llama_context * ctx, llama_da
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(struct llama_context * ctx, const uint8_t * src, size_t size) {
+    // PXA_SWA_KV: the serialised format walks kv_self's cells and layer tensors only. With the
+    // sliding cache armed, the sliding layers live in a second cache with an independent index
+    // space and would be silently omitted, producing a state blob that restores a hole in the
+    // attention window. Refuse explicitly instead of writing a plausible-looking broken file.
+    if (ctx->swa_kv_active) {
+        LLAMA_LOG_ERROR("%s: not supported while PXA_SWA_KV is armed\n", __func__);
+        return 0;
+    }
+
     llama_data_read_buffer data_ctx(src, size);
     try {
         return llama_state_set_data_internal(ctx, data_ctx);
@@ -9937,11 +10406,29 @@ static size_t llama_state_seq_get_data_internal(struct llama_context * ctx, llam
 }
 
 size_t llama_state_seq_get_size(struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // PXA_SWA_KV: the serialised format walks kv_self's cells and layer tensors only. With the
+    // sliding cache armed, the sliding layers live in a second cache with an independent index
+    // space and would be silently omitted, producing a state blob that restores a hole in the
+    // attention window. Refuse explicitly instead of writing a plausible-looking broken file.
+    if (ctx->swa_kv_active) {
+        LLAMA_LOG_ERROR("%s: not supported while PXA_SWA_KV is armed\n", __func__);
+        return 0;
+    }
+
     llama_data_write_dummy data_ctx;
     return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
 }
 
 size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // PXA_SWA_KV: the serialised format walks kv_self's cells and layer tensors only. With the
+    // sliding cache armed, the sliding layers live in a second cache with an independent index
+    // space and would be silently omitted, producing a state blob that restores a hole in the
+    // attention window. Refuse explicitly instead of writing a plausible-looking broken file.
+    if (ctx->swa_kv_active) {
+        LLAMA_LOG_ERROR("%s: not supported while PXA_SWA_KV is armed\n", __func__);
+        return 0;
+    }
+
     llama_data_write_buffer data_ctx(dst, size, ctx->model);
     try {
         return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
@@ -9960,6 +10447,15 @@ static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llam
 }
 
 size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags) {
+    // PXA_SWA_KV: the serialised format walks kv_self's cells and layer tensors only. With the
+    // sliding cache armed, the sliding layers live in a second cache with an independent index
+    // space and would be silently omitted, producing a state blob that restores a hole in the
+    // attention window. Refuse explicitly instead of writing a plausible-looking broken file.
+    if (ctx->swa_kv_active) {
+        LLAMA_LOG_ERROR("%s: not supported while PXA_SWA_KV is armed\n", __func__);
+        return 0;
+    }
+
     llama_data_read_buffer data_ctx(src, size);
     try {
         return llama_state_seq_set_data_internal(ctx, data_ctx, dest_seq_id, flags);

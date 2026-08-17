@@ -44,6 +44,7 @@ llm_build_context::llm_build_context(
         cparams          (lctx.cparams),
         batch            (batch),
         kv_self          (lctx.kv_self),
+        kv_swa           (lctx.swa_kv_active ? lctx.kv_swa : lctx.kv_self),
         n_embd           (hparams.n_embd),
         n_layer          (hparams.n_layer),
         n_rot            (hparams.n_rot),
@@ -69,6 +70,8 @@ llm_build_context::llm_build_context(
         n_outputs        (worst_case ? n_outputs_ > 0 ? n_outputs_ : n_tokens : lctx.n_outputs),
         n_outputs_enc    (worst_case ? n_tokens : lctx.embd_enc.size() / hparams.n_embd),
         kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),
+        n_kv_swa         (worst_case ? kv_swa.size : kv_swa.n),
+        kv_head_swa      (worst_case ? (kv_swa.recurrent ? 0 : kv_swa.size - n_tokens) : kv_swa.head),
         n_ctx_orig       (cparams.n_ctx_orig_yarn),
         flash_attn       (cparams.flash_attn),
         mla_attn         (cparams.mla_attn),
@@ -105,6 +108,7 @@ void llm_build_context::init() {
     lctx.inp_KQ_mask     = nullptr;
     lctx.inp_KQ_mask_swa = nullptr;
     lctx.inp_K_shift     = nullptr;
+    lctx.inp_K_shift_swa = nullptr;
     lctx.inp_mean        = nullptr;
     lctx.inp_cls         = nullptr;
     lctx.inp_s_copy      = nullptr;
@@ -146,21 +150,32 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     cb(lctx.inp_K_shift, "K_shift", -1);
     ggml_set_input(lctx.inp_K_shift);
 
+    // PXA_SWA_KV: the sliding cache has its own cell array, so it needs its own shift vector.
+    if (lctx.swa_kv_active) {
+        lctx.inp_K_shift_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, lctx.kv_swa.size);
+        cb(lctx.inp_K_shift_swa, "K_shift_swa", -1);
+        ggml_set_input(lctx.inp_K_shift_swa);
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
             continue;
         }
-        if (kv_self.k_l[il] == nullptr) {
+        // PXA_SWA_KV: shift each layer inside the cache that owns it, over that cache's own extent.
+        const llama_kv_cache & kvl = lctx.kv_for_layer(il);
+        const int64_t          n_rows_l = kvl.size;
+        struct ggml_tensor *   shift_l  = lctx.swa_kv_layer(il) ? lctx.inp_K_shift_swa : lctx.inp_K_shift;
+        if (il >= (int) kvl.k_l.size() || kvl.k_l[il] == nullptr || shift_l == nullptr) {
             continue;
         }
         const int64_t n_head_kv = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
         struct ggml_tensor * rope_factors = build_rope_factors(il);
         struct ggml_tensor * k =
-            ggml_view_3d(ctx0, kv_self.k_l[il],
-                    n_embd_head_k, n_head_kv, n_ctx,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_head_k),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
+            ggml_view_3d(ctx0, kvl.k_l[il],
+                    n_embd_head_k, n_head_kv, n_rows_l,
+                    ggml_row_size(kvl.k_l[il]->type, n_embd_head_k),
+                    ggml_row_size(kvl.k_l[il]->type, n_embd_k_gqa),
                     0);
 
         struct ggml_tensor * tmp;
@@ -176,14 +191,14 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                 }
             }
             tmp = ggml_rope_ext_inplace(ctx0, tmp,
-                    lctx.inp_K_shift, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
+                    shift_l, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, yarn_attn_factor_shift, beta_fast, beta_slow);
             cb(tmp, "K_shifted_f32", il);
             tmp = ggml_cpy(ctx0, tmp, k);
         } else {
             // we rotate only the first n_rot dimensions
             tmp = ggml_rope_ext_inplace(ctx0, k,
-                    lctx.inp_K_shift, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
+                    shift_l, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, yarn_attn_factor_shift, beta_fast, beta_slow);
         }
         cb(tmp, "K_shifted", il);
@@ -385,15 +400,19 @@ ggml_tensor * llm_build_context::build_inp_KQ_mask(bool causal) {
 
 ggml_tensor * llm_build_context::build_inp_KQ_mask_swa(bool causal) {
     GGML_ASSERT(hparams.n_swa > 0);
+    // PXA_SWA_KV: the sliding mask spans the sliding cache's index space, which is a different (and
+    // much smaller) extent from the full cache once the feature is armed. With it off, n_kv_swa
+    // aliases n_kv and this is the original code.
+    const int32_t n_kv_m = n_kv_swa;
     if (causal && flash_attn) {
-        lctx.inp_KQ_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        lctx.inp_KQ_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv_m, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         cb(lctx.inp_KQ_mask_swa, "KQ_mask_swa", -1);
         ggml_set_input(lctx.inp_KQ_mask_swa);
         return lctx.inp_KQ_mask_swa;
     }
 
     lctx.inp_KQ_mask_swa = causal
-        ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
+        ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_m,   GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
         : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
     cb(lctx.inp_KQ_mask_swa, "KQ_mask_swa", -1);
     ggml_set_input(lctx.inp_KQ_mask_swa);
@@ -560,7 +579,9 @@ void llm_build_context::llm_build_kv_store(
                     int32_t   kv_head,
          const llm_build_cb & cb,
                     int64_t   il) {
-    const int64_t n_ctx = cparams.n_ctx;
+    // PXA_SWA_KV: the transposed-V row stride is the row count of THIS cache, which is no longer
+    // necessarily cparams.n_ctx. kv.size is the same value whenever the feature is off.
+    const int64_t n_ctx = kv.size;
 
     //const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
@@ -568,7 +589,10 @@ void llm_build_context::llm_build_kv_store(
     const int64_t n_head_kv     = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
 
-    GGML_ASSERT(kv.size == n_ctx);
+    // The write must land inside THIS cache. That is the invariant the old
+    // `kv.size == cparams.n_ctx` assert was standing in for, stated directly.
+    GGML_ASSERT(kv_head >= 0 && (int64_t) kv_head + n_tokens <= (int64_t) kv.size);
+    (void) cparams;
 
     //struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa,
     //        (ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa))*kv_head);
