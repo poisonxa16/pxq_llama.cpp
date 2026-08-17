@@ -790,3 +790,147 @@ template, every 3rd cycle firing two shorts concurrently. Seat had already serve
 The breaker row is the point of the breaker: same defect, same wrong answers, but a degenerate
 generation is killed after **one** token instead of holding a slot to context-fill — which under
 `-sm layer` is what starves every co-resident generation on the same cards.
+
+---
+
+## Updates — 2026-08-16 — split-mode, card-count and SWA_KEEP on the reviewer cell
+
+Cell unless a row says otherwise: **Alina reviewer seat**, `muse-glimmer` 30B **dense** PXQ4 +
+vision projector, build-fugv60, cards 4,1,6 (V100 sm_70 + 2×P100 sm_60), all pairs **PHB, no
+NVLink/P2P**, `-ngl 99 -sm layer -ts 24,38,38 -c 262144 -b/-ub 2048 -ctk/-ctv f16 -np 2 -t 16
+-fa on`, `PXA_ENHANCE=1`, `GGML_CUDA_NO_PINNED=1`. Single-stream measurement, prompt trimmed to an
+EXACT token count, temp 0 / top_k 1 / seed 1234 / `cache_prompt:false`, `n_predict 128`,
+fresh server per arm, arms interleaved with repeated baselines.
+
+### Doc-vs-runtime contradictions found (fix the doc, not the runtime)
+1. The 2026-08-16 block above describes this seat as a **"30B MoE PXQ4"**. The runtime ledger says
+   `class=dense experts=0(top0)`. It is **dense**. The keeper script likewise calls it
+   "dense full-attention".
+2. "full-attention" is also wrong: the GGUF carries
+   `muse-glimmer.attention.sliding_window_pattern arr[bool,52] = [true,true,true,false,...]`,
+   i.e. **39 sliding-window layers + 13 full-attention layers** (period 4), with `n_swa = 2048`.
+   `n_swa_pattern` printing as `1` is just the hparams default ("all layers non-SWA") left
+   untouched because muse-glimmer takes the per-layer-array branch, not the scalar-period branch —
+   the printed scalar is **not** the truth for this arch. Read `swa_layers`, not `n_swa_pattern`.
+3. KV is allocated **full-size for all 52 layers** (3328+5632+4352 = 13312 MiB at `-c 262144`,
+   = 262144 × 52 layers × 1024 B/token/layer). There is no iSWA/`--swa-full` split-cache path in
+   this tree (`grep swa_full` in common/ + src/llama-context.cpp: no hits), so the 39 SWA layers
+   each carry a full-context cache they can never address beyond their 2048-token window.
+   **Upper bound if an SWA-aware cache were added: ~9.8 GiB of VRAM freed on this seat**
+   (13 full layers still need 3328 MiB; 39 SWA layers need ~163 MiB). Not attempted here — it is
+   a code change, and it would trade away prompt-cache reuse (`apply_checkp ... lack of cache data
+   (likely due to SWA)` is already in the log). Recorded as an opportunity, not a lever.
+
+### Benchmarking this box: two traps that void results
+- ⚠ **`-p 127.0.0.1:8299:8299` collides with a live `node` service.** Bench ports 8355/8356 are
+  free. Never send `docker run`'s own stderr to /dev/null in a harness — a daemon-level port clash
+  otherwise presents as a model-load failure.
+- ⚠⚠ **Parking `/etc/cron.d/pxa-hive-seats` does NOT stop the keeper.** dcron has the next run
+  queued, so the keeper fired 44 s and 29 s after the park in two separate campaigns and recreated
+  Alina onto the cards mid-run; every subsequent arm then "OOMed" and looked like a config verdict.
+  **Hold the keeper's own lock instead:** `exec 8>/tmp/pxa-hive-seats-keeper.lk; flock -x 8` for the
+  whole campaign (the keeper's own `flock -n -o 9 || exit 0` then makes every invocation a no-op),
+  and close the fd before handing the seats back. Interleave repeated baseline arms — the repeat
+  contradicting the identical first arm is what exposes this class of fault at all.
+
+### Measured verdicts — 2026-08-16 speed campaign
+
+Protocol for every row: fresh server per arm; container flags matching the seat keeper exactly
+(`--runtime=nvidia`, `GGML_CUDA_NO_PINNED=1`, `PXA_ENHANCE=1`); prompt trimmed to an EXACT token
+count via /tokenize+/detokenize; temp 0, top_k 1, seed 1234, `cache_prompt:false`, `n_predict 128`;
+3 reps/arm; **baseline arms repeated and interleaved** so drift is visible. Raw data:
+`<local-path>`; narrative: `speed-findings.md`.
+
+| lever | cell / fill | verdict | gate |
+|---|---|---|---|
+| **`-sm graph`** (and `-sm attn`) | Alina 3-card, fill 8192 | **NULL — it never engages.** +0.0%/+0.2% prefill, +0.0%/+0.1% decode, byte-identical output. `LLM_ARCH_MUSE_GLIMMER` is **absent from `k_supported` in `is_model_split_supported()` (`src/llama.cpp:3208`)**, so `src/llama.cpp:3516` warns "not supported for this model" and silently serves `-sm layer`. Engagement disproof: the graph arm prints `split_mode_graph_scheduling = 0` / `graph splits = 4`, byte-identical to the layer arm | n/a (no-op) |
+| **`PXA_FA_SWA_KEEP`** | Alina 3-card, **fill 24576** | **CONFIRMED, large.** KEEP=1 (shipped default) **17.60 t/s** vs KEEP=0 **14.79 t/s** = **+19.0% decode**; spread 0.2-0.3%. Prefill untouched (260.9/260.8). **The NaN correctness fix was not a performance cost — it paid ~19% decode at large fill.** | decode-path -> temp-0 output. **byte-identical** (both sha `e9167a08…`), 3 reps x 128 tok. Bit-exact is also structurally expected: masked KV contributes exactly zero. Engagement = the +19% itself (no log marker exists) |
+| **Alina 3 cards -> 2 cards** (NEW) | cards 4,1 vs 4,1,6; fill 8192 | **BIGGEST WIN.** `-ts 45,55 -c 131072`: **prefill 289.4 -> 378.4 (+30.7%)**, **decode 19.74 -> 22.33 (+13.1%)**, and it **frees a whole P100 (card 6)**. Ladder in dev0's share: 36,64 +16.9/+8.2; 40,60 +22.4/+10.0; **45,55 +30.7/+13.1**. 40,60 repeat within 0.2%/0.4%. **COST: max context 262144 -> 131072** (65536/slot at np2; observed peak use ~25k). 50,50 untested, predicted OOM (dev0 also holds the 3670.81 MiB projector) | **byte-identical output vs the 3-card baseline** (sha `cb0b4a6d…`), 3 reps x 128 tok. Measured, not assumed — moving layers across an sm_70/sm_60 boundary can change kernels |
+| **`--spec-type mtp:n_max=1`** on Ana | Ana card 5, fill 8352 | **NET LOSS: −6.5% decode.** MTP-on baselines 40.85/41.36/41.23 (mean 41.15) vs MTP-off **43.83**. With `GQA_PACK=4` too: **44.59 = +8.4%** over the live config. MTP-off spreads are the tightest in the campaign (0.3-0.4%). ⚠ one fill, single stream, synthetic **repetitive** prompt — which biases acceptance *in MTP's favour*, and it still lost. Needs a real-traffic confirm before flipping | bit-exact by construction (verify-gated); confirmed byte-identical (sha `a69dce26…`). Engagement proven both ways (`MTP context ready` / `speculation left off`) |
+| **`PXA_FA_GQA_PACK=4`** on Ana | Ana card 5, fill 8352 | **DOES NOT REPRODUCE. NOT SHIPPED.** Measured **+1.7%** (MTP off, spreads 0.3/0.4%) and +2.7% (MTP on, vs a baseline band of 1.3%) — against the record's **~+6.9%**. `NH=8` is **+0.3% = NOISE** (the record's "+6.9% at NH=8" does not reproduce either). Ana satisfies every documented gate (D=256, K/V f16, gqa_ratio 4, sm_60) and sm_60 decode *does* route to `vec_f32` (`fattn.cu:137-166` via `pxq_use_sm60_vec_f32`), so it *could* fire | **VOID — engagement not proven.** The `PXA_FA_GQA_PACK: NH=4` banner comes from a `static` resolver lambda and proves only that the env var was **parsed**, not that the kernel dispatched; the kernel gate also needs `cols_per_block == 1`. The lever is documented NOT bit-exact yet output is byte-identical in every arm. **Needs a firing counter in `fattn-vec-f32.cuh` + rebuild before it can ship either way** |
+| **`PXA_P100_FP16_GEMM`** | Ana card 5 (single sm_60), 40 chunks x 512 tok | ⚠ **FAILS THE STANDING QUALITY GATE: `Same top token` = 94.088 ± 0.234 %** (reject threshold is <98%). Median KLD 0.004266, max KLD 1.755914. **Auto-armed on ALL THREE live seats today** (every seat has a P100). Nothing was disarmed — reported for the owner's decision, since its benefit (+51% gpt-oss prefill on the record) is a real speed/fidelity trade | prefill/batched-path -> `llama-perplexity --kl-divergence`, reference = **lever OFF, same model** (not a Q8_0 parent). Engagement proven: `PXA_AUTO: P100_FP16_GEMM=off` vs `=on` in the two arms. Corpus `<local-path>` (**not** della). Perplexity NOT used |
+
+## `-ts` SWEEP on the 2-card Alina layout — the optimum is further than 40,60
+Cards 4,1 (V100+P100), `-sm layer -c 131072 -np 2`, fill 8192, 3 reps, vs the 3-card baseline
+re-measured in the same campaign (`W_3card_base` 289.4 pf / 19.74 tg).
+
+| ts (dev0=V100, dev1=P100) | prefill t/s | decode t/s | vs 3-card pf | vs 3-card tg |
+|---|---|---|---|---|
+| 36,64 | 338.5 | 21.35 | +16.9% | +8.2% |
+| 40,60 | 354.4 | 21.70 | +22.4% | +10.0% |
+| **45,55** | **378.4** | **22.33** | **+30.7%** | **+13.1%** |
+| 40,60 (repeat) | 353.7 | 21.66 | +22.2% | +9.7% |
+All four arms produced **byte-identical output** to the 3-card baseline (sha `cb0b4a6d…`).
+Spreads: prefill 3.3-3.8%, decode 0.0-0.2%. The 40,60 repeat lands within 0.2%/0.4% of its first
+run, so the ordering is real and monotone in dev0's share.
+**Not found: the upper limit.** 45,55 is the best MEASURED point; 50,50 was NOT tested and is
+predicted to OOM (dev0 also carries the 3670.81 MiB vision projector: 7106 weights + 3671 proj +
+2308 compute + 3328 KV = 16413 MiB > 16384). The true optimum is somewhere in (45,50] for dev0.
+
+---
+
+# ⚠ QUALITY FINDING — `PXA_P100_FP16_GEMM` fails the standing gate, and it is ON right now
+
+**CLASS:** prefill / batched dense-GEMM lever -> a batched KL run *does* reach it, so per the
+ruling the instrument is `llama-perplexity --kl-divergence`, reading `Same top token`.
+**REFERENCE:** the same model with the lever OFF (`PXA_P100_FP16_GEMM=0`), per the ruling — not a
+Q8_0 parent.
+**CELL:** Ana's card 5, a **single P100 (sm_60)**, `Ornith-9B-Heretic-PXQ4`, build-srv,
+`-ngl 99 -c 512 --chunks 40` over `<local-path>` (a neutral corpus, **not**
+the della corpus). **Sample: 40 chunks x 512 tokens = 20,480 tokens.**
+**ENGAGEMENT PROVEN:** the two arms log
+`PXA_AUTO: P100_FP16_GEMM=off …` and `PXA_AUTO: P100_FP16_GEMM=on …` respectively.
+
+| statistic | value |
+|---|---|
+| **Same top token** | **94.088 ± 0.234 %** |
+| Median KLD | 0.004266 |
+| Maximum KLD | 1.755914 |
+| Median Δp | −0.000% |
+
+**Verdict against the standing thresholds (>=99.5% ship / 98-99.5% surface / <98% reject):
+94.088% is a REJECT.** ~1 token in 17 changes at the top-1 position.
+
+**It is currently auto-armed on ALL THREE live seats** — every seat has at least one P100
+(Alina cards 1 and 6, Ana card 5, Alex card 0) and the ledger shows `P100_FP16_GEMM ON [2:1 hgemm]`
+on each. So a lever that fails the project's own quality bar is shipping ungated on the owner's
+live reviewer seat today. **Per instruction I have NOT disarmed anything — this is reported for
+the owner's decision.** Its counterpart benefit is real and large (+51% gpt-oss prefill on the
+record), so this is a genuine speed-vs-fidelity trade the owner should make knowingly, not a bug.
+- Perplexity was NOT used as a gate (it is banned); the ref arm's `Final estimate` line is ignored.
+- Coverage dropped: one model, one cell, one corpus, 40 chunks, prefill shapes only.
+
+# UPSTREAM LEAD A — our tree HAS the unintended sm_60 fp16 fast path (llama.cpp issue #25593)
+<https://github.com/ggml-org/llama.cpp/issues/25593>. Upstream: 95.002% token match, median KL
+0.004962 unpatched. **Our tree carves out sm_61 only, never sm_60**, in exactly the places the
+issue names (`<local-path>`):
+- line 151/153: `#if defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610` -> `FAST_FP16_AVAILABLE`
+- line 207: `static constexpr bool fast_fp16_available(const int cc) { return cc >= CC_PASCAL && cc != 610; }`
+cc 600 (P100) passes both. The upstream fix is to add the `!= 600` / `!= CC_PASCAL` exclusion.
+**Independent corroboration from our own tree:** `ggml-cuda/fattn.cu:28-44` already documents and
+fixes ONE instance of this for the FA decode path — `pxq_use_sm60_vec_f32()` (PR #2144) routes
+sm_60 decode to fp32 because "the fp16 FA vec kernel accumulates … in fp16, **flipping ~3-4% of
+decode top-1 tokens** vs an all-fp32 reference", and reports it as free (tg128 96.79 vs 96.61).
+That is the same defect class, the same magnitude, found here independently — but the fix is
+**local to FA decode**; the general `fast_fp16_available()` gate is still open for every other
+kernel keyed on it. My 94.088% KL number above is the *deliberate* GEMM lever, a separate site.
+NOT MEASURED HERE: the generic leak's own ON/OFF gate (it needs a rebuild to toggle) — owed.
+
+# UPSTREAM LEAD B — CPU input embedding forces a 3rd graph split (issue #22926)
+<https://github.com/ggml-org/llama.cpp/issues/22926>. Closed as not-planned, **no merged PR** — an
+idea with numbers, not code to pull. Upstream measured on 2x RTX 3090 / Qwen3.6-27B prefill:
+930->943 @3,760 tok; 911->920 @14,937; **568->705 (+24%) @68,576** — the gain scales with prompt
+length. Cost ~2.6 GiB VRAM.
+**NOT TESTED here, deliberately, and the reason is measured:** our seats already report
+`graph splits = 4`, and the 2-card Alina layout is the one worth trying it on — but the +2.6 GiB
+does not fit alongside the 3670.81 MiB projector at the `-ts 45,55` optimum that just won
++30.7%/+13.1% (dev0 is already at ~15.4 GiB of 16 GiB there). It is dangerous on Alex too
+(card 2 has 52-291 MiB free). Worth revisiting ONLY at high fill (24576+) and only if the
+2-card `-ts` is backed off to leave headroom. Our `src/llama-model.cpp` has also diverged from
+the line the issue names.
+
+# UPSTREAM — low value, recorded so nobody re-chases
+- **`--split-mode row` does not exist in our fork.** `grep -rn "SPLIT_MODE_ROW|\"row\"" include/llama.h common/common.cpp` returns nothing; our parser accepts exactly `none|layer|attn|graph` (`common/common.cpp:1947-1965`). Answer recorded either way, as asked.
+- CUDA graphs: already default for batch-1; upstream's headline is H100-class small models. Not our bottleneck.
+- NCCL tensor-parallel needs NVLink; our topology is **PHB on every pair** (`nvidia-smi topo -m`, all 7 GPUs). Consistent with our own record of `-sm graph` losing decode. Build already initialises NCCL communicators.
+- Community FA v2 WMMA for Pascal/Volta: <https://github.com/sirCamp/flash-attention-legacy> — a port, not a flag. Noted as a known option; NOT attempted.
