@@ -7986,12 +7986,24 @@ struct llama_context * llama_init_from_model(
                 // Guard band: cells stay resident for this many positions BEYOND the window, so a
                 // short backwards rewind (speculative rejection, sampler rewind) cannot uncover a
                 // position the window still needs. See the coverage check in llama_kv_cache_seq_rm.
-                const uint32_t guard   = std::max<uint32_t>(cparams.n_ubatch, 256u);
+                const uint32_t guard   = std::min<uint32_t>(std::max<uint32_t>(cparams.n_ubatch, 256u), 512u);
                 const uint32_t n_seq   = std::max<uint32_t>(1, cparams.n_seq_max);
-                // Per sequence we must simultaneously hold: the window, the guard band, and the
-                // ubatch currently being written. Sized per sequence because the two index spaces
-                // are separate but the SWA cache is still shared by all sequences.
-                const uint64_t per_seq = GGML_PAD((uint64_t) hp.n_swa + guard + cparams.n_ubatch, pad);
+
+                // Per sequence the cache must simultaneously hold: the window, the guard band, and
+                // the ubatch being written -- that is the LIVE requirement. It must also hold SLACK,
+                // and the slack is not optional padding:
+                //
+                //   the slot allocator needs a CONTIGUOUS run of n_ubatch cells, and eviction is by
+                //   position threshold, per sequence. When two sequences advance at different rates
+                //   (one decoding one token at a time while the other prefills), only one of them
+                //   frees cells in the region where their writes interleaved, which leaves holes a
+                //   single cell wide. Sized at exactly the live requirement there is no older,
+                //   fully-dead region to fall back on and a full-width prefill cannot be placed --
+                //   measured, not theorised: at zero slack this refused 14 decodes and dropped the
+                //   connections. Slack gives the allocator a wholly-dead region to use instead.
+                const uint64_t live    = (uint64_t) hp.n_swa + guard + cparams.n_ubatch;
+                const uint64_t slack   = 3ull * cparams.n_ubatch;
+                const uint64_t per_seq = GGML_PAD(live + slack, pad);
                 kv_size_swa = (uint32_t) std::min<uint64_t>(kv_size, per_seq * n_seq);
                 kv_size_swa = GGML_PAD(kv_size_swa, pad);
 
@@ -8003,9 +8015,11 @@ struct llama_context * llama_init_from_model(
                     ctx->swa_kv_active = true;
                     ctx->swa_kv_guard  = guard;
                     LLAMA_LOG_INFO("%s: PXA_SWA_KV armed: %d sliding layers -> %u cells, "
-                            "%d full layers -> %u cells (n_swa=%u guard=%u n_ubatch=%u n_seq_max=%u)\n",
+                            "%d full layers -> %u cells (n_swa=%u guard=%u n_ubatch=%u n_seq_max=%u "
+                            "live/seq=%llu slack/seq=%llu)\n",
                             __func__, n_swa_layers, kv_size_swa, n_full_layers, kv_size,
-                            hp.n_swa, guard, cparams.n_ubatch, n_seq);
+                            hp.n_swa, guard, cparams.n_ubatch, n_seq,
+                            (unsigned long long) live, (unsigned long long) slack);
                 }
             }
         }
