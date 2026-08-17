@@ -12,6 +12,8 @@
 #if defined IQK_IMPLEMENT
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
 #include <algorithm>
@@ -1384,6 +1386,26 @@ bool iqk_flash_attn_impl(int int_type_k,         // type of k
                          float * M, float * S) {
 
     if (!mask || nk1%32 != 0) return false; // the implementation assumes mask is not null and nk is a multiple of 32
+
+    // PXA_SWA_DBG: ground truth at the kernel boundary. Report any of the nq1 rows this call is
+    // actually going to process that has no unmasked cell in [0, nk1), with the exact pointer so it
+    // can be compared against what the wrapper checked.
+    {
+        static const bool dbg = []() { const char * e = getenv("PXA_SWA_DBG"); return e && e[0] == '1'; }();
+        if (dbg) {
+            const uint16_t * um = (const uint16_t *)mask;
+            const int mr = stride_m/(int)sizeof(uint16_t);
+            for (int j = 0; j < nq1; ++j) {
+                const uint16_t * row = um + (size_t)j*mr;
+                int live = 0;
+                for (int c = 0; c < nk1; ++c) if ((row[c] & 0x7fffu) != 0x7c00u) { ++live; }
+                if (live == 0) {
+                    fprintf(stderr, "PXA_IMPL_DEADROW: j=%d/%d nk1=%d stride_m=%d mask=%p Dk=%d Mout=%d\n",
+                            j, nq1, nk1, stride_m, (const void *)mask, Dk, (int)(M != nullptr));
+                }
+            }
+        }
+    }
 
     if (Dk == 576 && Dv == 512) {
         return iqk_fa_576_512(int_type_k, int_type_v, nq1, nk1, stride_q, stride_k, stride_v, stride_m, stride_qkv,

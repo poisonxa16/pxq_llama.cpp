@@ -212,6 +212,55 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     // Cost: at most one pass over the mask (2 B per cell per row) against attention work of
     // O(neq1*nek1*Dk) per head, i.e. well under 1% at Dk=128; decode (neq1 == 1 or 2) is trivial.
     // Never larger than the mask read the kernel would itself do if nothing were sliced.
+    // PXA_SWA_DBG=1: report any query row that is fully masked BEFORE anything is sliced.
+    // That separates "the mask handed to the kernel is already dead" from "the slice killed it",
+    // and n_swa in the report says whether it is a sliding layer or a full-attention layer.
+    static const bool pxa_swa_dbg = []() {
+        const char * e = getenv("PXA_SWA_DBG");
+        return e && e[0] == '1';
+    }();
+    if (pxa_swa_dbg && mask) {
+        const uint16_t * um = (const uint16_t *)mask;
+        const int mr = stride_m/(int)sizeof(uint16_t);
+        for (int j = 0; j < neq1; ++j) {
+            const uint16_t * row = um + (size_t)j*mr;
+            int live = 0;
+            for (int c = 0; c < nek1; ++c) if ((row[c] & 0x7fffu) != 0x7c00u) { ++live; }
+            if (live == 0) {
+                fprintf(stderr, "PXA_SWA_DBG ALL_INF_ROW pre-slice: j=%d/%d nek1=%d n_swa=%d "
+                        "neq2=%d nek2=%d stride_m=%d ith=%d\n",
+                        j, neq1, nek1, n_swa, neq2, nek2, stride_m, ith);
+            }
+        }
+        // Where do non-finite values enter? Q non-finite => an upstream layer already produced
+        // NaN. K/V non-finite on a cell the mask says is VISIBLE => that cache row was never
+        // written (or was written at the wrong offset) and we are reading uninitialised memory.
+        if (ith == 0 && int_type_k_in == GGML_TYPE_F16) {
+            int qbad = 0;
+            for (int j = 0; j < neq1; ++j) {
+                const float * qr = (const float *)((const char *)q + (size_t)j*stride_q);
+                for (int d = 0; d < Dk; ++d) if (!std::isfinite(qr[d])) { ++qbad; break; }
+            }
+            int kbad = 0, kbad_cell = -1, vis = 0;
+            const uint16_t * m0 = um;
+            for (int c = 0; c < nek1; ++c) {
+                if ((m0[c] & 0x7fffu) == 0x7c00u) continue;
+                ++vis;
+                const uint16_t * kr = (const uint16_t *)((const char *)k + (size_t)c*stride_k);
+                for (int d = 0; d < Dk; ++d) {
+                    if ((kr[d] & 0x7fffu) >= 0x7c00u) {   // inf or NaN in f16
+                        ++kbad; if (kbad_cell < 0) kbad_cell = c;
+                        break;
+                    }
+                }
+            }
+            if (qbad || kbad) {
+                fprintf(stderr, "PXA_SWA_DBG NONFINITE: qbad=%d/%d kbad=%d firstcell=%d visible=%d "
+                        "nek1=%d n_swa=%d neq1=%d\n", qbad, neq1, kbad, kbad_cell, vis, nek1, n_swa, neq1);
+            }
+        }
+    }
+
     constexpr int kMinBatchSwa = 256;
     if (n_swa > 0 && mask && nek1 > kMinBatchSwa && neq1 > 0) {
         const uint16_t * umask = (const uint16_t *)mask;
@@ -244,6 +293,26 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 mask = (const uint16_t *)mask + first;
                 nek1 = last - first;
             }
+        }
+    }
+
+    // PXA_SWA_DBG: re-check AFTER the slice. If a row is live before and dead after, the slice
+    // is the culprit; if it is dead here but was live before, only the slice can have done it.
+    if (pxa_swa_dbg && mask) {
+        const uint16_t * um2 = (const uint16_t *)mask;
+        const int mr2 = stride_m/(int)sizeof(uint16_t);
+        for (int j = 0; j < neq1; ++j) {
+            const uint16_t * row = um2 + (size_t)j*mr2;
+            int live = 0;
+            for (int c = 0; c < nek1; ++c) if ((row[c] & 0x7fffu) != 0x7c00u) { ++live; }
+            if (live == 0) {
+                fprintf(stderr, "PXA_SWA_DBG ALL_INF_ROW POST-slice: j=%d/%d nek1=%d n_swa=%d ith=%d\n",
+                        j, neq1, nek1, n_swa, ith);
+            }
+        }
+        if (ith == 0) {
+            fprintf(stderr, "PXA_SWA_DBG CALL: neq1=%d nek1=%d n_swa=%d neq2=%d nek2=%d stride_m=%d nth=%d\n",
+                    neq1, nek1, n_swa, neq2, nek2, stride_m, nth);
         }
     }
 
