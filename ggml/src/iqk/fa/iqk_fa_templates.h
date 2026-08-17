@@ -15,6 +15,8 @@
 
 #include <cstring>
 #include <type_traits>
+#include <cmath>
+#include <cstdio>
 #include <vector>
 
 #include "ggml-impl.h"
@@ -38,14 +40,42 @@ namespace {
 // parallel (--parallel N>1) where different slots have different sequence
 // lengths and therefore different mask patterns.
 // Returns the number of K elements to process (multiple of k_step).
+// Highest block boundary above which EVERY row is fully masked, so the tail can be skipped.
+//
+// PXA_NANFIX_MASK_EFF_NK1 (2026-08-17): this used to test only the FIRST element of each k_step
+// block --
+//     int ik = nk1 - k_step;
+//     for (; ik >= 0 && Mc[ik] != 0; ik -= k_step);
+// -- which is two assumptions, not one. It assumed a block is fully masked whenever its first
+// element is, and it assumed the mask is CAUSAL, i.e. live cells form a prefix so the first live
+// block found scanning down is the last one that matters.
+//
+// Both hold for an ordinary causal mask over a cache filled in position order. Neither holds for a
+// sliding-window mask over a cache whose live band FLOATS: there the band sits in the middle of the
+// range and need not start on a k_step boundary. When no block happened to begin on a live cell the
+// scan ran off the bottom, ik_max stayed 0, the k-loop body never executed, and the row finished
+// with M = -inf and S = 0 -- GGML_ASSERT(S > 0), with a mask that was perfectly well formed. That
+// is the same defect class as a sampled cell_max: a helper that is correct for one fill discipline
+// and silently wrong for another, with nothing in its name to say so.
+//
+// Now every element of a candidate block is examined and the scan stops at the highest block that
+// contains ANY live cell. The tail-skipping optimisation is preserved exactly -- for a causal mask
+// the topmost live block begins with a live cell, so the answer is unchanged and so is the cost --
+// but no live cell can be cut off any more, whatever the layout.
 inline int mask_effective_nk1(const char * mask, int n_rows, int stride_m, int nk1, int k_step) {
     int ik_max = 0;
     for (int j = 0; j < n_rows; ++j) {
         auto Mc = (const uint16_t *)(mask + j * stride_m);
-        int ik = nk1 - k_step;
-        for (; ik >= 0 && Mc[ik] != 0; ik -= k_step);
-        ik += k_step;
-        if (ik > ik_max) ik_max = ik;
+        for (int ik = nk1 - k_step; ik >= 0; ik -= k_step) {
+            if (ik + k_step <= ik_max) break;   // cannot raise ik_max any further from this row
+            bool live = false;
+            for (int t = 0; t < k_step; ++t) {
+                // live unless the entry is +/-inf; testing for inf rather than for "== 0" keeps a
+                // cell whose encoding is unexpected, which is the safe direction here.
+                if ((Mc[ik + t] & 0x7fffu) != 0x7c00u) { live = true; break; }
+            }
+            if (live) { ik_max = ik + k_step; break; }
+        }
     }
     return ik_max;
 }
@@ -1171,6 +1201,14 @@ struct FlashQKV {
             } else {
                 S += expf(s - fms.M[j]);
             }
+        }
+        if (!(S > 0)) {
+            // PXA_SWA_DBG: say WHAT went wrong before dying. M == -inf means the row saw no
+            // unmasked cell at all; M finite with S == 0 means every exp() underflowed; a NaN in
+            // either means a non-finite score reached the softmax.
+            fprintf(stderr, "PXA_FA_S0: j=%d S=%g M=%g Sisnan=%d Misnan=%d Misinf=%d D=%d q_step=%d\n",
+                    j, (double)S, (double)fms.M[j], (int)std::isnan(S), (int)std::isnan(fms.M[j]),
+                    (int)std::isinf(fms.M[j]), (int)D, (int)q_step);
         }
         GGML_ASSERT(S > 0);
         auto norm = F16::set1(1/S);
