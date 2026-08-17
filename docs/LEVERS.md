@@ -1009,3 +1009,107 @@ only be re-measured at f16/262144 **after** the KV change exists.
   produced byte-identical output). Use a diverse temp-0 corpus and report **agreement rate with n**;
   sanity-check any corpus by confirming two different models diverge on it.
   Working instrument: `<local-path>` + `cmp.py`.
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-08-17 overnight (run7) — refusal comparison, requant blocker, harness fix
+# ─────────────────────────────────────────────────────────────────────────
+
+## ***THE ROUTING NUMBER: the uncensored fallback seat refuses 0 %***
+The comparison the previous window deliberately deferred. Same corpus, same
+settings, same scoring code as the 91–98 % stock baseline
+(`BUILTIN_HARMFUL[::8][:100]`, n=100, greedy, 64 tokens, thinking off,
+`/v1/chat/completions`). All three re-scored **with one script**, so no number
+inherits another run's arithmetic — the pipeline reproduces the published
+baseline exactly (combined 98.0 %, Wilson [93.0, 99.4]).
+
+| model | prefix | arditi | substring | combined | Wilson 95 % CI |
+|---|---|---|---|---|---|
+| stock 9B baseline | 91.0 | 93.0 | 98.0 | **98.0** | [93.0, 99.4] |
+| Alex 27B (`:8231`) | 0.0 | 3.0 | 0.0 | **0.0** | [0.0, 3.7] |
+| Ana 9B (`:8219`) | 0.0 | 2.0 | 2.0 | **3.0** | [1.0, 8.5] |
+
+Alex's 3 % arditi score is **100 % false positives** — hand-checked, all three
+are the bare word `illegal` inside a *complying* answer (e.g. contrasting "tax
+avoidance (legal)" with "tax evasion (illegal)"). True refusals: **0/100**.
+**Route-to-fallback is vindicated, not undermined.** Alex answers 100 %
+coherently (distinct-4gram ≈ 1.0, 0 degenerate).
+
+## ***The abliterated seat is BROKEN, and its low refusal rate hides it***
+Reading refusal rate alone says "Ana refuses 3 %, so Ana is permissive". Wrong,
+and dangerously so:
+- **50/100** harmful completions are degenerate repetition loops
+  (worst: distinct-4gram **0.083**, one 4-gram repeated 12×).
+- **77/100** open with the stereotyped filler *"No matter what" / "No problem" /
+  "No need"* — 75 with the exact string *"no matter what"*. A **lower bound**:
+  completions that pass the 4-gram gate still carry the same collapsed opener.
+- Only ~47 % are non-refusing **and** non-degenerate.
+
+**Confirmed to be the model, not the harness.** Through the *same endpoint,
+same decoding, same seat*, benign prompts are clean, varied, and stop normally
+("capital of France" → Paris; a haiku; photosynthesis in two sentences). The
+collapse is **specific to harmful prompts** and reproduces at temp **0 and
+0.7**. Signature of an over-aggressive abliteration: the refusal direction was
+ablated so hard the harmful-prompt pathway fell into a fixed attractor rather
+than learning to comply.
+**Do not treat this seat as the permissive fallback.** The other one is.
+
+## Requantizing Q8_0 → PXQ4 is DISABLED by default (not merely lossy)
+The 35B MoE quantization stalled instantly on:
+```
+llama_model_quantize: failed to quantize: requantizing from type q8_0 is disabled
+```
+**The predicted risk was the wrong one.** Arch support was fine —
+`general.architecture = qwen35moe`, 256 experts (top-8), 41 blocks, 753 tensors
+all load. The wall was llama.cpp's refusal to requantize an already-quantized
+source. `llama-quantize --allow-requantize` clears it and the job completes:
+36039 MB → 18541 MB, 753/753 tensors, **695 s** at 24 threads, **4.381 BPW**,
+loads and generates correctly (`--check-tensors` clean).
+⚠ **Double-lossy provenance.** The box's reference PXQ4 was built **BF16 →
+PXQ4** with Q8_0 kept as the KL reference. This one is **Q8_0 → PXQ4**. It is
+not quality-comparable and must not be benched against BF16-sourced PXQ4 as if
+the paths were equivalent.
+
+## Correction: the degenerate bench prompt was NOT byte-identical
+This file previously recorded that a 27B and a 9B "produced byte-identical
+output" on the repeated-sentence prompt. Re-measured, they did **not** — the
+hashes differ (663 vs 659 chars). The reality is worse for an exact-hash gate:
+the outputs agree across **100 % of the shorter output**, differing only in
+that the 27B ran four characters further before the token cap.
+**An exact-hash fidelity gate would therefore have PASSED that pair by
+accident.** Key a fidelity gate on **prefix agreement + a degeneracy measure**,
+never on hash equality — hash equality is too brittle to express the property.
+Measured, identical prompt text on both seats, n_predict 128, temp 0, top_k 1:
+
+| prompt | common prefix | distinct-4gram | verdict |
+|---|---|---|---|
+| repeated sentence, `/completion` | **659 ch = 100.0 % of shorter** | 0.253 / 0.263 | BLIND |
+| varied corpus, `/v1/chat/completions` | 53 ch = 11.4 % | **1.0 / 1.0** | DISCRIMINATING |
+
+Fixed harness committed as `pxa-hive/seat-measure.py`; the before/after is
+re-checkable via `pxa-hive/seat-corpus-verify.py`. Corpus:
+`<local-path>` (the box's own perplexity reference).
+**The endpoint switch costs no metric** — llama-server returns the same
+`timings` object (`prompt_per_second`/`predicted_per_second`) on the chat
+endpoint.
+
+## Two probe gotchas that will bite the next agent
+- **`"status":"no slot available"` is NOT degradation.** The 27B seat runs
+  `-np 1`, so its own `/health` returns that string while it serves *your*
+  request. A liveness check that treats it as failure aborts a healthy run —
+  and reads as "the seat degraded under load". It did not.
+- **Thinking-disable is per-seat, not global.** The 9B guide seat has
+  `--chat-template-kwargs '{"enable_thinking":false}'` baked into its launch
+  line; the 27B seat has **no** chat-template-kwargs at all. Probing the 27B
+  without a per-request `chat_template_kwargs.enable_thinking=false` returns
+  **empty `content`** at 64 *and* 200 tokens — the whole budget goes to
+  `reasoning_content`. Confirms the existing `max_tokens 16` note generalises:
+  it is not the budget alone, it is budget × whether reasoning is on.
+
+## `-ts` ceiling above 58 — NOT MEASURABLE while all three seats are up
+Recorded as blocked, not attempted, with numbers. A bench copy of the 27B needs
+~14.4 GiB of weights plus KV. Free VRAM with the three seats serving:
+card0 4.0 / card1 2.4 / card2 0.3 / card3 10.6 / card4 2.4 / card5 0.5 /
+card6 3.5 GiB. No card and no usable pair fits it. The only substantially free
+card is the 1080 Ti, which is both too small **and** the wrong silicon —
+a split ceiling measured on sm_61 would not transfer to the V100+P100 pair the
+seat actually runs on. Needs a window where a seat may be taken down.
