@@ -934,3 +934,78 @@ the line the issue names.
 - CUDA graphs: already default for batch-1; upstream's headline is H100-class small models. Not our bottleneck.
 - NCCL tensor-parallel needs NVLink; our topology is **PHB on every pair** (`nvidia-smi topo -m`, all 7 GPUs). Consistent with our own record of `-sm graph` losing decode. Build already initialises NCCL communicators.
 - Community FA v2 WMMA for Pascal/Volta: <https://github.com/sirCamp/flash-attention-legacy> — a port, not a flag. Noted as a known option; NOT attempted.
+
+# 2026-08-16/17 — SWA-aware KV allocation lane (Alina / mgv-wt). Full record: `<local-path>`
+
+## sm_60 `FAST_FP16_AVAILABLE` carve-out — **MEASURED, LARGE REGRESSION, REVERTED. Do not re-chase.**
+Upstream llama.cpp issue #25593 proposes excluding cc 600 from the fast-fp16 gate alongside 610
+(claimed: median KLD 0.002298->0.000001, greedy token match 96.47%->99.89%, tg **+1.5%**, prefill
+"essentially tied"). Applied here and measured on Alina's own model/config
+(`-ts 24,38,38` cards 4,1,6, `-c 262144`, f16 KV, `-np 2`, `-fa on`, vision), interleaved REF/NEW/REF:
+
+| fill | pre-change | carve-out | pre-change (repeat) | prefill |
+|---|---|---|---|---|
+| 8192 | 269.45 / 18.52 | **136.94** / 18.54 | 269.56 / 18.51 | **−49.2%** |
+| 24576 | 229.19 / 11.95 | **96.29** / 11.98 | 229.27 / 11.98 | **−58.0%** |
+
+Repeat baseline agrees with the first to **0.04% / 0.03%**, so this is not drift. **Decode is
+untouched**; the whole cost is prefill and it grows with fill. Fidelity on a 12-anchor diverse temp-0
+corpus: **4/12 identical = 33.3% agreement (n=12)** — the change is numerically material.
+- **Upstream's "prefill essentially tied" is FALSE on P100 with this engine.** GP100 has genuine 2:1
+  FP16; forcing sm_60 onto fp32 roughly halves prefill for **any** head size.
+- **Upstream's "three sites" is wrong for this tree — there are TWO**: `ggml/src/ggml-cuda/common.cuh`
+  `FAST_FP16_AVAILABLE` macro and the `fast_fp16_available(cc)` host predicate. Keep them in lockstep.
+- The D=256 story from the Ana/Alex lane (`fattn-tile-f32` handles only D=64/128, so D=256 falls to
+  `vec_f32`) is real but is **NOT** why it regresses here: **the Alina target model is D=128**
+  (`n_embd_head_k/v = 128`; the `n_embd_k_gqa = 256` line is `head_count_kv 2 x key_length 128`, the
+  GQA embedding width — **not** the head dimension. Do not conflate these). Correct D analysis did not
+  rescue the lever; only the measurement settled it.
+- Prebuilt libs kept for a zero-rebuild redeploy if the owner ever wants the accuracy trade:
+  `build-fugv60/refl-sm60carve/` (carve-out) and `build-fugv60/refl-presm60/` (shipped/known-good).
+  **The CUDA kernels live in `libggml.so` (388 MB), not `llama-server`** — an A/B that swaps only the
+  binary is a fake reference. Prove which is loaded via `/proc/<pid>/maps`.
+
+## SWA-aware per-layer KV allocation — **NOT TRACTABLE as a patch in this fork. Not attempted.**
+Target had 52 layers, `n_swa = 2048`, `swa_layers[]` = **39 sliding / 13 full** (verified from the
+GGUF: `sliding_window_pattern` is a bool ARRAY `[T,T,T,F] x 13`, loaded via `get_key_or_arr` after
+the scalar read fails). `n_swa_pattern` is **cosmetic** — printed value `1` is the untouched default
+and nothing derives behaviour from it. KV today = **13312 MiB** (52 x 262144 x 256 x 2 B per side);
+sizing the 39 sliding layers to a 4096-cell window would recover **~9828 MiB**.
+**Why it is not a patch:** the cache is one global index space — a single `cells`/`head`/`size`/`n`
+shared by every layer. `llm_build_kv_store` asserts `kv.size == n_ctx` and uses **`n_ctx` as the
+V-transposed row stride**; the K-shift views `n_ctx` rows; the SWA mask is allocated at the graph-wide
+`n_kv`; the per-layer copy fast-path patches `view_offs = kv_self.head*step`; slot allocation, defrag
+and state save/load are all layer-agnostic. Shrinking a layer's tensor forces a per-layer
+cell->row mapping; the only bounded mapping is a ring, which (a) breaks contiguous writes at the wrap,
+(b) needs per-layer-class masks, and (c) **aliases under `-np 2`** — two live cells whose indices
+differ by a multiple of the window land on the same row, silently corrupting one sequence. Upstream
+solves this with a **separate** `llama_kv_cache_unified_iswa` (own cells/head/slot allocator, physical
+eviction) which **this fork does not have**. It also re-establishes the index-vs-position coupling
+that commit `16d5c1a8` removed after the NaN cascade — and adds a corruption mode that produces wrong
+tokens rather than NaNs, which the soft-fail counters would **not** catch. Multi-day port, not a night's work.
+
+## 2-card `-ts 45,55` at ctx 262144 — **the prize is REAL: it FITS once KV drops to ~3.5 GiB**
+Measured on cards 4,1 (vision on, `-b/-ub 2048`, `-np 2`). GPU tensors 14212.86 MiB, compute 2308/card,
+projector 3670.81 MiB on dev0.
+- f16 KV (13312 MiB): **OOM** — dev1 cannot place its 2308 MiB compute buffer (7787.79+6656+2308 = 16752 > 16384).
+- q8_0 KV (7072 MiB, recovers 6240): **OOM by only ~200 MiB** on dev0.
+- **q4_0 KV (3744 MiB, recovers 9568): FITS and serves.** dev0 = 6425.07+1944.01+2308.01+287.27 = **10964 MiB of 16140 free**.
+Since the SWA fix would recover **9828 MiB — ~260 MiB MORE than the arm that fit** — recovering the
+KV **would** let the 2-card layout run at full ctx 262144. ⚠ **Quantised KV is a FIT PROBE ONLY**; it
+alters numerics and its speed is not the shipped number (q4_0 decode pays a per-step dequant:
+8192 → 359.7/18.05, 24576 → 298.79/11.96, decode spreads 11.6%/24.8%). The +30.7%/+13.1% prize can
+only be re-measured at f16/262144 **after** the KV change exists.
+
+## Method notes earned tonight (both cost real time)
+- **An infrastructure failure must never render as a measurement verdict.** Two arms printed `fit=0`
+  from `docker run` **rc=125** (`invalid reference format`, empty `$IMG` — the container never
+  existed) and the decision table nearly retired the whole premise. Guards now: echo the fully
+  expanded command; `rc != 0` or "container never existed" => `VOID — HARNESS FAULT, NOT A VERDICT`;
+  only a container that started and then hit `cudaMalloc failed` counts as OOM.
+- **`17*23 -> 391` with `max_tokens 16` proves NOTHING on this model** — reasoning consumes the
+  budget (52 completion tokens for a 3-character answer) and `content` comes back **empty**, reading
+  as a failure. Budget >= 512 and inspect `reasoning_content` too.
+- **The shared repeated-sentence bench prompt is a degenerate fidelity instrument** (a 27B and a 9B
+  produced byte-identical output). Use a diverse temp-0 corpus and report **agreement rate with n**;
+  sanity-check any corpus by confirming two different models diverge on it.
+  Working instrument: `<local-path>` + `cmp.py`.
