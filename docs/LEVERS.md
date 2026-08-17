@@ -732,3 +732,61 @@ Closing an inventory gap: these are all read via `getenv` in shipped source and 
 `PXA_GEMV_DBG`, `PXA_GLUE_DBG`, `PXA_RDBG`, `PXA_ROUTER_FUSE_DBG`, `PXA_PXQ_DISPATCH_DBG`.
 `PXA_ROUTER_FUSE_DBG=1` dumps per-mode fired/declined counters — **the ratio is the assertion**, since
 a one-shot bool cannot distinguish "fired once" from "fires every token".
+
+---
+
+## Updates — 2026-08-16 — SWA flash-attention NaN fix + blast-radius levers
+
+Four `PXA_*` vars shipped with the restore-then-truncate NaN fix and were missing from this file.
+All measured on the 3-card reviewer cell (V100+2×P100, `-sm layer -ts 24,38,38 -c 262144 -b/-ub 2048
+-ctk/-ctv f16 -fa on`, 30B MoE PXQ4, `n_swa = 2048`) unless a row says otherwise.
+
+| var | default | what it does |
+|---|---|---|
+| `PXA_FA_SWA_SLICE` | **0 (slice OFF)** | `1` re-arms the old windowed SWA slice in `ggml-cuda/fattn.cu`. **Repro/benchmark only — it is UNSOUND with `np>1` or any slot reuse.** The slice assumed KV-cache *cell index* order equals *position* order, which holds only for one sequence laid into an empty cache. Otherwise `first = K->ne[1] - nton > 0` cuts the query's own cells out of the view, every sliced mask row is all `-inf`, and the fully-masked flash-attention output is NaN → **all logits non-finite**. |
+| `PXA_FA_SWA_KEEP` | **1 (n_swa preserved)** | `0` re-zeroes `op_params[4]` (the old dispatch behaviour: full-range KV iteration). Default keeps `n_swa`, so the kernels' mask-driven `KV_min_max` scan — which reads the actual mask and is correct for **any** cell layout — bounds SWA decode iteration instead of the index-arithmetic slice. |
+| `PXA_SWA_TRUNCATE_MIN_DISCARD` | `256` | server guard: minimum discarded tokens before a restore-then-truncate reuse is refused in favour of a clean full re-process. |
+| `PXA_SOFTFAIL_MAX_CONSEC` | `16` | server breaker: consecutive sampler soft-fails on one slot before that generation is stopped. Bounds blast radius; does **not** restore correctness. |
+
+`PXA_SWA_TRUNCATE_MAX_KEEP_FRAC` (default `0.5`) pairs with `MIN_DISCARD`: the guard fires only when
+*both* `discarded > MIN_DISCARD` **and** `n_past < MAX_KEEP_FRAC × cache_size`.
+
+### The slice is unreachable from `llama-perplexity` — gate this change with generations, not ppl/KL
+
+Structural, and it decides the method. The slice engages only when
+
+```
+first = K->ne[1] − 256·ceil((max(256, Q->ne[1]) + n_swa)/256) > 0
+```
+
+In a perplexity run the whole chunk is one batch, so `Q->ne[1] = n_ctx` and
+`nton = n_ctx + n_swa` rounded up, which is **always > `K->ne[1] = n_ctx`** ⇒ `first < 0` at **any**
+`n_ctx`. It is a **decode**-path difference: at `Q->ne[1] = 1`, `nton = 2304`, so it engages once the
+cache passes 2304 cells. A perplexity/KL run cannot exercise the changed code path at all — so
+perplexity and KL-vs-parent are the *wrong* instrument here, independent of the della-corpus problem.
+
+**Quality gate actually run (2026-08-16):** temp-0 greedy anchors, `seed 1234`, `-np 1`,
+`cache_prompt:false`, 8 prompts of **12,389 tokens** each (cache far past the 2304-cell threshold, so
+the slice *does* engage on the old arm), single sequence so the old path is in the regime where it
+was sound. New (slice off, `n_swa` kept) vs old (`PXA_FA_SWA_SLICE=1`): **8/8 byte-identical
+generations**, longest 364 chars. The change is output-identical wherever the old path was valid,
+and it is the only one of the two that is correct at all under `np>1`.
+*Coverage dropped:* 8 anchors, one cell, one model — not a corpus-wide KL. No Q8_0 parent exists on
+disk for this lineage and `llama-perplexity` is not built in this tree, so a parent-relative KL was
+not run.
+
+### Measured before/after (same binary, same launch line, only the lever varies)
+
+Adversarial workload = long prompt (6k–24k tok, topic rotating so the RAM cache fills with mutually
+unrelated large states) immediately followed by a short unrelated prompt sharing only the chat
+template, every 3rd cycle firing two shorts concurrently. Seat had already served real traffic.
+
+| arm | slice | guard | breaker | correct | soft-fails | blast radius |
+|---|---|---|---|---|---|---|
+| **after (shipping)** | off | on | on(16) | **15/16** | **0** | — (53 guard fires, 140 truncating reuses) |
+| **before (defect)** | **on** | off | off | 1/8-class | **101 in ~2 min** | one request ran to `p0=20476` **and still climbing** |
+| breaker isolated | on | off | **on(1)** | 1/8 | 14 | **13 fires, every one `n_decoded=1`**; requests returned in 0.4–1.2 s |
+
+The breaker row is the point of the breaker: same defect, same wrong answers, but a degenerate
+generation is killed after **one** token instead of holding a slot to context-fill — which under
+`-sm layer` is what starves every co-resident generation on the same cards.
