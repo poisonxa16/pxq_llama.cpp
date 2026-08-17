@@ -857,41 +857,55 @@ static llama_pos llama_kv_swa_seq_pos_max(const llama_kv_cache & cache, llama_se
 
 // Drop every cell that can never again be inside any sequence's attention window.
 //
-// Correctness argument (this is the whole safety case for a bounded cache, so it is spelled out):
-// the SWA mask masks cell c out for query position p exactly when `p - c.pos >= n_swa`. Every future
-// query for a sequence has p >= that sequence's current maximum position. So once
-// `pos_max[seq] - c.pos >= n_swa` holds, c is masked for that sequence for the rest of time. A cell
-// shared by several sequences is dropped only when that holds for ALL of them. Dropping at
-// `>= n_swa + guard` is therefore strictly conservative: it keeps `guard` positions more than the
-// window can ever read, which is what absorbs small backwards rewinds.
+// Correctness argument (this is the whole safety case for a bounded cache, so it is spelled out).
+// The SWA mask masks cell c out for query position p exactly when `p - c.pos >= n_swa`. So c is
+// dead once EVERY query position that can still be asked satisfies that. The smallest such position
+// is what we must compare against - NOT the largest:
+//   * for a sequence present in this ubatch, the smallest future query is the ubatch's own FIRST
+//     position for that sequence. The last token of a 2048-token ubatch has moved on 2048
+//     positions, but the first token still needs the window around where it starts.
+//   * for a sequence absent from this ubatch, the next query is at least pos_max + 1, so its
+//     current pos_max is a conservative stand-in.
+// A cell shared by several sequences is dropped only when this holds for ALL of them.
 //
-// This is a physical eviction of a cell, not a remapping of an index — the freed row is returned to
-// the same allocator that every other row comes from.
-static void llama_kv_swa_evict(llama_context & lctx, const llama_batch & batch) {
+// Using the ubatch MAXIMUM here instead would evict, mid-prefill, cells that the earliest tokens of
+// that same ubatch still attend to - wrong output with no error anywhere. The reference position is
+// therefore the minimum, and `guard` is then a pure safety margin for backwards rewinds, which is
+// what lets the caller drop it under allocation pressure without endangering correctness.
+//
+// This is a physical eviction of a cell, not a remapping of an index - the freed row goes back to
+// the same allocator every other row comes from.
+static void llama_kv_swa_evict(llama_context & lctx, const llama_batch & batch, uint32_t guard) {
     if (!lctx.swa_kv_active) {
         return;
     }
 
     auto & cache = lctx.kv_swa;
-    const llama_pos n_keep = (llama_pos) lctx.model.hparams.n_swa + (llama_pos) lctx.swa_kv_guard;
+    const llama_pos n_keep = (llama_pos) lctx.model.hparams.n_swa + (llama_pos) guard;
 
-    // pos_max per sequence, taking the incoming ubatch into account: the batch positions are about
-    // to become live, so they must not be able to be evicted by their own arrival.
-    std::map<llama_seq_id, llama_pos> pos_max;
+    // reference position per sequence: the earliest position that can still be queried
+    std::map<llama_seq_id, llama_pos> ref;
+
+    // sequences absent from the ubatch: their current maximum in this cache
     for (uint32_t i = 0; i < cache.size; ++i) {
         const auto & cell = cache.cells[i];
         if (cell.pos < 0) continue;
         for (auto s : cell.seq_id) {
-            auto it = pos_max.find(s);
-            if (it == pos_max.end() || it->second < cell.pos) pos_max[s] = cell.pos;
+            auto it = ref.find(s);
+            if (it == ref.end() || it->second < cell.pos) ref[s] = cell.pos;
         }
     }
+    // sequences present in the ubatch: their FIRST position in it overrides the above
+    std::map<llama_seq_id, llama_pos> in_batch;
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
             const llama_seq_id s = batch.seq_id[i][j];
-            auto it = pos_max.find(s);
-            if (it == pos_max.end() || it->second < batch.pos[i]) pos_max[s] = batch.pos[i];
+            auto it = in_batch.find(s);
+            if (it == in_batch.end() || it->second > batch.pos[i]) in_batch[s] = batch.pos[i];
         }
+    }
+    for (const auto & kv : in_batch) {
+        ref[kv.first] = kv.second;
     }
 
     uint32_t new_head = cache.size;
@@ -903,14 +917,14 @@ static void llama_kv_swa_evict(llama_context & lctx, const llama_batch & batch) 
 
         bool live = false;
         for (auto s : cell.seq_id) {
-            auto it = pos_max.find(s);
-            // A sequence we have never seen a position for cannot be advanced past this cell.
-            if (it == pos_max.end() || it->second - cell.pos < n_keep) { live = true; break; }
+            auto it = ref.find(s);
+            // a sequence with no reference position cannot be shown to have moved past this cell
+            if (it == ref.end() || it->second - cell.pos < n_keep) { live = true; break; }
         }
         if (live) continue;
 
         cell.seq_id.clear();
-        cell.pos = -1;
+        cell.pos   = -1;
         cell.delta = 0;
         cache.used--;
         ++n_evicted;
@@ -5955,20 +5969,30 @@ static int llama_decode_internal(
                 auto & kv_swa = lctx.kv_swa;
 
                 // retire everything the window can no longer reach, then allocate
-                llama_kv_swa_evict(lctx, u_batch);
+                llama_kv_swa_evict(lctx, u_batch, lctx.swa_kv_guard);
 
                 if (kv_swa.head > kv_swa.used + 2*n_tokens) {
                     kv_swa.head = 0;
                 }
 
                 if (!llama_kv_cache_find_slot(kv_swa, u_batch)) {
-                    // No contiguous run for this ubatch. This is a hard, loud failure (the decode
-                    // is refused) - never a silent overwrite. Sizing carries a full ubatch of
-                    // headroom per sequence precisely so this stays unreachable in practice.
-                    LLAMA_LOG_ERROR("%s: PXA_SWA_KV: no slot in the sliding cache for %u tokens "
-                            "(size=%u used=%u head=%u)\n", __func__, n_tokens,
-                            kv_swa.size, kv_swa.used, kv_swa.head);
-                    return 1;
+                    // find_slot needs a CONTIGUOUS run. Two sequences decoding at different rates
+                    // can leave the freed cells interleaved, so a near-miss is possible even with
+                    // space available. Retry once having given up the guard band - that is still
+                    // the exact window bound, so it costs robustness against a later rewind (which
+                    // the coverage check catches) rather than correctness.
+                    llama_kv_swa_evict(lctx, u_batch, 0);
+                    kv_swa.head = 0;
+
+                    if (!llama_kv_cache_find_slot(kv_swa, u_batch)) {
+                        // Hard, loud failure: the decode is refused. Never a silent overwrite.
+                        LLAMA_LOG_ERROR("%s: PXA_SWA_KV: no slot in the sliding cache for %u tokens "
+                                "(size=%u used=%u head=%u)\n", __func__, n_tokens,
+                                kv_swa.size, kv_swa.used, kv_swa.head);
+                        return 1;
+                    }
+                    LLAMA_LOG_WARN("%s: PXA_SWA_KV: sliding cache needed a guard-band drop to place "
+                            "%u tokens (size=%u used=%u)\n", __func__, n_tokens, kv_swa.size, kv_swa.used);
                 }
 
                 const uint32_t pad = llama_kv_cache_get_padding(cparams);
