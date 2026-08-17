@@ -5996,7 +5996,15 @@ static int llama_decode_internal(
                 }
 
                 const uint32_t pad = llama_kv_cache_get_padding(cparams);
-                auto max_cell_swa = llama_kv_cache_cell_max(kv_swa, pad);
+                // NOTE: the EXACT cell_max, not the padded sampling variant used for kv_self.
+                // That variant only inspects every pad-th cell, which is sound for a cache that
+                // fills contiguously from index 0 and never empties below the top - true of the
+                // full cache, false of this one. Here eviction leaves a live band that FLOATS, and
+                // a band lying entirely between two sampled indices makes the sampling variant
+                // return 0. n would then be clamped to `pad`, the live cells would sit OUTSIDE the
+                // mask and the K/V view, and every mask row for those sequences would be all -inf
+                // -> GGML_ASSERT(S > 0) in the flash-attention kernels. Observed exactly that.
+                auto max_cell_swa = llama_kv_cache_cell_max(kv_swa);
                 kv_swa.n = std::min(kv_swa.size, std::max(pad, GGML_PAD(max_cell_swa, pad)));
             }
         }
