@@ -7,6 +7,7 @@
 #include "ggml-common.h"
 
 #include "iqk/iqk_quantize.h"
+#include "pxq-cpu.h"
 
 #include <thread>
 #include <atomic>
@@ -1510,9 +1511,12 @@ static bool pxq4_tensor_eligible(const std::string & name, const ggml_tensor * t
 //   PXA_PXQ_ERRBUDGET_REF=<tsv>      compare against a stored budget; WARN at >1.5x any class
 //   PXA_PXQ_ERRBUDGET_MAXELEM=<n>    per-tensor sampling cap, whole rows (default 64M, 0 = all)
 //
-// LIMITATION, stated rather than hidden: the PXQ slab types are CUDA-only and have no CPU
-// to_float, so expert classes report "n/a". The report therefore covers the BACKBONE — which
-// is exactly the surface this revision changes and the entire surface the Laguna bug lived on.
+// PXQ coverage (2026-08-18): the slab types have no per-row to_float (a row's bytes are
+// scattered across its 64-row panel), so this instrument used to report "n/a" on every PXQ
+// tensor — blind on exactly the types it exists to police. The panel-aware CPU dequant
+// (pxa_pxq_dequant_row, pxq-cpu.c) decodes PXQ4/PXQ4HQ/PXQ2/PXQ3 from the tensor base, so
+// those measure like any other type now; only the 5-bit PXQ6 slab type (no CPU fallback
+// yet) still reports "n/a".
 struct pxa_err_acc {
     double sse = 0.0;
     double ssq = 0.0;
@@ -1555,9 +1559,13 @@ static void pxa_errbudget_accumulate(std::map<std::string, pxa_err_acc> & acc,
     a.ntensor++;
     a.types.insert(ggml_type_name(type));
     const ggml_type_traits_t tt = ggml_internal_get_type_traits(type);
-    // no CPU codec (PXQ slab types), or a row-interleaved layout whose rows are not
-    // independently decodable -> honestly report it as unmeasured rather than guess
-    if (tt.to_float == nullptr || interleaved_properties(type).second != 1) {
+    // PXQ slab types keep to_float NULL on purpose — decode them through the panel-aware
+    // CPU dequant instead (global row index into the tensor base; expert stacks are
+    // contiguous %64-row slices, so the panel arithmetic holds across ne[2])
+    const bool pxq = pxa_pxq_is_cpu_supported(type);
+    // no CPU codec (the 5-bit PXQ6 slab type), or a row-interleaved layout whose rows are
+    // not independently decodable -> honestly report it as unmeasured rather than guess
+    if (!pxq && (tt.to_float == nullptr || interleaved_properties(type).second != 1)) {
         a.nskipped++;
         return;
     }
@@ -1566,11 +1574,15 @@ static void pxa_errbudget_accumulate(std::map<std::string, pxa_err_acc> & acc,
     if (cap > 0 && ne0 > 0 && ne0*rows > cap) {
         rows = std::max<int64_t>(1, cap/ne0);
     }
-    const size_t rs = ggml_row_size(type, ne0);
+    const size_t rs = pxq ? 0 : ggml_row_size(type, ne0);
     std::vector<float> buf(ne0);
     double sse = 0.0, ssq = 0.0;
     for (int64_t r = 0; r < rows; ++r) {
-        tt.to_float((const char *)qdata + (size_t)r*rs, buf.data(), ne0);
+        if (pxq) {
+            pxa_pxq_dequant_row(type, qdata, r, ne0, buf.data());
+        } else {
+            tt.to_float((const char *)qdata + (size_t)r*rs, buf.data(), ne0);
+        }
         const float * x = src + (size_t)r*ne0;
         for (int64_t j = 0; j < ne0; ++j) {
             const double d = (double)x[j] - (double)buf[j];
