@@ -156,9 +156,42 @@ UNTRANSLATABLE = {
     "sm":  "vLLM's parallelism model has no -sm equivalent (layer/attn/graph).",
 }
 
+# Known llama-server build roots, most-specific first. The binary lives in a
+# different place on every box we own (DGX vs Unraid vs zbook), so hardcoding one
+# path emits a command that cannot run and blames the engine for it.
+ENGINE_DIR_CANDIDATES = [
+    "/mnt/models/pxa-sky-build/build70",   # DGX, sm_70
+    "/mnt/models/pxq_llama/build70",       # DGX, sm_70
+    "<local-path>",   # Unraid, sm_60;70 - serves PXQ4 in production
+    "<local-path>",      # Unraid, second live seat
+    "<local-path>",   # older fallbacks
+    "<local-path>",
+]
+
+def resolve_engine_dir():
+    """-> (dir, note). Honour PXA_ENGINE_DIR, else first candidate that exists."""
+    env = os.environ.get("PXA_ENGINE_DIR")
+    if env:
+        return env, ("PXA_ENGINE_DIR" if os.path.isfile(f"{env}/bin/llama-server")
+                     else "PXA_ENGINE_DIR (no llama-server there)")
+    for d in ENGINE_DIR_CANDIDATES:
+        if os.path.isfile(f"{d}/bin/llama-server"):
+            return d, "auto-detected"
+    onpath = shutil.which("llama-server")
+    if onpath:
+        return os.path.dirname(os.path.dirname(onpath)), "found on PATH"
+    return None, "no llama-server found"
+
 def build_cmd(engine, a, sel, kind):
     if engine == "llama":
-        E = os.environ.get("PXA_ENGINE_DIR", "/mnt/models/pxa-sky-build/build70")
+        E, note = resolve_engine_dir()
+        if E is None:
+            print("  REFUSING - no llama-server binary found. Looked at "
+                  f"{', '.join(ENGINE_DIR_CANDIDATES)} and $PATH.")
+            print("    Set PXA_ENGINE_DIR=/path/to/build (the dir containing bin/llama-server).")
+            sys.exit(4)
+        if note != "auto-detected":
+            print(f"  engine dir: {E}  [{note}]")
         cmd = [f"{E}/bin/llama-server", "-m", a.model, "--host", a.host, "--port", str(a.port),
                "-ngl", "99", "-sm", a.sm, "-c", str(a.ctx), "-b", str(a.ub), "-ub", str(a.ub),
                "-ctk", "f16", "-ctv", "f16", "-np", str(a.np), "-t", str(a.threads),
@@ -167,6 +200,7 @@ def build_cmd(engine, a, sel, kind):
         if a.spec: cmd += ["--spec-type", a.spec if ":" in a.spec else f"{a.spec}:n_max=4,n_min=2"]
         if a.mmproj: cmd += ["--mmproj", a.mmproj]
         env = {"PXA_ENHANCE": "1", "GGML_CUDA_NO_PINNED": "1"}
+        return cmd, env, ",".join(str(g[0]) for g in sel) if sel else ""
     else:
         model = a.model
         if kind == "gguf":
@@ -176,15 +210,28 @@ def build_cmd(engine, a, sel, kind):
                 print(f"    Convert first:  python3 src/gguf_to_vllm/... {a.model} {model}")
                 print(f"    Or use --engine llama to serve the .gguf directly.")
                 sys.exit(3)
+        # Only sm_70+ cards can run vLLM at all, and TP must divide the head
+        # counts - an odd TP like 7 is rejected by vLLM at startup. Take the
+        # largest power of two among the ELIGIBLE cards, and say what we dropped.
+        elig = [g for g in sel if g[2] >= MIN_VLLM_CAP]
+        tp = 1
+        while tp * 2 <= len(elig):
+            tp *= 2
+        used = elig[:tp]
+        if used and len(used) != len(sel):
+            dropped = [f"{g[0]}:sm_{g[2]}" for g in sel if g not in used]
+            print(f"  TP uses {tp} card(s) {[g[0] for g in used]}; not using {dropped} "
+                  f"(sm_<{MIN_VLLM_CAP} and/or TP must be a power of two)")
         cmd = ["vllm", "serve", model, "--host", a.host, "--port", str(a.port),
                "--quantization", "pxq4", "--dtype", "float16",
-               "--tensor-parallel-size", str(len(sel)),
+               "--tensor-parallel-size", str(max(1, tp)),
                "--max-model-len", str(a.ctx), "--max-num-seqs", str(a.np)]
         if a.spec:
             cmd += ["--speculative-config",
                     json.dumps({"method": "ngram", "num_speculative_tokens": 4})]
         env = {"VLLM_SM70_QUANT_BACKEND": "turbomind"}
-    return cmd, env
+        return cmd, env, ",".join(str(g[0]) for g in used) if used else ""
+    return cmd, env, ",".join(str(g[0]) for g in sel) if sel else ""
 
 def selftest(gpus):
     print("=== selftest: decision table against this machine ===")
@@ -252,6 +299,13 @@ def main():
     for b in blockers + fit_check(sel, mbytes, a.ctx, engine):
         print(f"  !! {b}")
 
+    # A forced engine still needs a real model. Printing a runnable-looking
+    # command for a path that does not exist is the failure mode this launcher
+    # exists to prevent - refuse like the gguf-without-conversion case does.
+    if kind in ("missing", "not_a_model"):
+        print(f"  REFUSING - no command can be built for a {kind} path: {a.model}")
+        print("=" * 78); sys.exit(2)
+
     refusals = []
     if engine == "vllm":
         if a.ts: refusals.append(("-ts", UNTRANSLATABLE["ts"]))
@@ -263,9 +317,9 @@ def main():
         print("  Drop them, or use --engine llama to keep them.")
         print("=" * 78); sys.exit(3)
 
-    cmd, env = build_cmd(engine, a, sel, kind)
+    cmd, env, cv = build_cmd(engine, a, sel, kind)
     envs = " ".join(f"{k}={v}" for k, v in env.items())
-    cv = a.cards or "all"
+    cv = cv or "all"
     print(f"  env:     CUDA_VISIBLE_DEVICES={cv} {envs}")
     print(f"  command: {' '.join(cmd)}")
     print("=" * 78)
@@ -276,7 +330,7 @@ def main():
     if not shutil.which(cmd[0]) and not os.path.exists(cmd[0]):
         print(f"pxa-launch: {cmd[0]} not found", file=sys.stderr); sys.exit(4)
     e = dict(os.environ); e.update(env)
-    if a.cards: e["CUDA_VISIBLE_DEVICES"] = a.cards
+    if cv and cv != "all": e["CUDA_VISIBLE_DEVICES"] = cv
     os.execvpe(cmd[0], cmd, e)
 
 if __name__ == "__main__":
