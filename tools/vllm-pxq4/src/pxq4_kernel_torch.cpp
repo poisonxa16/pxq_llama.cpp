@@ -43,6 +43,8 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 
@@ -104,6 +106,36 @@ void dequant_out(at::Tensor & out, const at::Tensor & slabs, const at::Tensor & 
                             g.panels, g.kslabs, at::cuda::getCurrentCUDAStream());
 }
 
+
+// Persistent per-device fp32 partials arena for the split mmv. Grown ONLY outside CUDA graph
+// capture; steady-state (and in-capture) calls are allocation-free. The first v2 TP=4 boot
+// allocated the partials with a per-call at::empty instead, and the alloc/free churn inside
+// the FULL decode-graph capture broke the fork's custom-allreduce graph-buffer registration
+// (cudaIpcGetMemHandle returned 'invalid argument' at custom_all_reduce.cuh:976 on all four
+// ranks, right after the capture bar hit 2/2). With the arena, the split path performs ZERO
+// in-capture allocations -- exactly the allocation behaviour of the v1 monolithic kernel,
+// which captured cleanly in the same config. Sizing uses max(M, mmv_max_m) so the eager
+// pre-capture warmup vLLM always runs (every layer, decode-shaped M) warms the arena past
+// anything a captured decode graph can need; if a capture would still outgrow it, we refuse
+// loudly instead of allocating.
+at::Tensor & mmv_partials_arena(const at::Tensor & like, int64_t need_floats) {
+    static std::array<at::Tensor, 64> cache;  // one slot per CUDA device index
+    const int64_t di = (int64_t)like.get_device();
+    TORCH_CHECK(di >= 0 && di < (int64_t)cache.size(), "pxq4: bad device index ", di);
+    at::Tensor & t = cache[(size_t)di];
+    if (!t.defined() || t.numel() < need_floats) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &st);
+        TORCH_CHECK(st == cudaStreamCaptureStatusNone,
+                    "pxq4: mmv partials arena would have to grow (to ", need_floats,
+                    " floats) during CUDA graph capture. Every PXQ4 layer must run eagerly "
+                    "once before capture (vLLM's pre-capture warmup does this); hitting this "
+                    "means the warmup skipped a layer or M exceeded mmv_max_m inside a graph.");
+        t = at::empty({need_floats}, like.options().dtype(at::kFloat));
+    }
+    return t;
+}
+
 void mmv_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
              const at::Tensor & anchor) {
     const Geom g = check_weight(slabs, anchor);
@@ -144,11 +176,12 @@ void mmv_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
         // K-chunk-split fast path: bit-identical to the monolithic kernel (see
         // k_pxq4_mmv_part) but with nfix-times the blocks, which is what keeps an 80-SM
         // V100 busy at decode on this model's small-N TP shapes. The fp32 partials come
-        // from the caching allocator: under torch.cuda.graph capture that allocation is
-        // served from the graph-private pool exactly like the `out = torch.empty(...)`
-        // the Python caller already performs per apply(), so capture safety is unchanged.
-        at::Tensor part = at::empty({M * (int64_t)g.panels * nfix * 256},
-                                    x.options().dtype(at::kFloat));
+        // from a persistent per-device arena warmed before capture (see
+        // mmv_partials_arena above) so this path allocates nothing at steady state or
+        // under CUDA graph capture.
+        const int64_t m_cap = std::max<int64_t>(M, kPxq4MmvMaxM);
+        at::Tensor & part = mmv_partials_arena(
+            x, m_cap * (int64_t)g.panels * nfix * (int64_t)(PXQ4_MMV_KSEG * PXQ4_BM));
         pxq4_launch_mmv_split_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(),
                                   part.data_ptr<float>(), out.data_ptr(),
                                   (int)M, g.panels, g.kslabs, /*vecx=*/true,
@@ -192,7 +225,7 @@ void mmv_out_scalar(at::Tensor & out, const at::Tensor & x, const at::Tensor & s
                         at::cuda::getCurrentCUDAStream());
 }
 
-int64_t version() { return 2; }  // 2 = K-chunk-split mmv decode path
+int64_t version() { return 3; }  // 2 = K-chunk-split mmv; 3 = capture-safe partials arena
 
 int64_t mmv_max_m() { return kPxq4MmvMaxM; }
 
