@@ -43,6 +43,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include <cstdlib>
 #include <cstring>
 
 #include "pxq4_kernel_launch.h"
@@ -128,8 +129,51 @@ void mmv_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
     // owned by the Python caller, and a hard check would make the op unusable for the
     // crossover sweep that decides where the ceiling actually belongs (plan risk 4).
 
-    pxq4_launch_mmv_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(), out.data_ptr(),
-                        (int)M, g.panels, g.kslabs, /*vecx=*/true,
+    // Split-path threshold. The split mmv pays a fixed two-launch + partials round-trip
+    // cost (~10 us); below ~8 MB of slab bytes the monolithic kernel's launch economy wins
+    // even at 12% occupancy (measured: TP4 o_proj, 4.2 MB, mono 21 us vs split 32 us, while
+    // every shape >= 8 MB gains 1.5-2.3x from the split). Env-tunable for re-baselining on
+    // a different part.
+    static const int64_t kSplitMinBytes = [] {
+        const char * e = getenv("PXQ4_MMV_SPLIT_MIN_BYTES");
+        return e && *e ? (int64_t)atoll(e) : (int64_t)(8 << 20);
+    }();
+    const int64_t slab_bytes = (int64_t)g.panels * g.kslabs * PXQ4_SLAB_BYTES;
+    const int nfix = pxq4_mmv_nfix(g.kslabs);
+    if (nfix > 1 && slab_bytes >= kSplitMinBytes) {
+        // K-chunk-split fast path: bit-identical to the monolithic kernel (see
+        // k_pxq4_mmv_part) but with nfix-times the blocks, which is what keeps an 80-SM
+        // V100 busy at decode on this model's small-N TP shapes. The fp32 partials come
+        // from the caching allocator: under torch.cuda.graph capture that allocation is
+        // served from the graph-private pool exactly like the `out = torch.empty(...)`
+        // the Python caller already performs per apply(), so capture safety is unchanged.
+        at::Tensor part = at::empty({M * (int64_t)g.panels * nfix * 256},
+                                    x.options().dtype(at::kFloat));
+        pxq4_launch_mmv_split_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(),
+                                  part.data_ptr<float>(), out.data_ptr(),
+                                  (int)M, g.panels, g.kslabs, /*vecx=*/true,
+                                  at::cuda::getCurrentCUDAStream());
+    } else {
+        pxq4_launch_mmv_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(),
+                            out.data_ptr(), (int)M, g.panels, g.kslabs, /*vecx=*/true,
+                            at::cuda::getCurrentCUDAStream());
+    }
+}
+
+// The pre-split monolithic mmv, kept callable so the parity gate can assert the split path
+// bit-identical against it on device, and as a one-line fallback if a future shape ever
+// misbehaves. Same ABI as mmv_out.
+void mmv_out_mono(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
+                  const at::Tensor & anchor) {
+    const Geom g = check_weight(slabs, anchor);
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == g.K && x.scalar_type() == at::kHalf, "pxq4: bad x");
+    TORCH_CHECK(out.dim() == 2 && out.size(0) == x.size(0) && out.size(1) == g.N &&
+                out.scalar_type() == at::kHalf, "pxq4: bad out");
+    TORCH_CHECK(x.is_contiguous() && out.is_contiguous(), "pxq4: x and out must be contiguous");
+    TORCH_CHECK(pxq4_mmv_supported(g.kslabs), "pxq4: K too large for mmv smem budget");
+    if (x.size(0) == 0) return;
+    pxq4_launch_mmv_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(),
+                        out.data_ptr(), (int)x.size(0), g.panels, g.kslabs, /*vecx=*/true,
                         at::cuda::getCurrentCUDAStream());
 }
 
@@ -148,7 +192,7 @@ void mmv_out_scalar(at::Tensor & out, const at::Tensor & x, const at::Tensor & s
                         at::cuda::getCurrentCUDAStream());
 }
 
-int64_t version() { return 1; }
+int64_t version() { return 2; }  // 2 = K-chunk-split mmv decode path
 
 int64_t mmv_max_m() { return kPxq4MmvMaxM; }
 
@@ -198,6 +242,7 @@ TORCH_LIBRARY(pxq4, m) {
     m.def("dequant_out(Tensor(a!) out, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out_scalar(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
+    m.def("mmv_out_mono(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("version() -> int");
     m.def("mmv_max_m() -> int");
     m.def("mmv_supported(int K) -> bool");
@@ -211,6 +256,7 @@ TORCH_LIBRARY_IMPL(pxq4, CUDA, m) {
     m.impl("dequant_out", &dequant_out);
     m.impl("mmv_out", &mmv_out);
     m.impl("mmv_out_scalar", &mmv_out_scalar);
+    m.impl("mmv_out_mono", &mmv_out_mono);
 }
 
 // Device-independent entry points. CompositeExplicitAutograd puts them on every backend

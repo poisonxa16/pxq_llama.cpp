@@ -6,3 +6,4 @@ cd "$(dirname "$0")"
 g++ -O2 -std=c++17 -shared -fPIC -Ihostsim -I. -pthread -Wno-unknown-pragmas \
     pxq4_kernel_hostsim.cpp -o libpxq4_hostsim.so
 python3 test_pxq4_kernel_ref.py
+python3 test_pxq4_mmv_split.py

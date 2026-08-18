@@ -15,6 +15,17 @@ void pxq4_launch_dequant_f16(const uint8_t * slabs, const void * anchor, void * 
 void pxq4_launch_mmv_f16(const uint8_t * slabs, const void * anchor, const void * x, void * out,
                          int M, int panels, int kslabs, bool vecx, cudaStream_t stream);
 
+// K-chunk-split mmv (decode fast path): identical values to pxq4_launch_mmv_f16 -- same
+// per-lane fold, same add order, same single rounding (see k_pxq4_mmv_part) -- but with
+// grid.y = nfix so small-N shapes stop starving the SMs. `part` is caller-provided fp32
+// scratch of pxq4_mmv_nfix(kslabs) * panels * M * 256 floats.
+void pxq4_launch_mmv_split_f16(const uint8_t * slabs, const void * anchor, const void * x,
+                               float * part, void * out, int M, int panels, int kslabs,
+                               bool vecx, cudaStream_t stream);
+
+// canonical chunk count for this K (= grid.y of the split mmv; sizes `part`).
+int  pxq4_mmv_nfix(int kslabs);
+
 // dynamic shared-memory bytes the mmv needs for this K, and whether that fits the device.
 int  pxq4_mmv_smem_bytes(int kslabs);
 bool pxq4_mmv_supported(int kslabs);

@@ -326,3 +326,109 @@ k_pxq4_mmv(const uint8_t * __restrict__ slabs,
         out[(size_t)iy * R + p * PXQ4_BM + row] = __float2half_rn(u);
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// K-chunk-split decode mmv: the same fold as k_pxq4_mmv, spread over grid.y = nfix blocks.
+//
+// WHY. k_pxq4_mmv launches one 256-thread block per (panel, token). At decode (M = 1) on this
+// model's TP4 shapes that is 64-136 blocks on an 80-SM V100: at most 256 threads per SM, i.e.
+// 12.5% occupancy, and the kernel is latency-bound, measured at 155-276 GB/s of weight traffic
+// against ~700 GB/s achieved by a plain fp16 GEMV on the same card (which is why 4x fewer
+// bytes was only buying ~1.2x less time). The canonical chunk fold already partitions K into
+// nfix independent per-lane partial sums; putting each chunk in its OWN block multiplies the
+// grid by nfix (8-16 for every real shape of this model) and restores enough parallelism to
+// approach bandwidth-bound behaviour. The cost is a small fp32 partials tensor
+// (M * panels * nfix * 256 floats, always < 1/4 of the weight bytes, usually L2-resident
+// between the two kernels).
+//
+// BIT-EXACTNESS ARGUMENT. Per (row, kseg) lane, k_pxq4_mmv computes
+//     su = ((0 + t_0) + t_1) + ... + t_{nfix-1},  t_c = 0 + dot32(kb=b0+kseg) + dot32(+KSEG)...
+// and then folds across ksegs, in kseg order, in k_pxq4_mmv's tail:
+//     u  = ((0 + su_0) + su_1) + su_2) + su_3;  out = __float2half_rn(u)
+// k_pxq4_mmv_part computes exactly t_c (identical staging, identical dot32 calls, identical
+// kb order and rounding) and stores it UNSUMMED. k_pxq4_mmv_reduce then performs literally
+// the two folds above, in the same order, in fp32, and applies the same single final rounding.
+// No addition is reassociated, no rounding point moves: the composition is bit-identical to
+// the monolithic kernel, which the parity gates assert (GPU: mmv_out vs mmv_out_mono;
+// hostsim: pxq4_hostsim_mmv_split_f16 vs pxq4_hostsim_mmv_f16).
+//
+// grid = (panels, nfix, M), block = 256; nfix MUST equal pxq4_canon_nfix(kslabs, CMAX) --
+// the launcher owns that (the kernel reads it from gridDim.y).
+// dynamic smem = pxq4_canon_max_chunk(K/32) * 32 floats, same bound as k_pxq4_mmv.
+// ---------------------------------------------------------------------------------------------
+template <bool VECX>
+static __global__ void __launch_bounds__(256)
+k_pxq4_mmv_part(const uint8_t * __restrict__ slabs,
+                const __half  * __restrict__ anchor,
+                const __half  * __restrict__ x,        // [M, K]
+                float         * __restrict__ part,     // [M, panels, nfix, KSEG*64]
+                const int K) {
+    const int p    = blockIdx.x;                       // panel
+    const int c    = blockIdx.y;                       // canonical chunk
+    const int iy   = blockIdx.z;                       // token
+    const int nfix = gridDim.y;                        // == pxq4_canon_nfix(kslabs, CMAX)
+
+    PXQ4_EXTERN_SHARED float pxq4_xs[];
+    __shared__ float tab[16];
+    __shared__ float sub[16];
+
+    pxq4_pol::stage_tabs(tab, sub, threadIdx.x);
+
+    const int row    = threadIdx.x & 63;
+    const int kseg   = threadIdx.x >> 6;
+    const int kslabs = K / PXQ4_QK;
+
+    const uint8_t * pan_slabs = slabs + (size_t)p * kslabs * pxq4_pol::SLAB;
+    const float     anch      = __half2float(anchor[(size_t)p * PXQ4_BM + row]);
+    const __half  * xt        = x + (size_t)iy * K;
+
+    // this block's canonical chunk -- the same b0/b1 the monolithic loop would compute for c
+    const int b0 = (kslabs * c) / nfix;
+    const int b1 = (kslabs * (c + 1)) / nfix;
+    const int n  = (b1 - b0) * PXQ4_QK;
+
+    __syncthreads();                                   // covers the stage_tabs writes
+    for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+        pxq4_xs[idx] = __half2float(xt[b0 * PXQ4_QK + idx]);
+    }
+    __syncthreads();
+
+    float t = 0.f;
+    for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
+        t += pxq4_dot32<VECX>(pan_slabs + (size_t)kb * pxq4_pol::SLAB, row, anch,
+                              pxq4_xs + (size_t)(kb - b0) * PXQ4_QK, tab, sub);
+    }
+    // one fully-coalesced 1024-B store per block: threadIdx.x == kseg*64 + row, matching the
+    // red[] layout of k_pxq4_mmv so the reduce below can replay its fold verbatim.
+    part[(((size_t)iy * gridDim.x + p) * nfix + c) * (PXQ4_MMV_KSEG * PXQ4_BM)
+         + threadIdx.x] = t;
+}
+
+// grid = (panels, M), block = 64 (one weight row each). Reads back the [nfix, KSEG*64] tile
+// of one (panel, token) and performs k_pxq4_mmv's two folds in its exact order (see the
+// bit-exactness argument above). All loads are coalesced: 64 consecutive floats per (c, s).
+static __global__ void __launch_bounds__(PXQ4_BM)
+k_pxq4_mmv_reduce(const float * __restrict__ part,    // [M, panels, nfix, KSEG*64]
+                  __half      * __restrict__ out,     // [M, R]
+                  const int nfix, const int R) {
+    const int p   = blockIdx.x;
+    const int iy  = blockIdx.y;
+    const int row = threadIdx.x;
+
+    const float * base = part + (((size_t)iy * gridDim.x + p) * nfix)
+                              * (PXQ4_MMV_KSEG * PXQ4_BM);
+    float su[PXQ4_MMV_KSEG];
+#pragma unroll
+    for (int s = 0; s < PXQ4_MMV_KSEG; ++s) su[s] = 0.f;
+    for (int c = 0; c < nfix; ++c) {                  // chunk fold: su_s = ((0+t_0)+t_1)+...
+#pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) {
+            su[s] += base[(size_t)c * (PXQ4_MMV_KSEG * PXQ4_BM) + s * PXQ4_BM + row];
+        }
+    }
+    float u = 0.f;                                    // kseg fold, in kseg order
+#pragma unroll
+    for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += su[s];
+    out[(size_t)iy * R + p * PXQ4_BM + row] = __float2half_rn(u);
+}

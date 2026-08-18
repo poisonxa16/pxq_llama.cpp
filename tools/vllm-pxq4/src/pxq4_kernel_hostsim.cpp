@@ -60,28 +60,35 @@ alignas(16) float pxq4_xs[PXQ4_HOSTSIM_SMEM_FLOATS];
 namespace {
 
 template <typename Body>
-void launch(unsigned gx, unsigned gy, unsigned nthreads, Body body) {
+void launch3(unsigned gx, unsigned gy, unsigned gz, unsigned nthreads, Body body) {
     blockDim = dim3(nthreads, 1, 1);
-    gridDim  = dim3(gx, gy, 1);
+    gridDim  = dim3(gx, gy, gz);
     g_bar_n  = nthreads;
-    for (unsigned by = 0; by < gy; ++by) {
-        for (unsigned bx = 0; bx < gx; ++bx) {
-            {
-                std::lock_guard<std::mutex> lk(g_bar_mtx);
-                g_bar_count = 0;
+    for (unsigned bz = 0; bz < gz; ++bz) {
+        for (unsigned by = 0; by < gy; ++by) {
+            for (unsigned bx = 0; bx < gx; ++bx) {
+                {
+                    std::lock_guard<std::mutex> lk(g_bar_mtx);
+                    g_bar_count = 0;
+                }
+                std::vector<std::thread> ts;
+                ts.reserve(nthreads);
+                for (unsigned t = 0; t < nthreads; ++t) {
+                    ts.emplace_back([=] {
+                        threadIdx = dim3(t, 0, 0);
+                        blockIdx  = dim3(bx, by, bz);
+                        body();
+                    });
+                }
+                for (auto & th : ts) th.join();
             }
-            std::vector<std::thread> ts;
-            ts.reserve(nthreads);
-            for (unsigned t = 0; t < nthreads; ++t) {
-                ts.emplace_back([=] {
-                    threadIdx = dim3(t, 0, 0);
-                    blockIdx  = dim3(bx, by, 0);
-                    body();
-                });
-            }
-            for (auto & th : ts) th.join();
         }
     }
+}
+
+template <typename Body>
+void launch(unsigned gx, unsigned gy, unsigned nthreads, Body body) {
+    launch3(gx, gy, 1u, nthreads, body);
 }
 
 }  // namespace
@@ -123,6 +130,30 @@ void pxq4_hostsim_mmv_f16(const uint8_t * slabs, const uint16_t * anchor, const 
             k_pxq4_mmv<false>(slabs, (const __half *)anchor, (const __half *)x, (__half *)out, R, K);
         });
     }
+}
+
+// K-chunk-split mmv (the decode fast path of libpxq4_sm70 v2). `part` must hold
+// M * panels * pxq4_canon_nfix(kslabs, CMAX) * 256 floats. Asserted bit-identical to
+// pxq4_hostsim_mmv_f16 by the parity gate -- see the argument at k_pxq4_mmv_part.
+void pxq4_hostsim_mmv_split_f16(const uint8_t * slabs, const uint16_t * anchor,
+                                const uint16_t * x, float * part, uint16_t * out,
+                                int M, int panels, int kslabs, int vecx) {
+    const int R    = panels * PXQ4_BM;
+    const int K    = kslabs * PXQ4_QK;
+    const int nfix = pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX);
+    if (pxq4_canon_max_chunk(kslabs) * PXQ4_QK > PXQ4_HOSTSIM_SMEM_FLOATS) abort();
+    if (vecx) {
+        launch3((unsigned)panels, (unsigned)nfix, (unsigned)M, 256u, [=] {
+            k_pxq4_mmv_part<true>(slabs, (const __half *)anchor, (const __half *)x, part, K);
+        });
+    } else {
+        launch3((unsigned)panels, (unsigned)nfix, (unsigned)M, 256u, [=] {
+            k_pxq4_mmv_part<false>(slabs, (const __half *)anchor, (const __half *)x, part, K);
+        });
+    }
+    launch3((unsigned)panels, (unsigned)M, 1u, PXQ4_BM, [=] {
+        k_pxq4_mmv_reduce(part, (__half *)out, nfix, R);
+    });
 }
 
 int pxq4_hostsim_canon_nfix(int kslabs)      { return pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX); }

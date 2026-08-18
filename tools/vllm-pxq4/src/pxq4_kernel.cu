@@ -60,6 +60,31 @@ void pxq4_launch_mmv_f16(const uint8_t * slabs, const void * anchor, const void 
     PXQ4_CUDA_CHECK(cudaGetLastError());
 }
 
+int pxq4_mmv_nfix(int kslabs) {
+    return pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX);
+}
+
+void pxq4_launch_mmv_split_f16(const uint8_t * slabs, const void * anchor, const void * x,
+                               float * part, void * out, int M, int panels, int kslabs,
+                               bool vecx, cudaStream_t stream) {
+    const int    R    = panels * PXQ4_BM;
+    const int    K    = kslabs * PXQ4_QK;
+    const int    nfix = pxq4_mmv_nfix(kslabs);
+    const size_t smem = (size_t)pxq4_mmv_smem_bytes(kslabs);
+    const dim3   grid((unsigned)panels, (unsigned)nfix, (unsigned)M);
+    if (vecx) {
+        k_pxq4_mmv_part<true><<<grid, 256, smem, stream>>>(
+            slabs, (const __half *)anchor, (const __half *)x, part, K);
+    } else {
+        k_pxq4_mmv_part<false><<<grid, 256, smem, stream>>>(
+            slabs, (const __half *)anchor, (const __half *)x, part, K);
+    }
+    PXQ4_CUDA_CHECK(cudaGetLastError());
+    const dim3 rgrid((unsigned)panels, (unsigned)M, 1u);
+    k_pxq4_mmv_reduce<<<rgrid, PXQ4_BM, 0, stream>>>(part, (__half *)out, nfix, R);
+    PXQ4_CUDA_CHECK(cudaGetLastError());
+}
+
 void pxq4_upload_tables(const float * book16, const float * sub16) {
     PXQ4_CUDA_CHECK(cudaMemcpyToSymbol(pxq4_book_g,  book16, 16 * sizeof(float)));
     PXQ4_CUDA_CHECK(cudaMemcpyToSymbol(pxq4_sub16_g, sub16,  16 * sizeof(float)));
