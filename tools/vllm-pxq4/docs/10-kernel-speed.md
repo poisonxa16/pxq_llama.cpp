@@ -106,10 +106,16 @@ and the difference is ~10 us on the smallest tensor.
     overhead — 240 pxq4 calls + attention/mamba ops per token, no graphs):
     old 5.23/5.23/5.28 -> new 5.34 tok/s. Confirms eager TP1 is overhead-bound, not
     kernel-bound; useless as a kernel vehicle, recorded for completeness.
-  * TP=4, CUDA graphs, p2a-nf (the shipping config): OLD kernel 43.40/41.57/41.70
-    tok/s. NEW kernel measurement pending at the time of this commit; predicted from
-    the per-layer delta (0.104 ms x 60 layers = 6.2 ms/token off a ~23 ms step):
-    mid-50s tok/s. This file will be amended when the A/B lands.
+  * TP=4, CUDA graphs, p2a-nf (the shipping config), identical flags both arms:
+      OLD kernel (v1): 43.40 / 41.57 / 41.70 / 41.36 / 43.31 tok/s
+      NEW kernel (v3): 53.38 / 53.61 / 58.23 / 54.46 / 60.01 (mean 55.9, +32% over the 42.3 mean) tok/s
+    Predicted from the per-layer delta was mid-50s (0.104 ms x 60 layers = 6.2 ms
+    off a ~23 ms step).
+  * Capture cost: v1 ~2:41 total; v2 (per-call in-capture at::empty) 209 s/it
+    PIECEWISE + 252 s/it FULL and blew the startup deadline; v3 (persistent arena,
+    zero in-capture allocations) 2:36 total PIECEWISE + 0:02 total FULL.
+  * Eager A/B is not a kernel vehicle on this stack and was retired: TP=4 eager
+    v1 measured 4.49-5.26 tok/s (~8x overhead-bound; kernel time ~3% of step).
 
 ## Remaining headroom, and what is NOT worth doing
 
