@@ -1292,19 +1292,23 @@ static bool pxa_pxq_backbone_native_class(const std::string & name, const ggml_t
 // second scan rather than a plumbed-through flag: llama_tensor_get_type() is on the public
 // path and its signature is not ours to churn. Called only for tensors the table wants to
 // move (a few dozen), so the duplicated regex work is negligible.
-static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, const std::string & name) {
+static ggml_type pxa_custom_rule_type(const llama_model_quantize_params * params, const std::string & name) {
     if (!params || !params->custom_quants) {
-        return false;
+        return GGML_TYPE_COUNT;
     }
     using CustomQ = std::pair<std::string, ggml_type>;
     const auto & rules = *static_cast<const std::vector<CustomQ>*>(params->custom_quants);
     for (const auto & rule : rules) {
         std::regex pattern(rule.first);
         if (std::regex_search(name, pattern)) {
-            return true;
+            return rule.second;   // first match wins, same as llama_tensor_get_type()
         }
     }
-    return false;
+    return GGML_TYPE_COUNT;
+}
+
+static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, const std::string & name) {
+    return pxa_custom_rule_type(params, name) < GGML_TYPE_COUNT;
 }
 
 // LOUD-DEMOTE counter: explicit --custom-q PXQ targets that geometry forced off their
@@ -1981,12 +1985,96 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         const bool bb_on = bb.mode != PXA_BB_LEGACY &&
                            !((pxq_tier == PXA_TIER_PXQU || pxq_tier == PXA_TIER_PXQ1) && !bb.univ);
         gguf_set_val_u32(ctx_out, "pxa.pxq.backbone_rev", bb_on ? 2u : 1u);
-        const char * bb_map =
-            !bb_on   ? "legacy:mxfp4" :
-            bb.lite  ? "lite:attn_gate_head=f16;token_embd=q6_k;attn_k,attn_v=q8_0;output=q8_0;gemm_backbone=mxfp4" :
-            bb.hq    ? "attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=pxq4hq;attn_k,attn_v=q8_0;attn_gate_head=f16;token_embd=q6_k;output=q8_0"
-                     : "attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=tier+1;attn_k,attn_v=q8_0;attn_gate_head=f16;token_embd=q6_k;output=q8_0";
-        gguf_set_val_str(ctx_out, "pxa.pxq.backbone_map", bb_map);
+        // The map is RESOLVED, not recited: run the write loop's own decision chain
+        // (pxa_pxq_backbone_type -> the --custom-q stand-down -> the explicit --*-type
+        // flags) over this model's actual tensors and record what came out, per role.
+        // The hardcoded strings this replaces ignored PXA_PXQ_KV, --custom-q and the
+        // model itself — the shipped 27B advertised attn_gate_head=f16 while containing
+        // ZERO f16 tensors (qwen35 has no per-head gate), so two arms that differed in
+        // backbone policy were indistinguishable by this KV. Roles the table declines
+        // ride the legacy MXFP4 rules pipeline and are omitted.
+        std::string bb_map = "legacy:mxfp4";
+        if (bb_on) {
+            std::map<std::string, std::set<std::string>> bb_roles;
+            for (int i = 0; i < ml.n_tensors; ++i) {
+                const ggml_tensor * meta = ml.get_tensor_meta(i);
+                const std::string tname = ggml_get_name(meta);
+                // mirror the write loop's eligibility gate: tensors it never quantizes
+                // (non-weight, 1D, norms) keep their source type, so a table claim on
+                // them (the .nextn. norms) would be one more string the file contradicts
+                if (tname.rfind("weight") != tname.size() - 6 ||
+                    ggml_n_dims(meta) < 2 ||
+                    tname.find("_norm.weight") != std::string::npos) {
+                    continue;
+                }
+                std::string val;
+                if (pxa_name_is(tname, "output.weight")) {   // the head: pxa_pxq_head_type() owns it
+                    if (!params->quantize_output_tensor) {
+                        continue;   // --leave-output-tensor: the head keeps its source type
+                    }
+                    val = ggml_type_name(params->output_tensor_type < GGML_TYPE_COUNT
+                                         ? params->output_tensor_type : pxa_pxq_head_type());
+                } else {
+                    const ggml_type bt = pxa_pxq_backbone_type(tname, meta, pxq_tier,
+                                                               model.hparams.n_expert > 1);
+                    if (bt == GGML_TYPE_COUNT) {
+                        continue;
+                    }
+                    val = ggml_type_name(bt);
+                }
+                // --custom-q claims beat the table (the write loop's stand-down), and the
+                // explicit --*-type flags beat both — mirror that order exactly
+                if (const ggml_type ct = pxa_custom_rule_type(params, tname); ct < GGML_TYPE_COUNT) {
+                    val = std::string("custom:") + ggml_type_name(ct);
+                }
+                const struct { const char * pat; ggml_type ty; } flag_ovr[] = {
+                    { "token_embd.weight",  params->token_embedding_type },
+                    { "attn_q.weight",      params->attn_q_type          },
+                    { "attn_k.weight",      params->attn_k_type          },
+                    { "attn_v.weight",      params->attn_v_type          },
+                    { "attn_qkv.weight",    params->attn_qkv_type        },
+                    { "attn_output.weight", params->attn_output_type     },
+                };
+                for (const auto & o : flag_ovr) {
+                    if (o.ty < GGML_TYPE_COUNT && tname.find(o.pat) != std::string::npos) {
+                        val = ggml_type_name(o.ty);
+                    }
+                }
+                std::string role = pxa_tensor_class(tname);
+                if (role.size() > 7 && role.compare(role.size() - 7, 7, ".weight") == 0) {
+                    role.resize(role.size() - 7);
+                }
+                if (role == "attn_gate") {   // keep the head/channel split the harness knows
+                    role = meta->ne[1] <= 256 ? "attn_gate_head" : "attn_gate_ch";
+                }
+                bb_roles[role].insert(val);
+            }
+            bb_map = bb.lite ? "lite:" : "";
+            for (const auto & r : bb_roles) {
+                std::string tys;
+                for (const auto & v : r.second) { if (!tys.empty()) tys += ","; tys += v; }
+                if (!bb_map.empty() && bb_map.back() != ':') bb_map += ";";
+                bb_map += r.first + "=" + tys;
+            }
+        }
+        gguf_set_val_str(ctx_out, "pxa.pxq.backbone_map", bb_map.c_str());
+        LLAMA_LOG_INFO("PXQ backbone map (resolved): %s\n", bb_map.c_str());
+        // and the raw override strings, so "why does this arm differ" is a KV lookup too
+        std::string bb_ovr;
+        if (const char * e = getenv("PXA_PXQ_BACKBONE"); e && *e) {
+            bb_ovr += std::string("PXA_PXQ_BACKBONE=") + e;
+        }
+        if (const char * e = getenv("PXA_PXQ_KV"); e && *e) {
+            if (!bb_ovr.empty()) bb_ovr += ";";
+            bb_ovr += std::string("PXA_PXQ_KV=") + e;
+        }
+        if (const char * e = getenv("PXA_PXQ_HEAD"); e && *e) {
+            if (!bb_ovr.empty()) bb_ovr += ";";
+            bb_ovr += std::string("PXA_PXQ_HEAD=") + e;
+        }
+        if (!bb_ovr.empty()) {
+            gguf_set_val_str(ctx_out, "pxa.pxq.backbone_overrides", bb_ovr.c_str());
+        }
     }
     if (pxq6_out || pxq6hq_out) {   // 4-bit-tier provenance: the frozen tables this file was built with
         gguf_set_val_u32(ctx_out, "pxa.pxq6.version", 1);
