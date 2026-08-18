@@ -710,6 +710,23 @@ class PXQ4LinearMethod(LinearMethodBase):
 
         PXQ4Workspace.materialize(slabs.device)
 
+        # Warm the split-mmv partials arena for THIS layer's shape, eagerly and
+        # pre-capture. The v3 op keeps a per-device fp32 partials arena and
+        # refuses to grow it under cuda-graph capture (an in-capture at::empty
+        # per call is what made v2's graph capture ~3x slower and tripped the
+        # startup deadline), so every PXQ4 layer must have sized it before the
+        # compiler or capture phase runs the first small-M forward. A dummy mmv
+        # at the ceiling M does exactly that, costs ~100 us per layer once, and
+        # doubles as an early crash surface for a bad weight. Guarded so older
+        # libs (version < 3, no arena) and no-mmv layers skip it harmlessly.
+        if layer.pxq4_use_mmv and layer.pxq4_mmv_max_m > 0:
+            m = int(layer.pxq4_mmv_max_m)
+            dev = layer.pxq4_slabs.device
+            x_warm = torch.zeros((m, layer.pxq4_K), dtype=torch.float16, device=dev)
+            out_warm = torch.empty((m, layer.pxq4_N), dtype=torch.float16, device=dev)
+            torch.ops.pxq4.mmv_out(out_warm, x_warm, layer.pxq4_slabs, layer.pxq4_anchor)
+            del x_warm, out_warm
+
     # ------------------------------------------------------------------
     # apply
     # ------------------------------------------------------------------
