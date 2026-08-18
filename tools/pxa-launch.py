@@ -53,7 +53,7 @@ def gpu_table():
     return rows, None
 
 def model_kind(path):
-    """gguf | hf_dir | vllm_dir | missing"""
+    """gguf | hf_dir | vllm_dir | not_a_model | missing"""
     if not os.path.exists(path):
         return "missing"
     if os.path.isfile(path) and path.endswith(".gguf"):
@@ -68,6 +68,7 @@ def model_kind(path):
             except Exception:
                 pass
             return "hf_dir"
+        return "not_a_model"          # exists, but no config.json - a real path, wrong contents
     return "missing"
 
 def model_bytes(path, kind):
@@ -92,26 +93,34 @@ def has_vllm_pxq4():
 
 def decide(sel, kind, model, forced, pkg):
     """-> (engine, reason, blockers[])"""
-    if not sel:
-        return None, "no GPUs selected/visible", []
     caps = sorted({g[2] for g in sel})
     names = ", ".join(f"{g[0]}:{g[1].replace('NVIDIA ','')} sm_{g[2]}" for g in sel)
 
     if forced:
+        # A forced engine must work even with no GPU table (that is what the
+        # "use --engine to force" advice promises when nvidia-smi is unavailable).
         bl = []
+        if not sel:
+            bl.append("no GPUs visible - proceeding on your say-so; the engine may fail to start")
         if forced == "vllm":
-            bad = [c for c in caps if c < MIN_VLLM_CAP]
+            bad = sorted({f"sm_{c}" for c in caps if c < MIN_VLLM_CAP})
             if bad:
-                bl.append(f"FORCED vllm but sm_{bad} present - vLLM kernels are sm_{MIN_VLLM_CAP}+; "
+                bl.append(f"FORCED vllm but {'/'.join(bad)} present - vLLM kernels are sm_{MIN_VLLM_CAP}+; "
                           "it will fail to load on these cards")
             if not pkg:
                 bl.append("FORCED vllm but vllm_pxq4 is not importable")
             if kind == "gguf":
                 bl.append("FORCED vllm but the model is a raw .gguf - vLLM needs the converted form")
-        return forced, f"forced by --engine ({names})", bl
+        if kind in ("missing", "not_a_model"):
+            bl.append(f"FORCED engine but the model path is unusable ({kind}): {model}")
+        return forced, f"forced by --engine ({names or 'no GPUs visible'})", bl
 
+    if not sel:
+        return None, "no GPUs selected/visible (use --engine to force anyway)", []
     if kind == "missing":
-        return None, f"model not found or unrecognised: {model}", []
+        return None, f"model path does not exist: {model}", []
+    if kind == "not_a_model":
+        return None, f"path exists but has no config.json and is not a .gguf: {model}", []
     if any(c < MIN_VLLM_CAP for c in caps):
         bad = sorted({f"sm_{c}" for c in caps if c < MIN_VLLM_CAP})
         return "llama", (f"{'/'.join(bad)} present - vLLM is compiled sm_{MIN_VLLM_CAP}+ only and "
@@ -162,6 +171,11 @@ def build_cmd(engine, a, sel, kind):
         model = a.model
         if kind == "gguf":
             model = a.model[:-5] + "-vllm"
+            if not os.path.isdir(model):
+                print(f"  REFUSING - vLLM needs a converted artifact and {model} does not exist.")
+                print(f"    Convert first:  python3 src/gguf_to_vllm/... {a.model} {model}")
+                print(f"    Or use --engine llama to serve the .gguf directly.")
+                sys.exit(3)
         cmd = ["vllm", "serve", model, "--host", a.host, "--port", str(a.port),
                "--quantization", "pxq4", "--dtype", "float16",
                "--tensor-parallel-size", str(len(sel)),
@@ -256,7 +270,9 @@ def main():
     print(f"  command: {' '.join(cmd)}")
     print("=" * 78)
     if a.explain:
-        return
+        # exit 5 => a plan was produced but carries known-fatal blockers, so a CI
+        # caller can tell "clean plan" from "plan that will not start"
+        sys.exit(5 if blockers else 0)
     if not shutil.which(cmd[0]) and not os.path.exists(cmd[0]):
         print(f"pxa-launch: {cmd[0]} not found", file=sys.stderr); sys.exit(4)
     e = dict(os.environ); e.update(env)

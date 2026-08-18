@@ -150,6 +150,49 @@ P1_PXQ4_MODULES = (
     "linear_attn.in_proj_qkvz",
 )
 
+# Leaf module names this backend CANNOT serve as PXQ4, whatever a checkpoint
+# asks for.  THIS LIST IS THE OWNER OF THE P2b DECISION: the LM head is fp16 in
+# this build, and the converter (tools/pxq4_gguf/namemap.py POLICY_MODULES) must
+# agree -- it must leave `lm_head` OUT of `pxq4_modules` and IN `ignore` for
+# every policy.  ``test_namemap_policies_are_servable`` pins the two together.
+#
+# Why it cannot be served, verified in the fork this session -- TWO independent
+# blocks, either of which is fatal on its own:
+#
+#   1. ``VocabParallelEmbedding.__init__`` calls create_weights with
+#      ``weight_loader=self.weight_loader`` (vocab_parallel_embedding.py:520-527),
+#      forcing its own bespoke v1 loader (:633-682).  That loader asserts
+#      ``loaded_weight.shape[output_dim] == org_vocab_size // param.packed_factor``,
+#      narrows by vocab shard indices and then does ``param[:n].copy_()`` /
+#      ``param[n:].fill_(0)``.  PXQ4LinearMethod.create_weights explicitly
+#      REFUSES a non-v2 loader whenever tp_size > 1 (linear.py of this package,
+#      the ``wl_name != "weight_loader_v2"`` guard), because the v1 loader
+#      cannot slice the 64-row panel layout.  At TP=4 that is a hard error.
+#   2. One checkpoint tensor -> one ``weight_loader`` call, but a PXQ4 module
+#      owns TWO parameters (``pxq4_slabs`` [P, S, 1088] and ``pxq4_anchor``
+#      [P, 64]) with different first-dim semantics.  The vocab loader has no
+#      way to express that; only the v2 parameter protocol does.
+#
+# ``embedding()`` (base_config.py:44, method_has_implemented_embedding :58-67)
+# is NOT the missing piece for the LM head -- the fork only requires it when
+# ``type(self) is VocabParallelEmbedding`` (vocab_parallel_embedding.py:488-497),
+# and ParallelLMHead is a subclass.  Serving a 4-bit head needs a dedicated
+# PXQ4 embedding method that reimplements the vocab-sharded loader over panels.
+# That is plan-09 P3 work, not a decorator tweak.  ``embed_tokens`` is listed
+# too: it is a real VocabParallelEmbedding, so it needs all of the above AND
+# ``embedding()``, and the backbone table pins it to q6_k anyway.
+UNSERVABLE_PXQ4_LEAF_MODULES = ("lm_head", "embed_tokens")
+
+
+def _unservable_entries(modules: "list[str] | tuple[str, ...]") -> list[str]:
+    """Entries of ``pxq4_modules`` naming a vocab-parallel module.
+
+    Matches on the final dotted component so that both ``lm_head`` and
+    ``model.language_model.lm_head`` are caught, while a hypothetical
+    ``foo.lm_head_proj`` (a LinearBase) is not.
+    """
+    return [m for m in modules if m.rsplit(".", 1)[-1] in UNSERVABLE_PXQ4_LEAF_MODULES]
+
 
 def _matches(prefix: str, pats: "list[str] | tuple[str, ...]") -> bool:
     """Plan 09 sec.6.5, verbatim.
@@ -276,6 +319,29 @@ class PXQ4Config(QuantizationConfig):
             raise ValueError(
                 "pxq4: 'pxq4_modules' is empty. A checkpoint with no PXQ4-served "
                 "module should not declare quant_method='pxq4' at all."
+            )
+
+        # Fail at engine start, not two thousand modules into model
+        # construction.  A P2b/P2c checkpoint whose converter listed `lm_head`
+        # in pxq4_modules is unloadable, and the only useful moment to say so
+        # is before any weight is touched.
+        unservable = _unservable_entries(self.pxq4_modules)
+        if unservable:
+            raise ValueError(
+                f"pxq4: {unservable} cannot be served by this build and must not "
+                "appear in quantization_config['pxq4_modules'].\n"
+                "This is the plan-09 P2b LM-head lever, and it is NOT implemented: "
+                "ParallelLMHead/VocabParallelEmbedding force their own v1 vocab "
+                "weight_loader (vocab_parallel_embedding.py:520-527, :633-682), "
+                "which cannot slice a 64-row panel layout and cannot fill the two "
+                "parameters (pxq4_slabs, pxq4_anchor) a PXQ4 module owns. See "
+                "UNSERVABLE_PXQ4_LEAF_MODULES.\n"
+                "FIX THE CHECKPOINT, not this list: the converter must leave these "
+                "names out of 'pxq4_modules' and put them in 'ignore', and must "
+                "emit the tensor as dense fp16 "
+                "(tools/pxq4_gguf/namemap.py POLICY_MODULES). A config that lists "
+                "lm_head describes a 4-bit head the engine will never read, so the "
+                "weights would be missing, not merely slow."
             )
 
         missing = [e for e in REQUIRED_IGNORE_ENTRIES if e not in self.ignore]
@@ -532,10 +598,13 @@ class PXQ4Config(QuantizationConfig):
             return self._dispatch(prefix, "fp16 (default)", UnquantizedLinearMethod())
 
         # ParallelLMHead / VocabParallelEmbedding: None -> UnquantizedEmbeddingMethod
-        # (vocab_parallel_embedding.py:479-482).  P2b re-encodes lm_head to PXQ4,
-        # which needs a QuantizeMethodBase implementing embedding() -- it does not
-        # exist yet, so fail loudly rather than silently serving fp16 weights that
-        # the P2b checkpoint does not contain.
+        # (vocab_parallel_embedding.py:479-483).  Backstop only: _validate()
+        # already rejected an lm_head/embed_tokens entry in pxq4_modules at
+        # from_config time, so this branch is unreachable through the normal
+        # path.  It stays for the two ways round that gate -- a directly
+        # constructed PXQ4Config, or pxq4_modules mutated after construction --
+        # because silently returning None here would serve fp16 weights that a
+        # P2b checkpoint does not contain.
         if _matches(prefix, self.pxq4_modules) and type(layer).__name__ in (
             "ParallelLMHead",
             "VocabParallelEmbedding",
@@ -544,7 +613,8 @@ class PXQ4Config(QuantizationConfig):
                 f"pxq4: '{prefix}' is listed in pxq4_modules but {type(layer).__name__} "
                 "is not a LinearBase and no PXQ4 embedding method exists. "
                 "Serving a 4-bit lm_head or embedding is plan-09 phase P2b/P3 and "
-                "is not implemented in this build."
+                "is not implemented in this build. This should have been caught by "
+                "PXQ4Config._validate() -- see UNSERVABLE_PXQ4_LEAF_MODULES."
             )
 
         # Attention (attention.py:159, mla_attention.py:928) and FusedMoE

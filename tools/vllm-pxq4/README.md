@@ -82,3 +82,52 @@ Ship gates before anyone should trust it:
 ## Licence
 
 Apache 2.0, matching vLLM. See `LICENSE-NOTICE.md` for the full attribution chain.
+
+---
+
+## Build and test
+
+Everything under `src/` is a FLAT directory on purpose: `build_hostsim.sh`, `setup.py`,
+`CMakeLists.txt` and the test imports all resolve relative to it. An earlier tidy-up into
+`csrc/ tests/ vllm_pxq4/` broke every entry point, so the layout that works is the one
+that ships.
+
+### GPU-free gates (run these first - they need no CUDA, no GPU, no lease)
+
+```bash
+cd src
+bash build_hostsim.sh          # compiles the CPU simulator, then runs the kernel suite
+python3 test_pxq4_config.py    # quant config / plugin registration
+python3 gguf_to_vllm_test.py   # converter, incl. a bit-exact gate against a C oracle
+python3 test_pxq4_linear.py    # linear method (skips cleanly if vLLM is absent)
+```
+
+`build_hostsim.sh` compiles `pxq4_kernel_hostsim.cpp`, which includes the REAL
+`pxq4_kernel.cuh` unmodified against a stub `cuda_fp16.h` and emulates a CUDA launch.
+So the kernel suite exercises the shipping kernel source, not a reimplementation that
+could drift from it.
+
+**A compiler is required.** Without `libpxq4_hostsim.so` the 8 simulator-backed tests
+FAIL rather than skip, and the failure text tells you to build it. On a box with no
+`g++` (our Unraid host has none) you will see `9/17` — that is a missing toolchain,
+not a kernel defect. Build on a dev host or inside the CUDA container.
+
+### CUDA extension (needs the CUDA toolkit; no GPU needed to compile)
+
+```bash
+bash src/build.sh              # sm_70; expect a "prior to sm_75" deprecation warning
+```
+
+### Measured status
+
+| suite | result | where |
+|---|---|---|
+| kernel parity (hostsim) | 17/17 | any host with g++ |
+| quant config | 27/27 | anywhere |
+| config integration | 6/6 | against the real vLLM fork |
+| converter | 79/79 + correct parse of the real 14.64 GiB artifact | anywhere |
+| CUDA build | clean sm_70, ops register | CUDA container |
+| end-to-end on GPU | **NOT DONE** | needs a V100 |
+
+The real artifact parses as 325 pxq4 + 132 q8_0 + 1 q6_K + 360 f32 + 48 mxfp4, and
+`data_start + sum(nbytes) == file size` exactly. Any design assuming uniform PXQ4 is wrong.

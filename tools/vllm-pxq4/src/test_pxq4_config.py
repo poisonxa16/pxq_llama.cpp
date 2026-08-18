@@ -414,19 +414,74 @@ def test_non_linear_layers_return_none():
     assert c.get_quant_method(Attention(), f"{ATTN_PREFIX}.attn") is None
 
 
-def test_pxq4_lm_head_is_refused_not_silently_ignored():
-    """P2b re-encodes lm_head; there is no PXQ4 embedding method, so a config
-    that asks for one must fail loudly."""
-    d = p1_config_dict()
-    d["pxq4_modules"] = [*d["pxq4_modules"], "lm_head"]
-    d["ignore"] = [x for x in d["ignore"] if x != "lm_head"]
-    c = cfg.PXQ4Config.from_config(d)
+def test_pxq4_lm_head_is_rejected_at_parse_time():
+    """THE REGRESSION TEST for the P2b/P2c load failure.
+
+    A converter that lists ``lm_head`` in ``pxq4_modules`` produces a checkpoint
+    this build cannot load at all -- ParallelLMHead forces the v1 vocab
+    weight_loader (vocab_parallel_embedding.py:520-527, :633-682), which cannot
+    slice the 64-row panel layout at TP>1 and cannot fill both pxq4_slabs and
+    pxq4_anchor.  Before this test the disagreement surfaced only deep in model
+    construction, after the engine had started and the weights were open.  It
+    must now fail at from_config, i.e. at engine start.
+    """
+    for name in ("lm_head", "model.language_model.lm_head", "model.embed_tokens"):
+        d = p1_config_dict()
+        d["pxq4_modules"] = [*d["pxq4_modules"], name]
+        d["ignore"] = [x for x in d["ignore"] if x != "lm_head"]
+        try:
+            cfg.PXQ4Config.from_config(d)
+        except ValueError as e:
+            assert name in str(e), (name, str(e))
+            assert "P2b" in str(e), str(e)
+        else:
+            raise AssertionError(f"expected ValueError for a PXQ4 {name}")
+
+
+def test_pxq4_lm_head_backstop_still_raises_in_dispatch():
+    """Defence in depth: the get_quant_method guard must survive a config that
+    got past _validate (direct construction, or post-construction mutation)."""
+    c = cfg.PXQ4Config.from_config(p1_config_dict())
+    c.pxq4_modules = [*c.pxq4_modules, "lm_head"]
+    c._ignore_for_dispatch = tuple(
+        x for x in c._ignore_for_dispatch if x != "lm_head"
+    )
     try:
         c.get_quant_method(ParallelLMHead(), "lm_head")
     except NotImplementedError as e:
         assert "P2b" in str(e)
     else:
         raise AssertionError("expected NotImplementedError for a PXQ4 lm_head")
+
+
+def test_namemap_policies_are_servable():
+    """CROSS-COMPONENT CONTRACT. The defect this pins: component A's converter
+    wrote ``sorted(POLICY_MODULES[policy])`` verbatim into
+    ``quantization_config['pxq4_modules']`` (convert.py:295) while its p2b/p2c
+    entries contained ``lm_head``, which this config rejects -- so every p2b/p2c
+    run died during model construction and nothing caught it earlier.
+
+    Skips (does not fail) when the converter is not importable, because the two
+    components ship to different directories in the plan-09 repo.
+    """
+    try:
+        from gguf_to_vllm import namemap as NM  # noqa: PLC0415
+    except ImportError:
+        print("   (skip: converter namemap not importable here)")
+        return
+    for policy, modules in sorted(NM.POLICY_MODULES.items()):
+        bad = cfg._unservable_entries(sorted(modules))
+        assert not bad, (
+            f"namemap.POLICY_MODULES[{policy!r}] serves {bad}, which "
+            f"PXQ4Config._validate rejects. The two components disagree about "
+            f"what {policy} means; fix the converter, not the config."
+        )
+        # And the real thing: the exact dict convert.py would emit must parse.
+        d = p1_config_dict()
+        d["pxq4_modules"] = sorted(modules)
+        d["ignore"] = NM.ignore_list(policy)
+        c = cfg.PXQ4Config.from_config(d)
+        assert set(c.pxq4_modules) == set(modules), policy
 
 
 def test_ignore_wins_over_allow_list():

@@ -21,6 +21,10 @@ WHAT THIS DOES NOT COVER, stated plainly:
 from __future__ import annotations
 
 import ctypes
+
+
+class _HostsimUnavailable(RuntimeError):
+    """Raised when the CPU simulator was never compiled - a skip, not a failure."""
 import os
 import sys
 
@@ -35,6 +39,17 @@ _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libpxq4_ho
 def _load_hostsim():
     if not os.path.exists(_LIB_PATH):
         return None
+    if not os.path.exists(_LIB_PATH):
+        # The host simulator is a BUILD ARTIFACT, not a checked-in file. Its absence
+        # means "no compiler here" (Unraid has no g++), not "the kernel is wrong".
+        # Reporting 8 hard failures for a missing toolchain is a misleading signal -
+        # the same class of defect this suite exists to catch. Skip loudly instead.
+        raise _HostsimUnavailable(
+            f"{os.path.basename(_LIB_PATH)} not built.\n"
+            f"    Build it with a C++ compiler:\n"
+            f"      g++ -O2 -std=c++17 -shared -fPIC -Ihostsim -I. -pthread \\\n"
+            f"          pxq4_kernel_hostsim.cpp -o libpxq4_hostsim.so\n"
+            f"    (this box has no g++; build on a dev host or in a CUDA container)")
     lib = ctypes.CDLL(_LIB_PATH)
     u8 = ctypes.POINTER(ctypes.c_uint8)
     u16 = ctypes.POINTER(ctypes.c_uint16)
