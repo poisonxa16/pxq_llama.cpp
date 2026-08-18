@@ -30,7 +30,11 @@ bool pxq4_mmv_supported(int kslabs) {
     // cudaFuncSetAttribute opt-in. We deliberately stay under it: opting in to the 96 KiB
     // Volta maximum would drop the kernel to one block per SM, and chunked staging (see
     // k_pxq4_mmv) means no real shape ever needs it — K = 17408 costs 4352 B.
-    const int stat_smem = (int)(2 * 16 * sizeof(float) + PXQ4_MMV_KSEG * PXQ4_BM * sizeof(float));
+    // 2*16 floats of tables + the KSEG*BM reduce tile + the fused kernel's `last` flag
+    // (k_pxq4_mmv_fused: ptxas reports 1168 B static, vs 1152 B for k_pxq4_mmv). Budget for
+    // the largest of the three, so a shape can never be admitted that the fused path cannot run.
+    const int stat_smem = (int)(2 * 16 * sizeof(float) + PXQ4_MMV_KSEG * PXQ4_BM * sizeof(float)
+                                + 16);
     return pxq4_mmv_smem_bytes(kslabs) + stat_smem <= 48 * 1024;
 }
 
@@ -71,17 +75,69 @@ void pxq4_launch_mmv_split_f16(const uint8_t * slabs, const void * anchor, const
     const int    K    = kslabs * PXQ4_QK;
     const int    nfix = pxq4_mmv_nfix(kslabs);
     const size_t smem = (size_t)pxq4_mmv_smem_bytes(kslabs);
-    const dim3   grid((unsigned)panels, (unsigned)nfix, (unsigned)M);
+    // ONE nfix, passed to BOTH kernels. Pre-swap, k_pxq4_mmv_part read nfix off gridDim.y
+    // while k_pxq4_mmv_reduce took it as an argument and nothing asserted they agreed; a
+    // mismatch produced silently wrong output. Now there is a single source of truth and it is
+    // checked here, since neither kernel can check it for itself. panels is gridDim.y under the
+    // chunk-major order, so it must clear the 65535 limit (136 at TP4, 272 at TP1 for gate_up).
+    if (nfix != pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX) || nfix < 1 || panels < 1) {
+        fprintf(stderr, "pxq4: split mmv nfix/panels inconsistent (nfix=%d panels=%d "
+                        "kslabs=%d) at %s:%d\n", nfix, panels, kslabs, __FILE__, __LINE__);
+        abort();
+    }
+    if (panels > 65535 || M > 65535) {
+        fprintf(stderr, "pxq4: split mmv grid limit exceeded: panels=%d M=%d\n", panels, M);
+        abort();
+    }
+    const dim3   grid((unsigned)nfix, (unsigned)panels, (unsigned)M);
     if (vecx) {
         k_pxq4_mmv_part<true><<<grid, 256, smem, stream>>>(
-            slabs, (const __half *)anchor, (const __half *)x, part, K);
+            slabs, (const __half *)anchor, (const __half *)x, part, K, nfix, panels);
     } else {
         k_pxq4_mmv_part<false><<<grid, 256, smem, stream>>>(
-            slabs, (const __half *)anchor, (const __half *)x, part, K);
+            slabs, (const __half *)anchor, (const __half *)x, part, K, nfix, panels);
     }
     PXQ4_CUDA_CHECK(cudaGetLastError());
     const dim3 rgrid((unsigned)panels, (unsigned)M, 1u);
     k_pxq4_mmv_reduce<<<rgrid, PXQ4_BM, 0, stream>>>(part, (__half *)out, nfix, R);
+    PXQ4_CUDA_CHECK(cudaGetLastError());
+}
+
+// Single-launch fused split mmv. Identical values to pxq4_launch_mmv_split_f16 (see
+// k_pxq4_mmv_fused). `ctr` is M*panels unsigned, zeroed once at allocation; every COMPLETED
+// launch leaves it zeroed, so steady state needs no memset and nothing is allocated in-capture.
+void pxq4_launch_mmv_fused_f16(const uint8_t * slabs, const void * anchor, const void * x,
+                               float * part, unsigned * ctr, void * out, int M, int panels,
+                               int kslabs, bool vecx, cudaStream_t stream) {
+    const int    R    = panels * PXQ4_BM;
+    const int    K    = kslabs * PXQ4_QK;
+    const int    nfix = pxq4_mmv_nfix(kslabs);
+    const size_t smem = (size_t)pxq4_mmv_smem_bytes(kslabs);
+    if (nfix < 2) {
+        // nfix == 1 makes the barrier degenerate; the monolithic path owns that case and the
+        // dispatch guard already excludes it. Keep the refusal explicit rather than implicit.
+        fprintf(stderr, "pxq4: fused split mmv requires nfix >= 2 (got %d)\n", nfix);
+        abort();
+    }
+    if (nfix != pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX) || panels < 1) {
+        fprintf(stderr, "pxq4: fused mmv nfix/panels inconsistent (nfix=%d panels=%d "
+                        "kslabs=%d)\n", nfix, panels, kslabs);
+        abort();
+    }
+    if (panels > 65535 || M > 65535) {
+        fprintf(stderr, "pxq4: fused mmv grid limit exceeded: panels=%d M=%d\n", panels, M);
+        abort();
+    }
+    const dim3 grid((unsigned)nfix, (unsigned)panels, (unsigned)M);   // c fastest
+    if (vecx) {
+        k_pxq4_mmv_fused<true><<<grid, 256, smem, stream>>>(
+            slabs, (const __half *)anchor, (const __half *)x, part, ctr, (__half *)out,
+            R, K, nfix, panels);
+    } else {
+        k_pxq4_mmv_fused<false><<<grid, 256, smem, stream>>>(
+            slabs, (const __half *)anchor, (const __half *)x, part, ctr, (__half *)out,
+            R, K, nfix, panels);
+    }
     PXQ4_CUDA_CHECK(cudaGetLastError());
 }
 

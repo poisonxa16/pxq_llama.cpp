@@ -68,7 +68,20 @@ struct pxq4_pol {
 
     // tid < 16 stages the book, 16 <= tid < 32 stages the sublevels. Callers must have at
     // least 32 threads and must __syncthreads() before reading tab/sub.
-    __device__ static void stage_tabs(float * tab, float * sub, int tid) {
+    // The table lives in shared memory as 16 floats and MUST stay 16 floats. The
+    // MODE_TAB table-delivery angle is closed: staging book PAIRS (256 float2 entries,
+    // so one LDS.64 fetches book[byte & 0xf] and book[byte >> 4] together) was built and
+    // measured bit-exact -- 16.1% fewer thread-instructions, 163x the bank conflicts,
+    // and 0.73-0.87x the speed. Warp-shuffle broadcast of the same values was also built:
+    // bit-exact, and a wash (0.99-1.03x), because SHFL uses the same Volta MIO issue port
+    // as LDS at the same rate, at 48 registers instead of 32. The array-REFERENCE
+    // parameters below make widening the table a COMPILE ERROR rather than a silent
+    // regression. See docs/10-kernel-speed.md, "The MODE_TAB table-delivery angle is
+    // closed".
+    __device__ static void stage_tabs(float (&tab)[16], float (&sub)[16], int tid) {
+        static_assert(sizeof(tab) == 64 && sizeof(sub) == 64,
+                      "pxq4: the book/sublevel tables must stay 16 floats = 64 bytes; a wider "
+                      "table reintroduces shared-memory bank conflicts (measured 0.797x)");
         if      (tid < 16) tab[tid]      = pxq4_book_g[tid];
         else if (tid < 32) sub[tid - 16] = pxq4_sub16_g[tid - 16];
     }
@@ -353,9 +366,20 @@ k_pxq4_mmv(const uint8_t * __restrict__ slabs,
 // the monolithic kernel, which the parity gates assert (GPU: mmv_out vs mmv_out_mono;
 // hostsim: pxq4_hostsim_mmv_split_f16 vs pxq4_hostsim_mmv_f16).
 //
-// grid = (panels, nfix, M), block = 256; nfix MUST equal pxq4_canon_nfix(kslabs, CMAX) --
-// the launcher owns that (the kernel reads it from gridDim.y).
+// grid = (nfix, panels, M), block = 256; nfix MUST equal pxq4_canon_nfix(kslabs, CMAX).
+//
+// nfix and panels arrive as EXPLICIT ARGUMENTS rather than being read off gridDim. Reading
+// them off gridDim also works, but the explicit form closes a latent hazard: the pre-swap
+// kernel took nfix from gridDim.y while k_pxq4_mmv_reduce took it as an argument, with
+// nothing asserting the two agreed. pxq4_launch_mmv_split_f16 now passes ONE value to both
+// and asserts it equals pxq4_canon_nfix(kslabs, CMAX). Cost measured on sm_70: +8 integer
+// instructions in the block prologue (328 -> 336), zero change to the 173-instruction dot32
+// loop body and zero change to the FFMA/FMUL/FADD census.
+//
 // dynamic smem = pxq4_canon_max_chunk(K/32) * 32 floats, same bound as k_pxq4_mmv.
+// Marker for out-of-tree consumers (benchmarks, hostsim shims) that must pick the right
+// launch shape and argument list for k_pxq4_mmv_part / k_pxq4_mmv_fused.
+#define PXQ4_MMV_PART_CHUNK_MAJOR 1
 // ---------------------------------------------------------------------------------------------
 template <bool VECX>
 static __global__ void __launch_bounds__(256)
@@ -363,11 +387,17 @@ k_pxq4_mmv_part(const uint8_t * __restrict__ slabs,
                 const __half  * __restrict__ anchor,
                 const __half  * __restrict__ x,        // [M, K]
                 float         * __restrict__ part,     // [M, panels, nfix, KSEG*64]
-                const int K) {
-    const int p    = blockIdx.x;                       // panel
-    const int c    = blockIdx.y;                       // canonical chunk
-    const int iy   = blockIdx.z;                       // token
-    const int nfix = gridDim.y;                        // == pxq4_canon_nfix(kslabs, CMAX)
+                const int K, const int nfix, const int panels) {
+    // GRID ORDER (chunk-major): c is the FASTEST-varying grid dimension, so a panel's nfix
+    // chunk blocks are adjacent in launch order. Under the previous (panels, nfix, M) order a
+    // panel's chunk blocks were strided by `panels` in linear block id, so the concurrently
+    // resident set read one k-chunk of every panel -- `panels` weight streams strided by
+    // kslabs*SLAB (174 KB on TP4 gate_up) -- instead of a few panels' full K range. This is a
+    // PURE ADDRESSING CHANGE: part[] keeps the identical (iy, p, c, tid) layout, every lane
+    // still visits the same kb in the same order, and k_pxq4_mmv_reduce is unchanged.
+    const int c      = blockIdx.x;                     // canonical chunk (fastest-varying)
+    const int p      = blockIdx.y;                     // panel
+    const int iy     = blockIdx.z;                     // token
 
     PXQ4_EXTERN_SHARED float pxq4_xs[];
     __shared__ float tab[16];
@@ -401,7 +431,7 @@ k_pxq4_mmv_part(const uint8_t * __restrict__ slabs,
     }
     // one fully-coalesced 1024-B store per block: threadIdx.x == kseg*64 + row, matching the
     // red[] layout of k_pxq4_mmv so the reduce below can replay its fold verbatim.
-    part[(((size_t)iy * gridDim.x + p) * nfix + c) * (PXQ4_MMV_KSEG * PXQ4_BM)
+    part[(((size_t)iy * panels + p) * nfix + c) * (PXQ4_MMV_KSEG * PXQ4_BM)
          + threadIdx.x] = t;
 }
 
@@ -431,4 +461,152 @@ k_pxq4_mmv_reduce(const float * __restrict__ part,    // [M, panels, nfix, KSEG*
 #pragma unroll
     for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += su[s];
     out[(size_t)iy * R + p * PXQ4_BM + row] = __float2half_rn(u);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// v4: single-launch fused split mmv -- k_pxq4_mmv_part and k_pxq4_mmv_reduce in one kernel.
+//
+// WHY. The two-launch split pays a full device drain + refill between the part kernel and the
+// reduce kernel. Measured on this card that gap is several microseconds per call and is larger
+// than the entire decode instruction stream is worth (the zero-instruction floor for the part
+// kernel is only 1.15-1.22x). This kernel does the reduce in whichever block of a
+// (panel, token) arrives LAST, so there is one launch instead of two, and ~240 launches per
+// decode step disappear from the CUDA graph.
+//
+// BIT-EXACTNESS. The atomic is an ARRIVAL COUNTER, never an accumulator: no floating-point
+// value is ever atomically combined, so the expression tree is untouched. The winning block
+// replays k_pxq4_mmv_reduce's fold verbatim -- chunks ascending c, then ksegs ascending s, one
+// __float2half_rn at the end -- reading the same fp32 part[] words the two-launch reduce would
+// have read. Composed with the argument at k_pxq4_mmv_part, this is bit-identical to the
+// monolithic k_pxq4_mmv.
+//
+// WHAT WOULD NOT BE BIT-EXACT (rejected; do not "simplify" into these):
+//   - one block summing a RANGE of chunks (grid-stride / persistent blocks). A left-associated
+//     chain cannot be split: ((t0+t1)+t2) + (t3+t4) != ((((t0+t1)+t2)+t3)+t4).
+//   - atomicAdd of floats into an accumulator: nondeterministic order, breaks the contract.
+//   - cooperative_groups::grid_group::sync(): needs cudaLaunchCooperativeKernel, which caps the
+//     grid at what fits resident; gate_up needs 2176 blocks. It would force the persistent-block
+//     rewrite above, i.e. exactly the reassociation this avoids.
+//
+// FORWARD PROGRESS. No block ever spins. Every block increments and exits; only the one that
+// observes old == nfix-1 continues. Deadlock is impossible regardless of block scheduling.
+//
+// ctr: M*panels unsigned, ZERO on entry. The winner rearms its slot to 0 before returning, so
+// a completed launch leaves the buffer ready for the next one -- no memset launch is needed and
+// nothing is allocated in-capture.
+//
+// CONCURRENCY. Exactly one PXQ4 mmv may be in flight per device at a time. This is NOT a new
+// constraint -- the persistent part[] arena is already shared and reused across every PXQ4
+// module and has the identical hazard -- but it is now a CORRECTNESS dependency of the barrier,
+// not only a scratch-aliasing one, and it is documented at the arena as well.
+//
+// FAILURE MODE. A launch torn down mid-flight leaves ctr non-zero; no later block then observes
+// old == nfix-1, out[] is never written, and the caller silently consumes stale fp16. The
+// failure is SILENT. Mitigation: the arena zeroes the counter region once at allocation, and
+// any error path that abandons a launch must reset the arena.
+// ---------------------------------------------------------------------------------------------
+
+#ifdef __CUDACC__
+// atom.release.gpu: the release fence is fused into the RMW. A separate __threadfence() before
+// a plain atomicAdd is also bit-exact but measurably slower (every block pays a full membar.gl).
+static __device__ __forceinline__ unsigned pxq4_arrive_release(unsigned * p) {
+    unsigned old;
+    asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(p) : "memory");
+    return old;
+}
+static __device__ __forceinline__ void pxq4_fence_acq_rel() {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+static __device__ __forceinline__ float pxq4_ld_part(const float * p) { return __ldcg(p); }
+#else
+// hostsim: blocks run strictly sequentially, so the RMW degenerates to ++ and the fences are
+// no-ops. This gates the VALUES the fused path computes; it can NEVER observe the race (see
+// the device stress harness, which is mandatory rather than optional).
+static inline unsigned pxq4_arrive_release(unsigned * p) { const unsigned old = *p; *p = old + 1u; return old; }
+static inline void  pxq4_fence_acq_rel() {}
+static inline float pxq4_ld_part(const float * p) { return *p; }
+#endif
+
+template <bool VECX>
+static __global__ void __launch_bounds__(256)
+k_pxq4_mmv_fused(const uint8_t * __restrict__ slabs,
+                 const __half  * __restrict__ anchor,
+                 const __half  * __restrict__ x,        // [M, K]
+                 float         * __restrict__ part,     // [M, panels, nfix, KSEG*64]
+                 unsigned      * __restrict__ ctr,      // [M, panels], zero on entry and exit
+                 __half        * __restrict__ out,      // [M, R]
+                 const int R, const int K, const int nfix, const int panels) {
+    const int c      = blockIdx.x;                      // canonical chunk (fastest-varying)
+    const int p      = blockIdx.y;                      // panel
+    const int iy     = blockIdx.z;                      // token
+
+    PXQ4_EXTERN_SHARED float pxq4_xs[];
+    __shared__ float tab[16];
+    __shared__ float sub[16];
+    __shared__ float red[PXQ4_MMV_KSEG * PXQ4_BM];
+    __shared__ int   last;
+
+    pxq4_pol::stage_tabs(tab, sub, threadIdx.x);
+
+    const int row    = threadIdx.x & 63;
+    const int kseg   = threadIdx.x >> 6;
+    const int kslabs = K / PXQ4_QK;
+
+    const uint8_t * pan_slabs = slabs + (size_t)p * kslabs * pxq4_pol::SLAB;
+    const float     anch      = __half2float(anchor[(size_t)p * PXQ4_BM + row]);
+    const __half  * xt        = x + (size_t)iy * K;
+
+    const int b0 = (kslabs * c) / nfix;
+    const int b1 = (kslabs * (c + 1)) / nfix;
+    const int n  = (b1 - b0) * PXQ4_QK;
+
+    __syncthreads();                                    // covers the stage_tabs writes
+    for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+        pxq4_xs[idx] = __half2float(xt[b0 * PXQ4_QK + idx]);
+    }
+    __syncthreads();
+
+    float t = 0.f;
+    for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
+        t += pxq4_dot32<VECX>(pan_slabs + (size_t)kb * pxq4_pol::SLAB, row, anch,
+                              pxq4_xs + (size_t)(kb - b0) * PXQ4_QK, tab, sub);
+    }
+
+    const size_t  tile  = (size_t)(PXQ4_MMV_KSEG * PXQ4_BM);
+    float * const pbase = part + (((size_t)iy * panels + p) * nfix) * tile;
+    pbase[(size_t)c * tile + threadIdx.x] = t;
+
+    // ---- arrival barrier over this (panel, token)'s nfix blocks --------------------------
+    // The __syncthreads() below is LOAD-BEARING and is the easiest line in this kernel to omit.
+    // The release orders only thread 0's OWN prior accesses, so without it lanes 1..255 may not
+    // have issued their part[] stores when the counter is bumped, and the winner reads stale
+    // words. Omitting it still passes a single-shot parity check, by luck. Do not remove it.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = pxq4_arrive_release(&ctr[(size_t)iy * panels + p]);
+        last = (old == (unsigned)(nfix - 1));
+        if (last) {
+            ctr[(size_t)iy * panels + p] = 0u;           // rearm for the next launch
+            pxq4_fence_acq_rel();                        // acquire the other blocks' part[]
+        }
+    }
+    __syncthreads();                                     // propagates the acquire to the block
+    if (!last) return;
+
+    // ---- k_pxq4_mmv_reduce's fold, verbatim ---------------------------------------------
+    // __ldcg keeps the read off L1 (not coherent across SMs on sm_70); the loaded value is the
+    // same fp32 word either way, so this is a cache-hint change only.
+    float su = 0.f;
+    for (int cc = 0; cc < nfix; ++cc) {                  // chunk fold, ascending c
+        su += pxq4_ld_part(&pbase[(size_t)cc * tile + threadIdx.x]);
+    }
+    red[threadIdx.x] = su;                               // threadIdx.x == kseg*64 + row
+    __syncthreads();
+    if (kseg == 0) {
+        float u = 0.f;                                   // kseg fold, ascending s
+#pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += red[s * PXQ4_BM + row];
+        out[(size_t)iy * R + p * PXQ4_BM + row] = __float2half_rn(u);
+    }
 }

@@ -23,6 +23,15 @@ void pxq4_launch_mmv_split_f16(const uint8_t * slabs, const void * anchor, const
                                float * part, void * out, int M, int panels, int kslabs,
                                bool vecx, cudaStream_t stream);
 
+// Single-launch fused twin of pxq4_launch_mmv_split_f16: the reduce runs in whichever block of
+// a (panel, token) arrives last, so there is one launch instead of two. Identical values (the
+// atomic is an arrival counter, never an accumulator -- see k_pxq4_mmv_fused). `ctr` is
+// caller-provided scratch of M * panels unsigned, ZERO on entry; a completed launch leaves it
+// zero. Requires nfix >= 2 and exactly one PXQ4 mmv in flight per device.
+void pxq4_launch_mmv_fused_f16(const uint8_t * slabs, const void * anchor, const void * x,
+                               float * part, unsigned * ctr, void * out, int M, int panels,
+                               int kslabs, bool vecx, cudaStream_t stream);
+
 // canonical chunk count for this K (= grid.y of the split mmv; sizes `part`).
 int  pxq4_mmv_nfix(int kslabs);
 

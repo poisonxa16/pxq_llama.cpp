@@ -136,6 +136,39 @@ at::Tensor & mmv_partials_arena(const at::Tensor & like, int64_t need_floats) {
     return t;
 }
 
+// Persistent per-device ARRIVAL-COUNTER arena for the fused single-launch split mmv
+// (k_pxq4_mmv_fused). M*panels unsigned words, ZERO on entry to every launch. A completed
+// launch rearms its own slots, so this is zeroed exactly ONCE, at allocation, which the same
+// not-during-capture invariant as the partials arena guarantees is outside graph capture.
+//
+// TWO PROPERTIES OF THIS BUFFER ARE LOAD-BEARING, and neither is enforceable in code here:
+//   * ONE PXQ4 mmv IN FLIGHT PER DEVICE AT A TIME. Two concurrent mmv calls on different
+//     streams would corrupt both the counters and part[]. This is NOT a new constraint -- the
+//     partials arena above is already shared and reused across every PXQ4 module and has the
+//     identical hazard -- but with the barrier it is a CORRECTNESS dependency, not only a
+//     scratch-aliasing one.
+//   * A LAUNCH TORN DOWN MID-FLIGHT LEAVES A COUNTER NON-ZERO, after which no block of that
+//     (panel, token) ever observes old == nfix-1, out[] is never written, and the caller
+//     silently consumes stale fp16. The failure is SILENT, not loud. Any error path that
+//     abandons a launch must reset this arena (drop the tensor so the next call reallocates
+//     and re-zeroes).
+at::Tensor & mmv_counter_arena(const at::Tensor & like, int64_t need_words) {
+    static std::array<at::Tensor, 64> cache;
+    const int64_t di = (int64_t)like.get_device();
+    TORCH_CHECK(di >= 0 && di < (int64_t)cache.size(), "pxq4: bad device index ", di);
+    at::Tensor & t = cache[(size_t)di];
+    if (!t.defined() || t.numel() < need_words) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &st);
+        TORCH_CHECK(st == cudaStreamCaptureStatusNone,
+                    "pxq4: mmv counter arena would have to grow (to ", need_words,
+                    " words) during CUDA graph capture; see mmv_partials_arena for why every "
+                    "PXQ4 layer must run eagerly once before capture.");
+        t = at::zeros({need_words}, like.options().dtype(at::kInt));  // ZERO on entry
+    }
+    return t;
+}
+
 void mmv_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
              const at::Tensor & anchor) {
     const Geom g = check_weight(slabs, anchor);
@@ -161,18 +194,53 @@ void mmv_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
     // owned by the Python caller, and a hard check would make the op unusable for the
     // crossover sweep that decides where the ceiling actually belongs (plan risk 4).
 
-    // Split-path threshold. The split mmv pays a fixed two-launch + partials round-trip
-    // cost (~10 us); below ~8 MB of slab bytes the monolithic kernel's launch economy wins
-    // even at 12% occupancy (measured: TP4 o_proj, 4.2 MB, mono 21 us vs split 32 us, while
-    // every shape >= 8 MB gains 1.5-2.3x from the split). Env-tunable for re-baselining on
-    // a different part.
+    // Split-vs-mono dispatch: an OCCUPANCY rule, not a byte-count rule.
+    //
+    // What decides the winner is whether the MONOLITHIC grid -- panels*M blocks of 256
+    // threads -- has enough blocks to fill the SMs. It does not depend on how many bytes the
+    // tensor holds. The old rule (slab_bytes >= 8 MB) used byte count as a proxy and got the
+    // model's out_proj/o_proj class wrong: 64 of the 240 PXQ4 modules touched per token
+    // (48 linear_attn.out_proj + 16 self_attn.o_proj, panels=80 kslabs=48 nfix=8, 3.98 MB)
+    // sat just under the threshold and shipped on mono at 12.5% occupancy.
+    //
+    // The stale comment this replaces recorded "TP4 o_proj, 4.2 MB, mono 21 us vs split
+    // 32 us". That does not reproduce in ANY L2 regime. Re-measured on sm_70 with a 48 MB
+    // L2-defeating working set (the o_proj slab is 3.98 MB against a 6 MB L2, so a
+    // single-copy benchmark reads ~30% fast and flatters mono): mono 24.4 us vs split
+    // 12.0 us. L2-warm, the regime that presumably produced the stale number: mono 17.7 us
+    // vs split 10.4 us. Split wins by 1.70-2.03x in both. The 8 MB threshold was costing
+    // ~0.79 ms per decode token.
+    //
+    // Crossover calibrated over 48 (shape, M) points on an 80-SM V100: every point with
+    // panels*M <= 160 wins on split (worst 1.04x), panels*M = 256 is a coin flip, every
+    // point with panels*M >= 272 wins on mono. 2*multiProcessorCount is the conservative end
+    // of that interval and is device-derived rather than hard-coded, since the constant is a
+    // property of this kernel's 256-thread blocks. Env-tunable for a different part.
+    static const int64_t kMaxMonoBlocks = [] {
+        if (const char * e = getenv("PXQ4_MMV_SPLIT_MAX_BLOCKS")) {
+            if (*e) return (int64_t)atoll(e);
+        }
+        int dev = 0, sm = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            sm <= 0) {
+            sm = 80;  // V100; only reached if the driver query fails
+        }
+        return (int64_t)(2 * sm);
+    }();
+    // Second veto, retained so the byte threshold can still force a shape back onto mono
+    // without a rebuild. Defaults to 0 = inactive (the old default was 8 MB). NOTE for
+    // operators: anyone with PXQ4_MMV_SPLIT_MIN_BYTES set in their environment today will
+    // keep getting the old byte veto ON TOP of the new occupancy rule.
     static const int64_t kSplitMinBytes = [] {
         const char * e = getenv("PXQ4_MMV_SPLIT_MIN_BYTES");
-        return e && *e ? (int64_t)atoll(e) : (int64_t)(8 << 20);
+        return e && *e ? (int64_t)atoll(e) : (int64_t)0;
     }();
     const int64_t slab_bytes = (int64_t)g.panels * g.kslabs * PXQ4_SLAB_BYTES;
     const int nfix = pxq4_mmv_nfix(g.kslabs);
-    if (nfix > 1 && slab_bytes >= kSplitMinBytes) {
+    const bool use_split = nfix > 1 && slab_bytes >= kSplitMinBytes &&
+                           (int64_t)g.panels * M <= kMaxMonoBlocks;
+    if (use_split) {
         // K-chunk-split fast path: bit-identical to the monolithic kernel (see
         // k_pxq4_mmv_part) but with nfix-times the blocks, which is what keeps an 80-SM
         // V100 busy at decode on this model's small-N TP shapes. The fp32 partials come
@@ -182,8 +250,15 @@ void mmv_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
         const int64_t m_cap = std::max<int64_t>(M, kPxq4MmvMaxM);
         at::Tensor & part = mmv_partials_arena(
             x, m_cap * (int64_t)g.panels * nfix * (int64_t)(PXQ4_MMV_KSEG * PXQ4_BM));
-        pxq4_launch_mmv_split_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(),
-                                  part.data_ptr<float>(), out.data_ptr(),
+        // v4: single launch. The reduce runs in whichever block of a (panel, token) arrives
+        // last, so the device drain + refill between the two kernels disappears and ~240
+        // kernel nodes leave the decode graph. Values are unchanged -- the atomic is an
+        // arrival counter, never an accumulator (see k_pxq4_mmv_fused).
+        at::Tensor & ctr = mmv_counter_arena(x, m_cap * (int64_t)g.panels);
+        TORCH_CHECK(nfix >= 2, "pxq4: fused split mmv needs nfix >= 2, got ", nfix);
+        pxq4_launch_mmv_fused_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(),
+                                  part.data_ptr<float>(), (unsigned *)ctr.data_ptr<int32_t>(),
+                                  out.data_ptr(),
                                   (int)M, g.panels, g.kslabs, /*vecx=*/true,
                                   at::cuda::getCurrentCUDAStream());
     } else {
@@ -210,6 +285,31 @@ void mmv_out_mono(at::Tensor & out, const at::Tensor & x, const at::Tensor & sla
                         at::cuda::getCurrentCUDAStream());
 }
 
+// The v3 two-launch split, kept callable so the device parity gate can assert the fused path
+// bit-identical against it (and against mmv_out_mono) on a real card. Do not delete: the fused
+// path's only strong gate is a device differential -- the hostsim runs blocks sequentially and
+// is structurally incapable of observing the barrier race.
+void mmv_out_split2(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
+                    const at::Tensor & anchor) {
+    const Geom g = check_weight(slabs, anchor);
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == g.K && x.scalar_type() == at::kHalf, "pxq4: bad x");
+    TORCH_CHECK(out.dim() == 2 && out.size(0) == x.size(0) && out.size(1) == g.N &&
+                out.scalar_type() == at::kHalf, "pxq4: bad out");
+    TORCH_CHECK(x.is_contiguous() && out.is_contiguous(), "pxq4: x and out must be contiguous");
+    TORCH_CHECK(pxq4_mmv_supported(g.kslabs), "pxq4: K too large for mmv smem budget");
+    const int64_t M = x.size(0);
+    if (M == 0) return;
+    const int nfix = pxq4_mmv_nfix(g.kslabs);
+    TORCH_CHECK(nfix >= 2, "pxq4: split mmv needs nfix >= 2, got ", nfix);
+    const int64_t m_cap = std::max<int64_t>(M, kPxq4MmvMaxM);
+    at::Tensor & part = mmv_partials_arena(
+        x, m_cap * (int64_t)g.panels * nfix * (int64_t)(PXQ4_MMV_KSEG * PXQ4_BM));
+    pxq4_launch_mmv_split_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), x.data_ptr(),
+                              part.data_ptr<float>(), out.data_ptr(),
+                              (int)M, g.panels, g.kslabs, /*vecx=*/true,
+                              at::cuda::getCurrentCUDAStream());
+}
+
 // Debug twin of mmv_out with the float4 activation loads disabled. Same values, different
 // load width; used to isolate an alignment fault from an arithmetic fault at G6/G8.
 void mmv_out_scalar(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
@@ -225,7 +325,9 @@ void mmv_out_scalar(at::Tensor & out, const at::Tensor & x, const at::Tensor & s
                         at::cuda::getCurrentCUDAStream());
 }
 
-int64_t version() { return 3; }  // 2 = K-chunk-split mmv; 3 = capture-safe partials arena
+// 2 = K-chunk-split mmv; 3 = capture-safe partials arena; 4 = single-launch fused split mmv;
+// 5 = chunk-major grid + occupancy-based split/mono dispatch
+int64_t version() { return 5; }
 
 int64_t mmv_max_m() { return kPxq4MmvMaxM; }
 
@@ -276,6 +378,7 @@ TORCH_LIBRARY(pxq4, m) {
     m.def("mmv_out(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out_scalar(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out_mono(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
+    m.def("mmv_out_split2(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("version() -> int");
     m.def("mmv_max_m() -> int");
     m.def("mmv_supported(int K) -> bool");
@@ -290,6 +393,7 @@ TORCH_LIBRARY_IMPL(pxq4, CUDA, m) {
     m.impl("mmv_out", &mmv_out);
     m.impl("mmv_out_scalar", &mmv_out_scalar);
     m.impl("mmv_out_mono", &mmv_out_mono);
+    m.impl("mmv_out_split2", &mmv_out_split2);
 }
 
 // Device-independent entry points. CompositeExplicitAutograd puts them on every backend

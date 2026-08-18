@@ -142,18 +142,51 @@ void pxq4_hostsim_mmv_split_f16(const uint8_t * slabs, const uint16_t * anchor,
     const int K    = kslabs * PXQ4_QK;
     const int nfix = pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX);
     if (pxq4_canon_max_chunk(kslabs) * PXQ4_QK > PXQ4_HOSTSIM_SMEM_FLOATS) abort();
+    // grid = (nfix, panels, M) -- c fastest, matching pxq4_launch_mmv_split_f16 (v4 grid order)
     if (vecx) {
-        launch3((unsigned)panels, (unsigned)nfix, (unsigned)M, 256u, [=] {
-            k_pxq4_mmv_part<true>(slabs, (const __half *)anchor, (const __half *)x, part, K);
+        launch3((unsigned)nfix, (unsigned)panels, (unsigned)M, 256u, [=] {
+            k_pxq4_mmv_part<true>(slabs, (const __half *)anchor, (const __half *)x, part, K,
+                                  nfix, panels);
         });
     } else {
-        launch3((unsigned)panels, (unsigned)nfix, (unsigned)M, 256u, [=] {
-            k_pxq4_mmv_part<false>(slabs, (const __half *)anchor, (const __half *)x, part, K);
+        launch3((unsigned)nfix, (unsigned)panels, (unsigned)M, 256u, [=] {
+            k_pxq4_mmv_part<false>(slabs, (const __half *)anchor, (const __half *)x, part, K,
+                                   nfix, panels);
         });
     }
     launch3((unsigned)panels, (unsigned)M, 1u, PXQ4_BM, [=] {
         k_pxq4_mmv_reduce(part, (__half *)out, nfix, R);
     });
+}
+
+// Single-launch fused split mmv (v4). `part` as above; `ctr` is M*panels unsigned and must be
+// ZERO on entry (the simulator zeroes it here so the caller cannot get it wrong). Gates the
+// VALUES only: the simulator runs blocks strictly sequentially, so the arrival counter
+// degenerates to ++ and the fences are no-ops -- it can never observe the device race. The
+// device stress harness is mandatory and this does not replace it.
+void pxq4_hostsim_mmv_fused_f16(const uint8_t * slabs, const uint16_t * anchor,
+                                const uint16_t * x, float * part, uint16_t * out,
+                                int M, int panels, int kslabs, int vecx) {
+    const int R    = panels * PXQ4_BM;
+    const int K    = kslabs * PXQ4_QK;
+    const int nfix = pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX);
+    if (pxq4_canon_max_chunk(kslabs) * PXQ4_QK > PXQ4_HOSTSIM_SMEM_FLOATS) abort();
+    if (nfix < 2) abort();
+    std::vector<unsigned> ctr((size_t)M * panels, 0u);
+    unsigned * cp = ctr.data();
+    if (vecx) {
+        launch3((unsigned)nfix, (unsigned)panels, (unsigned)M, 256u, [=] {
+            k_pxq4_mmv_fused<true>(slabs, (const __half *)anchor, (const __half *)x, part, cp,
+                                   (__half *)out, R, K, nfix, panels);
+        });
+    } else {
+        launch3((unsigned)nfix, (unsigned)panels, (unsigned)M, 256u, [=] {
+            k_pxq4_mmv_fused<false>(slabs, (const __half *)anchor, (const __half *)x, part, cp,
+                                    (__half *)out, R, K, nfix, panels);
+        });
+    }
+    // every completed launch must leave the counter rearmed
+    for (size_t i = 0; i < ctr.size(); ++i) if (ctr[i] != 0u) abort();
 }
 
 int pxq4_hostsim_canon_nfix(int kslabs)      { return pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX); }
