@@ -2,7 +2,7 @@
 
 Source of truth: struct-parsed GGUF header of `/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`
 on the DGX (script: `/mnt/models/pxa-build-cache/tc.py`, local copy
-`/tmp/claude-0/-home-user/3ecaecda-772d-5d99-a086-0883fbbd0af9/scratchpad/pxq-vllm/tc.py`,
+`<scratch>/pxq-vllm/tc.py`,
 raw JSON `.../pxq-vllm/out.json`). Only the header + tensor directory were read
 (first 10,997,184 bytes); no tensor data was touched.
 

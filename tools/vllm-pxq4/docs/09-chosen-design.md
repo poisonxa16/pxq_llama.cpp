@@ -263,7 +263,7 @@ problem instead of coding around it. Cost of the deferral: 0.366 GiB/GPU during 
 ## 4. Repository layout
 
 One git repo, **on this machine** at
-`/tmp/claude-0/-home-user/3ecaecda-772d-5d99-a086-0883fbbd0af9/scratchpad/pxq-vllm/pxq4-vllm/`,
+`<scratch>/pxq-vllm/pxq4-vllm/`,
 deployed to the DGX at `/mnt/models/pxa-vllm-pxq4/` (never to `/`, never to container `/`).
 
 ```
