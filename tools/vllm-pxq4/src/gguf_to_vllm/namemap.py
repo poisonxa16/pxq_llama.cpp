@@ -437,8 +437,29 @@ def _a_to_a_log(w):
     return _np.log(-a).astype(_np.float32)
 
 
+def _minus_one(w):
+    import numpy as _np
+    return (_np.asarray(w, dtype=_np.float32) - 1.0).astype(_np.float32)
+
+
+#: GEMMA-NORM CONVENTION (found 2026-08-19 after a day of mojibake): vLLM's
+#: qwen3_5 model code binds GemmaRMSNorm (out = normed * (1 + weight)) for the
+#: input/post layernorms, the attention q/k norms, and the final norm -- the HF
+#: checkpoint stores those weights ZERO-CENTERED. The GGUF, converted for
+#: llama.cpp's plain-multiply norms, stores them offset by +1. Copying the GGUF
+#: values verbatim makes every one of those norms scale ~2x: activations stay
+#: bounded (each later norm renormalizes), all per-layer math is self-
+#: consistent, and the model babbles. The old p2a-nf artifact (Aug 18) has
+#: zero-centered norms; the tree's converter had lost the subtraction.
+#: ssm_norm (RMSNormGated) multiplies by the PLAIN weight and must NOT be
+#: offset.
 VALUE_TRANSFORMS: dict[str, tuple[Callable[[Any], Any], str]] = {
     "ssm_a": (_a_to_a_log, "A_log = log(-A): ggml stores A, HF stores its log"),
+    "attn_norm.weight": (_minus_one, "gemma-norm: HF stores w-1, ggml stores w"),
+    "post_attention_norm.weight": (_minus_one, "gemma-norm: HF stores w-1, ggml stores w"),
+    "attn_q_norm.weight": (_minus_one, "gemma-norm: HF stores w-1, ggml stores w"),
+    "attn_k_norm.weight": (_minus_one, "gemma-norm: HF stores w-1, ggml stores w"),
+    "output_norm.weight": (_minus_one, "gemma-norm: HF stores w-1, ggml stores w"),
 }
 
 
