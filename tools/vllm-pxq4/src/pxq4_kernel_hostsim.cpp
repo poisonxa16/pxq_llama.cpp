@@ -201,3 +201,49 @@ void pxq4_hostsim_builtin_tables(float * book16, float * sub16) {
 }
 
 }  // extern "C"
+
+// v6: multi-token fused split mmv. Template-dispatched on exact M like the device launcher.
+// Values gate only (blocks strictly sequential; see pxq4_hostsim_mmv_fused_f16).
+template <int MT>
+static void pxq4_hostsim_mmv_fused_mt_run(const uint8_t * slabs, const uint16_t * anchor,
+                                          const uint16_t * x, float * part, unsigned * ctr,
+                                          uint16_t * out, int R, int K, int nfix, int panels,
+                                          int vecx) {
+    if (vecx) {
+        launch3((unsigned)nfix, (unsigned)panels, 1u, 256u, [=] {
+            k_pxq4_mmv_fused_mt<true, MT>(slabs, (const __half *)anchor, (const __half *)x,
+                                          part, ctr, (__half *)out, R, K, nfix, panels);
+        });
+    } else {
+        launch3((unsigned)nfix, (unsigned)panels, 1u, 256u, [=] {
+            k_pxq4_mmv_fused_mt<false, MT>(slabs, (const __half *)anchor, (const __half *)x,
+                                           part, ctr, (__half *)out, R, K, nfix, panels);
+        });
+    }
+}
+
+extern "C" void pxq4_hostsim_mmv_fused_mt_f16(const uint8_t * slabs, const uint16_t * anchor,
+                                              const uint16_t * x, float * part, uint16_t * out,
+                                              int M, int panels, int kslabs, int vecx) {
+    const int R    = panels * PXQ4_BM;
+    const int K    = kslabs * PXQ4_QK;
+    const int nfix = pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX);
+    if (M < 1 || M > 8) abort();
+    if ((size_t)pxq4_canon_max_chunk(kslabs) * PXQ4_QK * M > PXQ4_HOSTSIM_SMEM_FLOATS) abort();
+    if (nfix < 2) abort();
+    std::vector<unsigned> ctr((size_t)panels, 0u);
+    unsigned * cp = ctr.data();
+    switch (M) {
+        case 1: pxq4_hostsim_mmv_fused_mt_run<1>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        case 2: pxq4_hostsim_mmv_fused_mt_run<2>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        case 3: pxq4_hostsim_mmv_fused_mt_run<3>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        case 4: pxq4_hostsim_mmv_fused_mt_run<4>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        case 5: pxq4_hostsim_mmv_fused_mt_run<5>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        case 6: pxq4_hostsim_mmv_fused_mt_run<6>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        case 7: pxq4_hostsim_mmv_fused_mt_run<7>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        case 8: pxq4_hostsim_mmv_fused_mt_run<8>(slabs, anchor, x, part, cp, out, R, K, nfix, panels, vecx); break;
+        default: abort();
+    }
+    for (size_t i = 0; i < ctr.size(); ++i) if (ctr[i] != 0u) abort();
+}
+

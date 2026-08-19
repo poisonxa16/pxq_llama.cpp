@@ -194,6 +194,34 @@ void mmv_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
     // owned by the Python caller, and a hard check would make the op unusable for the
     // crossover sweep that decides where the ceiling actually belongs (plan risk 4).
 
+    // v6: MULTI-TOKEN fast path. For a decode batch of 2..8 tokens the per-token kernels
+    // above re-read the whole weight tensor once per token, which is why served throughput
+    // collapsed under concurrency. k_pxq4_mmv_fused_mt gives one block all M tokens of its
+    // (chunk, panel): weight bytes are decoded once and folded into M accumulators, so the
+    // step cost is ~flat in M. Values are per-token bit-identical to the monolithic kernel
+    // (see the kernel's header comment; gated by hostsim + GPU parity).
+    // Kill switch: PXQ4_MMV_MT=0 restores the v5 dispatch untouched.
+    static const bool kMtEnabled = [] {
+        const char * e = getenv("PXQ4_MMV_MT");
+        return !(e && *e && atoll(e) == 0);
+    }();
+    {
+        const int nfix_mt = pxq4_mmv_nfix(g.kslabs);
+        if (kMtEnabled && M >= 2 && M <= 8 && nfix_mt >= 2 &&
+            pxq4_mmv_mt_supported(g.kslabs, (int)M)) {
+            const int64_t m_cap = std::max<int64_t>(M, kPxq4MmvMaxM);
+            at::Tensor & part = mmv_partials_arena(
+                x, m_cap * (int64_t)g.panels * nfix_mt * (int64_t)(PXQ4_MMV_KSEG * PXQ4_BM));
+            at::Tensor & ctr = mmv_counter_arena(x, m_cap * (int64_t)g.panels);
+            pxq4_launch_mmv_fused_mt_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(),
+                                         x.data_ptr(), part.data_ptr<float>(),
+                                         (unsigned *)ctr.data_ptr<int32_t>(), out.data_ptr(),
+                                         (int)M, g.panels, g.kslabs, /*vecx=*/true,
+                                         at::cuda::getCurrentCUDAStream());
+            return;
+        }
+    }
+
     // Split-vs-mono dispatch: an OCCUPANCY rule, not a byte-count rule.
     //
     // What decides the winner is whether the MONOLITHIC grid -- panels*M blocks of 256
@@ -310,6 +338,86 @@ void mmv_out_split2(at::Tensor & out, const at::Tensor & x, const at::Tensor & s
                               at::cuda::getCurrentCUDAStream());
 }
 
+// Persistent per-device fp16 DEQUANT arena for linear_out's large-M path. Same growth
+// contract as mmv_partials_arena: grows only outside CUDA-graph capture. vLLM's eager
+// warmup runs every layer at every capture size before capture, so any M that can appear
+// inside a graph has already sized the arena.
+at::Tensor & dequant_arena(const at::Tensor & like, int64_t need_elems) {
+    static std::array<at::Tensor, 64> cache;
+    const int64_t di = (int64_t)like.get_device();
+    TORCH_CHECK(di >= 0 && di < (int64_t)cache.size(), "pxq4: bad device index ", di);
+    at::Tensor & t = cache[(size_t)di];
+    if (!t.defined() || t.numel() < need_elems) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &st);
+        TORCH_CHECK(st == cudaStreamCaptureStatusNone,
+                    "pxq4: dequant arena would have to grow (to ", need_elems,
+                    " fp16 elems) during CUDA graph capture; the eager pre-capture warmup "
+                    "must touch every PXQ4 layer first.");
+        t = at::empty({need_elems}, like.options().dtype(at::kHalf));
+    }
+    return t;
+}
+
+// v7: SINGLE-OP LINEAR DISPATCHER. out[M,N] = x[M,K] @ W^T with the small-M mmv vs
+// large-M dequant+cuBLAS policy decided HERE, per call, in C++.
+//
+// WHY THIS OP EXISTS: the Python-side branch (linear.py apply(): `M <= mmv_max_m`) is
+// traced ONCE by torch.compile per compile range, and this fork runs backed dynamic
+// shapes with evaluate_guards=False, so whichever branch the tracer saw is baked for the
+// entire range. That baked the per-token mmv into the (1,2048) prefill range and produced
+// served prefill at exactly one full weight read per token (measured 229 tok/s, 4.37 ms/token,
+// perfectly linear in prompt length, vs 3160 tok/s for the AWQ arm). A custom op is opaque
+// to dynamo/inductor, so the policy runs at execution time no matter what was traced.
+// Under CUDA-graph capture the branch is evaluated at capture time with the real M, which
+// is exactly what the captured kernels should be.
+void linear_out(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
+                const at::Tensor & anchor) {
+    const Geom g = check_weight(slabs, anchor);
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "pxq4: x must be a CUDA float16 tensor");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf, "pxq4: out must be a CUDA float16 tensor");
+    TORCH_CHECK(x.dim() == 2 && out.dim() == 2, "pxq4: x and out must be 2D");
+    TORCH_CHECK(x.size(1) == g.K, "pxq4: x K=", x.size(1), " does not match weight K=", g.K);
+    TORCH_CHECK(out.size(0) == x.size(0) && out.size(1) == g.N,
+                "pxq4: out must be [", x.size(0), ", ", g.N, "]");
+    TORCH_CHECK(x.is_contiguous() && out.is_contiguous(), "pxq4: x and out must be contiguous");
+    const int64_t M = x.size(0);
+    if (M == 0) return;
+    static const int64_t kMaxM = [] {
+        const char * e = getenv("PXQ4_MMV_MAX_M");
+        return (e && *e) ? (int64_t)atoll(e) : kPxq4MmvMaxM;
+    }();
+    if (M <= kMaxM && pxq4_mmv_supported(g.kslabs)) {
+        mmv_out(out, x, slabs, anchor);
+        return;
+    }
+    // Medium batches (kMaxM < M <= kSliceMax): ceil(M/kMaxM) sliced mmv calls. Each slice is
+    // one multi-token weight pass (~4.3 ms/slice/rank on this model at TP4), which beats the
+    // dequant+GEMM floor (~38 ms of dequant traffic) up to roughly M ~ 64; default 16 is the
+    // conservative, measured-safe end. Each token's fold is the canonical engine mmv fold,
+    // bit-identical to a direct mmv_out on that row. Slices are sequential launches on one
+    // stream, so the shared partials/counter arenas see one mmv in flight at a time.
+    static const int64_t kSliceMax = [] {
+        const char * e = getenv("PXQ4_MMV_SLICE_MAX");
+        return (e && *e) ? (int64_t)atoll(e) : (int64_t)16;
+    }();
+    if (M <= kSliceMax && kMaxM > 0 && pxq4_mmv_supported(g.kslabs)) {
+        for (int64_t r0 = 0; r0 < M; r0 += kMaxM) {
+            const int64_t rows = std::min<int64_t>(kMaxM, M - r0);
+            at::Tensor xs = x.narrow(0, r0, rows);
+            at::Tensor os = out.narrow(0, r0, rows);
+            mmv_out(os, xs, slabs, anchor);
+        }
+        return;
+    }
+    // Prefill / large-batch path: coalesced dequant into the fp16 arena, then cuBLAS HMMA.
+    at::Tensor & wbuf = dequant_arena(x, g.N * g.K);
+    at::Tensor w = wbuf.narrow(0, 0, g.N * g.K).view({g.N, g.K});
+    pxq4_launch_dequant_f16(slabs.data_ptr<uint8_t>(), anchor.data_ptr(), w.data_ptr(),
+                            g.panels, g.kslabs, at::cuda::getCurrentCUDAStream());
+    at::mm_out(out, x, w.t());
+}
+
 // Debug twin of mmv_out with the float4 activation loads disabled. Same values, different
 // load width; used to isolate an alignment fault from an arithmetic fault at G6/G8.
 void mmv_out_scalar(at::Tensor & out, const at::Tensor & x, const at::Tensor & slabs,
@@ -326,8 +434,11 @@ void mmv_out_scalar(at::Tensor & out, const at::Tensor & x, const at::Tensor & s
 }
 
 // 2 = K-chunk-split mmv; 3 = capture-safe partials arena; 4 = single-launch fused split mmv;
-// 5 = chunk-major grid + occupancy-based split/mono dispatch
-int64_t version() { return 5; }
+// 5 = chunk-major grid + occupancy-based split/mono dispatch; 6 = multi-token fused mmv for
+// decode batches 2..8 (weight bytes read once per step instead of once per token)
+// 7 = linear_out single-op dispatcher (mmv-vs-dequant+GEMM policy runs in C++ per call,
+// immune to torch.compile per-range branch baking)
+int64_t version() { return 7; }
 
 int64_t mmv_max_m() { return kPxq4MmvMaxM; }
 
@@ -376,6 +487,7 @@ at::Tensor builtin_tables() {
 TORCH_LIBRARY(pxq4, m) {
     m.def("dequant_out(Tensor(a!) out, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
+    m.def("linear_out(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out_scalar(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out_mono(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
     m.def("mmv_out_split2(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()");
@@ -391,6 +503,7 @@ TORCH_LIBRARY(pxq4, m) {
 TORCH_LIBRARY_IMPL(pxq4, CUDA, m) {
     m.impl("dequant_out", &dequant_out);
     m.impl("mmv_out", &mmv_out);
+    m.impl("linear_out", &linear_out);
     m.impl("mmv_out_scalar", &mmv_out_scalar);
     m.impl("mmv_out_mono", &mmv_out_mono);
     m.impl("mmv_out_split2", &mmv_out_split2);

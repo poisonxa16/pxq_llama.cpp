@@ -150,3 +150,72 @@ void pxq4_download_tables(float * book16, float * sub16) {
     PXQ4_CUDA_CHECK(cudaMemcpyFromSymbol(book16, pxq4_book_g,  16 * sizeof(float)));
     PXQ4_CUDA_CHECK(cudaMemcpyFromSymbol(sub16,  pxq4_sub16_g, 16 * sizeof(float)));
 }
+
+// v6: multi-token fused split mmv. One block owns all M tokens of its (chunk, panel); weight
+// bytes are decoded once per block instead of once per (block, token). M must be 1..8 and is
+// dispatched to an exact-MT template so every inner loop fully unrolls. Values are per-token
+// bit-identical to pxq4_launch_mmv_f16 (see k_pxq4_mmv_fused_mt). `ctr` is panels unsigned,
+// zero on entry and left zero by every completed launch.
+int pxq4_mmv_mt_smem_bytes(int kslabs, int M) {
+    return pxq4_canon_max_chunk(kslabs) * PXQ4_QK * (int)sizeof(float) * M;
+}
+
+bool pxq4_mmv_mt_supported(int kslabs, int M) {
+    if (M < 1 || M > 8) return false;
+    const int stat_smem = (int)(2 * 16 * sizeof(float) + PXQ4_MMV_KSEG * PXQ4_BM * sizeof(float)
+                                + 16);
+    return pxq4_mmv_mt_smem_bytes(kslabs, M) + stat_smem <= 48 * 1024;
+}
+
+template <bool VECX>
+static void pxq4_dispatch_mmv_fused_mt(const uint8_t * slabs, const __half * anchor,
+                                       const __half * x, float * part, unsigned * ctr,
+                                       __half * out, int M, int R, int K, int nfix,
+                                       int panels, size_t smem, cudaStream_t stream) {
+    const dim3 grid((unsigned)nfix, (unsigned)panels, 1u);
+    switch (M) {
+#define PXQ4_MT_CASE(MTV)                                                                     \
+        case MTV:                                                                             \
+            k_pxq4_mmv_fused_mt<VECX, MTV><<<grid, 256, smem, stream>>>(                      \
+                slabs, anchor, x, part, ctr, out, R, K, nfix, panels);                        \
+            break;
+        PXQ4_MT_CASE(1) PXQ4_MT_CASE(2) PXQ4_MT_CASE(3) PXQ4_MT_CASE(4)
+        PXQ4_MT_CASE(5) PXQ4_MT_CASE(6) PXQ4_MT_CASE(7) PXQ4_MT_CASE(8)
+#undef PXQ4_MT_CASE
+        default:
+            fprintf(stderr, "pxq4: fused mt mmv M out of range: %d\n", M);
+            abort();
+    }
+}
+
+void pxq4_launch_mmv_fused_mt_f16(const uint8_t * slabs, const void * anchor, const void * x,
+                                  float * part, unsigned * ctr, void * out, int M, int panels,
+                                  int kslabs, bool vecx, cudaStream_t stream) {
+    const int    R    = panels * PXQ4_BM;
+    const int    K    = kslabs * PXQ4_QK;
+    const int    nfix = pxq4_mmv_nfix(kslabs);
+    const size_t smem = (size_t)pxq4_mmv_mt_smem_bytes(kslabs, M);
+    if (nfix < 2) {
+        fprintf(stderr, "pxq4: fused mt mmv requires nfix >= 2 (got %d)\n", nfix);
+        abort();
+    }
+    if (!pxq4_mmv_mt_supported(kslabs, M)) {
+        fprintf(stderr, "pxq4: fused mt mmv unsupported (kslabs=%d M=%d)\n", kslabs, M);
+        abort();
+    }
+    if (nfix != pxq4_canon_nfix(kslabs, PXQ4_CANON_CMAX) || panels < 1 || panels > 65535) {
+        fprintf(stderr, "pxq4: fused mt mmv nfix/panels inconsistent (nfix=%d panels=%d "
+                        "kslabs=%d)\n", nfix, panels, kslabs);
+        abort();
+    }
+    if (vecx) {
+        pxq4_dispatch_mmv_fused_mt<true>(slabs, (const __half *)anchor, (const __half *)x,
+                                         part, ctr, (__half *)out, M, R, K, nfix, panels,
+                                         smem, stream);
+    } else {
+        pxq4_dispatch_mmv_fused_mt<false>(slabs, (const __half *)anchor, (const __half *)x,
+                                          part, ctr, (__half *)out, M, R, K, nfix, panels,
+                                          smem, stream);
+    }
+    PXQ4_CUDA_CHECK(cudaGetLastError());
+}

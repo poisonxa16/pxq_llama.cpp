@@ -191,6 +191,16 @@ def _register_fakes() -> None:
         torch._check(out.shape[1] == slabs.shape[0] * 64)
         return None
 
+    if hasattr(torch.ops.pxq4, "linear_out"):
+        @torch.library.register_fake("pxq4::linear_out")
+        def _linear_out_meta(out, x, slabs, anchor):  # noqa: ANN001, ANN202
+            torch._check(slabs.dim() == 3 and anchor.dim() == 2)
+            torch._check(x.dim() == 2 and out.dim() == 2)
+            torch._check(x.shape[1] == slabs.shape[1] * 32)
+            torch._check(out.shape[0] == x.shape[0])
+            torch._check(out.shape[1] == slabs.shape[0] * 64)
+            return None
+
     _fakes_registered = True
 
 

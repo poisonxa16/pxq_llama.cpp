@@ -45,3 +45,14 @@ void pxq4_upload_tables(const float * book16, const float * sub16);
 
 // read the tables back for validation (G6).
 void pxq4_download_tables(float * book16, float * sub16);
+
+// v6: multi-token fused split mmv — one block owns all M tokens of its (chunk, panel), so a
+// decode batch of M <= 8 reads each weight byte once instead of M times. Values per token are
+// bit-identical to pxq4_launch_mmv_f16. `part` as the split mmv (M*panels*nfix*256 floats);
+// `ctr` is panels unsigned, zero on entry and exit. Requires nfix >= 2 and
+// pxq4_mmv_mt_supported(kslabs, M).
+void pxq4_launch_mmv_fused_mt_f16(const uint8_t * slabs, const void * anchor, const void * x,
+                                  float * part, unsigned * ctr, void * out, int M, int panels,
+                                  int kslabs, bool vecx, cudaStream_t stream);
+int  pxq4_mmv_mt_smem_bytes(int kslabs, int M);
+bool pxq4_mmv_mt_supported(int kslabs, int M);

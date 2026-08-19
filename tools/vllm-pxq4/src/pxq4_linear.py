@@ -522,6 +522,7 @@ class PXQ4LinearMethod(LinearMethodBase):
         layer.pxq4_prefix = prefix
         # Decided in process_weights_after_loading, once the .so can answer.
         layer.pxq4_use_mmv = False
+        layer.pxq4_linear_op = hasattr(torch.ops, "pxq4") and hasattr(torch.ops.pxq4, "linear_out")
         layer.pxq4_mmv_max_m = 0
 
         # -- 6. never arm the fp16 fast path -------------------------------
@@ -727,6 +728,19 @@ class PXQ4LinearMethod(LinearMethodBase):
             torch.ops.pxq4.mmv_out(out_warm, x_warm, layer.pxq4_slabs, layer.pxq4_anchor)
             del x_warm, out_warm
 
+        # Warm the v7 dequant arena (linear_out's large-M path) for this layer's
+        # N*K, eagerly and pre-capture, for the same reason as the partials
+        # arena above: the arena refuses to grow under cuda-graph capture, and
+        # if capture sizes ever exceed mmv_max_m the captured graph takes the
+        # dequant+GEMM branch. One dummy call per layer keeps the maximum.
+        if getattr(layer, "pxq4_linear_op", False):
+            m = int(layer.pxq4_mmv_max_m or 8) + 1
+            dev = layer.pxq4_slabs.device
+            x_warm = torch.zeros((m, layer.pxq4_K), dtype=torch.float16, device=dev)
+            out_warm = torch.empty((m, layer.pxq4_N), dtype=torch.float16, device=dev)
+            torch.ops.pxq4.linear_out(out_warm, x_warm, layer.pxq4_slabs, layer.pxq4_anchor)
+            del x_warm, out_warm
+
     # ------------------------------------------------------------------
     # apply
     # ------------------------------------------------------------------
@@ -756,7 +770,13 @@ class PXQ4LinearMethod(LinearMethodBase):
             # kernels would launch an empty grid, which is legal but pointless.
             return out.reshape(*x.shape[:-1], N)
 
-        if layer.pxq4_use_mmv and M <= layer.pxq4_mmv_max_m:
+        if getattr(layer, "pxq4_linear_op", False):
+            # v7 single-op dispatcher: the mmv-vs-dequant+GEMM policy runs in C++ per
+            # call. The op is opaque to torch.compile, so no branch is baked per compile
+            # range (the Python branch below was baked as mmv for the whole (1,2048)
+            # prefill range by backed/no-guard dynamic shapes: 13.8x served prefill loss).
+            torch.ops.pxq4.linear_out(out, x2, layer.pxq4_slabs, layer.pxq4_anchor)
+        elif layer.pxq4_use_mmv and M <= layer.pxq4_mmv_max_m:
             # Decode path. One block per (panel, token): reads each weight byte
             # exactly once per token and never materializes the dequantized
             # weight, which is the entire bandwidth argument for this port.

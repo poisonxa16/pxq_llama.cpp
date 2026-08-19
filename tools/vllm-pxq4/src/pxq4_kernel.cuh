@@ -610,3 +610,167 @@ k_pxq4_mmv_fused(const uint8_t * __restrict__ slabs,
         out[(size_t)iy * R + p * PXQ4_BM + row] = __float2half_rn(u);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// v6: MULTI-TOKEN (MT) fused split mmv — the concurrency kernel.
+//
+// WHY. Every mmv variant above re-reads the whole weight tensor once PER TOKEN (grid.z = M).
+// At decode that makes a batch of M cost ~M times the weight traffic of M = 1, which is why
+// served per-stream throughput halved at concurrency 2 (16.1 ms -> 26.8 ms steps) while a
+// kernel that amortizes weight bytes over the batch (AWQ/TurboMind) lost only 12%. This
+// kernel gives one block ALL M tokens of its (chunk, panel): each weight byte is decoded
+// once and folded into M accumulators, so the weight traffic of a decode step is ~constant
+// in M for M <= 8 (activations and partials still scale with M, but they are KB not MB).
+//
+// BIT-EXACTNESS. Per token, the fold is UNCHANGED: pxq4_dot32_mt performs, for each token m,
+// exactly the b-loop and pxq4_acc2 calls of pxq4_dot32 in the same order on t[m], the caller
+// accumulates per-kb results in the same kb order, the partials keep the identical
+// [M, panels, nfix, 256] layout, and the winner replays k_pxq4_mmv_reduce's fold verbatim per
+// token. Interleaving tokens in the inner loop reorders nothing WITHIN any token's expression
+// tree, so each token's output is bit-identical to the monolithic kernel's — asserted by the
+// hostsim gate (test_pxq4_mmv_mt.py) and the GPU parity gate.
+//
+// GRID = (nfix, panels, 1), block = 256, template MT == M (1..8; the mmv ceiling is 8, so a
+// dispatchable batch always fits one tile and there is no ragged tail).
+// dynamic smem = pxq4_canon_max_chunk(kslabs) * 32 * MT floats: token m's chunk slice starts
+// at pxq4_xs + m*n (n = this chunk's float count, a multiple of 32 so every token slice keeps
+// the 16-B alignment the float4 loads need).
+// ctr = panels unsigned (token axis collapsed), same zero-on-entry/exit contract as v4.
+// ---------------------------------------------------------------------------------------------
+template <bool VECX, int MT>
+static __device__ __forceinline__ void pxq4_dot32_mt(const uint8_t * __restrict__ slab, int row,
+                                                     float anch,
+                                                     const float * __restrict__ xk,
+                                                     const int xs_stride,
+                                                     const float * __restrict__ tab,
+                                                     const float * __restrict__ sub,
+                                                     float (&res)[MT]) {
+    float eff[PXQ4_NEFF];
+    pxq4_pol::row_effs(slab, row, anch, sub, eff);
+    uint32_t q[4];
+    pxq4_ldcodes(slab + pxq4_pol::CODE_OFF + row * pxq4_pol::CODE_BYTES, q);
+
+    float t[MT][PXQ4_NEFF];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+        for (int i = 0; i < PXQ4_NEFF; ++i) t[m][i] = 0.f;
+    }
+
+    if (VECX) {
+#pragma unroll
+        for (int b = 0; b < 16; b += 2) {
+            const float2 p0 = pxq4_pol::pair(q, b,     tab);
+            const float2 p1 = pxq4_pol::pair(q, b + 1, tab);
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                const float4 xv = *(const float4 *)&xk[m * xs_stride + 2 * b];
+                t[m][(b * PXQ4_NEFF) >> 4]       = pxq4_acc2(t[m][(b * PXQ4_NEFF) >> 4],       p0.x, xv.x, p0.y, xv.y);
+                t[m][((b + 1) * PXQ4_NEFF) >> 4] = pxq4_acc2(t[m][((b + 1) * PXQ4_NEFF) >> 4], p1.x, xv.z, p1.y, xv.w);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int b = 0; b < 16; ++b) {
+            const float2 p = pxq4_pol::pair(q, b, tab);
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                t[m][(b * PXQ4_NEFF) >> 4] = pxq4_acc2(t[m][(b * PXQ4_NEFF) >> 4],
+                                                       p.x, xk[m * xs_stride + 2 * b],
+                                                       p.y, xk[m * xs_stride + 2 * b + 1]);
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) res[m] = eff[0] * t[m][0] + eff[1] * t[m][1];
+}
+
+template <bool VECX, int MT>
+static __global__ void __launch_bounds__(256)
+k_pxq4_mmv_fused_mt(const uint8_t * __restrict__ slabs,
+                    const __half  * __restrict__ anchor,
+                    const __half  * __restrict__ x,        // [MT, K]
+                    float         * __restrict__ part,     // [MT, panels, nfix, KSEG*64]
+                    unsigned      * __restrict__ ctr,      // [panels], zero on entry and exit
+                    __half        * __restrict__ out,      // [MT, R]
+                    const int R, const int K, const int nfix, const int panels) {
+    const int c = blockIdx.x;                              // canonical chunk (fastest-varying)
+    const int p = blockIdx.y;                              // panel
+
+    PXQ4_EXTERN_SHARED float pxq4_xs[];
+    __shared__ float tab[16];
+    __shared__ float sub[16];
+    __shared__ float red[PXQ4_MMV_KSEG * PXQ4_BM];
+    __shared__ int   last;
+
+    pxq4_pol::stage_tabs(tab, sub, threadIdx.x);
+
+    const int row    = threadIdx.x & 63;
+    const int kseg   = threadIdx.x >> 6;
+    const int kslabs = K / PXQ4_QK;
+
+    const uint8_t * pan_slabs = slabs + (size_t)p * kslabs * pxq4_pol::SLAB;
+    const float     anch      = __half2float(anchor[(size_t)p * PXQ4_BM + row]);
+
+    const int b0 = (kslabs * c) / nfix;
+    const int b1 = (kslabs * (c + 1)) / nfix;
+    const int n  = (b1 - b0) * PXQ4_QK;
+
+    __syncthreads();                                       // covers the stage_tabs writes
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        const __half * xt = x + (size_t)m * K;
+        for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+            pxq4_xs[m * n + idx] = __half2float(xt[b0 * PXQ4_QK + idx]);
+        }
+    }
+    __syncthreads();
+
+    float tacc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) tacc[m] = 0.f;
+    for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
+        float res[MT];
+        pxq4_dot32_mt<VECX, MT>(pan_slabs + (size_t)kb * pxq4_pol::SLAB, row, anch,
+                                pxq4_xs + (size_t)(kb - b0) * PXQ4_QK, n, tab, sub, res);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) tacc[m] += res[m];
+    }
+
+    const size_t tile = (size_t)(PXQ4_MMV_KSEG * PXQ4_BM);
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        part[(((size_t)m * panels + p) * nfix + c) * tile + threadIdx.x] = tacc[m];
+    }
+
+    // ---- arrival barrier over this panel's nfix blocks (see k_pxq4_mmv_fused) -----------
+    __syncthreads();                                       // all lanes' part[] stores issued
+    if (threadIdx.x == 0) {
+        const unsigned old = pxq4_arrive_release(&ctr[p]);
+        last = (old == (unsigned)(nfix - 1));
+        if (last) {
+            ctr[p] = 0u;                                   // rearm for the next launch
+            pxq4_fence_acq_rel();                          // acquire the other blocks' part[]
+        }
+    }
+    __syncthreads();                                       // propagates the acquire
+    if (!last) return;
+
+    // ---- k_pxq4_mmv_reduce's fold, verbatim, once per token ------------------------------
+    for (int m = 0; m < MT; ++m) {
+        const float * pbase = part + (((size_t)m * panels + p) * nfix) * tile;
+        float su = 0.f;
+        for (int cc = 0; cc < nfix; ++cc) {                // chunk fold, ascending c
+            su += pxq4_ld_part(&pbase[(size_t)cc * tile + threadIdx.x]);
+        }
+        red[threadIdx.x] = su;
+        __syncthreads();
+        if (kseg == 0) {
+            float u = 0.f;                                 // kseg fold, ascending s
+#pragma unroll
+            for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += red[s * PXQ4_BM + row];
+            out[(size_t)m * R + p * PXQ4_BM + row] = __float2half_rn(u);
+        }
+        __syncthreads();                                   // red[] is reused by the next token
+    }
+}
