@@ -508,6 +508,22 @@ k_pxq4_mmv_reduce(const float * __restrict__ part,    // [M, panels, nfix, KSEG*
 // ---------------------------------------------------------------------------------------------
 
 #ifdef __CUDACC__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+// sm_60 (P100): the PTX memory consistency model (.release/.acquire scopes, fence.acq_rel)
+// is sm_70+; ptxas rejects atom.release.gpu below that. Fall back to the classic pre-Volta
+// threadFenceReduction pattern: __threadfence() then a plain atomicAdd for the release side,
+// and __threadfence() again for the acquire side. This is exactly the "separate __threadfence()
+// before a plain atomicAdd" alternative the sm_70 comment below describes as bit-exact but
+// slower -- the atomic is an ARRIVAL COUNTER, never an FP accumulator, so no floating-point
+// expression tree is touched and the outputs stay bit-identical to the sm_70 build.
+static __device__ __forceinline__ unsigned pxq4_arrive_release(unsigned * p) {
+    __threadfence();                 // release: this thread's prior part[] stores are device-visible
+    return atomicAdd(p, 1u);
+}
+static __device__ __forceinline__ void pxq4_fence_acq_rel() {
+    __threadfence();                 // acquire: other blocks' part[] stores become visible
+}
+#else
 // atom.release.gpu: the release fence is fused into the RMW. A separate __threadfence() before
 // a plain atomicAdd is also bit-exact but measurably slower (every block pays a full membar.gl).
 static __device__ __forceinline__ unsigned pxq4_arrive_release(unsigned * p) {
@@ -518,6 +534,9 @@ static __device__ __forceinline__ unsigned pxq4_arrive_release(unsigned * p) {
 static __device__ __forceinline__ void pxq4_fence_acq_rel() {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
+#endif
+// __ldcg (ld.global.cg, L2-only) is available on every arch we build; on sm_60 L1 is not
+// coherent across SMs either, so the same hint is wanted there.
 static __device__ __forceinline__ float pxq4_ld_part(const float * p) { return __ldcg(p); }
 #else
 // hostsim: blocks run strictly sequentially, so the RMW degenerates to ++ and the fences are
