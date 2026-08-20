@@ -4245,6 +4245,17 @@ static bool llm_load_tensors(
         } else {
             model.buft_output = llama_default_buffer_type_cpu(true);
         }
+    } else if (model.devices.empty()) {
+        // Every branch below indexes model.devices[...]; on a CPU-only run of a CUDA build
+        // (no GPU, CUDA_VISIBLE_DEVICES="", or -ngl 0 with no devices) that vector is EMPTY
+        // and the read segfaults. device_count comes from model.splits (always >= 1), so the
+        // existing `device_count > 0` guard on the fit block does NOT cover this. Same class
+        // of bug, same fix: with no devices there is nothing to offload to, so place
+        // everything on the CPU.
+        model.buft_output = llama_default_buffer_type_cpu(true);
+        for (int i = i_gpu_start; i < n_layer; ++i) {
+            model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+        }
     } else {
         ggml_backend_buffer_type_t split_buft;
         if ((split_mode == LLAMA_SPLIT_MODE_GRAPH || split_mode == LLAMA_SPLIT_MODE_ATTN) && model.splits.size() > 1) {
@@ -4989,6 +5000,94 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         (hparams.causal_attn || !cparams.causal_attn) &&
         "causal attention is not supported by this model"
     );
+
+    // ---- DSpark: the block mask is NON-CAUSAL, and that is load-bearing ----
+    // Property 2 of the algorithm (ds4_cuda.cu:13466-13530): every draft row attends to
+    // every other row of the block INCLUDING later ones. Without it block drafting does
+    // not work at all - and it fails silently, as low acceptance rather than an error.
+    // The standard fill below is driven by cparams.causal_attn and would hide row 3 from
+    // row 1, so DSpark gets its own fill and returns before reaching it.
+    //
+    // Window rows keep ordinary causality against the block's BASE position (the target
+    // row's position, which rows 0 and 1 share): a draft position must not conjure
+    // history that does not exist yet.
+    if (lctx.model.arch == LLM_ARCH_DEEPSEEK4_DSPARK && lctx.inp_KQ_mask) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
+        const int64_t n_kv     = kv_self.n;
+        const int64_t n_rows   = batch.n_tokens;
+        const int64_t n_padded = GGML_PAD(n_rows, GGML_KQ_MASK_PAD);
+        const int64_t n_block  = (int64_t) lctx.model.hparams.dspark_block_size;
+        GGML_ASSERT(n_rows == n_block + 1);
+
+        // the block occupies the last n_rows cells written by this ubatch
+        const int64_t block_first = (int64_t) kv_self.head;
+        llama_pos base_pos = batch.pos[0];
+
+        float     * d32 = cparams.flash_attn ? nullptr : (float *)     lctx.inp_KQ_mask->data;
+        ggml_half * d16 = cparams.flash_attn ? (ggml_half *) lctx.inp_KQ_mask->data : nullptr;
+
+        // The mask is ALLOCATED at width `n_kv` (the llm_build_context member) and FILLED
+        // here at width `kv_self.n`. They agree by convention, not by construction; if they
+        // ever diverge the tail of every row is uninitialised backend memory and random rows
+        // attend to random cells, silently. Fill the whole ALLOCATED width and mask
+        // everything past the live KV, so the invariant cannot be violated by accident.
+        const int64_t n_mask_w = lctx.inp_KQ_mask->ne[0];
+        GGML_ASSERT(n_mask_w >= n_kv);
+
+        // NEGATIVE CONTROL for property 2 (non-causal intra-block attention). That property
+        // is invisible to any gate that reads this same forward's output - a causal mask
+        // cancels on both sides of such a comparison. PXA_DSPARK_FORCE_CAUSAL=1 fills the
+        // block square lower-triangular instead, so a gate can be shown to FAIL. If flipping
+        // it does NOT change the proposal, the mask is not reaching the attention at all and
+        // property 2 is unimplemented in practice whatever this code says.
+        static const bool force_causal = [] {
+            const char * e = getenv("PXA_DSPARK_FORCE_CAUSAL");
+            return e && *e && *e != '0';
+        }();
+
+        for (int64_t i = 0; i < n_padded; ++i) {
+            for (int64_t j = 0; j < n_mask_w; ++j) {
+                float v = -INFINITY;
+                if (i < n_rows && j < n_kv) {
+                    const bool in_block = (j >= block_first && j < block_first + n_rows);
+                    if (in_block) {
+                        // NON-CAUSAL: the whole block square is open, both directions.
+                        // Block row i occupies KV cell block_first + i, so the causal
+                        // control hides every cell strictly right of the diagonal.
+                        v = (force_causal && (j - block_first) > i) ? -INFINITY : 0.0f;
+                    } else if (!kv_self.cells[j].is_empty() &&
+                                kv_self.cells[j].has_seq_id(batch.seq_id[0][0]) &&
+                                kv_self.cells[j].pos <= base_pos) {
+                        // window history, causal against the block's base position, and
+                        // clipped to the sliding window when the model has one.
+                        const uint32_t swa = lctx.model.hparams.n_swa;
+                        if (swa == 0 || (base_pos - kv_self.cells[j].pos) < (llama_pos) swa) {
+                            v = 0.0f;
+                        }
+                    }
+                }
+                if (d32) d32[i*n_mask_w + j] = v;
+                else     d16[i*n_mask_w + j] = ggml_fp32_to_fp16(v);
+            }
+        }
+
+        // the captured target hidden states, written by the speculative loop
+        if (lctx.inp_dspark_cap) {
+            const size_t need = ggml_nelements(lctx.inp_dspark_cap);
+            GGML_ASSERT(lctx.dspark_cap_host.size() == need &&
+                    "llama_dspark_set_capture() must be called before the drafter forward");
+            ggml_backend_tensor_set(lctx.inp_dspark_cap, lctx.dspark_cap_host.data(),
+                    0, need*sizeof(float));
+        }
+
+        // M4: the Markov chain's seed - the token the target just committed
+        // (ds4.c:59232, the `token` argument of ds4_session_prepare_dspark_draft_impl).
+        if (lctx.inp_dspark_prev) {
+            ggml_backend_tensor_set(lctx.inp_dspark_prev, &lctx.dspark_prev_host,
+                    0, sizeof(int32_t));
+        }
+        return;
+    }
 
     if (lctx.inp_KQ_mask || lctx.inp_KQ_mask_swa) {
 #if IK_PRINT_TIMING == 2
@@ -5807,6 +5906,151 @@ static bool prepare_mtp_graph_inputs(
     return true;
 }
 
+// DSpark M4: pull the block drafter's per-position argmax ids and confidence logits off
+// the device once per forward.
+//
+// SIX transfers, 24 bytes, and they are six rather than one on purpose: the ids CANNOT be
+// packed in-graph. ggml_cuda's supports_op refuses CONCAT on an I32 src
+// (ggml-cuda.cu:7517-7520) and CPY handles only F32->F32/F16 (:7481-7492), so any packing
+// node would be scheduled onto the CPU and cost a D2H/H2D round trip of the whole chain
+// every proposal. Packing the CONFIDENCES is legal (they are F32) and is done in-graph, so
+// this is 1 + block_size reads rather than 2*block_size.
+//
+// The cost is instrumented (t_dspark_read_us) because it is the ONLY justification for the
+// fused GGML_OP_DSPARK_MARKOV_HEAD in plan 7.2, whose single F32 [2, block_size] dst makes
+// this one read. Do not add that op on a hunch; add it on this number.
+// M5. Pull the target's dspark_cap_%d nodes off the graph so the drafter can be fed
+// without a file. The nodes are LAST-ROW only: the drafter is seeded from the token the
+// target just committed, and a multi-row verify batch's capture rows for the speculative
+// positions describe tokens that may be about to be thrown away.
+//
+// The capture is [n_embd, hc, nt] with hc already collapsed by hc_weighted_sum, so the
+// row stride is n_embd and the row wanted is nt-1.
+static void llama_dspark_extract_capture(llama_context & lctx, ggml_cgraph * gf) {
+    const auto & hp = lctx.model.hparams;
+    lctx.dspark_cap_out_ok = false;
+
+    // The capture count comes from the GRAPH, not from hparams: dspark_n_target_layers is
+    // a DRAFTER hparam and is 0 on the target, which would make this a silent no-op.
+    const int64_t n_embd = hp.n_embd;
+    int n_cap = 0;
+    for (int slot = 0; slot < 16; ++slot) {
+        char probe[32];
+        snprintf(probe, sizeof(probe), "dspark_cap_%d", slot);
+        bool any = false;
+        for (int i = gf->n_nodes - 1; i >= 0 && !any; --i) {
+            any = strcmp(gf->nodes[i]->name, probe) == 0;
+        }
+        if (!any) break;
+        ++n_cap;
+    }
+    if (n_cap <= 0) {
+        return;                       // PXA_DSPARK_CAPTURE is off: not an error
+    }
+    lctx.dspark_cap_out.assign((size_t) n_cap*(size_t) n_embd, 0.0f);
+
+    int found = 0;
+    for (int slot = 0; slot < n_cap; ++slot) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "dspark_cap_%d", slot);
+        ggml_tensor * t = nullptr;
+        for (int i = gf->n_nodes - 1; i >= 0; --i) {
+            if (strcmp(gf->nodes[i]->name, nm) == 0) { t = gf->nodes[i]; break; }
+        }
+        if (!t) {
+            continue;
+        }
+        GGML_ASSERT(t->ne[0] == n_embd && "dspark capture row width != n_embd");
+        const int64_t nt  = t->ne[1] > 0 ? t->ne[1] : 1;
+        const size_t  off = (size_t)(nt - 1)*t->nb[1];
+        ggml_backend_t b  = ggml_backend_sched_get_tensor_backend(lctx.sched, t);
+        if (!b) {
+            continue;
+        }
+        ggml_backend_tensor_get_async(b, t, lctx.dspark_cap_out.data() + (size_t) slot*n_embd,
+                                      off, (size_t) n_embd*sizeof(float));
+        ++found;
+    }
+    if (found == 0) {
+        return;                       // PXA_DSPARK_CAPTURE is off: not an error
+    }
+    ggml_backend_sched_synchronize(lctx.sched);
+    lctx.dspark_cap_out_ok = (found == n_cap);
+}
+
+static void llama_dspark_extract_draft(llama_context & lctx, ggml_cgraph * gf) {
+    const auto & hp = lctx.model.hparams;
+    const int    nb = (int) hp.dspark_block_size;
+
+    lctx.dspark_draft_ok = false;
+    lctx.dspark_draft_ids .assign(nb, -1);
+    lctx.dspark_draft_conf.assign(nb, 0.0f);
+    if (nb <= 0) {
+        return;
+    }
+
+    // Exact names, not a sscanf prefix match: ggml derives view/cont node names from their
+    // source ("X (view)", "X (cont)"), so a prefix match would happily bind a view of an id
+    // instead of the id. Nothing views these today; the point is that nothing can.
+    std::vector<std::string> want(nb);
+    for (int k = 0; k < nb; ++k) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "dspark_id_%d", k);
+        want[k] = nm;
+    }
+
+    struct ggml_tensor * conf = nullptr;
+    std::vector<struct ggml_tensor *> ids(nb, nullptr);
+    int found = 0;
+    for (int i = gf->n_nodes - 1; i >= 0 && found < nb + 1; --i) {
+        struct ggml_tensor * t = gf->nodes[i];
+        if (!conf && strcmp(t->name, "result_dspark_conf") == 0) {
+            conf = t;
+            ++found;
+            continue;
+        }
+        for (int k = 0; k < nb; ++k) {
+            if (!ids[k] && want[k] == t->name) { ids[k] = t; ++found; break; }
+        }
+    }
+    if (!conf) {
+        return;
+    }
+    for (int k = 0; k < nb; ++k) {
+        if (!ids[k]) return;
+    }
+    GGML_ASSERT(ggml_nelements(conf) == nb && "result_dspark_conf is [1, block_size]");
+
+    // Drain the forward FIRST and start the clock after. The pending compute (and the
+    // logits copy issued just above) has to complete regardless of DSpark, so charging it
+    // to the readback would report ~800 us for 24 bytes and make the fused-op decision on
+    // a number that is almost entirely somebody else's.
+    ggml_backend_sched_synchronize(lctx.sched);
+    const int64_t t0 = ggml_time_us();
+
+    // async reads on each node's own backend, then ONE scheduler-wide sync. The
+    // synchronous ggml_backend_tensor_get would copy on cudaStreamPerThread, which is not
+    // the backend's compute stream - correct only by luck.
+    struct ggml_backend * b = ggml_backend_sched_get_tensor_backend(lctx.sched, conf);
+    GGML_ASSERT(b != nullptr);
+    ggml_backend_tensor_get_async(b, conf, lctx.dspark_draft_conf.data(), 0, (size_t) nb*sizeof(float));
+
+    std::vector<int32_t> raw(nb, -1);
+    for (int k = 0; k < nb; ++k) {
+        struct ggml_backend * bk = ggml_backend_sched_get_tensor_backend(lctx.sched, ids[k]);
+        GGML_ASSERT(bk != nullptr);
+        ggml_backend_tensor_get_async(bk, ids[k], &raw[k], 0, sizeof(int32_t));
+    }
+    ggml_backend_sched_synchronize(lctx.sched);
+
+    for (int k = 0; k < nb; ++k) {
+        lctx.dspark_draft_ids[k] = (llama_token) raw[k];
+    }
+    lctx.t_dspark_read_us += ggml_time_us() - t0;
+    lctx.n_dspark_read    += 1;
+    lctx.dspark_draft_ok   = true;
+}
+
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -6220,6 +6464,19 @@ static int llama_decode_internal(
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
         struct ggml_tensor * embd = nullptr;
 
+        // ... except for DSpark, where it structurally cannot be: the M4 Markov chain
+        // CONSUMES result_output, so it is appended after it and the chain's tail is the
+        // last node. Trusting the position here fires the "missing result_output" assert
+        // below on every single drafter forward. Name-scan instead - the same thing the
+        // embeddings branch already does a few lines down.
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+            res = nullptr;
+            for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                if (strcmp(gf->nodes[i]->name, "result_output") == 0) { res = gf->nodes[i]; break; }
+            }
+            GGML_ASSERT(res && "dspark graph has no result_output node");
+        }
+
         if (lctx.n_outputs == 0) {
             // no output
             res = nullptr;
@@ -6334,6 +6591,16 @@ static int llama_decode_internal(
             tim2 = ggml_time_us();
             printf("get_result(...): %d us\n", int(tim2-tim1));
 #endif
+        }
+
+        // extract the DSpark M4 draft (ids + confidence logits)
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+            llama_dspark_extract_draft(lctx, gf);
+        }
+
+        // M5: extract the TARGET-side capture the drafter consumes
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
+            llama_dspark_extract_capture(lctx, gf);
         }
 
         // extract embeddings
@@ -7775,6 +8042,21 @@ struct llama_context * llama_init_from_model(
 
     cparams.n_ubatch         = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // DSpark: the drafter's ubatch IS the block. Every forward is exactly
+    // block_size+1 rows (the target row plus k draft rows), the shape is constant by
+    // design so `can_reuse_graph` holds, and the worst-case graph reserve at context
+    // creation builds with n_ubatch - so anything else makes the reserve build a graph
+    // the drafter can never actually run. Forced here rather than left to the caller.
+    if (model->arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+        const uint32_t n_rows = model->hparams.dspark_block_size + 1;
+        if (cparams.n_batch != n_rows || cparams.n_ubatch != n_rows) {
+            LLAMA_LOG_INFO("%s: DSpark drafter: forcing n_batch/n_ubatch to block_size+1 = %u\n",
+                    __func__, n_rows);
+        }
+        cparams.n_batch  = n_rows;
+        cparams.n_ubatch = n_rows;
+    }
+
     cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
@@ -8447,6 +8729,268 @@ struct llama_context * llama_init_from_model(
     return ctx;
 }
 
+
+// ---------------------------------------------------------------------------
+// DSpark: bind a loaded support model to its target.
+//
+// The support GGUF has nine metadata keys. llm_load_hparams_dspark() derives every
+// hparam that is implied by a tensor SHAPE; this copies the ones that are not
+// implied by any shape, and then runs the assertions that separate "the right donor"
+// from "a donor that loads cleanly and drafts garbage".
+//
+// Deliberately NOT a change to llama_model_load's signature: no public API churn,
+// no load-order dependency. Call it once, after both models are loaded, before any
+// drafter graph is built.
+// ---------------------------------------------------------------------------
+bool llama_dspark_bind_target(struct llama_model * drafter, const struct llama_model * target) {
+    if (!drafter || !target) {
+        LLAMA_LOG_ERROR("%s: null model\n", __func__);
+        return false;
+    }
+    if (drafter->arch != LLM_ARCH_DEEPSEEK4_DSPARK) {
+        LLAMA_LOG_ERROR("%s: drafter arch is %s, expected deepseek4-dspark\n",
+                __func__, llama_model_arch_string(drafter));
+        return false;
+    }
+    if (target->arch != LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_ERROR("%s: target arch is %s, expected deepseek4\n",
+                __func__, llama_model_arch_string(target));
+        return false;
+    }
+
+    auto &       dh = drafter->hparams;
+    const auto & th = target->hparams;
+
+    // --- scalars that no drafter tensor shape implies ---
+    dh.n_expert_used            = th.n_expert_used;
+    dh.expert_weights_scale     = th.expert_weights_scale;
+    dh.expert_weights_norm      = th.expert_weights_norm;
+    dh.expert_gating_func       = th.expert_gating_func;
+    dh.f_norm_rms_eps           = th.f_norm_rms_eps;
+    dh.n_swa                    = th.n_swa;
+    dh.n_rot                    = th.n_rot;
+    dh.rope_freq_base_train     = th.rope_freq_base_train;
+    dh.rope_freq_scale_train    = th.rope_freq_scale_train;
+    dh.n_ctx_orig_yarn          = th.n_ctx_orig_yarn;
+    dh.n_ctx_train              = th.n_ctx_train;
+    dh.rope_scaling_type_train  = th.rope_scaling_type_train;
+    dh.dsv4_hc_sinkhorn_iters   = th.dsv4_hc_sinkhorn_iters;
+    dh.dsv4_hc_eps              = th.dsv4_hc_eps;
+    dh.dsv4_compress_rope_base  = th.dsv4_compress_rope_base;
+    dh.swiglu_limits            = th.swiglu_limits;
+    dh.swiglu_limits_shared     = th.swiglu_limits_shared;
+
+    // --- assertions: twelve of them, and they are the whole safety net ---
+    struct chk { bool ok; const char * what; };
+    const uint32_t last = dh.n_layer ? dh.n_layer - 1 : 0;
+    const ggml_tensor * main_proj = dh.n_layer ? drafter->layers[0].dspark_main_proj    : nullptr;
+    const ggml_tensor * w1        = dh.n_layer ? drafter->layers[last].dspark_markov_w1 : nullptr;
+    const ggml_tensor * conf      = dh.n_layer ? drafter->layers[last].dspark_conf_proj : nullptr;
+
+    int32_t max_cap = -1;
+    for (uint32_t i = 0; i < dh.dspark_n_target_layers; ++i) {
+        max_cap = std::max(max_cap, dh.dspark_target_layer_ids[i]);
+    }
+
+    const chk checks[] = {
+        { dh.n_embd == th.n_embd,                                          "drafter n_embd == target n_embd" },
+        { main_proj && main_proj->ne[0] == (int64_t) dh.dspark_n_target_layers * (int64_t) dh.n_embd,
+                                                                           "main_proj input == n_capture*n_embd" },
+        { dh.n_vocab == th.n_vocab,                                        "drafter n_vocab == target n_vocab" },
+        { w1 && w1->ne[1] == (int64_t) dh.n_vocab,                         "markov_w1 covers the vocab" },
+        { conf && conf->ne[0] == (int64_t) dh.n_embd + (int64_t) dh.dspark_markov_rank,
+                                                                           "conf_proj input == n_embd + markov_rank" },
+        { max_cap >= 0 && (uint32_t) max_cap < th.n_layer,                 "capture layer ids inside the target" },
+        { dh.dspark_stage_count == dh.n_layer,                             "stage_count == n_layers" },
+        { dh.dspark_noise_token >= 0 && (uint32_t) dh.dspark_noise_token < dh.n_vocab,
+                                                                           "noise_token_id inside the vocab" },
+        { target->tok_embd != nullptr,                                     "target carries token_embd" },
+        { target->output   != nullptr,                                     "target carries output.weight" },
+        { dh.dspark_markov_rank % 32 == 0,                                 "markov_rank % 32 == 0 (Q8_0 gemv)" },
+        { dh.n_expert_used > 0 && dh.n_expert > 0,                         "MoE routing constants are set" },
+        { dh.rope_type == th.rope_type,                                    "drafter and target share a rope convention" },
+    };
+
+    bool ok = true;
+    for (const auto & c : checks) {
+        if (!c.ok) { LLAMA_LOG_ERROR("%s: FAILED: %s\n", __func__, c.what); ok = false; }
+    }
+    if (!ok) return false;
+
+    drafter->dspark_target = target;
+
+    LLAMA_LOG_INFO("%s: DSpark bound: block_size=%u stages=%u capture_layers=[",
+            __func__, dh.dspark_block_size, dh.n_layer);
+    for (uint32_t i = 0; i < dh.dspark_n_target_layers; ++i) {
+        LLAMA_LOG_INFO("%s%d", i ? "," : "", dh.dspark_target_layer_ids[i]);
+    }
+    LLAMA_LOG_INFO("] n_expert_used=%u sinkhorn_iters=%u rms_eps=%g\n",
+            dh.n_expert_used, dh.dsv4_hc_sinkhorn_iters, (double) dh.f_norm_rms_eps);
+    return true;
+}
+
+
+int llama_dspark_get_capture(const struct llama_context * ctx, float * out, size_t max_n) {
+    if (!ctx || !ctx->dspark_cap_out_ok) {
+        return -1;
+    }
+    const size_t n = ctx->dspark_cap_out.size();
+    if (out && max_n >= n) {
+        memcpy(out, ctx->dspark_cap_out.data(), n*sizeof(float));
+    }
+    return (int) n;
+}
+
+bool llama_dspark_set_capture(struct llama_context * ctx, const float * data, size_t n) {
+    if (!ctx || !data) return false;
+    if (ctx->model.arch != LLM_ARCH_DEEPSEEK4_DSPARK) {
+        LLAMA_LOG_ERROR("%s: context is not a DSpark drafter\n", __func__);
+        return false;
+    }
+    const auto & hp = ctx->model.hparams;
+    const size_t need = (size_t) hp.dspark_n_target_layers * (size_t) hp.n_embd;
+    if (n != need) {
+        LLAMA_LOG_ERROR("%s: expected %zu floats (n_capture*n_embd), got %zu\n", __func__, need, n);
+        return false;
+    }
+    ctx->dspark_cap_host.assign(data, data + n);
+    return true;
+}
+
+// ---- M4: the Markov chain + confidence head, host side ---------------------
+
+bool llama_dspark_set_prev(struct llama_context * ctx, llama_token prev) {
+    if (!ctx) return false;
+    if (ctx->model.arch != LLM_ARCH_DEEPSEEK4_DSPARK) {
+        LLAMA_LOG_ERROR("%s: context is not a DSpark drafter\n", __func__);
+        return false;
+    }
+    if (prev < 0 || (uint32_t) prev >= ctx->model.hparams.n_vocab) {
+        LLAMA_LOG_ERROR("%s: prev token %d outside the vocab\n", __func__, prev);
+        return false;
+    }
+    ctx->dspark_prev_host = (int32_t) prev;
+    return true;
+}
+
+int llama_dspark_get_draft(struct llama_context * ctx, llama_token * ids_out, float * conf_out) {
+    if (!ctx || ctx->model.arch != LLM_ARCH_DEEPSEEK4_DSPARK) return -1;
+    if (!ctx->dspark_draft_ok) return -1;
+    const int nb = (int) ctx->model.hparams.dspark_block_size;
+    for (int k = 0; k < nb; ++k) {
+        if (ids_out)  ids_out [k] = ctx->dspark_draft_ids [k];
+        if (conf_out) conf_out[k] = ctx->dspark_draft_conf[k];
+    }
+    return nb;
+}
+
+// The reference's dspark_confident_prefix_len (ds4.c:32330-32341), verbatim, with ds4's
+// own sigmoid_stable (ds4.c ~:31500). It lives here rather than in each caller so the
+// truncation rule cannot drift between the harness, the spec loop and the server.
+//
+// threshold <= 0 disables pruning entirely (ds4's --dspark-confidence 0): the full block is
+// proposed. That is also the fixed-shape mode, and the A/B-parity mode against ds4.
+int llama_dspark_confident_prefix(const float * conf_logits, int n, float threshold) {
+    if (!conf_logits || n <= 0) return 0;
+    if (!(threshold > 0.0f))    return n;
+    int len = 0;
+    for (int k = 0; k < n; ++k) {
+        const float x = conf_logits[k];
+        const float p = x >= 0.0f ? 1.0f/(1.0f + expf(-x)) : expf(x)/(1.0f + expf(x));
+        if (p < threshold) break;
+        ++len;
+    }
+    return len;
+}
+
+void llama_dspark_read_stats(const struct llama_context * ctx, int64_t * n_reads, int64_t * total_us) {
+    if (n_reads)  *n_reads  = ctx ? ctx->n_dspark_read    : 0;
+    if (total_us) *total_us = ctx ? ctx->t_dspark_read_us : 0;
+}
+
+// ---- M4 self-test: synthetic successor weights -----------------------------
+//
+// Installs a synthetic markov_w1/markov_w2 pair with ONE property:
+//
+//     argmax_v ( w2[v] . w1[:, p] )  ==  (p + 1) mod n_vocab,  with a margin far larger
+//                                        than the real logit range
+//
+// so a genuinely SEQUENTIAL chain seeded with prev=t must emit [t+1, t+2, t+3, t+4, t+5]
+// while a PARALLELISED one emits [t+1, t+1, t+1, t+1, t+1]. That is a check with a
+// specific, loud, arithmetic failure mode - the opposite of a check that can only say yes.
+//
+// Construction: write p in base 64 as (c0, c1, c2) - 64^3 = 262144 > any vocab we serve -
+// and one-hot each digit into its own 64-wide slice of the rank-256 state. w2[v] carries
+// the one-hot of pp = (v-1) mod n_vocab. The dot product is then A^2 * (number of matching
+// digits): 3*A^2 at the unique successor, at most 2*A^2 anywhere else. A = 12 puts the
+// margin at 144, versus a measured real logit span of about 50 (M3a: about +-25).
+//
+// This mutates model weights, so it is an explicit call, never an env var: it must be
+// impossible for a production path to wander into it.
+bool llama_dspark_install_selftest_weights(struct llama_model * drafter) {
+    if (!drafter || drafter->arch != LLM_ARCH_DEEPSEEK4_DSPARK) return false;
+    const auto & hp = drafter->hparams;
+    if (hp.n_layer == 0) return false;
+
+    ggml_tensor * w1 = drafter->layers[hp.n_layer-1].dspark_markov_w1;
+    ggml_tensor * w2 = drafter->layers[hp.n_layer-1].dspark_markov_w2;
+    if (!w1 || !w2) return false;
+    if (w1->type != GGML_TYPE_Q8_0 || w2->type != GGML_TYPE_Q8_0) {
+        LLAMA_LOG_ERROR("%s: expected Q8_0 markov weights, got %s/%s\n",
+                __func__, ggml_type_name(w1->type), ggml_type_name(w2->type));
+        return false;
+    }
+
+    const int64_t rank = w1->ne[0];
+    const int64_t V    = w1->ne[1];
+    if (rank < 192) {
+        LLAMA_LOG_ERROR("%s: rank %lld < 192, the base-64 digit encoding does not fit\n",
+                __func__, (long long) rank);
+        return false;
+    }
+    if (V > 64LL*64LL*64LL) {
+        LLAMA_LOG_ERROR("%s: vocab %lld exceeds the base-64 encoding\n", __func__, (long long) V);
+        return false;
+    }
+
+    const float A = 12.0f;
+    const int64_t CHUNK = 4096;
+    std::vector<float>   f(rank*CHUNK);
+    std::vector<uint8_t> q((size_t) ggml_row_size(GGML_TYPE_Q8_0, rank) * CHUNK);
+
+    auto write_rows = [&](ggml_tensor * t, bool successor) {
+        for (int64_t base = 0; base < V; base += CHUNK) {
+            const int64_t nr = std::min<int64_t>(CHUNK, V - base);
+            std::fill(f.begin(), f.begin() + rank*nr, 0.0f);
+            for (int64_t r = 0; r < nr; ++r) {
+                const int64_t v  = base + r;
+                // w1 is indexed by p directly; w2[v] must carry the code of the p that
+                // maps TO v, i.e. pp = v-1.
+                const int64_t pp = successor ? ((v - 1 + V) % V) : v;
+                const int64_t c0 =  pp        % 64;
+                const int64_t c1 = (pp /   64) % 64;
+                const int64_t c2 = (pp / 4096) % 64;
+                float * row = f.data() + r*rank;
+                row[      c0] = A;
+                row[ 64 + c1] = A;
+                row[128 + c2] = A;
+            }
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), q.data(), 0, nr, rank, nullptr, nullptr);
+            ggml_backend_tensor_set(t, q.data(),
+                    (size_t) ggml_row_size(GGML_TYPE_Q8_0, rank) * base,
+                    (size_t) ggml_row_size(GGML_TYPE_Q8_0, rank) * nr);
+        }
+    };
+
+    write_rows(w1, /*successor*/ false);
+    write_rows(w2, /*successor*/ true);
+
+    LLAMA_LOG_WARN("%s: SYNTHETIC successor weights installed over markov_w1/w2 "
+                   "(rank=%lld vocab=%lld A=%.1f). This model no longer drafts real tokens.\n",
+                   __func__, (long long) rank, (long long) V, (double) A);
+    return true;
+}
+
 void llama_free(struct llama_context * ctx) {
     if (ctx && ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
         llama_dsv4_memory_free(*ctx);
@@ -8536,6 +9080,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         // DS4 is NORM-rope, same group as deepseek2 (upstream llama-model.cpp:2530).
         // Omitting this silently gives the wrong rope layout.
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK4_DSPARK:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2

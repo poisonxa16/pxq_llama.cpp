@@ -158,6 +158,15 @@ struct llama_hparams {
     uint32_t mtp_num_centroids = 0;
     uint32_t mtp_centroid_top_k = 0;
 
+    // DSpark block drafter (arch deepseek4-dspark). Read from the support GGUF;
+    // everything else the drafter needs is copied from the bound target model.
+    uint32_t dspark_block_size    = 0;   // k candidate positions per proposal
+    uint32_t dspark_stage_count   = 0;   // == n_layer, asserted at bind time
+    uint32_t dspark_markov_rank   = 0;
+    int32_t  dspark_noise_token   = -1;
+    std::array<int32_t, 8> dspark_target_layer_ids = {};
+    uint32_t dspark_n_target_layers = 0;
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
     llama_token dec_start_token_id = -1;

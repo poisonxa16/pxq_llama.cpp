@@ -67,6 +67,11 @@ struct llm_build_context {
     // disagree on the selection width.
     const bool is_warmup;
 
+    // true while building the worst-case RESERVE graph (no batch is ever run through it).
+    // Already implicit in n_kv/n_outputs/kv_head above; named so a builder can relax an
+    // assertion that only holds for a real batch without having to reverse-engineer it.
+    const bool is_reserve;
+
     const float freq_base;
     const float freq_scale;
     const float ext_factor;
@@ -343,6 +348,7 @@ struct llm_build_context {
     // (adapted from llama.cpp src/models/deepseek4.cpp @ upstream 82dbc4f01, MIT).
     //
     ggml_cgraph * build_deepseek4();
+    ggml_cgraph * build_dspark();
 
     // creates the DSV4 graph input tensors and publishes them via llama_dsv4_get_inputs()
     void build_dsv4_inputs();

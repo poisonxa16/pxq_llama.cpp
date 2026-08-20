@@ -1817,6 +1817,50 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        // DSpark block drafter ("deepseek4-dspark"). Three DS4 blocks in the RAW-SWA
+        // regime (compress ratio 0): the support file carries no compressor, no indexer
+        // and no hash-routing table, which is exactly the blk.0/blk.1 tensor set of the
+        // target - so the same LLM_TENSOR_* ids are reused under an "mtp.%d." prefix.
+        LLM_ARCH_DEEPSEEK4_DSPARK,
+        {
+            { LLM_TENSOR_ATTN_NORM,                "mtp.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_SINKS,               "mtp.%d.attn_sinks" },
+            { LLM_TENSOR_ATTN_Q_A,                 "mtp.%d.attn_q_a" },
+            { LLM_TENSOR_ATTN_Q_A_NORM,            "mtp.%d.attn_q_a_norm" },
+            { LLM_TENSOR_ATTN_Q_B,                 "mtp.%d.attn_q_b" },
+            { LLM_TENSOR_ATTN_KV,                  "mtp.%d.attn_kv" },
+            { LLM_TENSOR_ATTN_KV_A_NORM,           "mtp.%d.attn_kv_a_norm" },
+            { LLM_TENSOR_ATTN_OUT_A,               "mtp.%d.attn_output_a" },
+            { LLM_TENSOR_ATTN_OUT_B,               "mtp.%d.attn_output_b" },
+            { LLM_TENSOR_HC_ATTN_FN,               "mtp.%d.hc_attn_fn" },
+            { LLM_TENSOR_HC_ATTN_BASE,             "mtp.%d.hc_attn_base" },
+            { LLM_TENSOR_HC_ATTN_SCALE,            "mtp.%d.hc_attn_scale" },
+            { LLM_TENSOR_HC_FFN_FN,                "mtp.%d.hc_ffn_fn" },
+            { LLM_TENSOR_HC_FFN_BASE,              "mtp.%d.hc_ffn_base" },
+            { LLM_TENSOR_HC_FFN_SCALE,             "mtp.%d.hc_ffn_scale" },
+            { LLM_TENSOR_FFN_NORM,                 "mtp.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE_INP,             "mtp.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_EXP_PROBS_B,          "mtp.%d.exp_probs_b" },
+            { LLM_TENSOR_FFN_GATE_EXPS,            "mtp.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,            "mtp.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,              "mtp.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_GATE_SHEXP,           "mtp.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_SHEXP,           "mtp.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP,             "mtp.%d.ffn_up_shexp" },
+            // stage-0 only
+            { LLM_TENSOR_DSPARK_MAIN_PROJ,         "mtp.%d.main_proj" },
+            { LLM_TENSOR_DSPARK_MAIN_NORM,         "mtp.%d.main_norm" },
+            // last-stage only
+            { LLM_TENSOR_DSPARK_NORM,              "mtp.%d.norm" },
+            { LLM_TENSOR_HC_HEAD_FN,               "mtp.%d.hc_head_fn" },
+            { LLM_TENSOR_HC_HEAD_BASE,             "mtp.%d.hc_head_base" },
+            { LLM_TENSOR_HC_HEAD_SCALE,            "mtp.%d.hc_head_scale" },
+            { LLM_TENSOR_DSPARK_MARKOV_W1,         "mtp.%d.markov_head.markov_w1" },
+            { LLM_TENSOR_DSPARK_MARKOV_W2,         "mtp.%d.markov_head.markov_w2" },
+            { LLM_TENSOR_DSPARK_CONF_PROJ,         "mtp.%d.confidence_head.proj" },
+        },
+    },
+    {
         LLM_ARCH_UNKNOWN,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },

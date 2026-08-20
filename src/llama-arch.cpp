@@ -86,6 +86,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_HY_V3,           "hy_v3"        },
     { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
     { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
+    { LLM_ARCH_DEEPSEEK4_DSPARK, "deepseek4-dspark" },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -165,6 +166,15 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, "%s.hyper_connection.sinkhorn_iterations" },
     { LLM_KV_HYPER_CONNECTION_EPSILON,             "%s.hyper_connection.epsilon"             },
     { LLM_KV_HASH_LAYER_COUNT,                     "%s.hash_layer_count"                     },
+
+    // DSpark: literal keys, deliberately WITHOUT a "%s" - the support file spells
+    // them bare. Adding an arch prefix here makes every one of them silently absent.
+    { LLM_KV_DSPARK_BLOCK_SIZE,                    "dspark.block_size"                       },
+    { LLM_KV_DSPARK_STAGE_COUNT,                   "dspark.stage_count"                      },
+    { LLM_KV_DSPARK_N_LAYERS,                      "dspark.n_layers"                         },
+    { LLM_KV_DSPARK_MARKOV_RANK,                   "dspark.markov_rank"                      },
+    { LLM_KV_DSPARK_NOISE_TOKEN_ID,                "dspark.noise_token_id"                   },
+    { LLM_KV_DSPARK_TARGET_LAYER_IDS,              "dspark.target_layer_ids"                 },
 
     { LLM_KV_ATTENTION_HEAD_COUNT,             "%s.attention.head_count"             },
     { LLM_KV_ATTENTION_HEAD_COUNT_KV,          "%s.attention.head_count_kv"          },

@@ -41,6 +41,7 @@ add_library(llama
             ../include/llama.h
             llama.cpp
             llama-spec-features.cpp
+            llama-dspark-sched.cpp
             llama-vocab.cpp
             llama-grammar.cpp
             llama-sampling.cpp
@@ -111,6 +112,7 @@ add_library(llama
             graphs/build_arctic.cpp
             graphs/build_deepseek2.cpp
             graphs/build_deepseek4.cpp
+            graphs/build_dspark.cpp
             graphs/build_glm4.cpp
             graphs/build_bitnet.cpp
             graphs/build_cohere2.cpp

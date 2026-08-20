@@ -125,3 +125,15 @@ ggml_tensor * llama_dsv4_cpy_state_kv(const llama_context & lctx, ggml_context *
 ggml_tensor * llama_dsv4_cpy_state_score(const llama_context & lctx, ggml_context * ctx,
                                          llama_dsv4_stream s, ggml_tensor * cur,
                                          ggml_tensor * idxs, int32_t il);
+
+//
+// speculative rollback (M5) — see the block comment in the .cpp for WHY the compressor
+// ring cannot self-heal. Components are llama_dsv4_spec_component in llama.h.
+//
+bool     llama_dsv4_spec_snapshot      (llama_context & lctx, const llama_batch & batch);
+bool     llama_dsv4_spec_restore       (llama_context & lctx, uint32_t components);
+void     llama_dsv4_spec_discard       (llama_context & lctx);
+size_t   llama_dsv4_spec_snapshot_bytes(const llama_context & lctx);
+uint64_t llama_dsv4_debug_digest       (const llama_context & lctx, int component);
+size_t   llama_dsv4_debug_export       (const llama_context & lctx, int component,
+                                        float * out, size_t max_n);
