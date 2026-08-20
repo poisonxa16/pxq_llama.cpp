@@ -705,6 +705,81 @@ static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float *
 static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restrict x, size_t bx, ggml_fp16_t * restrict y, size_t by, int nrc);
 static void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, ggml_bf16_t * restrict x, size_t bx, ggml_bf16_t * restrict y, size_t by, int nrc);
 
+// ---------------------------------------------------------------------------------------------
+// "no CPU kernel for this type" refusal stubs for the table below.
+//
+// ggml_compute_forward_mul_mat and ggml_compute_forward_mul_mat_id read
+// type_traits[src0->type].vec_dot and call it; neither ever tests it for NULL. So a table entry
+// that leaves .vec_dot NULL does not fall back to anything -- if the op reaches the generic
+// chunked path with that type, the worker thread jumps through a null function pointer. That is
+// a bare SIGSEGV inside a thread pool: no tensor name, no type name, no hint about which build
+// option or which offload split opened the path.
+//
+// Why that stayed invisible: every type below is either accelerator-only in practice (you only
+// meet it on the CPU with a partial offload -- --cpu-moe, -ngl < 99) or used to be claimed
+// before the chunked path by an accelerated matmul that is now conditional. On the
+// configurations anyone actually runs, the NULL is never reached, so it reads as harmless.
+//
+// A NULL deref is never an acceptable outcome. These stubs preserve the exact semantics -- there
+// is no CPU kernel for this type -- but state it by name at the call site and abort cleanly.
+// Each one names what a real fix would take; a real kernel is always the better answer.
+// ---------------------------------------------------------------------------------------------
+#define PXA_NO_CPU_VEC_DOT(fn, tname, detail)                                                   \
+    static void fn(int n, float * restrict s, size_t bs, const void * restrict x, size_t bx,    \
+                   const void * restrict y, size_t by, int nrc) {                               \
+        GGML_UNUSED(n);  GGML_UNUSED(s);  GGML_UNUSED(bs); GGML_UNUSED(x);                      \
+        GGML_UNUSED(bx); GGML_UNUSED(y);  GGML_UNUSED(by); GGML_UNUSED(nrc);                    \
+        GGML_ABORT("ggml: type '%s' has no CPU vec_dot in this build (%s). Keep these tensors "  \
+                   "on the accelerator (raise -ngl / drop --cpu-moe), or requantize to a type "  \
+                   "that has a CPU kernel.", tname, detail);                                     \
+    }
+
+// PXQ1 (248) and PXQ6 (256): the two PXQ slab tiers that pxa_pxq_is_cpu_supported()
+// (ggml/src/pxq-cpu.c:120) does NOT list, so the panel-dequant early return in
+// ggml_compute_forward_mul_mat / _mul_mat_id never claims them and they fall through to the
+// chunked path. .to_float / .from_float / .vec_dot must stay absent for the slab types (see the
+// PXQ note further down: a 64-row panel interleave makes a single row pointer meaningless), so
+// the fix is not a per-row codec here -- it is panel dequant in pxq-cpu.c for these two tiers,
+// after which they join the early-return list. Until then, refuse by name.
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_pxq1_no_cpu, "pxq1",
+        "the PXQ1 tier has no panel dequant in pxq-cpu.c and is not in pxa_pxq_is_cpu_supported")
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_pxq6_no_cpu, "pxq6",
+        "the PXQ6 tier has no panel dequant in pxq-cpu.c and is not in pxa_pxq_is_cpu_supported")
+
+// bf16_r16: .to_float/.from_float/.vec_dot are commented out in its entry below while
+// .vec_dot_type = GGML_TYPE_BF16 stays live, so the generic path happily quantizes the
+// activations to bf16 and then calls NULL. Reachable from a bf16_r16 file or from -rtr repack.
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_bf16_r16_no_cpu, "bf16_r16",
+        "the 16-row bf16 repack only ever had an accelerated matmul, never a scalar dot")
+
+// i2_s: .vec_dot has always been NULL while .vec_dot_type = GGML_TYPE_Q8_0 is live, so the
+// generic path burns a full activation quantization pass and then calls NULL.
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_i2_s_no_cpu, "i2_s",
+        "i2_s has a dequantizer but no dot product in this tree")
+
+// q4_0_4x4 / 4x8 / 8x8: these carry .gemv/.gemm instead of a .vec_dot, and the gemv path is
+// entered only when ggml_n_dims(src0) == 2. A 3D src0 of one of these types walks past it into
+// the chunked path and calls NULL. Narrow, but the same shape.
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_q4_0_4x4_no_cpu, "q4_0_4x4",
+        "the 4x4 repack is gemv/gemm-only and gemv handles 2D src0 only")
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_q4_0_4x8_no_cpu, "q4_0_4x8",
+        "the 4x8 repack is gemv/gemm-only and gemv handles 2D src0 only")
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_q4_0_8x8_no_cpu, "q4_0_8x8",
+        "the 8x8 repack is gemv/gemm-only and gemv handles 2D src0 only")
+
+#if !GGML_USE_IQK_MULMAT
+// q8_KV_r8: vec_dot_q8_KV_r8_q8_KV (iqk_quantize.cpp:7369) has no body below its early return
+// and deliberately never will. q8_KV_r8 interleaves EIGHT logical rows (row_meta_size 4, eight
+// leading scales, quants at q8[128*ib + 32*l + 4*k + i] -- see dequantize_row_q8_KV_r8), and a
+// vec_dot call carries nrc == 1 and exactly one output float, so it structurally cannot express
+// eight rows of result. Pasting the single-row q8_KV body in there would return a confidently
+// wrong number instead of no number; a real fallback has to be a whole-panel routine. So the
+// generic matmul must not reach it at all, and the traits table is where that is said.
+// (Its sibling vec_dot_q8_KV_q8_KV DOES have a real scalar body and is wired up directly.)
+PXA_NO_CPU_VEC_DOT(pxa_vec_dot_q8_KV_r8_no_cpu, "q8_KV_r8",
+        "q8_KV_r8 is an 8-row interleave; a 1-row vec_dot cannot express it, and no panel-wise CPU fallback exists")
+#endif
+
 static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
@@ -1516,6 +1591,12 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 32,
         .type_size                = 5,
         .is_quantized             = true,
+        // NOT in pxa_pxq_is_cpu_supported() (pxq-cpu.c:120), unlike PXQ4/PXQ4HQ/PXQ2/PXQ3
+        // above, so mul_mat's panel-dequant early return does not claim this type and the
+        // chunked path calls .vec_dot. Left NULL, that was a null-pointer call. Refuse by name.
+        // .vec_dot_type stays at the default 0 == GGML_TYPE_F32 on purpose: src1 is F32, so
+        // src1->type == vec_dot_type and mul_mat skips activation quantization entirely.
+        .vec_dot                  = pxa_vec_dot_pxq1_no_cpu,
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
@@ -1530,6 +1611,9 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 32,
         .type_size                = 21,
         .is_quantized             = true,
+        // Same hole as PXQ1 above: no pxq-cpu.c panel dequant, so not in
+        // pxa_pxq_is_cpu_supported(), so the chunked path reaches .vec_dot. Refuse by name.
+        .vec_dot                  = pxa_vec_dot_pxq6_no_cpu,
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
@@ -1640,6 +1724,20 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t)quantize_row_q8_KV_ref,
         .vec_dot                  = vec_dot_q8_KV_q8_KV,
         .vec_dot_type             = GGML_TYPE_Q8_KV,
+        // .nrows was omitted here, so type_traits[Q8_KV].nrows was 0 (ggml.h:3281 -- an omitted
+        // designated initializer is zero, not one). mul_mat copies it into
+        // num_rows_per_vec_dot, which is only forced to 1 when nr0 or ne11 is ODD; for the even
+        // shapes a KV cache actually has it stayed 0, and the ir0/ir1 loops in
+        // ggml_compute_forward_mul_mat_one_chunk step by it -- an increment of zero, i.e. a
+        // hang, with the copy-out never executing either. Invisible until the accelerated
+        // matmul stopped claiming this op unconditionally; reachable from -ctk/-ctv q8_KV.
+        //
+        // COUPLED: setting this to 1 is only a fix while vec_dot_q8_KV_q8_KV actually assigns
+        // *s. Until recently its body ended at the early return, and the 0 here was the only
+        // thing making that visible -- nrc == 0 tripped its nrc == 1 assert, so the process
+        // died loudly instead of scoring attention against stale memory. If that function is
+        // ever emptied again, this line turns the crash back into silence.
+        .nrows                    = 1,
         .row_meta_size            = 8,
     },
     [GGML_TYPE_Q8_KV_R8] = {
@@ -1650,8 +1748,13 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_KV_r8,
         .from_float               = quantize_row_q8_KV_r8,
         .from_float_ref           = (ggml_from_float_t)quantize_row_q8_KV_r8_ref,
+#if GGML_USE_IQK_MULMAT
         .vec_dot                  = vec_dot_q8_KV_r8_q8_KV,
+#else
+        .vec_dot                  = pxa_vec_dot_q8_KV_r8_no_cpu, // 8-row interleave: see stub
+#endif
         .vec_dot_type             = GGML_TYPE_Q8_KV,
+        .nrows                    = 1,   // same omission as q8_KV above: 0 here hangs mul_mat
         .row_meta_size            = 4,
     },
     [GGML_TYPE_Q8_K16] = {
@@ -1700,6 +1803,11 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         //.from_float               = (ggml_from_float_t) ggml_fp32_to_bf16_row,
         //.from_float_ref           = (ggml_from_float_t) ggml_fp32_to_bf16_row_ref,
         //.vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_bf16,
+        // ...and that commented-out .vec_dot left the field NULL while .vec_dot_type below
+        // stayed live, so the generic path quantizes src1 to bf16 and then calls NULL. Restoring
+        // ggml_vec_dot_bf16 here would be wrong -- this is a 16-row interleave, a plain bf16 dot
+        // would misparse it -- so refuse by name until a real bf16_r16 dot exists.
+        .vec_dot                  = pxa_vec_dot_bf16_r16_no_cpu,
         .vec_dot_type             = GGML_TYPE_BF16,
         .nrows                    = 1,
         .row_meta_size            = 0,
@@ -1713,7 +1821,10 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL,
         .from_float               = NULL,
         .from_float_ref           = NULL,
-        .vec_dot                  = NULL,
+        // gemv/gemm-only type: the gemv path in mul_mat is entered only for a 2D src0, and
+        // anything else falls into the chunked path and calls .vec_dot. NULL made that a null
+        // call; refuse by name instead.
+        .vec_dot                  = pxa_vec_dot_q4_0_4x4_no_cpu,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
         .ncols                    = 4,
@@ -1730,7 +1841,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL,
         .from_float               = NULL,
         .from_float_ref           = NULL,
-        .vec_dot                  = NULL,
+        .vec_dot                  = pxa_vec_dot_q4_0_4x8_no_cpu,   // as q4_0_4x4 above
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
         .ncols                    = 4,
@@ -1747,7 +1858,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL,
         .from_float               = NULL,
         .from_float_ref           = NULL,
-        .vec_dot                  = NULL,
+        .vec_dot                  = pxa_vec_dot_q4_0_8x8_no_cpu,   // as q4_0_4x4 above
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
         .ncols                    = 8,
@@ -1876,9 +1987,23 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q1_0_g128,
         .from_float_ref           = (ggml_from_float_t)quantize_row_q1_0_g128_ref,
         .vec_dot                  = vec_dot_q1_0_g128_q8_0,
+#if GGML_USE_IQK_MULMAT
 #if defined __AVX2__
         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
 #else
+        .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+#endif
+#else
+        // ik OFF: unlike every other vec_dot in iqk_quantize.cpp, vec_dot_q1_0_g128_q8_0
+        // (iqk_quantize.cpp:10430) has no iqk_mul_mat prologue -- it is a real, ik-independent
+        // scalar kernel and it reads block_q8_0_x4 unconditionally. The __AVX2__ arm above was
+        // written for the interleaved x4 activation format the accelerated matmul consumes, and
+        // it was not wrapped in an ik guard like Q4_0/Q5_0/Q6_0/Q8_0/Q4_K/... were. So on an
+        // AVX2 host built with the accelerated matmul disabled, the kernel was handed
+        // block_q8_2_x4: 144 bytes per 128 activations against the 136 it strides by, qs at
+        // offset 16 against the 8 it reads from, and four uint16 scale words reinterpreted as
+        // fp16 block scales. Not a scale error -- a fully misparsed operand. Name the layout
+        // this kernel actually reads.
         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
 #endif
         .nrows                    = 1,
@@ -2140,7 +2265,9 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = dequantize_row_ms_i2s,
         .from_float               = NULL,
         .from_float_ref           = NULL,
-        .vec_dot                  = NULL,
+        // was NULL, with a live .vec_dot_type below -- mul_mat quantizes the activations to
+        // q8_0 and then calls through the null pointer.
+        .vec_dot                  = pxa_vec_dot_i2_s_no_cpu,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
         .row_meta_size            = 0,
