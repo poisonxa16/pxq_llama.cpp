@@ -395,6 +395,7 @@ static void pxq2_quantize_expert(const float * src, uint8_t * dst, int64_t R, in
             const int64_t row = row0 + p*64 + r;
             const float * wq = pxq_kqw_row_weights(x, imx, K, kqw);   // PXA_PXQ_KQW (== imx when off)
             const float anchor = pxq2_pick_anchor(x, wq, K, book, mids, sub, s4.data(), codes.data(), row);
+            const float anchor = pxq2_pick_anchor(x, imx, K, book, mids, sub, s4.data(), codes.data(), row);
             anchors[r] = ggml_fp32_to_fp16(anchor);
             pxq2_quant_row(x, wq, K, anchor, book, mids, sub, s4.data(), codes.data(), row);
             // scatter into slabs
@@ -466,6 +467,7 @@ static void pxq2_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     const int64_t panels      = R/64;
     const int64_t panel_bytes = panels > 0 ? exp_bytes/panels : 0;
     // Job granularity: fixed CHUNK=8 leaves cores idle on wide-and-short tensors --
+    // Job granularity: fixed CHUNK=8 leaves the box idle on wide-and-short tensors --
     // a dense R=5120 gives 80 panels = 10 jobs, so 10 of 72 cores work. Size it so there
     // are ~4 jobs per thread, clamped to [1,8] panels (a 64-row panel x K is already
     // substantial work, so CHUNK=1 costs nothing in scheduling overhead).

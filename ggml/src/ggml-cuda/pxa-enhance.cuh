@@ -298,6 +298,17 @@ static inline int pxa_router_fuse_mode_resolve() {
     }
     cached_mode = mode;
     cached_gen  = gen;
+static inline int pxa_router_fuse_mode_resolve() {
+    static const int mode = [](){
+        const char * e = getenv("PXA_ROUTER_FUSE");
+        if (e) { int m = atoi(e); return (m < 0 || m > 2) ? 0 : m; }
+        // ENHANCE auto-set: ON (mode 1) only for a pure-sm_70 non-mixed topology.
+        if (pxa_config_level() == 2 && g_pxa_topology.valid
+            && g_pxa_topology.has_sm70 && !g_pxa_topology.mixed) {
+            return 1;
+        }
+        return 0;
+    }();
     return mode;
 }
 
@@ -428,6 +439,7 @@ static inline int pxa_fa_prefill_split_ne11() {
         // The +45% P100 prefill is real but must be bought explicitly (PXA_FA_PREFILL_SPLIT=64)
         // on configs with the headroom.
         return 0;
+        return pxa_mode() == 1 ? 0 : 64;          // MAX -> inert; BALANCE -> 64
     }();
     return v;
 }

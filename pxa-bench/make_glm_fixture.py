@@ -21,6 +21,7 @@ import numpy as np
 
 import os, pathlib
 sys.path.insert(0, str(pathlib.Path(os.environ.get("GGUF_PY", pathlib.Path(__file__).resolve().parents[1] / "gguf-py"))))
+sys.path.insert(0, "<local-path>")
 import gguf  # noqa: E402
 
 N_LAYER = 47          # blk.0 dense, blk.1..46 MoE  (real GLM-4.7-Flash)
@@ -44,6 +45,7 @@ def f32(shape):
 
 
 OUT = os.environ.get("GLM_FIXTURE_OUT", "glm47-fixture.gguf")
+OUT = "<local-path>"
 
 w = gguf.GGUFWriter(OUT, "deepseek2", endianess=gguf.GGUFEndian.LITTLE)
 

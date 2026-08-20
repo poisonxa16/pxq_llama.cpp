@@ -1234,6 +1234,8 @@ static __global__ void k_pxq_mmv_reduce(const float * __restrict__ ws,
 }
 
 // (PXQ6_MMV_SPLIT_MAX moved up to the PXQ_CANON_v1 block)
+// fixed workspace row width for the K8-2D split (slots per (iy,j) row; S is capped at this)
+#define PXQ6_MMV_SPLIT_MAX 16
 
 // K8-2D S-SPLIT (2026-07-26): the single-weight 256-thr S-way twin of the gateup gen form
 // below, built for the 2D decode mmv's two pathological launch shapes (measured, nvprof
@@ -1253,6 +1255,18 @@ static __global__ void k_pxq_mmv_reduce(const float * __restrict__ ws,
 // FUSERED (2026-07-26): when `counters` is non-null the LAST block of each (iy,j) performs the
 // final canonical fold in-kernel (threadFenceReduction fence-and-flag pattern) and the driver
 // skips the k_pxq_mmv_reduce_s launch (default OFF -- measured loss, kept as documented dead end).
+// structure INSIDE K-chunk [kb0,kb1); stages only its x slice (dyn smem Kc + red) so smem stops
+// capping occupancy at large K. Partials to ws in fixed 16-slot rows; k_pxq_mmv_reduce_s sums
+// chunks in ascending order (deterministic run-to-run; differs from the proven chain order =>
+// NOT bit-exact vs the unsplit kernel -- G3/G4 gated like K1b/K6).
+// FUSERED (2026-07-26): when `counters` is non-null the LAST block of each (iy,j) performs the
+// final chunk reduction in-kernel (threadFenceReduction fence-and-flag pattern) and the driver
+// skips the k_pxq_mmv_reduce_s launch. Measured motivation (nvprof, F35B pure-PXQ4, 2xV100,
+// fill 5992): the standalone reducer ran 230 launches/token = 0.54 ms GPU + its CPU submission,
+// while both arms' GPU-busy was at parity -- the V100 deficit was per-token launch count, not
+// kernel throughput. The finisher sums chunks in the SAME fixed ascending order as
+// k_pxq_mmv_reduce_s => identical output values. Counters live in a persistent per-device
+// buffer, zero-initialized once; the finisher resets its counter, so no per-call memset.
 template <class POL, int MODE, bool VECX>
 static __global__ void __launch_bounds__(256)
 k_pxq6_mmv_ksplit_gen(const uint8_t * __restrict__ W,
@@ -1277,10 +1291,12 @@ k_pxq6_mmv_ksplit_gen(const uint8_t * __restrict__ W,
     // S-chunk boundaries == the enclosing fixed-chunk boundaries (floor((kslabs*c0)/nfix) ==
     // floor((kslabs*chunk)/S) exactly, since nfix/S is an integer)
     const int kb0 = (kslabs*c0)/nfix, kb1 = (kslabs*c1)/nfix;
+    const int kb0 = (kslabs*chunk)/S, kb1 = (kslabs*(chunk+1))/S;
     const int Kc  = (kb1 - kb0)*PXQ6_QK;
 
     extern __shared__ float pxq6_smem[];
     float * xs  = pxq6_smem;                      // Kc floats (chunk slice only)
+    float * red = pxq6_smem + Kc;                 // KSEG*64
 
     const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride) + kb0*PXQ6_QK;
     for (int idx = threadIdx.x; idx < Kc; idx += blockDim.x) xs[idx] = x[idx];
@@ -1291,6 +1307,9 @@ k_pxq6_mmv_ksplit_gen(const uint8_t * __restrict__ W,
     POL::stage_tabs(tab, sub, threadIdx.x);
     if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
     if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 256);
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : 1];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
     __syncthreads();
     pxq6_prmt_book pb{};
     if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
@@ -1310,6 +1329,19 @@ k_pxq6_mmv_ksplit_gen(const uint8_t * __restrict__ W,
                                              xs + (kb - kb0)*PXQ6_QK, tab, sub, plut, pb);
         }
         wsj[(size_t)(c*PXQ4_MMV_KSEG + kseg)*R + p*PXQ6_BM + row] = t;
+    float su = 0.f;
+    for (int kb = kb0 + kseg; kb < kb1; kb += PXQ4_MMV_KSEG) {
+        su += pxq6_dot32<POL, MODE, VECX>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                          xs + (kb - kb0)*PXQ6_QK, tab, sub, plut, pb);
+    }
+    red[kseg*64 + row] = su;
+    __syncthreads();
+    if (kseg == 0) {
+        float u = 0.f;
+        #pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += red[s*64 + row];
+        float * wsj = ws + ((size_t)iy*n_ids + j)*(size_t)PXQ6_MMV_SPLIT_MAX*R;   // fixed 16-slot rows
+        wsj[(size_t)chunk*R + p*PXQ6_BM + row] = u;
     }
     if (counters == nullptr) return;                 // driver launches k_pxq_mmv_reduce_s instead
     __threadfence();                                 // ws writes visible before the flag
@@ -1332,6 +1364,12 @@ k_pxq6_mmv_ksplit_gen(const uint8_t * __restrict__ W,
             for (int c = 0; c < nfix; ++c) sus += wsj2[(size_t)(c*PXQ4_MMV_KSEG + s)*R + grow];
             u += sus;
         }
+    // final reduction, SAME ascending order as k_pxq_mmv_reduce_s => identical values
+    const float * wsj2 = ws + ((size_t)iy*n_ids + j)*(size_t)PXQ6_MMV_SPLIT_MAX*R;
+    float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+    for (int grow = threadIdx.x; grow < R; grow += blockDim.x) {
+        float u = 0.f;
+        for (int s = 0; s < S; ++s) u += wsj2[(size_t)s*R + grow];
         out[grow] = u;
     }
 }
@@ -1343,6 +1381,12 @@ static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
         char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
         const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
         const int R, const int n_as, const int n_ids, const int kslabs) {
+// generic-S reducer for k_pxq6_mmv_ksplit_gen: sums the S chunk partials in ascending chunk
+// order (fixed => deterministic) and writes dst. One thread per (iy, j, grow).
+static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
+        char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+        const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+        const int R, const int n_as, const int n_ids, const int S) {
     const int grow = blockIdx.x*blockDim.x + threadIdx.x;
     if (grow >= R) return;
     const int j  = blockIdx.y;
@@ -1357,6 +1401,9 @@ static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
         for (int c = 0; c < nfix; ++c) sus += wsj[(size_t)(c*PXQ4_MMV_KSEG + s)*R + grow];
         u += sus;
     }
+    const float * wsj = ws + ((size_t)iy*n_ids + j)*(size_t)PXQ6_MMV_SPLIT_MAX*R;
+    float u = 0.f;
+    for (int s = 0; s < S; ++s) u += wsj[(size_t)s*R + grow];
     float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
     out[grow] = u;
 }
@@ -1378,6 +1425,14 @@ static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
 #ifndef PXQ_GU_MINBLK
 #define PXQ_GU_MINBLK 0   // MEASURED NULL 2026-08-04: +0.14% median. Default OFF.
 #endif
+// K1b generic S-split (NOT bit-exact; staged, G3-gated): 256-thr blocks, block pk handles the
+// K-chunk [chunk*Kc, (chunk+1)*Kc) with the full 64x4 kseg structure INSIDE the chunk. Stages
+// only its K-chunk slice of x (the smem rider from the deep-dive: dyn smem K/S + red).
+// Reduction: same workspace; the reducer sums S chunk-partials in ascending chunk order
+// (deterministic run-to-run; differs from the proven chain order => G3 before live use).
+// FUSERED: non-null `counters` => the last block of each (iy,j) applies the bias+GLU reduce
+// in-kernel (same fence-and-flag form and the same ascending order as k_pxq6_gateup_reduce_gen
+// => identical values) and the driver skips the standalone reduce launch.
 template <class POLU, class POLG, int MODE, bool VECX>
 #if PXQ_GU_MINBLK > 0
 static __global__ void __launch_bounds__(256, PXQ_GU_MINBLK)
@@ -2208,6 +2263,29 @@ k_pxq6_gateup_mmv_ksplit_gen_x2(const uint8_t * __restrict__ Wu, const uint8_t *
         if (bias_u) u += *(const float *)((const char *)bias_u + (size_t)e*bias_u_nb1 + (size_t)gr*sizeof(float));
         if (bias_g) g += *(const float *)((const char *)bias_g + (size_t)e*bias_g_nb1 + (size_t)gr*sizeof(float));
         out[gr] = pxq4_glu_apply(g, u, unary, alpha, limit);
+    }
+    if (counters == nullptr) return;                 // driver launches k_pxq6_gateup_reduce_gen instead
+    __threadfence();
+    __syncthreads();
+    __shared__ int lastblk;
+    if (threadIdx.x == 0) {
+        const int done = atomicAdd(&counters[iy*n_ids + j], 1) + 1;
+        lastblk = (done == (int)gridDim.x);
+        if (lastblk) counters[iy*n_ids + j] = 0;
+    }
+    __syncthreads();
+    if (!lastblk) return;
+    const float * wsj2 = ws + ((size_t)iy*n_ids + j)*2*8*R;
+    float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+    for (int grow = threadIdx.x; grow < R; grow += blockDim.x) {
+        float u = 0.f, g = 0.f;
+        for (int s = 0; s < S; ++s) {
+            u += wsj2[(size_t)s*R + grow];
+            g += wsj2[((size_t)8 + s)*R + grow];
+        }
+        if (bias_u) u += *(const float *)((const char *)bias_u + (size_t)e*bias_u_nb1 + (size_t)grow*sizeof(float));
+        if (bias_g) g += *(const float *)((const char *)bias_g + (size_t)e*bias_g_nb1 + (size_t)grow*sizeof(float));
+        out[grow] = pxq4_glu_apply(g, u, unary, alpha, limit);
     }
 }
 

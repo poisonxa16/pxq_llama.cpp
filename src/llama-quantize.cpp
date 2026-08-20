@@ -1143,6 +1143,7 @@ static bool pxq4_legacy_native_class(const std::string & name) {
                      // and neither name matches pxa_name_is(..., "attn_output.weight"), so without
                      // this PXA_PXQ_NATIVE=attn was a silent no-op on DS4.
                      pxa_name_is(name, "attn_output_a.weight") || pxa_name_is(name, "attn_output_b.weight"))) {
+                     pxa_name_is(name, "attn_output.weight") || pxa_name_is(name, "attn_gate.weight"))) {
         return true;
     }
     // NOTE: this used pxa_name_ends(), whose strict-suffix test can never match the top-level
@@ -1243,6 +1244,10 @@ static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
                                   : (c.hq   ? "PXQ4HQ"
                                   : (c.pxq6 ? "PXQ6"
                                             : "PXQ4 (byte-parity, MMVQ-eligible)")));
+            LLAMA_LOG_INFO("PXQ backbone rules: REV 2 (per-class promotion%s%s%s) — "
+                           "PXA_PXQ_BACKBONE=legacy restores the old flat-MXFP4 backbone\n",
+                           c.lite ? ", LITE (decode-free classes only)" : (c.hq ? ", PXQ4HQ backbone" : ""),
+                           c.univ ? ", incl. PXQ_UNIVERSAL/PXQ1" : "", "");
         }
         return c;
     }();
@@ -1309,6 +1314,9 @@ static bool pxa_pxq_backbone_native_class(const std::string & name, const ggml_t
 static ggml_type pxa_custom_rule_type(const llama_model_quantize_params * params, const std::string & name) {
     if (!params || !params->custom_quants) {
         return GGML_TYPE_COUNT;
+static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, const std::string & name) {
+    if (!params || !params->custom_quants) {
+        return false;
     }
     using CustomQ = std::pair<std::string, ggml_type>;
     const auto & rules = *static_cast<const std::vector<CustomQ>*>(params->custom_quants);
@@ -1332,6 +1340,14 @@ static int g_pxa_customq_demoted = 0;
 // The resolver. Returns GGML_TYPE_COUNT for "not mine — leave to the legacy pipeline".
 static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier,
                                        bool model_has_experts) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The resolver. Returns GGML_TYPE_COUNT for "not mine — leave to the legacy pipeline".
+static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier) {
     const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
     if (cfg.mode == PXA_BB_LEGACY || tier == PXA_TIER_NONE) {
         return GGML_TYPE_COUNT;
@@ -1357,6 +1373,9 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     // until that measurement says otherwise; use --custom-q '(ssm_out\.weight)=pxq4' to build
     // the native arm.
     if (pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
+    if (name.find(".nextn.") != std::string::npos)      return GGML_TYPE_COUNT;   // MTP companion
+    if (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight") ||
+        pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
 
     // token embeddings: a row GATHER, never a GEMM, so the P100 "k-quants are slow" rule does
     // not apply. Q6_K kills 0.121 relative RMS + the MXFP4 gain bias for ~+0.08 GiB on Laguna.
@@ -1387,6 +1406,11 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
             return GGML_TYPE_Q8_0;
         }();
         return kv;
+    // K and V projections are already q8_0 in both our files and Q4_K_M's — parity, keep.
+    // attn_v_b is MLA's V projection and was inheriting flat MXFP4; same role, same rule.
+    if (pxa_name_is(name, "attn_k.weight") || pxa_name_is(name, "attn_v.weight") ||
+        pxa_name_is(name, "attn_v_b.weight")) {
+        return GGML_TYPE_Q8_0;
     }
     // THE Laguna killer: a per-HEAD attention gate is a handful of softplus scalars per layer
     // (Laguna: 72 rows, 0.03% of the file) whose error multiplies an ENTIRE head. Never
@@ -1518,6 +1542,7 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     const ggml_type hi = cfg.hq   ? GGML_TYPE_PXQ4HQ
                        : cfg.pxq6 ? GGML_TYPE_PXQ6
                                   : GGML_TYPE_PXQ4;
+    const ggml_type hi = cfg.hq ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ6;
     switch (tier) {
         case PXA_TIER_PXQ1:                                       // only via PXA_PXQ_BACKBONE=universal
         case PXA_TIER_PXQ2:
@@ -1526,6 +1551,7 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
             return (pxa_name_is(name, "attn_output.weight")   ||
                     pxa_name_is(name, "attn_output_a.weight") ||
                     pxa_name_is(name, "attn_output_b.weight")) ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ4;
+            return pxa_name_is(name, "attn_output.weight") ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ4;
         case PXA_TIER_PXQ3:
         case PXA_TIER_PXQU:
             return GGML_TYPE_PXQ4HQ;
@@ -1577,6 +1603,9 @@ static bool pxq4_tensor_eligible(const std::string & name, const ggml_tensor * t
 // (pxa_pxq_dequant_row, pxq-cpu.c) decodes PXQ4/PXQ4HQ/PXQ2/PXQ3 from the tensor base, so
 // those measure like any other type now; only the 5-bit PXQ6 slab type (no CPU fallback
 // yet) still reports "n/a".
+// LIMITATION, stated rather than hidden: the PXQ slab types are CUDA-only and have no CPU
+// to_float, so expert classes report "n/a". The report therefore covers the BACKBONE — which
+// is exactly the surface this revision changes and the entire surface the Laguna bug lived on.
 struct pxa_err_acc {
     double sse = 0.0;
     double ssq = 0.0;
@@ -1626,6 +1655,9 @@ static void pxa_errbudget_accumulate(std::map<std::string, pxa_err_acc> & acc,
     // no CPU codec (the 5-bit PXQ6 slab type), or a row-interleaved layout whose rows are
     // not independently decodable -> honestly report it as unmeasured rather than guess
     if (!pxq && (tt.to_float == nullptr || interleaved_properties(type).second != 1)) {
+    // no CPU codec (PXQ slab types), or a row-interleaved layout whose rows are not
+    // independently decodable -> honestly report it as unmeasured rather than guess
+    if (tt.to_float == nullptr || interleaved_properties(type).second != 1) {
         a.nskipped++;
         return;
     }
@@ -1643,6 +1675,11 @@ static void pxa_errbudget_accumulate(std::map<std::string, pxa_err_acc> & acc,
         } else {
             tt.to_float((const char *)qdata + (size_t)r*rs, buf.data(), ne0);
         }
+    const size_t rs = ggml_row_size(type, ne0);
+    std::vector<float> buf(ne0);
+    double sse = 0.0, ssq = 0.0;
+    for (int64_t r = 0; r < rows; ++r) {
+        tt.to_float((const char *)qdata + (size_t)r*rs, buf.data(), ne0);
         const float * x = src + (size_t)r*ne0;
         for (int64_t j = 0; j < ne0; ++j) {
             const double d = (double)x[j] - (double)buf[j];
@@ -1872,6 +1909,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                            "PXQ1/PXQ_UNIVERSAL need the `universal` opt-in too. "
                            "Use PXA_PXQ_BACKBONE=core,universal for a core backbone here.\n");
         }
+        (void) pxa_pxq_backbone_cfg();   // resolve + log the mode once, before the write loop
     }
 
     int nthread = params->nthread;
@@ -2133,6 +2171,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         if (!bb_ovr.empty()) {
             gguf_set_val_str(ctx_out, "pxa.pxq.backbone_overrides", bb_ovr.c_str());
         }
+        const char * bb_map =
+            !bb_on   ? "legacy:mxfp4" :
+            bb.lite  ? "lite:attn_gate_head=f16;token_embd=q6_k;attn_k,attn_v=q8_0;output=q8_0;gemm_backbone=mxfp4" :
+            bb.hq    ? "attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=pxq4hq;attn_k,attn_v=q8_0;attn_gate_head=f16;token_embd=q6_k;output=q8_0"
+                     : "attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=tier+1;attn_k,attn_v=q8_0;attn_gate_head=f16;token_embd=q6_k;output=q8_0";
+        gguf_set_val_str(ctx_out, "pxa.pxq.backbone_map", bb_map);
     }
     if (pxq6_out || pxq6hq_out) {   // 4-bit-tier provenance: the frozen tables this file was built with
         gguf_set_val_u32(ctx_out, "pxa.pxq6.version", 1);
@@ -2470,6 +2514,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 if (pxq_tier != PXA_TIER_NONE) {
                     const ggml_type bb = pxa_pxq_backbone_type(name, tensor, pxq_tier,
                                                                qs.model.hparams.n_expert > 1);
+                    const ggml_type bb = pxa_pxq_backbone_type(name, tensor, pxq_tier);
                     // the regex scan is the expensive half, so only pay it for a tensor the
                     // table actually wants to move
                     if (bb < GGML_TYPE_COUNT && bb != new_type && !pxa_custom_rule_matches(params, name)) {
@@ -2762,6 +2807,17 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     LLAMA_LOG_WARN("%s: %s fails PXQ slab geometry (ne0=%" PRId64 ", ne1=%" PRId64 ") — demoting %s -> %s\n",
                                    __func__, name.c_str(), tensor->ne[0], tensor->ne[1],
                                    ggml_type_name(new_type), ggml_type_name(demoted));
+                    // safety: a PXQ target on a non-eligible tensor (bad custom rule) — the
+                    // native codecs need _exps geometry and there is no CPU codec to fall to.
+                    // BACKBONE_REV 2 changed the landing type from mxfp4 to q8_0: this path
+                    // only ever fires on rare, small tensors, and MXFP4's two failure channels
+                    // (a 3.54-effective-bit codec at 4.25 bpw, plus a systematic gain bias) make
+                    // it the one type we never want to fall into silently. Legacy mode keeps
+                    // the old mxfp4 landing so it byte-reproduces pre-rev-2 recipes.
+                    const bool bb_legacy = pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY;
+                    const ggml_type demoted = bb_legacy ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
+                    LLAMA_LOG_WARN("%s: %s is not PXQ-eligible — demoting %s -> %s\n",
+                                   __func__, name.c_str(), ggml_type_name(new_type), ggml_type_name(demoted));
                     new_type = demoted;
                     do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
                             new_size, chunk_size_multiplier, params);
@@ -2866,6 +2922,79 @@ QuantizationDone:;
         LLAMA_LOG_ERROR("\n⚠⚠ %d tensor(s) targeted by --custom-q were DEMOTED off their requested PXQ type "
                         "(slab-geometry failures — see the CUSTOM-Q DEMOTED lines above). "
                         "Dump and diff the tier table before benching this artifact.\n", g_pxa_customq_demoted);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // PXQ-P5 composition summary + assertion (2026-07-27). Motivation: a dense (no-expert)
+    // model quantized with PXA_PXQ_BACKBONE=legacy under a PXQ4 target emitted a file that was
+    // 91% MXFP4 / 0% PXQ, exit 0 — a plausible artifact whose NAME misrepresents its contents.
+    // The summary prints EVERY run; the assertion fires only for PXQ-family targets:
+    //   FAIL if PXQ-family bytes < 50% of the output (majority floor — the smallest legitimate
+    //   shipped artifact, the pre-rev-2 uniform PXQ1 35B, is 70.7% PXQ by bytes), or if a
+    //   UNIFORM PXQ target contributed ZERO bytes of its named tier (catches a PXQ6 target
+    //   emitting PXQ4HQ — the 122B naming-migration class). On failure every file this run
+    //   wrote is removed and the run exits non-zero. Explicit override:
+    //   --pxq-composition-override (env PXA_PXQ_COMPOSITION_OVERRIDE=1) downgrades to a WARN.
+    // ------------------------------------------------------------------------------------------
+    {
+        std::vector<std::pair<int, std::pair<int64_t, size_t>>> rows(comp_stats.begin(), comp_stats.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.second > y.second.second; });
+        LLAMA_LOG_INFO("%s: ---- output composition (by bytes) ----\n", __func__);
+        for (const auto & r : rows) {
+            LLAMA_LOG_INFO("%s:   %-10s %5lld tensors  %9.2f MiB  %5.1f%%\n", __func__,
+                    ggml_type_name((ggml_type) r.first), (long long) r.second.first,
+                    r.second.second/1024.0/1024.0,
+                    total_size_new ? 100.0*r.second.second/total_size_new : 0.0);
+        }
+
+        static const std::set<int> pxq_family = { 248, 252, 253, 254, 255, 256 };   // PXQ1,4,4HQ,2,3,6
+        int spec_type = -1;          // the single tier a UNIFORM PXQ target names (-1 = none/map)
+        bool pxq_target = true;
+        switch (params->ftype) {
+            case LLAMA_FTYPE_MOSTLY_PXQ1:           spec_type = 248; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ2:           spec_type = 254; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ3:           spec_type = 255; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ4:           spec_type = 252; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ4HQ:         spec_type = 253; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ6:           spec_type = 256; break;
+            case LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL:  spec_type = -1;  break;   // map-defined mix
+            default: pxq_target = false; break;
+        }
+        if (pxq_target && total_size_new > 0) {
+            size_t fam_bytes = 0, spec_bytes = 0;
+            for (const auto & r : comp_stats) {
+                if (pxq_family.count(r.first))  fam_bytes  += r.second.second;
+                if (r.first == spec_type)       spec_bytes += r.second.second;
+            }
+            const double fam_share = (double) fam_bytes / (double) total_size_new;
+            const bool below_floor = fam_share < 0.50;
+            const bool tier_absent = (spec_type >= 0) && (spec_bytes == 0);
+            if (below_floor || tier_absent) {
+                const bool override_on = getenv("PXA_PXQ_COMPOSITION_OVERRIDE")
+                                      && atoi(getenv("PXA_PXQ_COMPOSITION_OVERRIDE")) != 0;
+                const pxa_pxq_bb_cfg & bb = pxa_pxq_backbone_cfg();
+                char msg[512];
+                snprintf(msg, sizeof(msg),
+                        "PXQ composition assertion: target %s produced %.1f%% PXQ-family bytes"
+                        "%s%s (floor 50%%; backbone=%s). The output would misrepresent its"
+                        " contents.",
+                        llama_model_ftype_name(params->ftype).c_str(), 100.0*fam_share,
+                        tier_absent ? " and ZERO bytes of the named tier " : "",
+                        tier_absent ? ggml_type_name((ggml_type) spec_type) : "",
+                        bb.mode == PXA_BB_LEGACY ? "legacy" : (bb.lite ? "lite" : (bb.hq ? "hq" : "v2")));
+                if (override_on) {
+                    LLAMA_LOG_WARN("%s: %s OVERRIDDEN by --pxq-composition-override — file kept.\n",
+                            __func__, msg);
+                } else {
+                    for (const auto & f : comp_written_files) {
+                        if (std::remove(f.c_str()) == 0) {
+                            LLAMA_LOG_ERROR("%s: removed mislabelled output %s\n", __func__, f.c_str());
+                        }
+                    }
+                    throw std::runtime_error(msg);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------------

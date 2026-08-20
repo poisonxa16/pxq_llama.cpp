@@ -167,6 +167,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_hy3_tensors(const LLM_TN & tn);
 
+    bool create_hy3_tensors(const LLM_TN & tn);
+
     llama_model_loader & ml;
     llama_model        & model;
 
