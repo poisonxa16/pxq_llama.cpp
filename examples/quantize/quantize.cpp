@@ -201,7 +201,7 @@ static void usage(const char * executable) {
     printf("      --ffn-up-type ggml_type: use this ggml_type for the ffn_up tensor.\n\n");
     printf("  --keep-split: will generate quantized model in the same shards as input\n");
     printf("  --partial-requant: quantize only missing split files in the split quantized .gguf destination directory\n");
-    printf("  --override-kv KEY=TYPE:VALUE\n");
+    printf("  --override-kv KEY=TYPE:VALUE   (TYPE: int|uint|float|bool|str; uint writes GGUF UINT32)\n");
     printf("      Advanced option to override model metadata by key in the quantized model. May be specified multiple times.\n\n");
     printf("Note: --include-weights and --exclude-weights cannot be used together\n");
     printf("Note: The token embeddings tensor is loaded in system RAM, even in case of full GPU/VRAM offload.\n");

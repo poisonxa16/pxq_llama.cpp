@@ -13,6 +13,9 @@ enum llm_expert_gating_func_type {
     LLM_EXPERT_GATING_FUNC_SOFTMAX               = 1,
     LLM_EXPERT_GATING_FUNC_SIGMOID               = 2,
     LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3,
+    // DeepSeek-V4. Value 4 is written into the GGUF by the converter and MUST match
+    // gguf-py ExpertGatingFuncType.SQRTSOFTPLUS (upstream constants.py:4747).
+    LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS       = 4,
 };
 
 struct llama_hparams {
@@ -128,6 +131,21 @@ struct llama_hparams {
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
 
+    // DeepSeek-V4 (mirrors llama.cpp src/llama-hparams.h:241-248 @ upstream 82dbc4f01).
+    // NOTE: DS4's swiglu clamp limits live in swiglu_limits / swiglu_limits_shared
+    // below - this tree already routes the swiglu_clamp_exp / swiglu_clamp_shexp GGUF
+    // keys into those arrays (see LLM_ARCH_STEP35), so upstream's separate
+    // swiglu_clamp_exp / swiglu_clamp_shexp fields are deliberately NOT duplicated.
+    uint32_t dsv4_o_group_count     = 0;
+    uint32_t dsv4_o_lora_rank       = 0;
+    uint32_t dsv4_hc_mult           = 0;
+    uint32_t dsv4_hc_sinkhorn_iters = 0;
+    uint32_t dsv4_hash_layer_count  = 0;
+    float    dsv4_compress_rope_base = 0.0f;
+    float    dsv4_hc_eps             = 0.0f;
+    // per-layer attention regime: 0 = raw SWA, 4 = CSA + lightning indexer, 128 = HCA
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
+
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 
@@ -179,6 +197,10 @@ struct llama_hparams {
         if (this->n_ff_exp           != other.n_ff_exp)           return true;
         if (this->n_ff_shexp         != other.n_ff_shexp)         return true;
         if (this->n_expert_shared    != other.n_expert_shared)    return true;
+
+        // DS4: the per-layer compression schedule changes the KV geometry, so it is
+        // part of the cache identity. The scalar dsv4_* values follow from it.
+        if (this->dsv4_compress_ratios != other.dsv4_compress_ratios) return true;
 
         if (this->rope_finetuned  != other.rope_finetuned)  return true;
         if (this->n_ctx_orig_yarn != other.n_ctx_orig_yarn) return true;

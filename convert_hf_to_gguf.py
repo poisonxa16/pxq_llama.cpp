@@ -173,6 +173,72 @@ class Model:
         if len(sym_diff := tensor_names_from_parts.symmetric_difference(self.tensor_names)) > 0:
             raise ValueError(f"Mismatch between weight map and model parts for tensor names: {sym_diff}")
 
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        """Hook for subclasses to drop a source tensor while the index is built."""
+        return item
+
+    def index_tensors(self) -> dict[str, Callable[[], Tensor]]:
+        """Build a `name -> loader` index over ALL shards, up front.
+
+        Adapted from llama.cpp `conversion/base.py::ModelBase.index_tensors`
+        @ upstream commit 82dbc4f01 (MIT, Copyright (c) 2023-2026 The ggml authors).
+
+        get_tensors() is a streaming generator, and a generator cannot pair a
+        weight with a sidecar scale tensor that lives in a different shard. Any
+        converter for a quantized source format (fp8 block-scale, MXFP4
+        nibble+scale) needs the index instead. Opt-in: nothing calls this unless
+        a model class does.
+
+        The values are FACTORIES, not tensors: LazyBase memoises its result in
+        `_data`, so handing out one shared lazy object per name would pin every
+        materialised tensor in RAM for the whole run.
+        """
+        tensors: dict[str, Callable[[], Tensor]] = {}
+        tensor_names_from_parts: set[str] = set()
+        tensor_names_from_index: set[str] = set()
+        self._open_parts: list[Any] = []
+
+        if len(self.part_names) > 1:
+            index_name = "model.safetensors" if self.is_safetensors else "pytorch_model.bin"
+            index_name += ".index.json"
+            logger.info(f"gguf: indexing model weight map from '{index_name}'")
+            with open(self.dir_model / index_name, "r", encoding="utf-8") as f:
+                index: dict[str, Any] = json.load(f)
+                weight_map = index.get("weight_map")
+                if weight_map is None or not isinstance(weight_map, dict):
+                    raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
+                tensor_names_from_index.update(weight_map.keys())
+
+        for part_name in self.part_names:
+            logger.info(f"gguf: indexing model part '{part_name}'")
+            if self.is_safetensors:
+                from safetensors import safe_open
+                model_part = safe_open(self.dir_model / part_name, framework="pt", device="cpu")
+            else:
+                model_part = torch.load(str(self.dir_model / part_name), map_location="cpu", mmap=True, weights_only=True)
+            # the loaders below read through this handle long after the loop ends
+            self._open_parts.append(model_part)
+
+            for name in model_part.keys():
+                tensor_names_from_parts.add(name)
+                if self.is_safetensors:
+                    data_gen = lambda p=model_part, n=name: LazyTorchTensor.from_safetensors_slice(p.get_slice(n))  # noqa: E731
+                else:
+                    data_gen = lambda p=model_part, n=name: LazyTorchTensor.from_eager(p[n])  # noqa: E731
+                item = self.filter_tensors((name, data_gen))
+                if item is None:
+                    continue
+                tensors[item[0]] = item[1]
+
+        self.tensor_names = tensor_names_from_index or tensor_names_from_parts
+        if tensor_names_from_index:
+            sym_diff = tensor_names_from_parts.symmetric_difference(tensor_names_from_index)
+            if len(sym_diff) > 0:
+                raise ValueError(f"Mismatch between weight map and model parts for tensor names: {sym_diff}")
+
+        return tensors
+
     def format_tensor_name(self, key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight") -> str:
         if key not in gguf.MODEL_TENSORS[self.model_arch]:
             raise ValueError(f"Missing {key!r} for MODEL_TENSORS of {self.model_arch!r}")
@@ -5572,6 +5638,532 @@ class HYV3Model(Model):
 
 
 
+@Model.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(Model):
+    """DeepSeek-V4 (`model_type: deepseek_v4`, `DeepseekV4ForCausalLM`).
+
+    Adapted from llama.cpp `conversion/deepseek.py` (class `DeepseekV4Model`)
+    @ upstream commit 82dbc4f01 -- MIT, Copyright (c) 2023-2026 The ggml authors.
+    Originating upstream PRs: #24162 (base) and follow-ups #25202/#25370/#25521/
+    #25588/#25702/#25787.
+
+    The HF checkpoint is NOT in transformers layout: tensors are named
+    `layers.N.attn.wq_a.weight` etc., the dense weights ship as fp8 e4m3 with
+    128x128 ue8m0 block scales in a sidecar `<name>.scale`, and the routed
+    experts ship as MXFP4 nibble pairs with one ue8m0 byte per 32 values.
+
+    Two deliberate deviations from upstream, both reversible by env var:
+
+    * `PXA_DSV4_EXPERTS` (default `dequant`): the routed experts are
+      DEQUANTIZED from their MXFP4 nibbles to f32 instead of being repacked raw
+      into ggml MXFP4 blocks. Upstream's repack pins every expert at 4.25 bpw,
+      and `llama-quantize` then short-circuits on `tensor->type == new_type`,
+      so a later `--outtype PXQ2` run silently emits a 4.25-bpw file (137 GiB
+      of experts, which does not fit this box). Set `PXA_DSV4_EXPERTS=mxfp4`
+      for upstream's byte-for-byte behaviour.
+    * `PXA_DSV4_ROUTER_BF16` (default unset): the MoE router `ffn_gate_inp` is
+      written F32 rather than inheriting its BF16 source dtype (which is what
+      upstream's `tensor_force_quant` ends up doing). Every other MoE arch in
+      this tree writes an F32 router and the quantizer never touches it. Set to
+      1 to restore upstream's BF16 router.
+
+    NOT converted (conversion v0, matching upstream): the `mtp.*` tensors
+    (MTP / DSpark). Upstream PR #25784 is still open.
+    """
+
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+    _skipped_mtp_tensors = 0
+
+    # e2m1 code points, in ggml's nibble order (see kvalues_mxfp4 in
+    # ggml/src/ggml-common.h -- that table is DOUBLED, ggml pairs it with
+    # GGML_E8M0_TO_FP32_HALF; the product is identical to what we do here).
+    _MXFP4_E2M1 = np.array(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=np.float32)
+
+    def __init__(self, *args, **kwargs):
+        type(self)._skipped_mtp_tensors = 0
+        super().__init__(*args, **kwargs)
+
+        # DS4 keeps every hyperparameter at the top level of config.json; re-read
+        # it verbatim so nothing that Model.load_hparams() filtered is lost.
+        with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
+            raw_hparams = json.load(f)
+        for key, value in raw_hparams.items():
+            self.hparams.setdefault(key, value)
+
+        self.block_count = self.hparams["num_hidden_layers"]
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        mode = os.environ.get("PXA_DSV4_EXPERTS", "dequant").strip().lower()
+        if mode not in ("dequant", "mxfp4"):
+            raise ValueError(f"PXA_DSV4_EXPERTS must be 'dequant' or 'mxfp4', got {mode!r}")
+        self._expert_mode = mode
+        self._router_bf16 = os.environ.get("PXA_DSV4_ROUTER_BF16", "").strip() not in ("", "0")
+
+        if self._expert_mode == "mxfp4":
+            # the experts are written with raw_dtype=MXFP4, so the file really is
+            # an MXFP4 file whatever --outtype said. Declare it up front so the
+            # general.file_type KV and the default filename are honest.
+            logger.warning("DeepSeek-V4: PXA_DSV4_EXPERTS=mxfp4 -- routed experts are repacked, "
+                           "NOT dequantized. A later --outtype PXQ*/IQ* run will NOT be able to "
+                           "re-quantize them without --allow-requantize.")
+            self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4
+
+        self.model_tensors: dict[str, Callable[[], Tensor]] = self.index_tensors()
+
+        self._dsv4_fp8_dequantized: set[str] = set()
+        self._dsv4_bf16_tensors: set[str] = set()
+        self._dsv4_f32_tensors: set[str] = set()
+        self._dsv4_extra_names: set[str] = set()
+        self._dsv4_extra_generated = False
+
+        # ORDER IS LOAD-BEARING: the source dtypes must be recorded BEFORE
+        # dequant_model() replaces the fp8 loaders, or every tensor looks f32
+        # and tensor_force_quant() pins the whole model wrong, silently.
+        self._collect_source_dtypes()
+        self.dequant_model()
+
+        if type(self)._skipped_mtp_tensors:
+            logger.info("Skipping %d DeepSeek-V4 MTP tensor(s) for conversion v0",
+                        type(self)._skipped_mtp_tensors)
+
+        # add a default chat template; a built-in template overrides it later
+        template_path = Path(__file__).parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.jinja"
+        if template_path.is_file():
+            with open(template_path, "r", encoding="utf-8") as f:
+                self.gguf_writer.add_chat_template(f.read())
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+        if name.startswith("mtp."):
+            cls._skipped_mtp_tensors += 1
+            return None
+        return super().filter_tensors(item)
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        model_tensors = getattr(self, "model_tensors", None)
+        if model_tensors is None:
+            # Model.__init__ probes the first tensor (--outtype auto) before the
+            # index exists; fall back to the streaming reader for that one probe.
+            yield from Model.get_tensors(self)
+            return
+        for name in list(model_tensors.keys()):
+            yield name, model_tensors[name]()
+
+    @staticmethod
+    def _float8_dtypes() -> tuple[torch.dtype, ...]:
+        return tuple(
+            dtype for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e5m2", None),
+            ) if dtype is not None
+        )
+
+    @staticmethod
+    def _e8m0_to_float(scale: Tensor) -> Tensor:
+        torch_float8_e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if torch_float8_e8m0 is not None and scale.dtype == torch_float8_e8m0:
+            return scale.float()
+
+        bits = scale.view(torch.uint8).float()
+        return torch.exp2(bits - 127.0)
+
+    def _collect_source_dtypes(self) -> None:
+        for name, gen in self.model_tensors.items():
+            dtype = gen().dtype
+            if dtype == torch.bfloat16:
+                self._dsv4_bf16_tensors.add(name)
+            elif dtype == torch.float32:
+                self._dsv4_f32_tensors.add(name)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+
+        self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
+        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
+        self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
+        self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
+
+        score_func = hparams.get("scoring_func")
+        if score_func != "sqrtsoftplus":
+            raise ValueError(f"DeepSeek-V4 expects scoring_func == 'sqrtsoftplus', got {score_func!r}")
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRTSOFTPLUS)
+
+        self.gguf_writer.add_swiglu_clamp_exp([hparams["swiglu_limit"]] * self.block_count)
+        self.gguf_writer.add_swiglu_clamp_shexp([hparams["swiglu_limit"]] * self.block_count)
+
+        self.gguf_writer.add_indexer_head_count(hparams["index_n_heads"])
+        self.gguf_writer.add_indexer_key_length(hparams["index_head_dim"])
+        self.gguf_writer.add_indexer_top_k(hparams["index_topk"])
+
+        self.gguf_writer.add_attention_output_group_count(hparams["o_groups"])
+        self.gguf_writer.add_attention_output_lora_rank(hparams["o_lora_rank"])
+
+        compress_ratios = list(hparams["compress_ratios"])
+        # The real 0731 checkpoint ships 46 entries for 43 layers: indices
+        # 43..45 belong to the (dropped) mtp.0..2 blocks. Written verbatim,
+        # exactly as upstream does -- the loader must index by layer, not
+        # assume len() == n_layer.
+        if len(compress_ratios) != self.block_count:
+            logger.info("DeepSeek-V4: compress_ratios has %d entries for %d layers "
+                        "(the tail belongs to the MTP blocks); writing it verbatim",
+                        len(compress_ratios), self.block_count)
+        for ratio in compress_ratios:
+            if ratio not in (0, 4, 128):
+                raise ValueError(f"Unsupported DeepSeek-V4 compress ratio {ratio!r} "
+                                 f"(expected one of 0 / 4 / 128)")
+        self.gguf_writer.add_attention_compress_ratios(compress_ratios)
+        self.gguf_writer.add_attention_compress_rope_freq_base(hparams["compress_rope_theta"])
+
+        self.gguf_writer.add_hyper_connection_count(hparams["hc_mult"])
+        self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
+        self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
+        self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
+
+        # RoPE scaling. Upstream's shared base writes this; ours does not, so the
+        # DS4 class has to. Without it a >65536 context ropes wrong, silently.
+        rope_scaling = hparams.get("rope_scaling") or {}
+        if rope_scaling.get("type") == "yarn" and "factor" in rope_scaling:
+            self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+            self.gguf_writer.add_rope_scaling_factor(rope_scaling["factor"])
+            self.gguf_writer.add_rope_scaling_orig_ctx_len(rope_scaling["original_max_position_embeddings"])
+            if (beta_fast := rope_scaling.get("beta_fast")) is not None:
+                self.gguf_writer.add_rope_scaling_yarn_beta_fast(beta_fast)
+            if (beta_slow := rope_scaling.get("beta_slow")) is not None:
+                self.gguf_writer.add_rope_scaling_yarn_beta_slow(beta_slow)
+            if (mscale_all_dim := rope_scaling.get("mscale_all_dim")) is not None:
+                self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * mscale_all_dim)
+
+    def dequant_model(self):
+        """fp8 e4m3 weight * ue8m0 128x128 block scale -> f32.
+
+        NOTE this is DS4's own convention, NOT DeepSeek-V3's: the sidecar is
+        `<weight>.scale` (not `_scale_inv`), it is raw ue8m0, the block size is
+        hardcoded 128x128, and the operation is a MULTIPLY.
+        """
+        fp8_dtypes = self._float8_dtypes()
+        tensors_to_remove: list[str] = []
+
+        def dequant_fp8_weight(weight: Tensor, scale: Tensor) -> Tensor:
+            out_features, in_features = weight.shape
+            scale_f = self._e8m0_to_float(scale)
+            scale_f = scale_f.repeat_interleave(128, 0)[:out_features]
+            scale_f = scale_f.repeat_interleave(128, 1)[:, :in_features]
+            return weight.float() * scale_f
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".scale"):
+                continue
+            weight_name = name.removesuffix(".scale") + ".weight"
+            if weight_name not in self.model_tensors:
+                continue
+
+            weight = self.model_tensors[weight_name]
+            scale = self.model_tensors[name]
+            if weight().dtype not in fp8_dtypes:
+                # the routed experts are MXFP4 (int8 nibble pairs), not fp8 --
+                # their scale is consumed by the expert path, keep it.
+                continue
+
+            self.model_tensors[weight_name] = lambda w=weight, s=scale: dequant_fp8_weight(w(), s())
+            self._dsv4_fp8_dequantized.add(weight_name)
+            tensors_to_remove.append(name)
+
+        for name in tensors_to_remove:
+            del self.model_tensors[name]
+
+        logger.info("DeepSeek-V4: %d fp8 tensor(s) will be dequantized with ue8m0 128x128 block scales",
+                    len(self._dsv4_fp8_dequantized))
+
+    # ---------------------------------------------------------------- experts
+    @staticmethod
+    def _pack_mxfp4_blocks(weight: Tensor, scale: Tensor) -> np.ndarray:
+        """Upstream's raw repack into the ggml MXFP4 block layout (17 B / 32 values).
+
+        Only used when PXA_DSV4_EXPERTS=mxfp4. Verbatim from upstream.
+        """
+        packed = weight.contiguous().view(torch.uint8)
+        scale_u8 = scale.contiguous().view(torch.uint8)
+
+        out_features, packed_cols = packed.shape
+        logical_cols = packed_cols * 2
+        if logical_cols % 32 != 0:
+            raise ValueError(f"MXFP4 source row has {logical_cols} values, expected a multiple of 32")
+
+        n_blocks = logical_cols // 32
+        if tuple(scale_u8.shape) != (out_features, n_blocks):
+            raise ValueError(f"MXFP4 scale shape {tuple(scale_u8.shape)} does not match {(out_features, n_blocks)}")
+
+        src = packed.reshape(out_features, n_blocks, 16)
+        low = src & 0x0F
+        high = (src >> 4) & 0x0F
+
+        # The safetensors bytes store adjacent values as low/high nibbles.
+        # ggml MXFP4 blocks store values 0..15 in low nibbles and 16..31 in high nibbles.
+        vals = torch.stack((low, high), dim=-1).reshape(out_features, n_blocks, 32)
+        qs = vals[:, :, :16] | (vals[:, :, 16:] << 4)
+        raw = torch.cat((scale_u8.unsqueeze(-1), qs.to(torch.uint8)), dim=-1)
+        return raw.reshape(out_features, n_blocks * 17).cpu().numpy()
+
+    @classmethod
+    def _unpack_mxfp4_blocks(cls, weight: Tensor, scale: Tensor) -> np.ndarray:
+        """MXFP4 nibbles + ue8m0 block scales -> f32, bit-for-bit what ggml's own
+        dequantize_row_mxfp4() produces: e2m1[nibble] * 2**(scale_byte - 127)."""
+        packed = weight.contiguous().view(torch.uint8).cpu().numpy()
+        scale_u8 = scale.contiguous().view(torch.uint8).cpu().numpy()
+
+        out_features, packed_cols = packed.shape
+        logical_cols = packed_cols * 2
+        if logical_cols % 32 != 0:
+            raise ValueError(f"MXFP4 source row has {logical_cols} values, expected a multiple of 32")
+
+        n_blocks = logical_cols // 32
+        if tuple(scale_u8.shape) != (out_features, n_blocks):
+            raise ValueError(f"MXFP4 scale shape {tuple(scale_u8.shape)} does not match {(out_features, n_blocks)}")
+
+        # adjacent logical values are the low/high nibble of one source byte
+        vals = np.empty((out_features, logical_cols), dtype=np.uint8)
+        vals[:, 0::2] = packed & 0x0F
+        vals[:, 1::2] = packed >> 4
+
+        out = cls._MXFP4_E2M1[vals]
+        out *= np.repeat(np.exp2(scale_u8.astype(np.float32) - 127.0), 32, axis=1)
+        return out
+
+    def _expert_source_names(self, bid: int, proj: str) -> list[tuple[str, str]]:
+        n_experts = self.hparams["n_routed_experts"]
+        names: list[tuple[str, str]] = []
+        for eid in range(n_experts):
+            weight_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.weight"
+            scale_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.scale"
+            if weight_name not in self.model_tensors or scale_name not in self.model_tensors:
+                raise KeyError(f"Missing routed expert tensors for {weight_name}")
+            names.append((weight_name, scale_name))
+        return names
+
+    def _write_mxfp4_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
+        """Upstream path (PXA_DSV4_EXPERTS=mxfp4): repack, write raw MXFP4."""
+        data: np.ndarray | None = None
+        consumed: list[str] = []
+
+        for eid, (weight_name, scale_name) in enumerate(self._expert_source_names(bid, proj)):
+            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
+            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+            packed = self._pack_mxfp4_blocks(weight, scale)
+            if data is None:
+                data = np.empty((self.hparams["n_routed_experts"], *packed.shape), dtype=packed.dtype)
+            data[eid] = packed
+            consumed.extend((weight_name, scale_name))
+
+        assert data is not None
+        new_name = self.format_tensor_name(tensor_key, bid)
+        shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
+        logger.info(f"{new_name}: repacked routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
+        self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+
+        return consumed
+
+    def _dequant_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> tuple[str, Tensor, list[str]]:
+        """PXA path (default): unpack the MXFP4 experts to a stacked f32 tensor and
+        let the normal --outtype machinery own it, so `llama-quantize` sees a real
+        high-precision source instead of a 4.25-bpw one it will refuse to touch."""
+        n_experts = self.hparams["n_routed_experts"]
+        names = self._expert_source_names(bid, proj)
+        gens = [(self.model_tensors[w], self.model_tensors[s]) for w, s in names]
+        consumed = [n for pair in names for n in pair]
+
+        probe = self.model_tensors[names[0][0]]()
+        rows, packed_cols = int(probe.shape[0]), int(probe.shape[1])
+        shape = (n_experts, rows, packed_cols * 2)
+
+        unpack = self._unpack_mxfp4_blocks
+
+        def build(pairs: list[tuple[Callable[[], Tensor], Callable[[], Tensor]]]) -> Tensor:
+            out = np.empty(shape, dtype=np.float32)
+            for i, (wgen, sgen) in enumerate(pairs):
+                w = LazyTorchTensor.to_eager(wgen())
+                s = LazyTorchTensor.to_eager(sgen())
+                out[i] = unpack(w, s)
+                del w, s
+            return torch.from_numpy(out)
+
+        lazy = LazyTorchTensor(
+            meta=LazyTorchTensor.meta_with_dtype_and_shape(torch.float32, shape),
+            args=(gens,),
+            func=build,
+        )
+        return self.format_tensor_name(tensor_key, bid), cast("Tensor", lazy), consumed
+
+    def _write_hash_routing_tensors(self) -> list[str]:
+        consumed: list[str] = []
+
+        for bid in range(self.hparams["num_hash_layers"]):
+            name = f"layers.{bid}.ffn.gate.tid2eid"
+            if name not in self.model_tensors:
+                raise KeyError(f"Missing hash routing tensor {name}")
+
+            data_torch = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            data = data_torch.to(torch.int32).cpu().numpy()
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_TID2EID, bid, ".weight")
+            logger.info(f"{new_name}: converted hash routing table to I32, shape = {{{', '.join(str(n) for n in reversed(data.shape))}}}")
+            self.gguf_writer.add_tensor(new_name, data)
+            consumed.append(name)
+
+        return consumed
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        if self._dsv4_extra_generated:
+            return ()
+        self._dsv4_extra_generated = True
+
+        consumed: list[str] = self._write_hash_routing_tensors()
+        extra: list[tuple[str, Tensor]] = []
+
+        # w1 -> FFN_GATE_EXP, w2 -> FFN_DOWN_EXP, w3 -> FFN_UP_EXP.
+        # (upstream's _map_dsv4_tensor_name() answers FFN_GATE_EXP for all three;
+        #  that branch is FILTER-ONLY and copying it here would silently corrupt
+        #  every MoE layer.)
+        for bid in range(self.block_count):
+            for proj, tensor_key in (("w1", gguf.MODEL_TENSOR.FFN_GATE_EXP),
+                                     ("w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP),
+                                     ("w3", gguf.MODEL_TENSOR.FFN_UP_EXP)):
+                if self._expert_mode == "mxfp4":
+                    consumed.extend(self._write_mxfp4_expert_tensor(bid, proj, tensor_key))
+                else:
+                    new_name, tensor, used = self._dequant_expert_tensor(bid, proj, tensor_key)
+                    self._dsv4_extra_names.add(new_name)
+                    extra.append((new_name, tensor))
+                    consumed.extend(used)
+
+        for name in consumed:
+            del self.model_tensors[name]
+
+        return extra
+
+    def _format_dsv4_tensor_name(self, key: gguf.MODEL_TENSOR, bid: int | None, suffix: str = ".weight") -> str:
+        return self.format_tensor_name(key, bid, suffix)
+
+    def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_TENSOR, str]:
+        root_map: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
+            "embed.weight": (gguf.MODEL_TENSOR.TOKEN_EMBD, ".weight"),
+            "norm.weight": (gguf.MODEL_TENSOR.OUTPUT_NORM, ".weight"),
+            "head.weight": (gguf.MODEL_TENSOR.OUTPUT, ".weight"),
+            "hc_head_fn": (gguf.MODEL_TENSOR.HC_HEAD_FN, ".weight"),
+            "hc_head_base": (gguf.MODEL_TENSOR.HC_HEAD_BASE, ".weight"),
+            "hc_head_scale": (gguf.MODEL_TENSOR.HC_HEAD_SCALE, ".weight"),
+        }
+        if name in root_map:
+            return root_map[name]
+
+        match = re.match(r"layers\.(\d+)\.(.+)$", name)
+        if match is None:
+            raise ValueError(f"Unsupported DeepSeek-V4 tensor {name!r}")
+
+        layer = int(match.group(1))
+        if bid != layer:
+            raise ValueError(f"Tensor {name!r} parsed bid {bid} but layer name has {layer}")
+
+        layer_map: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
+            "hc_attn_fn": (gguf.MODEL_TENSOR.HC_ATTN_FN, ".weight"),
+            "hc_attn_base": (gguf.MODEL_TENSOR.HC_ATTN_BASE, ".weight"),
+            "hc_attn_scale": (gguf.MODEL_TENSOR.HC_ATTN_SCALE, ".weight"),
+            "hc_ffn_fn": (gguf.MODEL_TENSOR.HC_FFN_FN, ".weight"),
+            "hc_ffn_base": (gguf.MODEL_TENSOR.HC_FFN_BASE, ".weight"),
+            "hc_ffn_scale": (gguf.MODEL_TENSOR.HC_FFN_SCALE, ".weight"),
+            "attn.attn_sink": (gguf.MODEL_TENSOR.ATTN_SINKS, ".weight"),
+            "attn.wq_a.weight": (gguf.MODEL_TENSOR.ATTN_Q_A, ".weight"),
+            "attn.wq_b.weight": (gguf.MODEL_TENSOR.ATTN_Q_B, ".weight"),
+            "attn.q_norm.weight": (gguf.MODEL_TENSOR.ATTN_Q_A_NORM, ".weight"),
+            "attn.wkv.weight": (gguf.MODEL_TENSOR.ATTN_KV, ".weight"),
+            "attn.kv_norm.weight": (gguf.MODEL_TENSOR.ATTN_KV_NORM, ".weight"),
+            "attn.wo_a.weight": (gguf.MODEL_TENSOR.ATTN_OUT_A, ".weight"),
+            "attn.wo_b.weight": (gguf.MODEL_TENSOR.ATTN_OUT_B, ".weight"),
+            "attn.compressor.ape": (gguf.MODEL_TENSOR.ATTN_COMPRESSOR_APE, ".weight"),
+            "attn.compressor.wkv.weight": (gguf.MODEL_TENSOR.ATTN_COMPRESSOR_WKV, ".weight"),
+            "attn.compressor.wgate.weight": (gguf.MODEL_TENSOR.ATTN_COMPRESSOR_WGATE, ".weight"),
+            "attn.compressor.norm.weight": (gguf.MODEL_TENSOR.ATTN_COMPRESSOR_NORM, ".weight"),
+            "attn.indexer.wq_b.weight": (gguf.MODEL_TENSOR.INDEXER_ATTN_Q_B, ".weight"),
+            "attn.indexer.weights_proj.weight": (gguf.MODEL_TENSOR.INDEXER_PROJ, ".weight"),
+            "attn.indexer.compressor.ape": (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_APE, ".weight"),
+            "attn.indexer.compressor.wkv.weight": (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_WKV, ".weight"),
+            "attn.indexer.compressor.wgate.weight": (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE, ".weight"),
+            "attn.indexer.compressor.norm.weight": (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_NORM, ".weight"),
+            "attn_norm.weight": (gguf.MODEL_TENSOR.ATTN_NORM, ".weight"),
+            "ffn_norm.weight": (gguf.MODEL_TENSOR.FFN_NORM, ".weight"),
+            "ffn.gate.weight": (gguf.MODEL_TENSOR.FFN_GATE_INP, ".weight"),
+            "ffn.gate.bias": (gguf.MODEL_TENSOR.FFN_EXP_PROBS_B, ".bias"),
+            "ffn.gate.tid2eid": (gguf.MODEL_TENSOR.FFN_GATE_TID2EID, ".weight"),
+            "ffn.shared_experts.w1.weight": (gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight"),
+            "ffn.shared_experts.w2.weight": (gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight"),
+            "ffn.shared_experts.w3.weight": (gguf.MODEL_TENSOR.FFN_UP_SHEXP, ".weight"),
+        }
+
+        tensor_name = match.group(2)
+        if tensor_name in layer_map:
+            return layer_map[tensor_name]
+
+        raise ValueError(f"Unsupported DeepSeek-V4 tensor {name!r}")
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # tensors emitted by generate_extra_tensors() are already GGUF-named
+        if name in self._dsv4_extra_names:
+            return [(name, data_torch)]
+
+        # routed experts are handled wholesale by generate_extra_tensors()
+        if re.match(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$", name):
+            return []
+
+        tensor_key, suffix = self._map_dsv4_tensor_name(name, bid)
+        if tensor_key == gguf.MODEL_TENSOR.FFN_GATE_TID2EID:
+            return []
+
+        new_name = self._format_dsv4_tensor_name(tensor_key, bid, suffix)
+
+        # prepare_tensors() does `d.squeeze().numpy()`, which turns a 1-ELEMENT
+        # tensor into a 0-d array and would emit a GGUF tensor with n_dims == 0
+        # (ggml requires >= 1). DS4 has exactly one such tensor, `hc_head_scale`
+        # with shape [1]. Upstream dropped the squeeze from its own loop; we do
+        # not own that shared code, so write these directly with an explicit 1-D
+        # shape instead. F32: it is one scalar per model.
+        if math.prod(tuple(data_torch.shape)) == 1:
+            arr = LazyTorchTensor.to_eager(data_torch).reshape(1).float().cpu().numpy()
+            logger.info(f"{new_name}: 1-element tensor written directly as F32 [1]")
+            self.gguf_writer.add_tensor(new_name, arr)
+            return []
+
+        return [(new_name, data_torch)]
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        del bid  # unused
+
+        # PXA deviation (see the class docstring): keep the MoE router F32.
+        if not self._router_bf16 and new_name.endswith("ffn_gate_inp.weight"):
+            return gguf.GGMLQuantizationType.F32
+
+        if name in self._dsv4_fp8_dequantized and n_dims >= 2:
+            return gguf.GGMLQuantizationType.Q8_0
+        if name in self._dsv4_f32_tensors:
+            return gguf.GGMLQuantizationType.F32
+        if name in self._dsv4_bf16_tensors and n_dims >= 2:
+            return gguf.GGMLQuantizationType.BF16
+
+        if self._expert_mode == "mxfp4":
+            # self.ftype is MOSTLY_MXFP4 in that mode and the base ftype ladder
+            # cannot resolve it; every non-expert tensor must be pinned here.
+            return gguf.GGMLQuantizationType.BF16 if n_dims >= 2 else gguf.GGMLQuantizationType.F32
+
+        return False
+
+
 ###### CONVERSION LOGIC ######
 
 
@@ -5607,6 +6199,10 @@ class LazyTorchTensor(gguf.LazyBase):
         "BOOL": torch.bool,
         "F8_E4M3": torch.float8_e4m3fn,
         "F8_E5M2": torch.float8_e5m2,
+        # DeepSeek-V4 ships ue8m0 block scales next to its fp8 e4m3 weights.
+        # torch.float8_e8m0fnu exists from torch 2.7; older torch reads the raw
+        # bytes instead (DeepseekV4Model._e8m0_to_float handles both).
+        "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
     }
 
     def numpy(self) -> gguf.LazyNumpyTensor:

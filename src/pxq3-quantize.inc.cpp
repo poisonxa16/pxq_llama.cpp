@@ -374,6 +374,7 @@ static void pxq3_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
         return pxq_imatrix_column_usable(w, K) ? w : nullptr;
     };
     (void)pxq3_book_q(); (void)pxq3_sub_q(); (void)pxq3_mids_q();   // init tables before threading
+    pxq_ceiling_check("PXQ3", pxq3_book_q(), 8, pxq3_sub_q(), 16);  // refuse structurally-clipping tables
     // P15 (2026-07-27): thread over (expert, panel-chunk) jobs, not experts alone. A DENSE
     // tensor (E == 1) previously fell into the serial branch and ran its whole R x K on ONE
     // thread (measured: 103% CPU at -t 32 quantizing the dense 27B, ~9.7 s/tensor). Panels

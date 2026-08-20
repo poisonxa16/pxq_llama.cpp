@@ -113,6 +113,17 @@ static const char * cu_get_error_str(CUresult err) {
 #define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
 #endif
 
+// Ported from upstream llama.cpp ggml/src/ggml-cuda/common.cuh:111 (MIT).
+// Gates the CUB-backed argsort path in argsort.cu, which is what lets
+// ggml_argsort()/ggml_top_k() handle more than 1024 columns (the bitonic
+// shared-memory kernel is capped by the 1024-thread CUDA block limit).
+// CUB DeviceSegmentedRadixSort/DeviceSegmentedSort have no compute-capability
+// floor, so this is valid on sm_60/sm_61/sm_70.
+// (upstream spells the HIP guard GGML_USE_HIP; this tree uses GGML_USE_HIPBLAS)
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#    define GGML_CUDA_USE_CUB
+#endif // !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+
 #if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \

@@ -85,6 +85,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA4_MTP,      "gemma4_mtp"   },
     { LLM_ARCH_HY_V3,           "hy_v3"        },
     { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
+    { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -160,6 +161,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MTP_USE_ORDERED_EMBEDDINGS,        "%s.use_ordered_embeddings"            },
     { LLM_KV_MTP_CENTROID_COUNT,                "%s.centroid_count"                    },
     { LLM_KV_MTP_CENTROID_TOP_K,                "%s.centroid_top_k"                    },
+    { LLM_KV_HYPER_CONNECTION_COUNT,               "%s.hyper_connection.count"               },
+    { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, "%s.hyper_connection.sinkhorn_iterations" },
+    { LLM_KV_HYPER_CONNECTION_EPSILON,             "%s.hyper_connection.epsilon"             },
+    { LLM_KV_HASH_LAYER_COUNT,                     "%s.hash_layer_count"                     },
 
     { LLM_KV_ATTENTION_HEAD_COUNT,             "%s.attention.head_count"             },
     { LLM_KV_ATTENTION_HEAD_COUNT_KV,          "%s.attention.head_count_kv"          },
@@ -189,6 +194,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_KEY_LENGTH_SWA,         "%s.attention.key_length_swa"         },
     { LLM_KV_ATTENTION_VALUE_LENGTH_SWA,       "%s.attention.value_length_swa"       },
     { LLM_KV_ATTENTION_VALUE_SCALE,            "%s.attention.value_scale"            },
+    { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,        "%s.attention.output_group_count"        },
+    { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,          "%s.attention.output_lora_rank"          },
+    { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,   "%s.attention.compress_rope_freq_base"   },
+    { LLM_KV_ATTENTION_COMPRESS_RATIOS,           "%s.attention.compress_ratios"           },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,          "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,      "%s.rope.dimension_count_swa"             },

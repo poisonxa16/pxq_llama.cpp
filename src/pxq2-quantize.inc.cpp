@@ -5,7 +5,8 @@
 // compiled standalone by pxa-bench/pxqu_ref.cpp (the correctness / wrel-reproduction tool).
 //
 // FORMAT (frozen):
-//   values : 2-bit codes into the frozen LM4 book (4 entries, NO zero entry, absmax != 1)
+//   values : 2-bit codes into the LM4 book (4 entries; absmax 1.0 since 2026-08-02 — see
+//            ggml-pxq2-tables.h HISTORY for the absmax-0.706 book this replaced and why)
 //   scales : per-ROW fp16 anchor (64 anchors = 128 B header at the head of each 64-row panel)
 //            x one 4-bit sub-scale per 16-elem block through the frozen PXQ6 SUB16 table
 //            (two nibbles pack into the one scale byte per 32 elems -> slab scale SoA = 64 B,
@@ -31,6 +32,11 @@
 // GATES (Q-G1/Q-G2): byte-parity vs the numpy reference;
 // wrel on the frozen 36-slice rng-42 protocol reproduces the lab number (0.3020488) per
 // pxa-bench/pxqu_wrel.py (±1e-4, snapped-SUB16-adjusted oracle).
+// GATES (Q-G1/Q-G2, see PXQ-UNIVERSAL-2026-07-17.md B1): byte-parity vs the numpy reference;
+// wrel on the frozen 36-slice rng-42 protocol reproduced the lab number (0.3020488) per
+// pxa-bench/pxqu_wrel.py (±1e-4, snapped-SUB16-adjusted oracle). ⚠ That lab number belongs
+// to the RETIRED absmax-0.706 book; rerunning the wrel gate against the current book needs
+// the oracle refit (or PXA_PXQ2_BOOK set to the old book for a pure parity check).
 //
 // Env:
 //   PXA_PXQ2_ANCHOR_FIT=1  widen the row-anchor search (5 fp16 candidates around absmax,
@@ -230,6 +236,46 @@ static inline const float * pxq2_sub_q() {
     return sub;
 }
 
+#ifndef PXQ_CEILING_CHECK_DEFINED
+#define PXQ_CEILING_CHECK_DEFINED
+// Reconstruction-ceiling invariant (2026-08-02). The two-level scale composition
+//     w = anchor * SUB16[s4] * book[c],   anchor == row absmax
+// can only reach  max(SUB16) * max|book|  of the row's own maximum. A ceiling
+// materially below 1.0 structurally clips every row's peak weights — the defect that
+// made PXQ2-as-built degenerate on DS4-Flash while PASSING its global-wrel gate
+// (ceiling 0.6970: 18.8% of squared error in the top-1% weights, output "dekameters").
+// A tier that cannot represent its own row maxima must fail HERE, at build time,
+// not after an 83 GB quantize.  PXA_PXQ_CEILING_ACCEPT=1 downgrades to a warning
+// (deliberate experiments only).
+static void pxq_ceiling_check(const char * tier, const float * book, int nbook,
+                              const float * sub, int nsub) {
+    float bmax = 0.f, smax = 0.f;
+    for (int i = 0; i < nbook; ++i) { float a = fabsf(book[i]); if (a > bmax) bmax = a; }
+    for (int i = 0; i < nsub;  ++i) { float a = fabsf(sub[i]);  if (a > smax) smax = a; }
+    const float ceiling = bmax * smax;
+    if (ceiling >= 0.95f) {
+        return;
+    }
+    if (ceiling >= 0.80f) {
+        fprintf(stderr,
+            "%s: WARNING: reconstruction ceiling %.4f x row absmax (max|book| %.5f x max(SUB16) %.5f "
+            "< 0.95) — row-peak weights are mildly clipped; expect elevated top-1%% error\n",
+            tier, ceiling, bmax, smax);
+        return;
+    }
+    fprintf(stderr,
+        "%s: FATAL: reconstruction ceiling %.4f x row absmax (max|book| %.5f x max(SUB16) %.5f). "
+        "The book/SUB16 composition cannot reach the row anchor: every row's peak weights would be "
+        "clipped by %.0f%%. This produced a degenerate model once (PXQ2 + the absmax-0.706 book) "
+        "and is refused at build time. Refit the book with absmax ~1.0 (or SUB16 for the book's "
+        "range); PXA_PXQ_CEILING_ACCEPT=1 overrides deliberately.\n",
+        tier, ceiling, bmax, smax, 100.f*(1.f - ceiling));
+    if (!getenv("PXA_PXQ_CEILING_ACCEPT")) {
+        exit(EXIT_FAILURE);
+    }
+}
+#endif
+
 static inline const double * pxq2_mids_q() {
     static double mids[3];
     static bool init = false;
@@ -409,6 +455,7 @@ static void pxq2_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
         return pxq_imatrix_column_usable(w, K) ? w : nullptr;
     };
     (void)pxq2_book_q(); (void)pxq2_sub_q(); (void)pxq2_mids_q();   // init tables before threading
+    pxq_ceiling_check("PXQ2", pxq2_book_q(), 4, pxq2_sub_q(), 16);  // refuse structurally-clipping tables
     // P15 (2026-07-27): thread over (expert, panel-chunk) jobs, not experts alone. A DENSE
     // tensor (E == 1) previously fell into the serial branch and ran its whole R x K on ONE
     // thread (measured: 103% CPU at -t 32 quantizing the dense 27B, ~9.7 s/tensor). Panels

@@ -4465,9 +4465,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FAKE_CPY",
     "FUSED_NORM",
     "FUSED_RMS_RMS_ADD",
+
+    "DSV4_HC_SPLIT_SINKHORN",
+    "DSV4_HC_WEIGHTED_SUM",
+    "DSV4_HC_EXPAND",
+
+    "MASK_TO_IDX",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4586,9 +4592,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "norm(x,y)",
     "rms(x1)+rms(x2)",
 
+    "dsv4_hc_split_sinkhorn(x)",
+    "dsv4_hc_weighted_sum(x,w)",
+    "dsv4_hc_expand(x,r,p,c)",
+
+    "mask_to_idx(m)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -9418,7 +9429,12 @@ static struct ggml_tensor * ggml_rope_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    // PXA_ROPE_FLIPPED_v1: op_params[15] is the "flipped" flag (rotate the
+    // TRAILING n_dims channels instead of the leading ones). It is written
+    // after construction by the caller, so zero it here explicitly rather than
+    // relying on ggml_new_tensor_impl's { 0 } initialiser - a stale 1 would
+    // silently rotate the wrong half of every rope in the graph.
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
@@ -9430,6 +9446,7 @@ static struct ggml_tensor * ggml_rope_impl(
     } else {
         memset(params + 11, 0,         sizeof(int32_t) * GGML_MROPE_SECTIONS);
     }
+    params[15] = 0; // GGML_ROPE_FLIPPED_PARAM
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ROPE;
@@ -9613,13 +9630,19 @@ struct ggml_tensor * ggml_rope_back(
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 
-    int32_t params[11] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    // params[11..14] are the mrope sections, params[15] is the flipped flag
+    // (PXA_ROPE_FLIPPED_v1). Both are read unconditionally by the forward
+    // implementations, so write them explicitly instead of leaning on the
+    // tensor allocator's zero-init.
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
     memcpy(params +  8, &attn_factor,  sizeof(float));
     memcpy(params +  9, &beta_fast,    sizeof(float));
     memcpy(params + 10, &beta_slow,    sizeof(float));
+    memset(params + 11, 0,             sizeof(int32_t) * GGML_MROPE_SECTIONS);
+    params[15] = 0; // GGML_ROPE_FLIPPED_PARAM
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op   = GGML_OP_ROPE_BACK;
@@ -10252,6 +10275,123 @@ struct ggml_tensor * ggml_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
     result->src[6] = saved_steps;
+
+    return result;
+}
+
+// DeepSeek-V4 fused hyper-connection ops.
+// Transcribed from upstream llama.cpp ggml/src/ggml.c @ 44c7b01de.
+
+struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        int                   n_hc,
+        int                   sinkhorn_iters,
+        float                 eps) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(mixes));
+    GGML_ASSERT(ggml_is_contiguous(scale));
+    GGML_ASSERT(ggml_is_contiguous(base));
+
+    GGML_ASSERT(n_hc > 0);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(mixes->ne[0] == (2 + n_hc) * n_hc);
+    GGML_ASSERT(mixes->ne[2] == 1);
+    GGML_ASSERT(mixes->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(scale) >= 3);
+    GGML_ASSERT(ggml_nelements(base)  >= mixes->ne[0]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, mixes);
+
+    ggml_set_op_params_i32(result, 0, n_hc);
+    ggml_set_op_params_i32(result, 1, sinkhorn_iters);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_DSV4_HC_SPLIT_SINKHORN;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(x->ne[1] == weights->ne[0]);
+    GGML_ASSERT(x->ne[2] == weights->ne[1]);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2]);
+
+    result->op     = GGML_OP_DSV4_HC_WEIGHTED_SUM;
+    result->src[0] = x;
+    result->src[1] = weights;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(post->type      == GGML_TYPE_F32);
+    GGML_ASSERT(comb->type      == GGML_TYPE_F32);
+
+    GGML_ASSERT(block_out->ne[0] == residual->ne[0]);
+    GGML_ASSERT(block_out->ne[1] == residual->ne[2]);
+    GGML_ASSERT(block_out->ne[2] == 1);
+    GGML_ASSERT(block_out->ne[3] == 1);
+    GGML_ASSERT(post->ne[0] == residual->ne[1]);
+    GGML_ASSERT(post->ne[1] == residual->ne[2]);
+    GGML_ASSERT(post->ne[2] == 1);
+    GGML_ASSERT(post->ne[3] == 1);
+    GGML_ASSERT(comb->ne[0] == residual->ne[1]);
+    GGML_ASSERT(comb->ne[1] == residual->ne[1]);
+    GGML_ASSERT(comb->ne[2] == residual->ne[2]);
+    GGML_ASSERT(comb->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, residual);
+
+    result->op     = GGML_OP_DSV4_HC_EXPAND;
+    result->src[0] = block_out;
+    result->src[1] = residual;
+    result->src[2] = post;
+    result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_mask_to_index
+
+struct ggml_tensor * ggml_mask_to_index(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        int64_t               max_row_size) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(max_row_size > 0);
+
+    const int64_t ne0 = MIN(mask->ne[0], max_row_size);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne0, mask->ne[1], mask->ne[2], mask->ne[3]);
+
+    result->op     = GGML_OP_MASK_TO_IDX;
+    result->src[0] = mask;
 
     return result;
 }
@@ -20319,6 +20459,23 @@ static void ggml_compute_forward_rope_f32(
     // this essentially just switches the sign of sin.
     const float sin_sign = forward ? 1.0f : -1.0f;
 
+    // PXA_ROPE_FLIPPED_v1: rotate the TRAILING n_dims channels of each row and
+    // leave the leading (ne0 - n_dims) alone. Partial-RoPE architectures store
+    // rows as [nope | pe], so the flipped form removes the view/rope/concat
+    // triple: the row is roped in place and the nope half never moves.
+    //
+    // Deliberately stricter than upstream, which silently ignores the flag for
+    // mrope/vision: those layouts address the tail channels themselves, so a
+    // flipped request there is a caller bug and must be loud, not silent.
+    const bool is_flipped = dst->op_params[15] != 0;
+    GGML_ASSERT(!(is_flipped && (is_mrope || is_vision)) &&
+            "flipped RoPE is not defined for mrope/vision layouts");
+    const int64_t rope_offset = is_flipped ? ne0 - n_dims : 0;
+
+    // an in-place node shares src0's buffer, so the channels this op does not
+    // rotate are already in place and the passthrough copy below is a no-op.
+    const bool is_inplace = src0->data == dst->data;
+
     const int32_t * pos = (const int32_t *) src1->data;
 
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
@@ -20362,7 +20519,9 @@ static void ggml_compute_forward_rope_f32(
                         }
                     } else {
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
-                            const int64_t ic = i0/2;
+                            // rope_offset is 0 unless flipped; when flipped the
+                            // pair (ic, ic + n_dims/2) slides into the tail.
+                            const int64_t ic = i0/2 + rope_offset;
 
                             const float cos_theta = cache[i0 + 0];
                             const float sin_theta = cache[i0 + 1];
@@ -20379,11 +20538,13 @@ static void ggml_compute_forward_rope_f32(
                     }
                 } else {
                     for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+                        const int64_t ic = i0 + rope_offset;
+
                         const float cos_theta = cache[i0 + 0];
                         const float sin_theta = cache[i0 + 1];
 
-                        const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-                              float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
+                        const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
+                              float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + ic*nb0);
 
                         const float x0 = src[0];
                         const float x1 = src[1];
@@ -20391,6 +20552,16 @@ static void ggml_compute_forward_rope_f32(
                         dst_data[0] = x0*cos_theta - x1*sin_theta;
                         dst_data[1] = x0*sin_theta + x1*cos_theta;
                     }
+                }
+
+                if (is_flipped && is_inplace) {
+                    // nothing else to copy: dst IS src0.
+                    // Deliberately NOT applied to non-flipped in-place ropes -
+                    // the K-shift path (llama-build-context.cpp) uses those on
+                    // every arch with context shift, and leaving that case
+                    // exactly as it was keeps this port structurally inert
+                    // outside DeepSeek-V4 rather than inert-by-argument.
+                    continue;
                 }
 
                 if (is_vision) {
@@ -20410,8 +20581,12 @@ static void ggml_compute_forward_rope_f32(
                         dst_data[n_dims] = x0*sin_theta + x1*cos_theta;
                     }
                 } else {
-                    // fill the remain channels with data from src tensor
-                    for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
+                    // fill the remain channels with data from src tensor.
+                    // flipped ropes rotate [rope_offset, ne0) so the untouched
+                    // channels are the LEADING [0, rope_offset) instead.
+                    const int64_t pass0 = is_flipped ? 0           : n_dims;
+                    const int64_t pass1 = is_flipped ? rope_offset : ne0;
+                    for (int64_t i0 = pass0; i0 < pass1; i0 += 2) {
                         const float * const src = (float *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         float * dst_data  = (float *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
 
@@ -20442,6 +20617,14 @@ static void ggml_compute_forward_rope_f16(
     const int mode       = ((int32_t *) dst->op_params)[2];
     //const int n_ctx      = ((int32_t *) dst->op_params)[3];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    // PXA_ROPE_FLIPPED_v1 is implemented for f32 (CPU) and f32/f16 (CUDA) only.
+    // Abort rather than silently rotating the leading channels: this path is
+    // never taken by any arch that sets the flag, and a wrong answer here would
+    // be invisible.
+    GGML_ASSERT(dst->op_params[15] == 0 &&
+            "flipped RoPE is not implemented for f16 on the CPU backend");
+
     memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
     memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
     memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
@@ -23259,6 +23442,302 @@ static void ggml_compute_forward_delta_net(
     }
 }
 
+// DeepSeek-V4 fused hyper-connection ops.
+// Transcribed from upstream llama.cpp ggml/src/ggml-cpu/ops.cpp @ 44c7b01de
+// (C++ -> C: std::min/max -> MIN/fmaxf; arithmetic unaltered).
+
+static void ggml_compute_forward_dsv4_hc_split_sinkhorn(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * mixes = dst->src[0];
+    const struct ggml_tensor * scale = dst->src[1];
+    const struct ggml_tensor * base  = dst->src[2];
+
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+    GGML_ASSERT(mixes->nb[0] == sizeof(float));
+    GGML_ASSERT(scale->nb[0] == sizeof(float));
+    GGML_ASSERT(base->nb[0]  == sizeof(float));
+    GGML_ASSERT(dst->nb[0]   == sizeof(float));
+
+    const int n_hc           = ggml_get_op_params_i32(dst, 0);
+    const int sinkhorn_iters = ggml_get_op_params_i32(dst, 1);
+    const float eps          = ggml_get_op_params_f32(dst, 2);
+    const int64_t mix_hc     = mixes->ne[0];
+    const int64_t n_rows     = ggml_nrows(mixes);
+
+    GGML_ASSERT(n_hc > 0 && n_hc <= 16);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(mix_hc == (2 + n_hc) * n_hc);
+    GGML_ASSERT(ggml_nrows(dst) == n_rows);
+
+    const float * scale_data = (const float *) scale->data;
+    const float * base_data  = (const float *) base->data;
+
+    const float pre_scale  = scale_data[0];
+    const float post_scale = scale_data[1];
+    const float comb_scale = scale_data[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (n_rows + nth - 1) / nth;
+    const int64_t r0 = dr * ith;
+    const int64_t r1 = MIN(r0 + dr, n_rows);
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const float * mix = (const float *) ((const char *) mixes->data + r*mixes->nb[1]);
+        float * out = (float *) ((char *) dst->data + r*dst->nb[1]);
+
+        for (int i = 0; i < n_hc; ++i) {
+            const float z = mix[i] * pre_scale + base_data[i];
+            out[i] = 1.0f / (1.0f + expf(-z)) + eps;
+        }
+
+        for (int i = 0; i < n_hc; ++i) {
+            const int off = n_hc + i;
+            const float z = mix[off] * post_scale + base_data[off];
+            out[off] = 2.0f / (1.0f + expf(-z));
+        }
+
+        float c[16*16];
+
+        // The ggml graph stores comb as [src_hc, dst_hc, token] and softmaxes
+        // over src_hc, then alternates normalization over dst_hc and src_hc.
+        // (The consumer, hc_expand, names these axes the other way around;
+        // both ends are transcribed verbatim so the composition is upstream's.)
+        for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+            float row_max = -INFINITY;
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                const int idx = src_hc + dst_hc*n_hc;
+                const int off = 2*n_hc + idx;
+                const float v = mix[off] * comb_scale + base_data[off];
+                c[idx] = v;
+                row_max = fmaxf(row_max, v);
+            }
+
+            float row_sum = 0.0f;
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                const int idx = src_hc + dst_hc*n_hc;
+                const float v = expf(c[idx] - row_max);
+                c[idx] = v;
+                row_sum += v;
+            }
+
+            const float inv_sum = 1.0f / row_sum;
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                const int idx = src_hc + dst_hc*n_hc;
+                c[idx] = c[idx] * inv_sum + eps;
+            }
+        }
+
+        for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+            float sum = 0.0f;
+            for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                sum += c[src_hc + dst_hc*n_hc];
+            }
+
+            const float inv_denom = 1.0f / (sum + eps);
+            for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                c[src_hc + dst_hc*n_hc] *= inv_denom;
+            }
+        }
+
+        for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+            for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                float sum = 0.0f;
+                for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                    sum += c[src_hc + dst_hc*n_hc];
+                }
+
+                const float inv_denom = 1.0f / (sum + eps);
+                for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                    c[src_hc + dst_hc*n_hc] *= inv_denom;
+                }
+            }
+
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                float sum = 0.0f;
+                for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                    sum += c[src_hc + dst_hc*n_hc];
+                }
+
+                const float inv_denom = 1.0f / (sum + eps);
+                for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                    c[src_hc + dst_hc*n_hc] *= inv_denom;
+                }
+            }
+        }
+
+        for (int i = 0; i < n_hc*n_hc; ++i) {
+            out[2*n_hc + i] = c[i];
+        }
+    }
+}
+
+static void ggml_compute_forward_dsv4_hc_weighted_sum(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * x       = dst->src[0];
+    const struct ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[0]       == dst->ne[0]);
+    GGML_ASSERT(x->ne[1]       == weights->ne[0]);
+    GGML_ASSERT(x->ne[2]       == dst->ne[1]);
+    GGML_ASSERT(weights->ne[1] == dst->ne[1]);
+    GGML_ASSERT(x->ne[3]       == 1);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+    GGML_ASSERT(dst->ne[2]     == 1);
+    GGML_ASSERT(dst->ne[3]     == 1);
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_hc     = x->ne[1];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n_elem   = n_embd * n_tokens;
+
+    const int64_t i0 = (n_elem * params->ith) / params->nth;
+    const int64_t i1 = (n_elem * (params->ith + 1)) / params->nth;
+
+    const char * x_data = (const char *) x->data;
+    const char * w_data = (const char *) weights->data;
+          char * y_data = (      char *) dst->data;
+
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t d = i % n_embd;
+        const int64_t t = i / n_embd;
+
+        float acc = 0.0f;
+        for (int64_t h = 0; h < n_hc; ++h) {
+            const float xv = *(const float *) (x_data + d*x->nb[0] + h*x->nb[1] + t*x->nb[2]);
+            const float wv = *(const float *) (w_data + h*weights->nb[0] + t*weights->nb[1]);
+            acc += xv * wv;
+        }
+
+        *(float *) (y_data + d*dst->nb[0] + t*dst->nb[1]) = acc;
+    }
+}
+
+static void ggml_compute_forward_dsv4_hc_expand(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * block_out = dst->src[0];
+    const struct ggml_tensor * residual  = dst->src[1];
+    const struct ggml_tensor * post      = dst->src[2];
+    const struct ggml_tensor * comb      = dst->src[3];
+
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(post->type      == GGML_TYPE_F32);
+    GGML_ASSERT(comb->type      == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->ne[0] == dst->ne[0]);
+    GGML_ASSERT(block_out->ne[1] == dst->ne[2]);
+    GGML_ASSERT(residual->ne[0]  == dst->ne[0]);
+    GGML_ASSERT(residual->ne[1]  == dst->ne[1]);
+    GGML_ASSERT(residual->ne[2]  == dst->ne[2]);
+    GGML_ASSERT(post->ne[0]      == dst->ne[1]);
+    GGML_ASSERT(post->ne[1]      == dst->ne[2]);
+    GGML_ASSERT(comb->ne[0]      == dst->ne[1]);
+    GGML_ASSERT(comb->ne[1]      == dst->ne[1]);
+    GGML_ASSERT(comb->ne[2]      == dst->ne[2]);
+    GGML_ASSERT(block_out->ne[3] == 1);
+    GGML_ASSERT(residual->ne[3]  == 1);
+    GGML_ASSERT(post->ne[2]      == 1);
+    GGML_ASSERT(post->ne[3]      == 1);
+    GGML_ASSERT(comb->ne[3]      == 1);
+    GGML_ASSERT(dst->ne[3]       == 1);
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_hc     = dst->ne[1];
+    const int64_t n_tokens = dst->ne[2];
+    const int64_t n_elem   = n_embd * n_hc * n_tokens;
+
+    const int64_t i0 = (n_elem * params->ith) / params->nth;
+    const int64_t i1 = (n_elem * (params->ith + 1)) / params->nth;
+
+    const char * block_data = (const char *) block_out->data;
+    const char * res_data   = (const char *) residual->data;
+    const char * post_data  = (const char *) post->data;
+    const char * comb_data  = (const char *) comb->data;
+          char * dst_data   = (      char *) dst->data;
+
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t d      = i % n_embd;
+        const int64_t tmp    = i / n_embd;
+        const int64_t dst_hc = tmp % n_hc;
+        const int64_t t      = tmp / n_hc;
+
+        const float block_v = *(const float *) (block_data + d*block_out->nb[0] + t*block_out->nb[1]);
+        const float post_v  = *(const float *) (post_data  + dst_hc*post->nb[0] + t*post->nb[1]);
+
+        float acc = block_v * post_v;
+        for (int64_t src_hc = 0; src_hc < n_hc; ++src_hc) {
+            const float comb_v = *(const float *) (comb_data + dst_hc*comb->nb[0] + src_hc*comb->nb[1] + t*comb->nb[2]);
+            const float res_v  = *(const float *) (res_data  + d*residual->nb[0] + src_hc*residual->nb[1] + t*residual->nb[2]);
+            acc += comb_v * res_v;
+        }
+
+        *(float *) (dst_data + d*dst->nb[0] + dst_hc*dst->nb[1] + t*dst->nb[2]) = acc;
+    }
+}
+
+// ggml_compute_forward_mask_to_idx
+
+static void ggml_compute_forward_mask_to_idx(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * mask = dst->src[0];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask->ne[1] == dst->ne[1] && mask->ne[2] == dst->ne[2] && mask->ne[3] == dst->ne[3]);
+    GGML_ASSERT(mask->ne[0] >= dst->ne[0]);
+    GGML_ASSERT(dst->nb[0] == sizeof(int32_t));
+
+    const int64_t ne00 = mask->ne[0];
+    const int64_t ne0  = dst->ne[0];
+
+    // Rows are independent; split them across threads.
+    const int64_t nr = ggml_nrows(dst);
+    const int64_t r0 = (nr * params->ith) / params->nth;
+    const int64_t r1 = (nr * (params->ith + 1)) / params->nth;
+
+    for (int64_t ir = r0; ir < r1; ++ir) {
+        const int64_t i1 = ir % dst->ne[1];
+        const int64_t i2 = (ir / dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = ir / (dst->ne[1] * dst->ne[2]);
+
+        const char    * mask_r = (const char *) mask->data + i1*mask->nb[1] + i2*mask->nb[2] + i3*mask->nb[3];
+              int32_t * idx_r  = (int32_t *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t j = 0; j < ne0; ++j) {
+            idx_r[j] = -1;
+        }
+
+        int64_t n = 0;
+        for (int64_t j = 0; j < ne00 && n < ne0; ++j) {
+            const float v = mask->type == GGML_TYPE_F16
+                ? GGML_FP16_TO_FP32(((const ggml_fp16_t *) mask_r)[j])
+                : ((const float *) mask_r)[j];
+            // Keep every row the mask does not hard-exclude. `!(v <= -inf)` is
+            // deliberately not `v == 0`: it also keeps finite-but-negative bias
+            // entries (ALiBi) and NaN, so the index list is always a SUPERSET of
+            // the visible set. A superset stays correct because the consumer
+            // re-applies the real mask value at each selected row; a subset would
+            // silently drop KV. See the contract note on ggml_mask_to_index().
+            if (!(v <= -INFINITY)) {
+                idx_r[n++] = (int32_t) j;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_win_part
 
 static void ggml_compute_forward_win_part_f32(
@@ -24997,6 +25476,22 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_delta_net(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            {
+                ggml_compute_forward_dsv4_hc_split_sinkhorn(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            {
+                ggml_compute_forward_dsv4_hc_weighted_sum(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_EXPAND:
+            {
+                ggml_compute_forward_dsv4_hc_expand(params, tensor);
+            } break;
+        case GGML_OP_MASK_TO_IDX:
+            {
+                ggml_compute_forward_mask_to_idx(params, tensor);
+            } break;
         case GGML_OP_WIN_PART:
             {
                 ggml_compute_forward_win_part(params, tensor);
@@ -26057,6 +26552,10 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_FILL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_DELTA_NET:
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+        case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_MASK_TO_IDX:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -26792,6 +27291,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OUT_PROD:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_DELTA_NET:
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+        case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_MASK_TO_IDX:
             {
                 n_tasks = n_threads;
             } break;

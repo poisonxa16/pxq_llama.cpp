@@ -331,6 +331,19 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.shared_experts.up_proj", # deepseek2
         ),
 
+        # Sparse ("lightning") attention indexer -- HF naming used by the DSA
+        # family. Kept in sync with llama.cpp upstream @82dbc4f01.
+        # NOTE: DeepSeek-V4 does NOT go through TensorNameMap -- its converter
+        # class maps `layers.N.attn.indexer.*` itself (_map_dsv4_tensor_name),
+        # because the whole HF checkpoint uses a non-transformers layout.
+        MODEL_TENSOR.INDEXER_PROJ: (
+            "model.layers.{bid}.self_attn.indexer.weights_proj",  # DSA
+        ),
+
+        MODEL_TENSOR.INDEXER_ATTN_Q_B: (
+            "model.layers.{bid}.self_attn.indexer.wq_b",  # DSA
+        ),
+
         # AWQ-activation gate
         MODEL_TENSOR.FFN_ACT: (
             "transformer.blocks.{bid}.ffn.act",  # mpt

@@ -61,6 +61,12 @@ struct llm_build_context {
     const int64_t n_expert;
     const int64_t n_expert_used;
 
+    // true while building the warm-up graph. The warm-up run deliberately routes
+    // to EVERY expert (see n_expert_used above), so any arch that supplies its own
+    // expert selection must fall back to the router for this build or the two
+    // disagree on the selection width.
+    const bool is_warmup;
+
     const float freq_base;
     const float freq_scale;
     const float ext_factor;
@@ -333,6 +339,59 @@ struct llm_build_context {
     ggml_cgraph * build_hy3();
 
     //
+    // DeepSeek-V4. Implementation + full provenance in src/graphs/build_deepseek4.cpp
+    // (adapted from llama.cpp src/models/deepseek4.cpp @ upstream 82dbc4f01, MIT).
+    //
+    ggml_cgraph * build_deepseek4();
+
+    // creates the DSV4 graph input tensors and publishes them via llama_dsv4_get_inputs()
+    void build_dsv4_inputs();
+
+    // hyper-connections
+    ggml_tensor * build_dsv4_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
+            ggml_tensor * hc_base, ggml_tensor ** post, ggml_tensor ** comb, int il) const;
+    ggml_tensor * build_dsv4_hc_post(ggml_tensor * x, ggml_tensor * residual,
+            ggml_tensor * post, ggml_tensor * comb, int il) const;
+    ggml_tensor * build_dsv4_hc_head(ggml_tensor * x, ggml_tensor * hc_fn,
+            ggml_tensor * hc_scale, ggml_tensor * hc_base) const;
+
+    // attention core (upstream llm_graph_context::build_attn_mha, kq_b/v_mla dropped)
+    // n_visible_max: an UPPER BOUND on how many KV rows any single query row can see
+    // through kq_mask, or -1 when unknown/not worth it. When it is materially smaller
+    // than the mask width the flash-attention node gets a sparse index list (src[5])
+    // and attends only the visible rows. It must be a true upper bound -- too small
+    // silently drops KV. See build_dsv4_attn_mha() for the derivation at each caller.
+    ggml_tensor * build_dsv4_attn_mha(ggml_cgraph * gf, ggml_tensor * q, ggml_tensor * k,
+            ggml_tensor * v, ggml_tensor * kq_mask, ggml_tensor * sinks, float kq_scale, int il,
+            int64_t n_visible_max = -1) const;
+
+    // compressed-KV reconstruction from the compressor ring state
+    ggml_tensor * build_dsv4_hca_compressed_kv_from_state(ggml_tensor * kv_state, ggml_tensor * score_state,
+            ggml_tensor * state_read_idxs, ggml_tensor * comp_pos, ggml_tensor * norm,
+            int64_t n_embd_head, const char * name, int il) const;
+    ggml_tensor * build_dsv4_overlap_compressed_kv_from_state(ggml_tensor * kv_state, ggml_tensor * score_state,
+            ggml_tensor * state_read_idxs, ggml_tensor * comp_pos, ggml_tensor * norm,
+            int64_t ratio, int64_t n_embd_head, const char * name, int il) const;
+
+    // lightning indexer
+    ggml_tensor * build_dsv4_lid_top_k(ggml_tensor * qr, ggml_tensor * cur,
+            ggml_tensor * inp_pos, int il) const;
+    ggml_tensor * build_dsv4_top_k_mask(ggml_tensor * kq_mask, ggml_tensor * top_k,
+            const char * name, int il) const;
+
+    // the three per-layer attention regimes, selected by compress_ratios[il]
+    ggml_tensor * build_dsv4_csa_lid_attention(ggml_cgraph * gf, ggml_tensor * q, ggml_tensor * kv,
+            ggml_tensor * qr, ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * sinks,
+            float kq_scale, int il) const;
+    ggml_tensor * build_dsv4_hca_attention(ggml_cgraph * gf, ggml_tensor * q, ggml_tensor * kv,
+            ggml_tensor * sinks, float kq_scale, int il) const;
+    ggml_tensor * build_dsv4_raw_attention(ggml_cgraph * gf, ggml_tensor * q, ggml_tensor * kv,
+            ggml_tensor * sinks, float kq_scale, int il) const;
+
+    ggml_tensor * build_dsv4_attention(ggml_cgraph * gf, ggml_tensor * cur,
+            ggml_tensor * inp_pos, int il) const;
+
+    //
     static ggml_tensor * llm_build_lora_mm(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * w, ggml_tensor * cur);
 
@@ -411,7 +470,11 @@ struct llm_build_context {
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr);
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         // PXA/DSV4: pre-computed expert selection. When non-null the router top-k is
+         // skipped and these ids are used instead; the weights still come from probs[].
+         // Used by DeepSeek-V4's first `hash_layer_count` blocks (token-id hash table).
+         ggml_tensor * selected_experts_in = nullptr);
 
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
@@ -429,7 +492,8 @@ llm_expert_gating_func_type   gating_op,
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr) {
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         ggml_tensor * selected_experts_in = nullptr) {
         return llm_build_moe_ffn(ctx, lctx, cur,
                 gate_inp,   nullptr,
                 up_exps,    nullptr,
@@ -439,7 +503,7 @@ llm_expert_gating_func_type   gating_op,
                 n_expert, n_expert_used,
                 type_op, norm_w, scale_w, w_scale,
                 gating_op, cb, il, graph, add_input, up_gate_exps, up_gate_exps_b,
-                input_logits, down_exps_s);
+                input_logits, down_exps_s, selected_experts_in);
     }
 
     static ggml_tensor * llm_build_std_moe_ffn(ggml_context * ctx, llama_context & lctx,
