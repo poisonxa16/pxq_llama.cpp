@@ -6248,6 +6248,7 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         // Fused single-launch decode form first; it declines to the split path below for any
         // shape/op/geometry it cannot serve.
         if (pxa_pxq_gateup_2d(ctx, dst) == 0) return;
+    if (!pxq_mmvq_fug && (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type))) {
         const float limit_px = *(const float *)(dst->op_params + 1);
         // PXA_DENSE_FUG_PREC_v1: op_params[0] on a FUSED_UP_GATE node is the UNARY OP id
         // (GGML_UNARY_OP_SILU == 10), NOT a ggml_prec. Both ggml_cuda_op_mul_mat_cublas (which

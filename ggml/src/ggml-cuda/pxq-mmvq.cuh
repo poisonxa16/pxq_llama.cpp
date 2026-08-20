@@ -189,6 +189,22 @@ static inline int pxa_pxq_mmvq_mode() {
     cached = m;
     cached_gen = gen;
     return m;
+static inline int pxa_pxq_mmvq_mode() {
+    static const int mode = [](){
+        const char * e = getenv("PXA_PXQ_MMVQ");
+        int m = e ? atoi(e) : 0;
+        if (m < 0 || m > 2) m = 0;
+        // this TU holds frozen copies of the book / SUB tables; a runtime override would silently
+        // diverge from the fused kernels, so decline instead.
+        if (m && (getenv("PXA_PXQ6_BOOK") || getenv("PXA_PXQ6_SUB") || getenv("PXA_PXQ6_SUB_HQ"))) {
+            fprintf(stderr, "PXA_PXQ_MMVQ: DISABLED — a PXA_PXQ6_BOOK/_SUB/_SUB_HQ override is set\n");
+            m = 0;
+        }
+        if (m) fprintf(stderr, "PXA_PXQ_MMVQ: mode %d (PXQ4/PXQ4HQ decode via the q8_1 MMVQ kernel, "
+                       "s8 book snap — NOT bit-exact vs the fused fp16 mmv, fidelity-gated)\n", m);
+        return m;
+    }();
+    return mode;
 }
 
 // PXQ tile height for the MMVQ block, 1|2|4|8|16 (default 4). See mmvq-templates.cuh.
