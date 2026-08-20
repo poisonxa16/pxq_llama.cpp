@@ -394,6 +394,58 @@ static bool dsv4_alloc(llama_dsv4_memory & mem, const llama_model & model, bool 
 // lifecycle
 //
 
+
+// PXA_DSV4_STATE_RING_PAD — extra compressor-ring rows so a multi-row batch cannot
+// overwrite the history the overlap compressor is about to read.
+//
+// MEASURED (harness dspark_m5_kvprobe, 2026-08-02): with the ring at its upstream size
+// the compressor state after ONE 6-row batch differs from the same six tokens decoded
+// one at a time in EXACTLY one compressed row per ratio-4 layer — 1344 of 387072 CSA
+// floats, max_abs 3.4-6.0 against an RMS of 1.12. That is structural, not rounding, and
+// it happens on a FULLY ACCEPTED batch: it is a property of the batch shape, not of
+// whether the drafted tokens were right.
+//
+// WHY. state_size is 2*ratio for the overlapped streams and the overlap compressor reads
+// exactly 2*ratio positions of history, so the ring holds precisely what it needs and not
+// one row more. A batch at p..p+nt-1 writes rows p%S..(p+nt-1)%S; a boundary at q reads
+// prev-window rows (q-2r+1)%S..(q-r)%S. With S == 2r those two sets intersect for every q
+// in the batch, so the FIRST boundary of the batch reads a row this batch has already
+// overwritten. Later boundaries are safe because their windows fall inside the batch and
+// are served from the ubatch scratch rows — which is why exactly one row per layer is hit.
+//
+// FIX. Size the ring to history + the widest batch: S = H + n_ubatch. Then no in-batch
+// write can alias an out-of-batch read, because the two are at most n_ubatch + H - 1
+// positions apart and the ring is that wide. state_source_idx(), the scratch-row base and
+// the graph all derive from state_size, so nothing else has to change.
+//
+// DEFAULT OFF, on the evidence. A/B'd on the GPU (V100, sm_70) with the M5 KV probe:
+// enabling the pad did NOT make a fully-accepted batch state-equivalent to sequential
+// decode (FULL 0/4 either way) and did NOT make the rejected batch self-heal (NOREST 0/4
+// either way). The one arm it changed was RAWONLY - restore the raw ring, replay every
+// position from p - which went 0/4 -> 4/4, i.e. WITH the pad the compressed streams do
+// recover from a full single-token replay and without it they do not. That is a real
+// effect and it is why the lever exists, but it is not the mechanism behind the
+// batch-vs-sequential difference, and it does not change the M5 identity result.
+//
+// Since it also changes multi-row (prefill) numerics and would therefore invalidate every
+// temp-0 baseline taken on an earlier binary, shipping it ON is not justified by what has
+// been measured. =1 enables it. Byte-unchanged at the default.
+static bool dsv4_state_ring_pad_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("PXA_DSV4_STATE_RING_PAD");
+        return e ? atoi(e) != 0 : false;
+    }();
+    return on;
+}
+
+// history the compressor reads: 2*ratio for the overlapped streams, ratio for the plain one
+static uint32_t dsv4_state_rows(uint32_t history, uint32_t n_ubatch) {
+    if (!dsv4_state_ring_pad_enabled()) {
+        return history;
+    }
+    return history + (n_ubatch > 0 ? n_ubatch : 1u);
+}
+
 bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type type_v,
                             uint32_t kv_size, bool offload) {
     const llama_model   & model   = lctx.model;
@@ -442,7 +494,7 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
     //   LID  ratio 4    state 2*ratio (overlapped)  n_embd_state 2*indexer_head_size
     mem->s[LLAMA_DSV4_CSA] = {};
     mem->s[LLAMA_DSV4_CSA].ratio        = DSV4_CSA_RATIO;
-    mem->s[LLAMA_DSV4_CSA].state_size   = 2*DSV4_CSA_RATIO;
+    mem->s[LLAMA_DSV4_CSA].state_size   = dsv4_state_rows(2*DSV4_CSA_RATIO, n_ub);
     mem->s[LLAMA_DSV4_CSA].n_embd_state = 2*n_embd_head_k;
     mem->s[LLAMA_DSV4_CSA].n_embd_k     = hparams.n_embd_k_gqa(0);
     mem->s[LLAMA_DSV4_CSA].cache_size   = GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u);
@@ -450,7 +502,7 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
 
     mem->s[LLAMA_DSV4_HCA] = {};
     mem->s[LLAMA_DSV4_HCA].ratio        = DSV4_HCA_RATIO;
-    mem->s[LLAMA_DSV4_HCA].state_size   = DSV4_HCA_RATIO;
+    mem->s[LLAMA_DSV4_HCA].state_size   = dsv4_state_rows(DSV4_HCA_RATIO, n_ub);
     mem->s[LLAMA_DSV4_HCA].n_embd_state = n_embd_head_k;
     mem->s[LLAMA_DSV4_HCA].n_embd_k     = hparams.n_embd_k_gqa(0);
     mem->s[LLAMA_DSV4_HCA].cache_size   = GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u);
@@ -458,7 +510,7 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
 
     mem->s[LLAMA_DSV4_LID] = {};
     mem->s[LLAMA_DSV4_LID].ratio        = DSV4_CSA_RATIO;
-    mem->s[LLAMA_DSV4_LID].state_size   = 2*DSV4_CSA_RATIO;
+    mem->s[LLAMA_DSV4_LID].state_size   = dsv4_state_rows(2*DSV4_CSA_RATIO, n_ub);
     mem->s[LLAMA_DSV4_LID].n_embd_state = 2*hparams.indexer_head_size;
     mem->s[LLAMA_DSV4_LID].n_embd_k     = hparams.indexer_head_size;
     mem->s[LLAMA_DSV4_LID].cache_size   = GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u);
@@ -474,6 +526,10 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
         total += ggml_backend_buffer_get_size(buf);
     }
 
+    LLAMA_LOG_INFO("%s: DSV4 state ring: CSA %u, HCA %u, LID %u rows (pad %s, n_ubatch %u)\n",
+                   __func__, mem->s[LLAMA_DSV4_CSA].state_size, mem->s[LLAMA_DSV4_HCA].state_size,
+                   mem->s[LLAMA_DSV4_LID].state_size, dsv4_state_ring_pad_enabled() ? "ON" : "off",
+                   lctx.cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: DSV4 memory: raw ring %u cells, CSA %u rows, HCA %u rows, LID %u rows, "
                    "%.2f MiB across %zu buffer(s)\n",
                    __func__, mem->raw_size,
@@ -864,4 +920,416 @@ ggml_tensor * llama_dsv4_cpy_state_score(const llama_context & lctx, ggml_contex
                                          ggml_tensor * idxs, int32_t il) {
     ggml_tensor * dst = llama_dsv4_get_state_score(lctx, ctx, s, il);
     return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, cur), idxs);
+}
+
+//
+// =========================== SPECULATIVE ROLLBACK (M5) ===========================
+//
+// A DSpark verify batch of 1+k rows writes DSV4 state for EVERY row, including the rows a
+// rejected draft occupies. Unlike the standard llama_kv_cache there is no seq_rm here, no
+// crop and no truncate -- and the compressor state ring is not merely un-rolled-back, it
+// is STRUCTURALLY too small to hold a speculative window alongside the history the overlap
+// compressor still needs:
+//
+//   CSA/LID: ratio 4, state_size = 2*ratio = 8, overlap = true.
+//   A boundary at position q reads the PREVIOUS window q-7 .. q-4, whose ring rows are
+//   (q-7)%8 .. (q-4)%8  ==  (q+1)%8 .. (q+4)%8.
+//   A batch at p .. p+5 has already written rows p%8 .. (p+5)%8.
+//   For every q in [p, p+5] those two sets intersect, so the previous-window read returns
+//   a FUTURE row instead of the history it asked for. The ring holds exactly 2*ratio
+//   positions and the compressor needs exactly 2*ratio of history: there is no slack for
+//   even one speculative row, let alone five.
+//
+// Therefore the rejected rows cannot be "healed" by re-decoding the correct token at the
+// same position -- by the time we do, the history that position's compressor boundary
+// needed has already been overwritten. The fix is a snapshot taken BEFORE the verify batch
+// and restored when the batch is not fully accepted. Only the rows the batch writes need
+// saving, and the compression plans already enumerate exactly those rows.
+//
+// The raw SWA ring is a different story and is saved separately so the two can be
+// attributed independently: raw_size >= n_ubatch + n_swa + 1 by construction, so a
+// speculative row and the window it would collide with never share a ring row. That is an
+// argument, not a measurement, which is why RAW is its own restore component.
+//
+
+struct dsv4_saved_row {
+    ggml_tensor * t   = nullptr;
+    size_t        off = 0;    // byte offset into the tensor
+    size_t        len = 0;    // bytes
+    size_t        blob_off = 0;
+};
+
+struct dsv4_spec_snapshot_state {
+    bool                        valid = false;
+    std::vector<uint8_t>        blob;
+    std::vector<dsv4_saved_row> rows[4];   // indexed by DSV4 component: RAW, CSA, HCA, LID
+};
+
+static dsv4_spec_snapshot_state g_dsv4_snap;
+
+static void dsv4_snap_add(dsv4_spec_snapshot_state & S, int comp, ggml_tensor * t, int64_t row) {
+    if (!t || row < 0 || row >= t->ne[1]) {
+        return;
+    }
+    const size_t len = t->nb[1];
+    dsv4_saved_row r;
+    r.t        = t;
+    r.off      = (size_t) row * len;
+    r.len      = len;
+    r.blob_off = S.blob.size();
+    S.blob.resize(S.blob.size() + len);
+    ggml_backend_tensor_get(t, S.blob.data() + r.blob_off, r.off, r.len);
+    S.rows[comp].push_back(r);
+}
+
+size_t llama_dsv4_spec_snapshot_bytes(const llama_context & /*lctx*/) {
+    return g_dsv4_snap.valid ? g_dsv4_snap.blob.size() : 0;
+}
+
+bool llama_dsv4_spec_snapshot(llama_context & /*lctx*/, const llama_batch & batch) {
+    if (!g_dsv4) {
+        return false;
+    }
+    llama_dsv4_memory & mem = *g_dsv4;
+
+    dsv4_spec_snapshot_state & S = g_dsv4_snap;
+    S.valid = false;
+    S.blob.clear();
+    for (int c = 0; c < 4; ++c) {
+        S.rows[c].clear();
+    }
+
+    // RAW ring rows this batch will write. Deduplicated: two rows of a DSpark verify batch
+    // share position p (the row-0 splice), and saving the same row twice would restore the
+    // second copy over the first -- harmless here because both copies are pre-batch, but
+    // it would silently mask an ordering bug later.
+    {
+        std::vector<int64_t> seen;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const llama_pos p = dsv4_batch_pos(batch, i);
+            if (p < 0) {
+                continue;
+            }
+            const int64_t row = (int64_t) (p % (llama_pos) mem.raw_size);
+            if (std::find(seen.begin(), seen.end(), row) != seen.end()) {
+                continue;
+            }
+            seen.push_back(row);
+            for (ggml_tensor * t : mem.raw_k) {
+                dsv4_snap_add(S, 0, t, row);
+            }
+        }
+    }
+
+    // Compressed streams. The plans are a PURE function of the batch, so they are rebuilt
+    // locally rather than read from st.plan -- st.plan belongs to whatever batch is
+    // currently mid-flight and this call deliberately runs before llama_decode().
+    for (int si = 0; si < 3; ++si) {
+        dsv4_stream_state & st = mem.s[si];
+        if (st.k.empty()) {
+            continue;
+        }
+        const llama_dsv4_comp_plan plan =
+            dsv4_build_comp_plan(batch, st.ratio, st.overlap, st.state_size, st.cache_size);
+
+        const int comp = si + 1;
+        for (size_t j = 0; j < st.k.size(); ++j) {
+            for (int32_t dst : plan.state_persist_dst_idxs) {
+                dsv4_snap_add(S, comp, st.st_kv   [j], dst);
+                dsv4_snap_add(S, comp, st.st_score[j], dst);
+            }
+            for (int64_t dst : plan.state_write_idxs) {
+                dsv4_snap_add(S, comp, st.k[j], dst);
+            }
+        }
+    }
+
+    S.valid = true;
+    return true;
+}
+
+bool llama_dsv4_spec_restore(llama_context & /*lctx*/, uint32_t components) {
+    dsv4_spec_snapshot_state & S = g_dsv4_snap;
+    if (!S.valid) {
+        return false;
+    }
+    for (int c = 0; c < 4; ++c) {
+        if (!(components & (1u << c))) {
+            continue;
+        }
+        for (const dsv4_saved_row & r : S.rows[c]) {
+            ggml_backend_tensor_set(r.t, S.blob.data() + r.blob_off, r.off, r.len);
+        }
+    }
+    return true;
+}
+
+void llama_dsv4_spec_discard(llama_context & /*lctx*/) {
+    g_dsv4_snap.valid = false;
+    g_dsv4_snap.blob.clear();
+    for (int c = 0; c < 4; ++c) {
+        g_dsv4_snap.rows[c].clear();
+    }
+}
+
+// FNV-1a over the raw bytes of a component's tensors. Debug instrument for the M5 KV
+// probe: a digest cannot saturate the way a logit can, so a model whose forward pass has
+// collapsed still gives a decisive answer about whether the STATE differs.
+static uint64_t dsv4_digest_tensors(const std::vector<ggml_tensor *> & ts, uint64_t h) {
+    std::vector<uint8_t> buf;
+    for (ggml_tensor * t : ts) {
+        if (!t) {
+            continue;
+        }
+        const size_t n = ggml_nbytes(t);
+        buf.resize(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, n);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= (uint64_t) buf[i];
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+// Count non-finite F32 elements across every DSV4 tensor. A digest alone cannot tell a
+// live state machine from one that has NaN'd: two different NaN payloads hash differently
+// and the probe would report "DIFFER" for a model that never computed anything. This is
+// the guard against exactly that false positive.
+static int64_t dsv4_count_nonfinite(const std::vector<ggml_tensor *> & ts) {
+    int64_t n_bad = 0;
+    std::vector<float> buf;
+    for (ggml_tensor * t : ts) {
+        if (!t || t->type != GGML_TYPE_F32) {
+            continue;
+        }
+        const int64_t n = ggml_nelements(t);
+        buf.resize((size_t) n);
+        ggml_backend_tensor_get(t, buf.data(), 0, (size_t) n*sizeof(float));
+        for (int64_t i = 0; i < n; ++i) {
+            if (!std::isfinite(buf[(size_t) i])) {
+                ++n_bad;
+            }
+        }
+    }
+    return n_bad;
+}
+
+uint64_t llama_dsv4_debug_digest(const llama_context & /*lctx*/, int component) {
+    if (!g_dsv4) {
+        return 0;
+    }
+    llama_dsv4_memory & mem = *g_dsv4;
+    uint64_t h = 1469598103934665603ull;
+    if (component == -2) {
+        int64_t n_bad = dsv4_count_nonfinite(mem.raw_k);
+        for (int si = 0; si < 3; ++si) {
+            n_bad += dsv4_count_nonfinite(mem.s[si].k);
+            n_bad += dsv4_count_nonfinite(mem.s[si].st_kv);
+            n_bad += dsv4_count_nonfinite(mem.s[si].st_score);
+        }
+        return (uint64_t) n_bad;
+    }
+    if (component < 0) {
+        h = dsv4_digest_tensors(mem.raw_k, h);
+        for (int si = 0; si < 3; ++si) {
+            h = dsv4_digest_tensors(mem.s[si].k,        h);
+            h = dsv4_digest_tensors(mem.s[si].st_kv,    h);
+            h = dsv4_digest_tensors(mem.s[si].st_score, h);
+        }
+        return h;
+    }
+    if (component == 0) {
+        return dsv4_digest_tensors(mem.raw_k, h);
+    }
+    if (component >= 1 && component <= 3) {
+        dsv4_stream_state & st = mem.s[component - 1];
+        h = dsv4_digest_tensors(st.k,        h);
+        h = dsv4_digest_tensors(st.st_kv,    h);
+        h = dsv4_digest_tensors(st.st_score, h);
+        return h;
+    }
+    return 0;
+}
+
+// Digest a stream's compressed K cache EXCLUDING each tensor's final row.
+// The final row (cache_size-1) is the by-design masked dummy-write slot: ub=1
+// non-boundary steps park a masked scratch write there while a batch containing a
+// boundary does not, so the two submission styles leave different bytes in a row
+// attention never reads. Hashing it makes state-equivalence gates fail on a slot
+// with no consequences (measured 2026-08-02: the ENTIRE batched-vs-sequential
+// FULL/CTRL difference on the CPU path is this slot -- 21 layers x 64 floats per
+// stream, nothing else). The "live" digest answers the question those gates
+// actually ask: is the ATTENDED state equivalent?
+static uint64_t dsv4_digest_tensors_skip_last_row(const std::vector<ggml_tensor *> & ts, uint64_t h) {
+    std::vector<uint8_t> buf;
+    for (ggml_tensor * t : ts) {
+        if (!t) {
+            continue;
+        }
+        const size_t row_bytes = (size_t) t->nb[1];
+        const size_t n_full    = (size_t) ggml_nbytes(t);
+        const size_t n         = t->ne[1] > 1 ? n_full - row_bytes : n_full;
+        buf.resize(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, n);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= (uint64_t) buf[i];
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+uint64_t llama_dsv4_debug_digest_live(const llama_context & /*lctx*/, int component) {
+    if (!g_dsv4) {
+        return 0;
+    }
+    llama_dsv4_memory & mem = *g_dsv4;
+    uint64_t h = 1469598103934665603ull;
+    if (component < 0) {
+        h = dsv4_digest_tensors(mem.raw_k, h);
+        for (int si = 0; si < 3; ++si) {
+            h = dsv4_digest_tensors_skip_last_row(mem.s[si].k, h);
+            h = dsv4_digest_tensors(mem.s[si].st_kv,    h);
+            h = dsv4_digest_tensors(mem.s[si].st_score, h);
+        }
+        return h;
+    }
+    if (component == 0) {
+        return dsv4_digest_tensors(mem.raw_k, h);
+    }
+    if (component >= 1 && component <= 3) {
+        dsv4_stream_state & st = mem.s[component - 1];
+        h = dsv4_digest_tensors_skip_last_row(st.k, h);
+        h = dsv4_digest_tensors(st.st_kv,    h);
+        h = dsv4_digest_tensors(st.st_score, h);
+        return h;
+    }
+    return 0;
+}
+
+// Export a component's F32 state so a probe can measure HOW MUCH two states differ, not
+// just THAT they differ. A digest answers "are these the same bytes"; it cannot tell a
+// last-ulp reordering from a structurally wrong read, and those two have opposite
+// consequences for whether a fully-accepted batch is usable.
+size_t llama_dsv4_debug_export(const llama_context & /*lctx*/, int component,
+                               float * out, size_t max_n) {
+    if (!g_dsv4) {
+        return 0;
+    }
+    llama_dsv4_memory & mem = *g_dsv4;
+    std::vector<const std::vector<ggml_tensor *> *> groups;
+    if (component == 0) {
+        groups.push_back(&mem.raw_k);
+    } else if (component >= 1 && component <= 3) {
+        dsv4_stream_state & st = mem.s[component - 1];
+        groups.push_back(&st.k);
+        groups.push_back(&st.st_kv);
+        groups.push_back(&st.st_score);
+    } else {
+        groups.push_back(&mem.raw_k);
+        for (int si = 0; si < 3; ++si) {
+            groups.push_back(&mem.s[si].k);
+            groups.push_back(&mem.s[si].st_kv);
+            groups.push_back(&mem.s[si].st_score);
+        }
+    }
+
+    size_t n = 0;
+    for (const std::vector<ggml_tensor *> * g : groups) {
+        for (ggml_tensor * t : *g) {
+            if (!t || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const size_t cnt = (size_t) ggml_nelements(t);
+            if (out && n + cnt <= max_n) {
+                ggml_backend_tensor_get(t, out + n, 0, cnt*sizeof(float));
+            }
+            n += cnt;
+        }
+    }
+    return n;
+}
+
+//
+// public C API (llama.h). Thin forwarders: the module is a process-global singleton, so
+// the context argument is validated but otherwise unused -- exactly as everywhere else in
+// this file. See llama_dsv4_get_inputs()'s note about the single-context first cut.
+//
+
+bool llama_dspark_kv_snapshot(struct llama_context * ctx, struct llama_batch batch) {
+    if (!ctx || !g_dsv4) {
+        return false;
+    }
+    return llama_dsv4_spec_snapshot(*ctx, batch);
+}
+
+bool llama_dspark_kv_restore(struct llama_context * ctx, uint32_t components) {
+    if (!ctx || !g_dsv4) {
+        return false;
+    }
+    return llama_dsv4_spec_restore(*ctx, components);
+}
+
+void llama_dspark_kv_discard(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    llama_dsv4_spec_discard(*ctx);
+}
+
+size_t llama_dspark_kv_snapshot_bytes(struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    return llama_dsv4_spec_snapshot_bytes(*ctx);
+}
+
+uint64_t llama_dspark_kv_digest(struct llama_context * ctx, int component) {
+    if (!ctx) {
+        return 0;
+    }
+    return llama_dsv4_debug_digest(*ctx, component);
+}
+
+uint64_t llama_dspark_kv_digest_live(struct llama_context * ctx, int component) {
+    if (!ctx) {
+        return 0;
+    }
+    return llama_dsv4_debug_digest_live(*ctx, component);
+}
+
+// NEGATIVE CONTROL for the M5 identity gate. Perturbs exactly the rows the last snapshot
+// covers - i.e. exactly the rows a speculative batch overwrites - by `amount`. If the
+// identity gate still passes with a perturbation the size of the corruption the KV probe
+// MEASURED, then that gate is insensitive at this scale and its "HOLDS" means nothing.
+// A gate whose failure mode has never been demonstrated is decoration.
+bool llama_dspark_kv_scramble(struct llama_context * ctx, float amount) {
+    if (!ctx || !g_dsv4 || !g_dsv4_snap.valid) {
+        return false;
+    }
+    std::vector<float> buf;
+    // components 1..3 only: the compressed streams are what cannot self-heal
+    for (int c = 1; c < 4; ++c) {
+        for (const dsv4_saved_row & r : g_dsv4_snap.rows[c]) {
+            if (r.t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const size_t n = r.len/sizeof(float);
+            buf.resize(n);
+            ggml_backend_tensor_get(r.t, buf.data(), r.off, r.len);
+            for (size_t i = 0; i < n; ++i) {
+                buf[i] += ((i & 1) ? amount : -amount);
+            }
+            ggml_backend_tensor_set(r.t, buf.data(), r.off, r.len);
+        }
+    }
+    return true;
+}
+
+size_t llama_dspark_kv_export(struct llama_context * ctx, int component, float * out, size_t max_n) {
+    if (!ctx) {
+        return 0;
+    }
+    return llama_dsv4_debug_export(*ctx, component, out, max_n);
 }

@@ -1755,6 +1755,24 @@ private:
 void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
     gguf_context * ctx = ml.meta;
 
+    // The DSpark support GGUF carries NO tokenizer keys at all, and the
+    // LLM_KV_TOKENIZER_MODEL read below is REQUIRED (it throws when absent).
+    // The drafter never tokenizes: it consumes the target's hidden states and
+    // emits ids through the target's lm_head, so an empty vocab is correct, not
+    // a workaround. Same terminal state as tokenizer.ggml.model == "no_vocab".
+    if (kv.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+        tokenizer_model = "none";
+        type            = LLAMA_VOCAB_TYPE_NONE;
+        special_bos_id  = LLAMA_TOKEN_NULL;
+        special_eos_id  = LLAMA_TOKEN_NULL;
+        special_unk_id  = LLAMA_TOKEN_NULL;
+        special_sep_id  = LLAMA_TOKEN_NULL;
+        special_pad_id  = LLAMA_TOKEN_NULL;
+        special_mask_id = LLAMA_TOKEN_NULL;
+        linefeed_id     = LLAMA_TOKEN_NULL;
+        return;
+    }
+
     // determine vocab type
     {
         ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model);

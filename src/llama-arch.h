@@ -84,6 +84,7 @@ enum llm_arch {
     LLM_ARCH_HY_V3,
     LLM_ARCH_MUSE_GLIMMER,
     LLM_ARCH_DEEPSEEK4,
+    LLM_ARCH_DEEPSEEK4_DSPARK,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -149,6 +150,17 @@ enum llm_kv {
     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
     LLM_KV_HYPER_CONNECTION_EPSILON,
     LLM_KV_HASH_LAYER_COUNT,
+
+    // DSpark block drafter. NOTE: these six names are LITERALS with no "%s" -
+    // the support GGUF spells them bare ("dspark.block_size"), NOT arch-prefixed.
+    // LLM_KV::operator() formats the name with the arch string; a name carrying no
+    // conversion specifier formats to itself, which is exactly what we need here.
+    LLM_KV_DSPARK_BLOCK_SIZE,
+    LLM_KV_DSPARK_STAGE_COUNT,
+    LLM_KV_DSPARK_N_LAYERS,
+    LLM_KV_DSPARK_MARKOV_RANK,
+    LLM_KV_DSPARK_NOISE_TOKEN_ID,
+    LLM_KV_DSPARK_TARGET_LAYER_IDS,
 
     LLM_KV_ATTENTION_HEAD_COUNT,
     LLM_KV_ATTENTION_HEAD_COUNT_KV,
@@ -409,6 +421,14 @@ enum llm_tensor {
     LLM_TENSOR_INDEXER_COMPRESSOR_APE,
     LLM_TENSOR_INDEXER_COMPRESSOR_NORM,
     LLM_TENSOR_FFN_GATE_TID2EID,
+
+    // DSpark drafter-only tensors (support GGUF, arch deepseek4-dspark)
+    LLM_TENSOR_DSPARK_MAIN_PROJ,
+    LLM_TENSOR_DSPARK_MAIN_NORM,
+    LLM_TENSOR_DSPARK_NORM,
+    LLM_TENSOR_DSPARK_MARKOV_W1,
+    LLM_TENSOR_DSPARK_MARKOV_W2,
+    LLM_TENSOR_DSPARK_CONF_PROJ,
 
     LLM_TENSOR_UNKNOWN,
 };

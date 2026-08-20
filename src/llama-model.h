@@ -389,6 +389,16 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_norm   = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid    = nullptr; // I32 hash routing table
 
+    // DSpark drafter, per stage. Only stage 0 carries main_proj/main_norm and only
+    // the last stage carries norm / hc_head_* / markov_* / conf_proj - the rest are
+    // null and the graph must not dereference them off-stage.
+    struct ggml_tensor * dspark_main_proj    = nullptr;
+    struct ggml_tensor * dspark_main_norm    = nullptr;
+    struct ggml_tensor * dspark_norm         = nullptr;
+    struct ggml_tensor * dspark_markov_w1    = nullptr;
+    struct ggml_tensor * dspark_markov_w2    = nullptr;
+    struct ggml_tensor * dspark_conf_proj    = nullptr;
+
     // long rope factors
     struct ggml_tensor * rope_long  = nullptr;
     struct ggml_tensor * rope_short = nullptr;
@@ -476,6 +486,9 @@ struct llama_model {
     struct ggml_tensor * hc_head_scale = nullptr;
 
     std::unique_ptr<ggml_tensor> output_mtp_ptr;
+
+    // DSpark drafter -> its target. Non-owning; set by llama_dspark_bind_target().
+    const llama_model * dspark_target = nullptr;
 
     llama_split_tensor split_output;
     llama_split_tensor split_output_norm;

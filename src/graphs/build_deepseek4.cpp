@@ -432,6 +432,62 @@ void llm_build_context::build_dsv4_inputs() {
 
 // upstream: build_hc_pre(x, hc_fn, hc_scale, hc_base, &post, &comb, il).
 // Produces the layer input, plus the post weights and the Sinkhorn-normalised
+
+// ---------------------------------------------------------------------------
+// DSpark target-side capture (M2).
+//
+// DSpark consumes the mean of the target's FOUR hyper-connection streams at the end of
+// each of its three capture blocks (ds4.c:15977-15985 sets the weights to 1/4 and
+// ds4.c:25874-25897 takes the sum; the call site ds4.c:26214 fires AFTER the FFN
+// hc_post, i.e. at the very end of the block). Reproduced here with the SAME fused op
+// the DS4 body already uses, so no new ggml op appears.
+//
+// The 1/hc weight tensor is materialised in-graph from a [hc, nt]-shaped view of the
+// stream itself (x*0 + 1/hc). That avoids adding a hand-filled graph input purely to
+// carry a constant - the drafter will need one for the non-causal block mask, but the
+// capture does not.
+//
+// LAZY BY CONSTRUCTION: the capture is taken from the SAME out_ids gather the output
+// head uses, so a prompt chunk captures n_outputs rows (=1), not n_tokens. That is what
+// keeps M2 off the `n_outputs_embd` landmine (llama.cpp:5491) that cost the 35B 40% of
+// its cold prefill - we never widen n_outputs, so there is nothing to widen.
+//
+// Off unless PXA_DSPARK_CAPTURE=1. Default path is byte-unchanged.
+// ---------------------------------------------------------------------------
+static bool dspark_capture_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_DSPARK_CAPTURE");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
+
+// Which target layers to tap. Default = the last three, matching
+// dspark.target_layer_ids = [40,41,42] on the 0731 checkpoint. M4 takes these from the
+// bound drafter instead of the environment.
+static bool dspark_is_capture_layer(int il, int n_layer, int * slot_out) {
+    static const char * spec = getenv("PXA_DSPARK_CAPTURE_LAYERS");
+    if (spec && *spec) {
+        int slot = 0;
+        const char * s = spec;
+        while (*s) {
+            char * end = nullptr;
+            long v = strtol(s, &end, 10);
+            if (end == s) break;
+            if ((int) v == il) { if (slot_out) *slot_out = slot; return true; }
+            ++slot;
+            s = (*end == ',') ? end + 1 : end;
+        }
+        return false;
+    }
+    const int first = n_layer - 3;
+    if (il >= first && il < n_layer) {
+        if (slot_out) *slot_out = il - first;
+        return true;
+    }
+    return false;
+}
+
 // hc x hc combination matrix consumed by build_dsv4_hc_post().
 ggml_tensor * llm_build_context::build_dsv4_hc_pre(
         ggml_tensor  * x,
@@ -1606,6 +1662,33 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         inpL = build_dsv4_hc_post(cur, residual, post, comb, il);
         inpL = lctx.cvec.apply_to(ctx0, inpL, il);
         cb(inpL, "l_last", il);
+
+        int dspark_slot = -1;
+        if (dspark_capture_enabled() && dspark_is_capture_layer(il, n_layer, &dspark_slot)) {
+            // Take the capture through the same out_ids gather the head uses, so a prompt
+            // chunk captures n_outputs rows rather than n_tokens.
+            ggml_tensor * src  = inpL;                       // [n_embd, hc, n_tokens]
+            ggml_tensor * flat = ggml_reshape_2d(ctx0, src, n_embd*hc, n_tokens);
+            int64_t nt = n_tokens;
+            if (inp_out_ids && n_tokens > 1) {
+                flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+                nt   = n_outputs;
+                src  = ggml_reshape_3d(ctx0, flat, n_embd, hc, nt);
+            }
+            // uniform 1/hc weights, shaped [hc, nt]: any [hc, nt] view scaled to zero
+            // and biased. Cheap (hc*nt elements) and needs no new graph input.
+            ggml_tensor * w = ggml_view_2d(ctx0, flat, hc, nt, flat->nb[1], 0);
+            w = ggml_scale_bias(ctx0, ggml_cont(ctx0, w), 0.0f, 1.0f/(float) hc);
+
+            ggml_tensor * capr = ggml_dsv4_hc_weighted_sum(ctx0, src, w);
+            ggml_format_name(capr, "dspark_cap_%d", dspark_slot);
+            // M5: these nodes have NO consumer, so ggml-alloc is free to hand their
+            // storage to the next allocation the instant they are computed
+            // (ggml-alloc.c:500,547). Without the OUTPUT flag the host read back float
+            // bit patterns of whatever landed there next - the same trap M4 hit twice.
+            capr->flags |= GGML_TENSOR_FLAG_OUTPUT;
+            ggml_build_forward_expand(gf, capr);
+        }
     }
 
     if (inp_out_ids && n_tokens > 1) {

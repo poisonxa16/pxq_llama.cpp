@@ -121,6 +121,7 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     bool create_glm_dsa_tensors(const LLM_TN & tn);
 
     bool create_deepseek4_tensors(const LLM_TN & tn);
+    bool create_dspark_tensors(const LLM_TN & tn);
 
     bool create_glm4_tensors(const LLM_TN & tn);
 
@@ -3116,6 +3117,88 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
     return use_mmap_buffer;
 }
 
+
+// DSpark drafter tensors. Three DS4 raw-SWA blocks under an "mtp.%d." prefix, plus:
+//   stage 0    : main_proj {3*n_embd, n_embd}, main_norm {n_embd}
+//   last stage : norm, hc_head_{fn,base,scale}, markov_w1/w2 {rank, n_vocab}, conf_proj
+// There is NO token_embd, NO output and NO output_norm in the support file - the drafter
+// borrows the TARGET's tok_embd and output.weight at graph-build time.
+bool create_tensors_helper::create_dspark_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const int64_t q_lora_rank     = hparams.n_lora_q;
+    const int64_t n_ff_exp        = hparams.n_ff_exp;
+    const int64_t n_expert_shared = hparams.n_expert_shared;
+
+    const int64_t o_groups    = hparams.dsv4_o_group_count;
+    const int64_t o_lora_rank = hparams.dsv4_o_lora_rank;
+    const int64_t hc_mult     = hparams.dsv4_hc_mult;
+    const int64_t hc_dim      = hc_mult * n_embd;
+    const int64_t hc_mix_dim  = (2 + hc_mult) * hc_mult;
+
+    const int64_t markov_rank = hparams.dspark_markov_rank;
+    const int64_t n_capture   = hparams.dspark_n_target_layers;
+
+    if (o_groups <= 0 || o_lora_rank <= 0 || hc_mult <= 0 || markov_rank <= 0) {
+        throw std::runtime_error("DSpark: o_groups / o_lora_rank / hc_mult / markov_rank must all be > 0");
+    }
+
+    const int last = n_layer - 1;
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+
+        layer.attn_norm      = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd});
+        layer.attn_sinks     = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head});
+        layer.wq_a           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_A,       "weight", i), {n_embd, q_lora_rank});
+        layer.attn_q_a_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank});
+        layer.wq_b           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_B,       "weight", i), {q_lora_rank, n_head * n_embd_head_k});
+        layer.wkv            = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV,        "weight", i), {n_embd, n_embd_head_k});
+        layer.attn_kv_a_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k});
+        layer.wo_a           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_A,     "weight", i), {n_head * n_embd_head_k / o_groups, o_lora_rank * o_groups});
+        layer.wo_b           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_B,     "weight", i), {o_groups * o_lora_rank, n_embd});
+
+        layer.hc_attn_fn     = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim});
+        layer.hc_attn_base   = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim});
+        layer.hc_attn_scale  = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3});
+        layer.hc_ffn_fn      = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix_dim});
+        layer.hc_ffn_base    = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim});
+        layer.hc_ffn_scale   = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3});
+
+        layer.ffn_gate_inp   = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP,   "weight", i), {n_embd, n_expert});
+        layer.ffn_exp_probs_b= create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",  i), {n_expert});
+        layer.ffn_norm       = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,       "weight", i), {n_embd});
+
+        layer.ffn_gate_exps  = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert});
+        layer.ffn_down_exps  = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert});
+        layer.ffn_up_exps    = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert});
+
+        layer.ffn_gate_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared});
+        layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    });
+        layer.ffn_up_shexp   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared});
+
+        if (i == 0) {
+            layer.dspark_main_proj = create_tensor(ctx_split, tn(LLM_TENSOR_DSPARK_MAIN_PROJ, "weight", i), {n_capture * n_embd, n_embd});
+            layer.dspark_main_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_DSPARK_MAIN_NORM, "weight", i), {n_embd});
+        }
+        if (i == last) {
+            layer.dspark_norm      = create_tensor(ctx_layer, tn(LLM_TENSOR_DSPARK_NORM,      "weight", i), {n_embd});
+            // one output head for the whole drafter -> model level, matching DS4
+            model.hc_head_fn       = create_tensor(ctx_split, tn(LLM_TENSOR_HC_HEAD_FN,       "weight", i), {hc_dim, hc_mult});
+            model.hc_head_base     = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_HEAD_BASE,     "weight", i), {hc_mult});
+            model.hc_head_scale    = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_HEAD_SCALE,    "weight", i), {1});
+            layer.dspark_markov_w1 = create_tensor(ctx_split, tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight", i), {markov_rank, n_vocab});
+            layer.dspark_markov_w2 = create_tensor(ctx_split, tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight", i), {markov_rank, n_vocab});
+            layer.dspark_conf_proj = create_tensor(ctx_split, tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight", i), {n_embd + markov_rank, 1});
+        }
+    }
+
+    return use_mmap_buffer;
+}
+
 bool create_tensors_helper::create_glm4_moe_tensors(const LLM_TN & tn) {
     LOADING_PRELUDE
 
@@ -4786,6 +4869,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_glm_dsa_tensors(tn); break;
         case LLM_ARCH_DEEPSEEK4:
             use_mmap_buffer = create_deepseek4_tensors(tn); break;
+        case LLM_ARCH_DEEPSEEK4_DSPARK:
+            use_mmap_buffer = create_dspark_tensors(tn); break;
         case LLM_ARCH_GLM4_MOE:
             use_mmap_buffer = create_glm4_moe_tensors(tn); break;
         case LLM_ARCH_BITNET:
