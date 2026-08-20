@@ -87,6 +87,28 @@ struct llama_dsv4_memory {
     std::vector<ggml_context *>        ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
 
+
+    std::unordered_map<int32_t, size_t> map_il;   // layer id -> slot
+    std::vector<ggml_tensor *> k;                 // [n_embd_k,     cache_size]
+    std::vector<ggml_tensor *> st_kv;             // [n_embd_state, state_size]
+    std::vector<ggml_tensor *> st_score;          // [n_embd_state, state_size]
+
+    llama_dsv4_comp_plan plan;
+};
+
+struct llama_dsv4_memory {
+    // raw SWA(128) token cache — the one true ring
+    uint32_t raw_size = 0;
+    std::unordered_map<int32_t, size_t> raw_map_il;
+    std::vector<ggml_tensor *> raw_k;             // [n_embd_k_raw, raw_size]
+
+    dsv4_stream_state s[3];                       // indexed by llama_dsv4_stream
+
+    llama_dsv4_inputs inputs;
+
+    std::vector<ggml_context *>        ctxs;
+    std::vector<ggml_backend_buffer_t> bufs;
+
     // host-side staging for the input tensors (kept alive across set_inputs)
     std::vector<int64_t> raw_k_idxs_host;
 };
@@ -391,7 +413,9 @@ static bool dsv4_alloc(llama_dsv4_memory & mem, const llama_model & model, bool 
 }
 
 //
-// lifecycle
+// THE PLAN BUILDER — transcribed from upstream dsv4_build_comp_plan().
+// Only the accessor shape changed (llama_ubatch -> llama_batch) and the n_stream == 1
+// folding described at the top. The arithmetic is upstream's, deliberately unaltered.
 //
 
 
@@ -446,6 +470,296 @@ static uint32_t dsv4_state_rows(uint32_t history, uint32_t n_ubatch) {
     return history + (n_ubatch > 0 ? n_ubatch : 1u);
 }
 
+static llama_seq_id dsv4_batch_seq(const llama_batch & batch, int32_t i, int32_t s) {
+    if (batch.seq_id && batch.seq_id[i]) {
+        return batch.seq_id[i][s];
+    }
+    return batch.all_seq_id;
+}
+
+static int32_t dsv4_batch_n_seq_id(const llama_batch & batch, int32_t i) {
+    return batch.n_seq_id ? batch.n_seq_id[i] : 1;
+}
+
+// The reserve/worst-case graph is built straight from llama_batch_get_one(), whose pos
+// array is NULL and whose positions are implied by all_pos_0/all_pos_1. llama_decode
+// normalises that before its own graph build, but llama_build_graph() for the reserve
+// pass does not -- so every read of a position here must go through this.
+static llama_pos dsv4_batch_pos(const llama_batch & batch, int32_t i) {
+    return batch.pos ? batch.pos[i] : batch.all_pos_0 + (llama_pos) i*batch.all_pos_1;
+}
+
+static llama_dsv4_comp_plan dsv4_build_comp_plan(
+        const llama_batch & batch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t kv_size) {
+    llama_dsv4_comp_plan plan;
+    plan.n_visible.resize(batch.n_tokens);
+    plan.n_stream = 1;
+
+    // n_stream == 1 => dsv4_stream_offset() is identically 0 upstream; folded out.
+    const int64_t state_rows = (int64_t) state_size;
+
+    struct persist_row {
+        int32_t   dst;
+        int32_t   src;
+        llama_pos pos;
+    };
+
+    std::vector<persist_row> persist_rows;
+
+    // The overlap compressor consumes state_read_idxs as two contiguous halves: the first
+    // ratio*n_blocks entries are the "previous-window" gather indices for every block,
+    // followed by the "current-window" indices. Collected separately, appended prev-then-cur.
+    std::vector<int32_t> overlap_prev_reads;
+    std::vector<int32_t> overlap_cur_reads;
+
+    std::map<std::pair<llama_seq_id, llama_pos>, int64_t> curr_token_idx_map;
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t s = 0; s < dsv4_batch_n_seq_id(batch, i); ++s) {
+            curr_token_idx_map[std::make_pair(dsv4_batch_seq(batch, i, s), dsv4_batch_pos(batch, i))] = i;
+        }
+    }
+
+    const auto state_source_idx = [&](llama_seq_id seq_id, llama_pos pos) -> int32_t {
+        if (pos < 0) {
+            // The overlap compressor needs a zero/-inf source for the first block's previous
+            // half. The graph appends that row after the current-ubatch scratch rows.
+            return (int32_t) (state_rows + batch.n_tokens);
+        }
+
+        const auto key = std::make_pair(seq_id, pos);
+        if (curr_token_idx_map.find(key) != curr_token_idx_map.end()) {
+            return (int32_t) (state_rows + curr_token_idx_map.at(key));
+        }
+
+        return (int32_t) (pos%state_size);
+    };
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const llama_pos pos = dsv4_batch_pos(batch, i);
+
+        if (pos < 0) {
+            continue;
+        }
+
+        plan.state_pos.push_back((int32_t) (pos%ratio));
+
+        const int64_t n_visible = (int64_t) (pos + 1)/ratio;
+        plan.n_visible[i] = (int32_t) n_visible;
+        plan.n_kv = std::max(plan.n_kv, n_visible);
+
+        for (int32_t s = 0; s < dsv4_batch_n_seq_id(batch, i); ++s) {
+            const llama_seq_id seq_id = dsv4_batch_seq(batch, i, s);
+            const int32_t state_idx = (int32_t) (pos%state_size);
+
+            const auto it = std::find_if(persist_rows.begin(), persist_rows.end(),
+                    [state_idx](const persist_row & row) {
+                        return row.dst == state_idx;
+                    });
+            if (it == persist_rows.end()) {
+                persist_rows.push_back({ state_idx, (int32_t) i, pos });
+            } else if (pos > it->pos) {
+                it->src = (int32_t) i;
+                it->pos = pos;
+            }
+
+            if ((pos + 1) % (llama_pos) ratio != 0) {
+                continue;
+            }
+
+            const llama_pos source_start = pos + 1 - (llama_pos) ratio;
+
+            plan.state_write_idxs.push_back(pos/(llama_pos) ratio);
+            plan.state_write_pos .push_back((int32_t) source_start);
+
+            if (overlap) {
+                const llama_pos prev_start = source_start - (llama_pos) ratio;
+
+                for (uint32_t j = 0; j < ratio; ++j) {
+                    overlap_prev_reads.push_back(state_source_idx(seq_id, prev_start + (llama_pos) j));
+                }
+                for (uint32_t j = 0; j < ratio; ++j) {
+                    overlap_cur_reads.push_back(state_source_idx(seq_id, source_start + (llama_pos) j));
+                }
+            } else {
+                for (uint32_t j = 0; j < ratio; ++j) {
+                    plan.state_read_idxs.push_back(state_source_idx(seq_id, source_start + (llama_pos) j));
+                }
+            }
+        }
+    }
+
+    if (ratio == DSV4_CSA_RATIO && plan.state_write_idxs.empty() && !plan.state_pos.empty()) {
+        // Non-boundary CSA steps still need a write op so their graph matches boundary steps.
+        // Use a padded scratch row that is masked from attention.
+        assert(kv_size > 0);
+
+        int32_t i = 0;
+        while (i < batch.n_tokens && dsv4_batch_pos(batch, i) < 0) {
+            ++i;
+        }
+        assert(i < batch.n_tokens);
+
+        const llama_pos    pos    = dsv4_batch_pos(batch, i);
+        const llama_seq_id seq_id = dsv4_batch_seq(batch, i, 0);
+        const int32_t source_idx  = state_source_idx(seq_id, pos);
+
+        plan.state_write_idxs.push_back((int64_t) kv_size - 1);
+        plan.state_write_pos .push_back(0);
+
+        if (overlap) {
+            for (uint32_t j = 0; j < ratio; ++j) {
+                overlap_prev_reads.push_back(source_idx);
+                overlap_cur_reads .push_back(source_idx);
+            }
+        } else {
+            for (uint32_t j = 0; j < ratio; ++j) {
+                plan.state_read_idxs.push_back(source_idx);
+            }
+        }
+    }
+
+    if (overlap) {
+        // [ all blocks' prev-window indices | all blocks' cur-window indices ]
+        plan.state_read_idxs.reserve(overlap_prev_reads.size() + overlap_cur_reads.size());
+        plan.state_read_idxs.insert(plan.state_read_idxs.end(),
+                overlap_prev_reads.begin(), overlap_prev_reads.end());
+        plan.state_read_idxs.insert(plan.state_read_idxs.end(),
+                overlap_cur_reads.begin(), overlap_cur_reads.end());
+    }
+
+    plan.n_kv = GGML_PAD(plan.n_kv, 256);
+
+    std::sort(persist_rows.begin(), persist_rows.end(),
+            [](const persist_row & a, const persist_row & b) {
+                return a.dst < b.dst;
+            });
+
+    for (const persist_row & row : persist_rows) {
+        plan.state_persist_src_idxs.push_back(row.src);
+        plan.state_persist_dst_idxs.push_back(row.dst);
+    }
+
+    static const bool debug = []() {
+        const char * env = getenv("LLAMA_DSV4_COMPRESS_DEBUG");
+        return env && atoi(env) > 0;
+    }();
+
+    if (debug) {
+        LLAMA_LOG_INFO("%s: ratio=%u n_tokens=%d n_persist=%zu n_write=%zu n_read=%zu n_kv=%lld\n",
+                __func__, ratio, batch.n_tokens, plan.state_persist_dst_idxs.size(),
+                plan.state_write_idxs.size(), plan.state_read_idxs.size(), (long long) plan.n_kv);
+    }
+
+    return plan;
+}
+
+//
+// allocation
+//
+
+static bool dsv4_alloc(llama_dsv4_memory & mem, const llama_model & model, bool offload,
+                       uint32_t n_layer) {
+    const llama_hparams & hparams = model.hparams;
+
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+
+    // 4 stores per layer (raw k, comp k, state kv, state score) across 3 streams + raw
+    const size_t n_tensors_max = 16u*n_layer;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it != ctx_map.end()) {
+            return it->second;
+        }
+        ggml_init_params params = {
+            /*.mem_size   =*/ n_tensors_max*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            return nullptr;
+        }
+        ctx_map[buft] = ctx;
+        mem.ctxs.push_back(ctx);
+        return ctx;
+    };
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        // This fork resolves the per-layer buffer type through model.buft_layer[],
+        // not upstream's model.dev_layer() / ggml_backend_dev_buffer_type().
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (offload) {
+            buft = model.buft_layer[il].buft;
+        }
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to create ggml context for DSV4 layer %u\n", __func__, il);
+            return false;
+        }
+
+        const uint32_t ratio = hparams.dsv4_compress_ratios[il];
+
+        // raw SWA(128) K, every layer
+        {
+            ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                 hparams.n_embd_k_gqa(il), mem.raw_size);
+            ggml_format_name(k, "dsv4_raw_k_l%u", il);
+            mem.raw_map_il[il] = mem.raw_k.size();
+            mem.raw_k.push_back(k);
+        }
+
+        // CSA + LID ride the ratio-4 layers; HCA rides the ratio-128 layers.
+        for (int si = 0; si < 3; ++si) {
+            dsv4_stream_state & st = mem.s[si];
+            const bool want = (si == LLAMA_DSV4_HCA) ? (ratio == DSV4_HCA_RATIO)
+                                                     : (ratio == DSV4_CSA_RATIO);
+            if (!want) {
+                continue;
+            }
+
+            ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, st.n_embd_k, st.cache_size);
+            ggml_tensor * kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, st.n_embd_state, st.state_size);
+            ggml_tensor * sc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, st.n_embd_state, st.state_size);
+
+            ggml_format_name(k,  "dsv4_s%d_k_l%u",        si, il);
+            ggml_format_name(kv, "dsv4_s%d_state_kv_l%u", si, il);
+            ggml_format_name(sc, "dsv4_s%d_state_sc_l%u", si, il);
+
+            st.map_il[il] = st.k.size();
+            st.k       .push_back(k);
+            st.st_kv   .push_back(kv);
+            st.st_score.push_back(sc);
+        }
+    }
+
+    for (auto & kvp : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(kvp.second, kvp.first);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate DSV4 buffer\n", __func__);
+            return false;
+        }
+        // DSV4 attention reads compressed-K / compressor-state rows that the current graph
+        // does not necessarily overwrite. Uninitialized buffer contents would leak in as
+        // instance-specific garbage and corrupt recall — zero everything up front so reads
+        // of un-written rows are deterministic. (Upstream does this via clear_compressed().)
+        ggml_backend_buffer_clear(buf, 0);
+        mem.bufs.push_back(buf);
+    }
+
+    return true;
+}
+
+//
+// lifecycle
+//
+
 bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type type_v,
                             uint32_t kv_size, bool offload) {
     const llama_model   & model   = lctx.model;
@@ -485,6 +799,9 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
     const uint32_t n_ub  = lctx.cparams.n_ubatch > 0 ? lctx.cparams.n_ubatch : 512u;
     mem->raw_size = GGML_PAD(n_ub + n_swa + 1, 256u);
     mem->n_swa    = n_swa;
+    // raw SWA ring: window 128, padded. Upstream sizes it from the SWA window, not kv_size.
+    const uint32_t n_swa = hparams.n_swa > 0 ? hparams.n_swa : 128u;
+    mem->raw_size = GGML_PAD(n_swa + 1, 256u);
 
     const uint32_t n_embd_head_k = hparams.n_embd_head_k(0);   // method here, field upstream
 
@@ -495,6 +812,7 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
     mem->s[LLAMA_DSV4_CSA] = {};
     mem->s[LLAMA_DSV4_CSA].ratio        = DSV4_CSA_RATIO;
     mem->s[LLAMA_DSV4_CSA].state_size   = dsv4_state_rows(2*DSV4_CSA_RATIO, n_ub);
+    mem->s[LLAMA_DSV4_CSA].state_size   = 2*DSV4_CSA_RATIO;
     mem->s[LLAMA_DSV4_CSA].n_embd_state = 2*n_embd_head_k;
     mem->s[LLAMA_DSV4_CSA].n_embd_k     = hparams.n_embd_k_gqa(0);
     mem->s[LLAMA_DSV4_CSA].cache_size   = GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u);
@@ -503,6 +821,7 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
     mem->s[LLAMA_DSV4_HCA] = {};
     mem->s[LLAMA_DSV4_HCA].ratio        = DSV4_HCA_RATIO;
     mem->s[LLAMA_DSV4_HCA].state_size   = dsv4_state_rows(DSV4_HCA_RATIO, n_ub);
+    mem->s[LLAMA_DSV4_HCA].state_size   = DSV4_HCA_RATIO;
     mem->s[LLAMA_DSV4_HCA].n_embd_state = n_embd_head_k;
     mem->s[LLAMA_DSV4_HCA].n_embd_k     = hparams.n_embd_k_gqa(0);
     mem->s[LLAMA_DSV4_HCA].cache_size   = GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u);
@@ -511,6 +830,7 @@ bool llama_dsv4_memory_init(llama_context & lctx, ggml_type type_k, ggml_type ty
     mem->s[LLAMA_DSV4_LID] = {};
     mem->s[LLAMA_DSV4_LID].ratio        = DSV4_CSA_RATIO;
     mem->s[LLAMA_DSV4_LID].state_size   = dsv4_state_rows(2*DSV4_CSA_RATIO, n_ub);
+    mem->s[LLAMA_DSV4_LID].state_size   = 2*DSV4_CSA_RATIO;
     mem->s[LLAMA_DSV4_LID].n_embd_state = 2*hparams.indexer_head_size;
     mem->s[LLAMA_DSV4_LID].n_embd_k     = hparams.indexer_head_size;
     mem->s[LLAMA_DSV4_LID].cache_size   = GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u);
@@ -671,6 +991,7 @@ void llama_dsv4_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
         ggml_backend_tensor_set(inp.raw_kq_mask, mask.data(), 0, mask.size()*sizeof(float));
     } else if (inp.raw_kq_mask) {
+    if (inp.raw_kq_mask) {
         const int64_t n_kv_raw = inp.raw_kq_mask->ne[0];
         const llama_pos n_swa  = (llama_pos) (hparams.n_swa > 0 ? hparams.n_swa : 128u);
 
@@ -868,6 +1189,13 @@ ggml_tensor * llama_dsv4_get_raw_win_k(const llama_context & lctx, ggml_context 
     }
     const llama_hparams & hp = lctx.model.hparams;
     return dsv4_k_attn_view(ctx, win, hp.n_embd_head_k(il), hp.n_head_kv(il));
+}
+
+ggml_tensor * llama_dsv4_get_raw_k(const llama_context & lctx, ggml_context * ctx, int32_t il) {
+    llama_dsv4_memory & mem = dsv4_mem();
+    ggml_tensor * k = mem.raw_k[mem.raw_map_il.at(il)];
+    const llama_hparams & hp = lctx.model.hparams;
+    return dsv4_k_attn_view(ctx, k, hp.n_embd_head_k(il), hp.n_head_kv(il));
 }
 
 ggml_tensor * llama_dsv4_cpy_raw_k(const llama_context & /*lctx*/, ggml_context * ctx,
@@ -1332,4 +1660,18 @@ size_t llama_dspark_kv_export(struct llama_context * ctx, int component, float *
         return 0;
     }
     return llama_dsv4_debug_export(*ctx, component, out, max_n);
+}
+
+ggml_tensor * llama_dsv4_cpy_state_kv(const llama_context & lctx, ggml_context * ctx,
+                                      llama_dsv4_stream s, ggml_tensor * cur,
+                                      ggml_tensor * idxs, int32_t il) {
+    ggml_tensor * dst = llama_dsv4_get_state_kv(lctx, ctx, s, il);
+    return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, cur), idxs);
+}
+
+ggml_tensor * llama_dsv4_cpy_state_score(const llama_context & lctx, ggml_context * ctx,
+                                         llama_dsv4_stream s, ggml_tensor * cur,
+                                         ggml_tensor * idxs, int32_t il) {
+    ggml_tensor * dst = llama_dsv4_get_state_score(lctx, ctx, s, il);
+    return ggml_set_rows(ctx, dst, dsv4_rows_src(ctx, dst, cur), idxs);
 }
