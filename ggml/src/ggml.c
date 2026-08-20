@@ -23059,7 +23059,13 @@ static int ggml_compute_forward_ssm_conv_f32(
 
     if (n_kv == 1 && nc == 4 && !src4) { // TODO: implement per token state saving in iqk_ssm_conv4
         float * dst_silu = NULL;
-        if (node < cgraph->n_nodes + 2 &&
+        // node is the loop index from ggml_graph_compute_thread, so it is always
+        // <= n_nodes-1 and "node < n_nodes + 2" was a tautology that gated nothing --
+        // nodes[node+1] and nodes[node+2] were read unconditionally. Backend-sched hands
+        // us ggml_graph_view sub-graphs whose nodes pointer indexes into the parent, and
+        // with an eval callback registered those views are a single node, so this read
+        // routinely landed outside the view (and past the allocation at the parent tail).
+        if (node + 2 < cgraph->n_nodes &&
             cgraph->nodes[node+1]->op == GGML_OP_VIEW && cgraph->nodes[node+1]->src[0] == dst &&
             cgraph->nodes[node+2]->op == GGML_OP_UNARY && cgraph->nodes[node+2]->src[0] == cgraph->nodes[node+1] &&
             (enum ggml_unary_op)cgraph->nodes[node+2]->op_params[0] == GGML_UNARY_OP_SILU) {
@@ -23434,6 +23440,26 @@ static void ggml_compute_forward_delta_net_f32(
     }
 
     const int64_t total_heads = n_heads * n_seqs;
+
+    // v, g and beta arrive as PERMUTED VIEWS (src/llama-delta-net.cpp:130-132), and v is on top
+    // of that a strided view into the fused conv output (src/llama-delta-net.cpp:431-433).
+    // ggml_permute only relabels axes, so the memory underneath stays head-fastest, and only
+    // q, k and state are asserted contiguous. The ik fast path above is handed src2->nb[1..3]
+    // and honours all of it; this fallback used to re-derive every address from ne[] as if the
+    // tensors were contiguous and token-fastest, which is an exact transpose for g/beta and the
+    // wrong stride entirely for v. Address them through nb[], the same way ik does.
+    //
+    // It survived unnoticed because for n_tokens == 1 all three wrong formulas collapse to the
+    // right ones -- single-token decode was always correct, only prefill was wrong.
+    const int64_t vnb1 = src2->nb[1]/sizeof(float);   // v    token stride
+    const int64_t vnb2 = src2->nb[2]/sizeof(float);   // v    head  stride
+    const int64_t vnb3 = src2->nb[3]/sizeof(float);   // v    seq   stride
+    const int64_t gnb0 = src3->nb[0]/sizeof(float);   // g    token stride
+    const int64_t gnb2 = src3->nb[2]/sizeof(float);   // g    head  stride
+    const int64_t gnb3 = src3->nb[3]/sizeof(float);   // g    seq   stride
+    const int64_t bnb1 = src4->nb[1]/sizeof(float);   // beta token stride
+    const int64_t bnb2 = src4->nb[2]/sizeof(float);   // beta head  stride
+    const int64_t bnb3 = src4->nb[3]/sizeof(float);   // beta seq   stride
     const int64_t heads_per_thread = (total_heads + nth - 1) / nth;
     const int64_t h_start = ith * heads_per_thread;
     const int64_t h_end = (h_start + heads_per_thread < total_heads) ? h_start + heads_per_thread : total_heads;
@@ -23449,10 +23475,11 @@ static void ggml_compute_forward_delta_net_f32(
         const int64_t head_idx  = h_idx % n_heads;
         const int64_t head_idx_kq = repeat_type == 0 ? head_idx / gqa_ratio : head_idx % (n_heads/gqa_ratio);
 
-        const int64_t qkv_head_offset  = batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens);
+        const int64_t v_head_offset    = batch_idx * vnb3 + head_idx * vnb2;
         const int64_t qkv_head_offset_kq = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
         const int64_t qkv_token_stride = head_dim;
-        const int64_t g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        const int64_t g_head_offset    = batch_idx * gnb3 + head_idx * gnb2;
+        const int64_t beta_head_offset = batch_idx * bnb3 + head_idx * bnb2;
         const int64_t state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int64_t out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int64_t out_token_stride = head_dim * n_heads;
@@ -23467,10 +23494,10 @@ static void ggml_compute_forward_delta_net_f32(
         for (int64_t t = 0; t < n_tokens; ++t) {
             const float * q_t = q_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
-            const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
+            const float * v_t = v_data + v_head_offset + t * vnb1;
 
-            const float g_val    = g_data[g_head_offset + t];
-            const float beta_raw = beta_data[g_head_offset + t];
+            const float g_val    = g_data[g_head_offset + t * gnb0];
+            const float beta_raw = beta_data[beta_head_offset + t * bnb1];
 
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
