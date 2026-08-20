@@ -28,9 +28,11 @@
 //   bf16 expert weights (verified none on Ornith-35B), and pxa-bench/pxqu_wrel.py measures the
 //   gate with the same convention on both sides.
 //
-// GATES (Q-G1/Q-G2): byte-parity vs the numpy reference;
-// wrel on the frozen 36-slice rng-42 protocol reproduces the lab number (0.3020488) per
-// pxa-bench/pxqu_wrel.py (±1e-4, snapped-SUB16-adjusted oracle).
+// GATES (Q-G1/Q-G2, see PXQ-UNIVERSAL-2026-07-17.md B1): byte-parity vs the numpy reference;
+// wrel on the frozen 36-slice rng-42 protocol reproduced the lab number (0.3020488) per
+// pxa-bench/pxqu_wrel.py (±1e-4, snapped-SUB16-adjusted oracle). ⚠ That lab number belongs
+// to the RETIRED absmax-0.706 book; rerunning the wrel gate against the current book needs
+// the oracle refit (or PXA_PXQ2_BOOK set to the old book for a pure parity check).
 //
 // Env:
 //   PXA_PXQ2_ANCHOR_FIT=1  widen the row-anchor search (5 fp16 candidates around absmax,
@@ -168,6 +170,63 @@ static inline bool pxq2_v3_enabled() {
     return on;
 }
 #endif
+
+// ── ceiling check (from ds4-merge-dsa) ──────────────────────────────────────────────────────
+// A tier whose book x SUB16 composition cannot reach the row anchor structurally clips every
+// row's peak weights — the defect that made PXQ2-as-built degenerate on DS4-Flash while
+// PASSING its global-wrel gate (ceiling 0.6970: 18.8% of squared error in the top-1% weights,
+// output "dekameters"). That must fail HERE, at build time, not after an 83 GB quantize.
+// PXA_PXQ_CEILING_ACCEPT=1 downgrades to a warning (deliberate experiments only).
+//
+// Deliberately NOT inside PXQ_FIX_GATES_DEFINED: pxq6-quantize.inc.cpp is included first and
+// wins that macro, so a definition placed in there from this file is silently skipped and
+// pxq3's call site fails to resolve. Its own guard makes include order irrelevant.
+#ifndef PXQ_CEILING_CHECK_DEFINED
+#define PXQ_CEILING_CHECK_DEFINED
+static void pxq_ceiling_check(const char * tier, const float * book, int nbook,
+                              const float * sub, int nsub, const char * legacy_note = nullptr) {
+    float bmax = 0.f, smax = 0.f;
+    for (int i = 0; i < nbook; ++i) { float a = fabsf(book[i]); if (a > bmax) bmax = a; }
+    for (int i = 0; i < nsub;  ++i) { float a = fabsf(sub[i]);  if (a > smax) smax = a; }
+    const float ceiling = bmax * smax;
+    if (ceiling >= 0.95f) {
+        return;
+    }
+    if (ceiling >= 0.80f) {
+        fprintf(stderr,
+            "%s: WARNING: reconstruction ceiling %.4f x row absmax (max|book| %.5f x max(SUB16) %.5f "
+            "< 0.95) — row-peak weights are mildly clipped; expect elevated top-1%% error\n",
+            tier, ceiling, bmax, smax);
+        return;
+    }
+    // A table we froze on purpose and still ship as the default is a documented limitation,
+    // not an unvetted book. It warns and names the lever; everything else still aborts.
+    if (legacy_note) {
+        fprintf(stderr,
+            "%s: WARNING: reconstruction ceiling %.4f x row absmax (max|book| %.5f x max(SUB16) %.5f) "
+            "— row-peak weights clipped by %.0f%%. Known limitation of a deliberately retained "
+            "table: %s\n",
+            tier, ceiling, bmax, smax, 100.f*(1.f - ceiling), legacy_note);
+        return;
+    }
+    fprintf(stderr,
+        "%s: FATAL: reconstruction ceiling %.4f x row absmax (max|book| %.5f x max(SUB16) %.5f). "
+        "The book/SUB16 composition cannot reach the row anchor: every row's peak weights would be "
+        "clipped by %.0f%%. This produced a degenerate model once (PXQ2 + the absmax-0.706 book) "
+        "and is refused at build time. Refit the book with absmax ~1.0 (or SUB16 for the book's "
+        "range); PXA_PXQ_CEILING_ACCEPT=1 overrides deliberately.\n",
+        tier, ceiling, bmax, smax, 100.f*(1.f - ceiling));
+    if (!getenv("PXA_PXQ_CEILING_ACCEPT")) {
+        exit(EXIT_FAILURE);
+    }
+}
+#endif
+
+// True when the effective book is still the frozen v1 LM4 table (pxq2_book_q_ == PXQ2_BOOK_INIT).
+static inline bool pxq2_book_is_frozen_v1(const float * book) {
+    for (int i = 0; i < 4; ++i) { if (book[i] != pxq2_book_q_[i]) return false; }
+    return true;
+}
 
 static inline bool pxq2_parse_n(const char * e, float * out, int want) {
     int n = 0; float v[16];
@@ -409,6 +468,14 @@ static void pxq2_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
         return pxq_imatrix_column_usable(w, K) ? w : nullptr;
     };
     (void)pxq2_book_q(); (void)pxq2_sub_q(); (void)pxq2_mids_q();   // init tables before threading
+    // The frozen v1 book is below the bar by construction (0.70557 x 0.98779 = 0.6970) and is
+    // STILL the default, because every PXQ2 file already shipped decodes against it. That
+    // clipping is documented in ggml-pxq2-tables.h and the remedy is a lever, so for that one
+    // table this warns. Any OTHER sub-bar book — including a bad PXA_PXQ2_BOOK — still aborts.
+    pxq_ceiling_check("PXQ2", pxq2_book_q(), 4, pxq2_sub_q(), 16,
+                      pxq2_book_is_frozen_v1(pxq2_book_q())
+                        ? "the frozen v1 LM4 book; set PXA_PXQ_CEIL_V2=1 (or PXA_PXQ2_V3=1) for a ceiling-correct book"
+                        : nullptr);
     // P15 (2026-07-27): thread over (expert, panel-chunk) jobs, not experts alone. A DENSE
     // tensor (E == 1) previously fell into the serial branch and ran its whole R x K on ONE
     // thread (measured: 103% CPU at -t 32 quantizing the dense 27B, ~9.7 s/tensor). Panels

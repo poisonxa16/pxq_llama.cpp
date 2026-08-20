@@ -115,6 +115,7 @@ namespace GGUFMeta {
             switch (ty) {
                 case LLAMA_KV_OVERRIDE_TYPE_BOOL:  return "bool";
                 case LLAMA_KV_OVERRIDE_TYPE_INT:   return "int";
+                case LLAMA_KV_OVERRIDE_TYPE_UINT:  return "uint";
                 case LLAMA_KV_OVERRIDE_TYPE_FLOAT: return "float";
                 case LLAMA_KV_OVERRIDE_TYPE_STR:   return "str";
             }
@@ -130,7 +131,8 @@ namespace GGUFMeta {
                     case LLAMA_KV_OVERRIDE_TYPE_BOOL:  {
                         LLAMA_LOG_INFO("%s\n", ovrd->val_bool ? "true" : "false");
                     } break;
-                    case LLAMA_KV_OVERRIDE_TYPE_INT:   {
+                    case LLAMA_KV_OVERRIDE_TYPE_INT:
+                    case LLAMA_KV_OVERRIDE_TYPE_UINT:  {
                         LLAMA_LOG_INFO("%" PRId64 "\n", ovrd->val_i64);
                     } break;
                     case LLAMA_KV_OVERRIDE_TYPE_FLOAT: {
@@ -165,6 +167,14 @@ namespace GGUFMeta {
         template<typename OT>
         static typename std::enable_if<!std::is_same<OT, bool>::value && std::is_integral<OT>::value, bool>::type
         try_override(OT & target, const struct llama_model_kv_override * ovrd) {
+            // uint: is the same 64-bit payload, tagged so quantize writes UINT32
+            if (ovrd && ovrd->tag == LLAMA_KV_OVERRIDE_TYPE_UINT) {
+                if (validate_override(LLAMA_KV_OVERRIDE_TYPE_UINT, ovrd)) {
+                    target = ovrd->val_i64;
+                    return true;
+                }
+                return false;
+            }
             if (validate_override(LLAMA_KV_OVERRIDE_TYPE_INT, ovrd)) {
                 target = ovrd->val_i64;
                 return true;
@@ -1644,4 +1654,10 @@ template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum
 template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
 
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(enum llm_kv, unsigned int&, bool);
+
+// DeepSeek-V4 reads attention.compress_ratios as a raw array whose length may EXCEED
+// n_layer (the 0731 Flash release ships 46 for 43 blocks), which get_key_or_arr() rejects
+// by design. Both overloads are needed: the llm_kv one forwards to the string one.
+template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::vector<uint32_t> &, bool);
+template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv, std::vector<uint32_t> &, bool);
 

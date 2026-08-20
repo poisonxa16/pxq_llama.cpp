@@ -643,6 +643,13 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         ggml_cpy_flt_cuda<float, int32_t> (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream, dest_ptrs_d, graph_cpynode_index);
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_flt_cuda<int32_t, float> (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream, dest_ptrs_d, graph_cpynode_index);
+    } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32) {
+        // Same-type integer copy. Reached by DeepSeek-V4: its hash-routed blocks build the
+        // expert selection with an I32 get_rows that has no CUDA path, so the scheduler splits
+        // the graph there and has to move an I32 tensor across the boundary. Short prompts do
+        // not split the same way, so this only fires once a prompt is long enough -- it aborted
+        // the server at ~3.8k tokens while two-token probes passed.
+        ggml_cpy_flt_cuda<int32_t, int32_t> (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream, dest_ptrs_d, graph_cpynode_index);
     } else if (ggml_are_same_shape(src0, src1) && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0) {
         // This is needed for MLA with mla=2 when using q8_0 cache.
         transpose_q8_0(ctx, src0, src1);

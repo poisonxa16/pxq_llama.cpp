@@ -32,6 +32,7 @@ static inline const char * llm_expert_gating_func_name(llm_expert_gating_func_ty
         case LLM_EXPERT_GATING_FUNC_SOFTMAX: return "softmax";
         case LLM_EXPERT_GATING_FUNC_SIGMOID: return "sigmoid";
         case LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "weight";
+        case LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS: return "sqrtsoftplus";
         default: return "none";
     }
 }
@@ -1622,6 +1623,110 @@ void llm_load_hparams(
                     hparams.n_embd_head_v_full = 128;
                     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   hparams.n_embd_head_k_full);
                     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v_full);
+                }
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                // Adapted from llama.cpp src/models/deepseek4.cpp
+                // (llama_model_deepseek4::load_arch_hparams, lines 18-60) @ upstream
+                // commit 82dbc4f01, PR #24162 and follow-ups.
+                // Copyright (c) 2023-2026 The ggml authors. MIT.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
+
+                // Upstream stores these in hparams.swiglu_clamp_{exp,shexp}. This tree
+                // already maps the very same GGUF keys onto swiglu_limits /
+                // swiglu_limits_shared (see LLM_ARCH_STEP35 above), so reuse those.
+                // NOTE the DS4 semantics: the GATE is clamped to [-inf, limit] BEFORE
+                // swiglu_split - it is NOT silu-then-clamp (graph lane, chunk D).
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_limits, hparams.n_layer, true);
+                if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_limits_shared, hparams.n_layer, false)) {
+                    hparams.swiglu_limits_shared = hparams.swiglu_limits;
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         hparams.dsv4_o_group_count);
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
+                ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    hparams.dsv4_compress_rope_base);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+                ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
+
+                // Per-layer attention regime. get_key_or_arr() insists the array length is
+                // exactly n_layer (upstream accepted >= n_layer) and throws a descriptive
+                // error otherwise; a scalar would broadcast, which the validation below
+                // still accepts only if it is one of the three legal ratios.
+                std::fill(hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.end(), 0u);
+                {
+                    // DS4 ships MORE ratios than blocks: the 0731 Flash release carries 46 for
+                    // 43 layers. Upstream accepts >= n_layer and uses the first n_layer; our
+                    // shared get_key_or_arr() demands an exact match and would reject the model
+                    // outright. Relaxing the shared guard is not an option -- for every other
+                    // arch a short array must stay an error, not a silent broadcast of zeros --
+                    // so read the raw array here and take the prefix.
+                    //
+    // The per-layer regime pattern occupies indices [0, n_layer); anything past that
+                    // is padding whose length is NOT fixed -- converters in the wild emit both
+                    // n_layer+1 and n_layer+hash_layer_count. Upstream requires only size >= n_layer
+                    // and copies the prefix (llama-model.cpp, LLM_ARCH_DEEPSEEK4), so match that.
+                    // A SHORT array stays a hard error: broadcasting one value across every layer
+                    // would assign the wrong attention regime and yield plausible garbage.
+                    //     idx  0  1  2   3  4   5 ...  42 | 43 ...
+                    //     val  0, 0, 4, 128, 4, 128 ...  4 |  0 ...
+                    std::vector<uint32_t> ratios;
+                    ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios, true);
+                    if (ratios.size() < hparams.n_layer) {
+                        throw std::runtime_error(format(
+                                    "DeepSeek-V4: attention.compress_ratios has %u entries, need at least n_layer=%u",
+                                    (uint32_t) ratios.size(), hparams.n_layer));
+                    }
+                    if (hparams.n_layer > hparams.dsv4_compress_ratios.size()) {
+                        throw std::runtime_error(format("DeepSeek-V4: n_layer=%u exceeds LLAMA_MAX_LAYERS", hparams.n_layer));
+                    }
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        hparams.dsv4_compress_ratios[il] = ratios[il];
+                    }
+                }
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    const uint32_t r = hparams.dsv4_compress_ratios[il];
+                    if (r != 0 && r != 4 && r != 128) {
+                        throw std::runtime_error(format(
+                                    "DeepSeek-V4 loader only supports compression ratios 0, 4 and 128 (layer %u has %u)",
+                                    il, r));
+                    }
+                }
+
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
+                if (hparams.expert_gating_func != LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS) {
+                    throw std::runtime_error("DeepSeek-V4 loader currently expects sqrtsoftplus MoE scoring");
+                }
+
+                // Upstream additionally does:
+                //     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                //     hparams.set_swa_pattern(0);
+                // Neither exists in this tree: there is only the scalar n_swa (set above
+                // from attention.sliding_window = 128) plus the per-layer swa_layers[]
+                // flag. swa_layers[] is deliberately left all-zero - it selects
+                // n_embd_head_k_swa inside n_embd_head_k(il), which is NOT what DS4 wants.
+                // "Which layers are raw-SWA" is dsv4_compress_ratios[il] == 0, and that
+                // decision is carried by the DSV4 memory module (chunk C) and the graph
+                // (chunk D), not by swa_layers[].
+
+                // Upstream leaves the model type UNKNOWN for every layer count
+                // (deepseek4.cpp:57-60). Do not invent an "<n>B_A<m>B" label until the
+                // active-parameter count has actually been measured.
+                switch (hparams.n_layer) {
+                    default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
         default: (void)0;

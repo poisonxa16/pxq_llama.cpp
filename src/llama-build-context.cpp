@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <atomic>
 #include <stdexcept>
 #include "llama-build-context.h"
@@ -57,6 +58,7 @@ llm_build_context::llm_build_context(
         n_embd_v_gqa     (hparams.n_embd_v_gqa()),
         n_expert         (hparams.n_expert),
         n_expert_used    (warmup ? hparams.n_expert : hparams.n_expert_used),
+        is_warmup        (warmup),
         freq_base        (cparams.rope_freq_base),
         freq_scale       (cparams.rope_freq_scale),
         ext_factor       (cparams.yarn_ext_factor),
@@ -1056,7 +1058,8 @@ ggml_tensor * llm_build_context::llm_build_moe_ffn(
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
          ggml_tensor * up_gate_exps, ggml_tensor * up_gate_exps_b,
-         ggml_tensor * input_logits, ggml_tensor * down_exps_s) {
+         ggml_tensor * input_logits, ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in) {
 
     GGML_ASSERT(gate_inp || input_logits);
 
@@ -1066,7 +1069,21 @@ llm_expert_gating_func_type   gating_op,
     int64_t n_tokens = cur->ne[1];
     bool weight_before_ffn = lctx.model.arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // PXA/DSV4: DeepSeek-V4 clamps the SwiGLU halves inside the routed experts:
+    // up -> [-limit, limit], gate -> [-inf, limit], THEN silu(gate)*up. It is NOT
+    // silu-then-clamp (that is the gpt-oss/step35 variant). Arch-gated so that no
+    // other model's code path can change, and it forces the unfused up/gate branch.
+    // Ported from upstream llama-graph.cpp build_moe_ffn (LLM_ARCH_DEEPSEEK4 case).
+    const float dsv4_limit = lctx.model.arch == LLM_ARCH_DEEPSEEK4 && il >= 0
+        ? lctx.model.hparams.swiglu_limits[il] : 0.0f;
+    const bool dsv4_clamp = dsv4_limit > 1e-6f;
+
     ggml_tensor * logits = gate_inp ? llm_build_lora_mm(lctx, ctx, gate_inp, cur) : input_logits; // [n_expert, n_tokens]
+    if (gate_inp && gating_op == LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS) {
+        // sqrt(softplus(x)) needs the F32 accumulator: softplus is ~linear for
+        // large x, so an F16 logit loses routing order between close experts.
+        ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+    }
     cb(logits, "ffn_moe_logits", il);
 
     if (gate_inp_b) {
@@ -1090,6 +1107,11 @@ llm_expert_gating_func_type   gating_op,
             {
                 probs = logits; // [n_expert, n_tokens]
             } break;
+        case LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS:
+            {
+                // DeepSeek-V4 router scoring (upstream llama-graph.cpp)
+                probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits)); // [n_expert, n_tokens]
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -1111,7 +1133,12 @@ llm_expert_gating_func_type   gating_op,
 
     // select experts
     ggml_tensor * selected_experts;
-    if (lctx.cparams.grouped_expert_routing && lctx.model.arch == LLM_ARCH_BAILINGMOE2 && n_tokens > 0) {
+    if (selected_experts_in) {
+        // PXA/DSV4: expert ids supplied by the caller (token-id hash table on the
+        // first hash_layer_count blocks). The router logits/probs above are still
+        // computed - the WEIGHTS come from probs[selected], exactly as upstream.
+        selected_experts = selected_experts_in;
+    } else if (lctx.cparams.grouped_expert_routing && lctx.model.arch == LLM_ARCH_BAILINGMOE2 && n_tokens > 0) {
         auto& hparams = lctx.model.hparams;
         selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
     } else {
@@ -1181,6 +1208,12 @@ llm_expert_gating_func_type   gating_op,
     //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
     bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI_MOE);
 
+    // PXA/DSV4: none of the fused up/gate kernels can express DS4's asymmetric
+    // clamp (up two-sided, gate one-sided), so take the explicit branch below.
+    if (dsv4_clamp) {
+        can_use_fmoe = false;
+    }
+
     ggml_tensor * par;
     if (can_use_fmoe && up_gate_exps) {
         if (up_gate_exps_b) {
@@ -1234,7 +1267,16 @@ llm_expert_gating_func_type   gating_op,
             cb(gate, "ffn_moe_gate_biased", il);
         }
 
-        if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
+        if (dsv4_clamp) {
+            // DeepSeek-V4: clamp BOTH halves, then silu(gate)*up. Order matters -
+            // clamping silu(gate) instead of gate is a different (wrong) function.
+            up   = ggml_clamp(ctx, up,   -dsv4_limit, dsv4_limit);
+            cb(up, "ffn_moe_up_clamped", il);
+            gate = ggml_clamp(ctx, gate, -INFINITY,   dsv4_limit);
+            cb(gate, "ffn_moe_gate_clamped", il);
+            par  = ggml_swiglu_split(ctx, gate, up);
+            cb(par, "ffn_moe_swiglu_limited", il);
+        } else if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
             par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
             if (lctx.model.arch == LLM_ARCH_STEP35) {
                 *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
@@ -2321,11 +2363,17 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     llm.init();
 
     {
-        // PXA_BUILDGRAPH_DBG: first-N graph builds print the workspace identity — hunting the
-        // np>=8+MTP init segfault where build #8 dies inside ggml_new_object with the bounds
+        // PXA_BUILDGRAPH_DBG: first-N graph builds print the workspace identity — used to hunt
+        // the np>=8+MTP init segfault where build #8 died inside ggml_new_object with the bounds
         // check NOT firing (ctx/buffer garbage -> use-after-free suspect, not arena overflow).
+        // Env-gated (PXA_BUILDGRAPH_DBG=1): it was unconditional, so every run wrote 64 lines to
+        // stderr, which corrupts any log a harness parses and buries real output.
+        static const bool pxa_dbg_on = [] {
+            const char * e = getenv("PXA_BUILDGRAPH_DBG");
+            return e && atoi(e) > 0;
+        }();
         static std::atomic<int> pxa_dbg_n{0};
-        const int pxa_n = pxa_dbg_n.fetch_add(1);
+        const int pxa_n = pxa_dbg_on ? pxa_dbg_n.fetch_add(1) : 64;
         if (pxa_n < 64) {
             fprintf(stderr, "PXA_BUILD_DBG #%d lctx=%p meta=%p metasz=%zu ntok=%d worst=%d nodes_budget=%zu\n",
                 pxa_n, (void *) &lctx, (void *) lctx.buf_compute_meta.data(), lctx.buf_compute_meta.size(),
@@ -2634,6 +2682,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_HY_V3:
             {
                 result = llm.build_hy3();
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                result = llm.build_deepseek4();
             } break;
         default:
             GGML_ABORT("fatal error");

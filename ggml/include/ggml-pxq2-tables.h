@@ -21,6 +21,12 @@
 //   sub-scale LUT: PXQ6_SUB16_INIT from ggml-pxq6-tables.h REUSED VERBATIM (the SUB16 LUT is
 //   codebook-agnostic -- measured bit-identical after fp16 snap on the LM8 refit, checked for
 //   LM4 in gate B0). PXQ2 defines NO sub table of its own.
+//   ⚠ CEILING (ds4-merge-dsa, DS4-FP8-REQUANT-2026-08-02.md §6): the SUB16 range was frozen
+//   for books with absmax == 1.0 (max(SUB16) = 0.98779). The reconstruction ceiling of the
+//   composition is  max|w| = anchor * max(SUB16) * max|book|,  with anchor == the row absmax,
+//   so a book with absmax < 1 CLIPS every row's peak weights. The v1 book below has absmax
+//   0.70557 -> ceiling 0.6970 x row absmax. This is the bug PXA_PXQ_CEIL_V2 fixes; see the v2
+//   block. v1 stays the default for byte-compat with every PXQ2 file already shipped.
 // Book is the alternating-co-fit LM4 (kept round 2), fp16-snapped, emitted as exact fp32 hex.
 // NO zero entry and absmax != 1 by design (Lloyd centroids of absmax-normalized data);
 // the min-|v| entry is index 2 (PXQ2_ZIDX) -- used for all-zero blocks.
@@ -82,4 +88,24 @@
 // fp16-snapped, strictly ascending: -0.791015625, -0.2712402344, 0.1007080078, 0.6655273438
 #define PXQ2_BOOK_V3_INIT { \
     -0x1.9500000000000p-1f, -0x1.15c0000000000p-2f, 0x1.9c80000000000p-4f, 0x1.54c0000000000p-1f }
+
+// ---------------------------------------------------------------------------------------------
+// DS4-Flash refit book (ds4-merge-dsa, 2026-08-02) -- SUPERSEDED, kept for the record. An LM4
+// Lloyd refit on real DS4-Flash expert weights with absmax PINNED TO 1.0, i.e. the same ceiling
+// fix arrived at independently and a week earlier, but applied by REPLACING the default book --
+// which silently changes decode for every v1 file that does not carry pxa.pxq2.book. v2 (pure
+// rescale, gated) and v3 (family refit, gated) reach the same ceiling without that break, so
+// this book is not wired to a lever. Its measurement stands: on DS4 experts vs the shipped
+// book, global wrel 0.3207 -> 0.3108, top-1% rel 0.2874 -> 0.2734 (unweighted-MSE protocol).
+// To decode or reproduce a file built with it:
+//   PXA_PXQ2_BOOK=-1.0,-0.338623046875,0.19189453125,0.8857421875
+// fp16-snapped, strictly ascending: -1.0, -0.338623046875, 0.19189453125, 0.8857421875
+//   { -0x1.0000000000000p+0f, -0x1.5ac0000000000p-2f, 0x1.8900000000000p-3f, 0x1.c580000000000p-1f }
+//
+// HISTORY (from ds4-merge-dsa) -- why absmax != 1 was never safe with a verbatim SUB16: reusing
+// PXQ6's SUB16 capped reconstruction at 0.6970 x row absmax; every row's peak weights clipped
+// ~30%, 18.8% of squared error concentrated in the top-1% weights, degenerate output on
+// DS4-Flash while GLOBAL wrel looked *better* than the coherent community arm (0.3296 vs
+// 0.3535). Files built with the ORIGINAL b2_e16 book carry it in their pxa.pxq2.book KV; decode
+// them with PXA_PXQ2_BOOK=-0.70556640625,-0.1876220703125,0.186767578125,0.70263671875
 

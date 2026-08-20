@@ -100,6 +100,9 @@ class Keys:
         ATTN_LOGIT_SOFTCAPPING            = "{arch}.attn_logit_softcapping"
         FINAL_LOGIT_SOFTCAPPING           = "{arch}.final_logit_softcapping"
         ROUTER_LOGIT_SOFTCAPPING          = "{arch}.router_logit_softcapping"
+        HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
+        SWIGLU_CLAMP_EXP                  = "{arch}.swiglu_clamp_exp"
+        SWIGLU_CLAMP_SHEXP                = "{arch}.swiglu_clamp_shexp"
 
     class Attention:
         HEAD_COUNT        = "{arch}.attention.head_count"
@@ -118,6 +121,22 @@ class Keys:
         SLIDING_WINDOW_PATTERN = "{arch}.attention.sliding_window_pattern"
         OUTPUT_SCALE                 = "{arch}.attention.output_scale"
         TEMPERATURE_LENGTH           = "{arch}.attention.temperature_length"
+        OUTPUT_GROUP_COUNT           = "{arch}.attention.output_group_count"
+        OUTPUT_LORA_RANK             = "{arch}.attention.output_lora_rank"
+        COMPRESS_RATIOS              = "{arch}.attention.compress_ratios"
+        COMPRESS_ROPE_FREQ_BASE      = "{arch}.attention.compress_rope_freq_base"
+
+        # NOTE: the C++ side already carries these three under byte-identical key
+        # strings (LLM_KV_ATTENTION_INDEXER_* in src/llama-arch.cpp).
+        class Indexer:
+            HEAD_COUNT = "{arch}.attention.indexer.head_count"
+            KEY_LENGTH = "{arch}.attention.indexer.key_length"
+            TOP_K      = "{arch}.attention.indexer.top_k"
+
+    class HyperConnection:
+        COUNT                = "{arch}.hyper_connection.count"
+        SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"
+        EPSILON              = "{arch}.hyper_connection.epsilon"
 
     class Rope:
         DIMENSION_COUNT          = "{arch}.rope.dimension_count"
@@ -267,6 +286,7 @@ class MODEL_ARCH(IntEnum):
     SMOLLM3      = auto()
     SEED_OSS     = auto()
     LAGUNA       = auto()
+    DEEPSEEK4    = auto()
 
 class MODEL_TENSOR(IntEnum):
     TOKEN_EMBD           = auto()
@@ -375,6 +395,33 @@ class MODEL_TENSOR(IntEnum):
     MTP_POST_PROJ        = auto()
     MTP_TOKEN_ORDERING   = auto()
     MTP_CENTROIDS        = auto()
+    # DeepSeek-V4 (hyper-connections, o-LoRA, per-layer compressors, lightning indexer,
+    # hash routing). Names follow llama.cpp upstream @82dbc4f01.
+    HC_HEAD_FN               = auto()
+    HC_HEAD_BASE             = auto()
+    HC_HEAD_SCALE            = auto()
+    HC_ATTN_FN               = auto()
+    HC_ATTN_BASE             = auto()
+    HC_ATTN_SCALE            = auto()
+    HC_FFN_FN                = auto()
+    HC_FFN_BASE              = auto()
+    HC_FFN_SCALE             = auto()
+    ATTN_SINKS               = auto()
+    ATTN_KV                  = auto()
+    ATTN_KV_NORM             = auto()
+    ATTN_OUT_A               = auto()
+    ATTN_OUT_B               = auto()
+    ATTN_COMPRESSOR_WKV      = auto()
+    ATTN_COMPRESSOR_WGATE    = auto()
+    ATTN_COMPRESSOR_APE      = auto()
+    ATTN_COMPRESSOR_NORM     = auto()
+    INDEXER_PROJ             = auto()
+    INDEXER_ATTN_Q_B         = auto()
+    INDEXER_COMPRESSOR_WKV   = auto()
+    INDEXER_COMPRESSOR_WGATE = auto()
+    INDEXER_COMPRESSOR_APE   = auto()
+    INDEXER_COMPRESSOR_NORM  = auto()
+    FFN_GATE_TID2EID         = auto()
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
@@ -438,6 +485,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.SMOLLM3:        "smollm3",
     MODEL_ARCH.SEED_OSS:       "seed_oss",
     MODEL_ARCH.LAGUNA:         "laguna",
+    MODEL_ARCH.DEEPSEEK4:      "deepseek4",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -548,6 +596,34 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.MTP_POST_PROJ:             "mtp_post_proj",
     MODEL_TENSOR.MTP_TOKEN_ORDERING:        "mtp_token_ordering",
     MODEL_TENSOR.MTP_CENTROIDS:             "mtp_centroids",
+    # DeepSeek-V4.  NOTE: ATTN_KV_NORM deliberately shares the string of the
+    # pre-existing ATTN_KV_A_NORM ("blk.{bid}.attn_kv_a_norm") -- that is what
+    # upstream writes, so the GGUF stays byte-compatible with mainline.
+    MODEL_TENSOR.HC_HEAD_FN:                "output_hc_fn",
+    MODEL_TENSOR.HC_HEAD_BASE:              "output_hc_base",
+    MODEL_TENSOR.HC_HEAD_SCALE:             "output_hc_scale",
+    MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
+    MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
+    MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
+    MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
+    MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.ATTN_SINKS:                "blk.{bid}.attn_sinks",
+    MODEL_TENSOR.ATTN_KV:                   "blk.{bid}.attn_kv",
+    MODEL_TENSOR.ATTN_KV_NORM:              "blk.{bid}.attn_kv_a_norm",
+    MODEL_TENSOR.ATTN_OUT_A:                "blk.{bid}.attn_output_a",
+    MODEL_TENSOR.ATTN_OUT_B:                "blk.{bid}.attn_output_b",
+    MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_kv",
+    MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_gate",
+    MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
+    MODEL_TENSOR.ATTN_COMPRESSOR_NORM:      "blk.{bid}.attn_compressor_norm",
+    MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
+    MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_WKV:    "blk.{bid}.indexer_compressor_kv",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE:  "blk.{bid}.indexer_compressor_gate",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_APE:    "blk.{bid}.indexer_compressor_ape",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_NORM:   "blk.{bid}.indexer_compressor_norm",
+    MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -1574,6 +1650,49 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
     ],
+    MODEL_ARCH.DEEPSEEK4: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.HC_HEAD_FN,
+        MODEL_TENSOR.HC_HEAD_BASE,
+        MODEL_TENSOR.HC_HEAD_SCALE,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV,
+        MODEL_TENSOR.ATTN_KV_NORM,
+        MODEL_TENSOR.ATTN_OUT_A,
+        MODEL_TENSOR.ATTN_OUT_B,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_WKV,
+        MODEL_TENSOR.ATTN_COMPRESSOR_WGATE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_APE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_NORM,
+        MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_WKV,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_APE,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_TID2EID,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+    ],
     # TODO
 }
 
@@ -1754,6 +1873,10 @@ class GGMLQuantizationType(IntEnum):
 class ExpertGatingFuncType(IntEnum):
     SOFTMAX  = 1
     SIGMOID  = 2
+    # DeepSeek-V4 "sqrtsoftplus". Value 4 is an interface fact -- it is written
+    # into the GGUF and must match llama.cpp upstream exactly. 3 is unused there.
+    SQRTSOFTPLUS = 4
+    SQRT_SOFTPLUS = 4   # alias (the PXA spec spells it with the underscore)
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h

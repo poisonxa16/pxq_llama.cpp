@@ -3630,6 +3630,13 @@ bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_over
         sep += 4;
         kvo.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
         kvo.val_i64 = std::atol(sep);
+    } else if (strncmp(sep, "uint:", 5) == 0) {
+        // distinct from int: so llama-quantize can BAKE a UINT32 key. The loader
+        // type-checks GGUF metadata strictly, so a key read as uint32_t must be
+        // written as UINT32, not INT32.
+        sep += 5;
+        kvo.tag = LLAMA_KV_OVERRIDE_TYPE_UINT;
+        kvo.val_i64 = (int64_t) std::strtoull(sep, nullptr, 10);
     } else if (strncmp(sep, "float:", 6) == 0) {
         sep += 6;
         kvo.tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT;

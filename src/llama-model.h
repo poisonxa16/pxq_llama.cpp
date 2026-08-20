@@ -366,6 +366,29 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // DeepSeek-V4. Field names match llama.cpp src/llama-model.h @ upstream 82dbc4f01
+    // so that the graph body transliterated from src/models/deepseek4.cpp compiles
+    // unchanged. Copyright (c) 2023-2026 The ggml authors. MIT.
+    // (`wq_a`/`wq_b`/`attn_q_a_norm`/`attn_sinks`/`wkv` above are reused as-is;
+    //  `wkv` had no other user in this tree.)
+    struct ggml_tensor * wo_a                = nullptr;
+    struct ggml_tensor * wo_b                = nullptr;
+    struct ggml_tensor * hc_attn_fn          = nullptr;
+    struct ggml_tensor * hc_attn_base        = nullptr;
+    struct ggml_tensor * hc_attn_scale       = nullptr;
+    struct ggml_tensor * hc_ffn_fn           = nullptr;
+    struct ggml_tensor * hc_ffn_base         = nullptr;
+    struct ggml_tensor * hc_ffn_scale        = nullptr;
+    struct ggml_tensor * attn_comp_wkv       = nullptr;
+    struct ggml_tensor * attn_comp_wgate     = nullptr;
+    struct ggml_tensor * attn_comp_ape       = nullptr;
+    struct ggml_tensor * attn_comp_norm      = nullptr;
+    struct ggml_tensor * indexer_comp_wkv    = nullptr;
+    struct ggml_tensor * indexer_comp_wgate  = nullptr;
+    struct ggml_tensor * indexer_comp_ape    = nullptr;
+    struct ggml_tensor * indexer_comp_norm   = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid    = nullptr; // I32 hash routing table
+
     // long rope factors
     struct ggml_tensor * rope_long  = nullptr;
     struct ggml_tensor * rope_short = nullptr;
@@ -447,6 +470,11 @@ struct llama_model {
     struct ggml_tensor * output_norm_enc;
     struct ggml_tensor * output_mtp = nullptr;
 
+    // DeepSeek-V4 hyper-connection output head (upstream llama-model.h:585-587)
+    struct ggml_tensor * hc_head_fn    = nullptr;
+    struct ggml_tensor * hc_head_base  = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
+
     std::unique_ptr<ggml_tensor> output_mtp_ptr;
 
     llama_split_tensor split_output;
@@ -515,7 +543,12 @@ struct llama_model {
     size_t max_nodes(int n_tokens) const {
         auto n_tensors = tensors_by_name.size();
         if (split_mode == LLAMA_SPLIT_MODE_GRAPH && !devices.empty()) n_tensors *= devices.size();
-        if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35) {
+        // DeepSeek-V4's unfused graph is huge (a 20-iteration Sinkhorn loop of
+        // soft_max/sum_rows/div/add per layer, plus the hc x hc post loop), so it needs
+        // the same token-scaled bound - the flat 65536 below aborts mid-build at ub2048.
+        // Mirrors upstream llama_context::graph_max_nodes() (llama-context.cpp:2349).
+        if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35 ||
+            arch == LLM_ARCH_DEEPSEEK4) {
             return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
         }
         //return std::max<size_t>(1024, 8*n_tensors);

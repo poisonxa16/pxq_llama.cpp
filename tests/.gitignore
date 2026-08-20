@@ -6,3 +6,4 @@ ggml-common.h
 !peg-parser
 !fixtures
 !fixtures/glm4-moe-lite-tiny
+!fixtures/dsv4-tiny
