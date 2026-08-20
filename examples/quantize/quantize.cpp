@@ -188,7 +188,7 @@ static void usage(const char * executable) {
     printf("  --pxq-universal {12g|16g|16g-hq|/path/to/map.tiers}: PXQ-UNIVERSAL per-tensor tier map.\n");
     printf("  --pxq-composition-override: keep a PXQ-target output that FAILS the composition assertion\n");
     printf("        (PXQ family < 50%% of bytes, or zero bytes of the named tier). Default: abort + remove.\n");
-    printf("        Presets resolve to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
+    printf("        A bare <name> resolves to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
     printf("        The file is '#'-commented lines of regex=type (pxq1|pxq2|pxq3|pxq4; pxq6 = the 5-bit tier since 2026-07-21), fed through --custom-q.\n\n");
     printf("  --repack Repack all tensors to the corresponding _r4/8 variant if available.\n\n");
     printf("  --repack-pattern Comma separated list of regexs to use for matching tensor names to be repacked.\n\n");
