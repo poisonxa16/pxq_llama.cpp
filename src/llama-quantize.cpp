@@ -2128,6 +2128,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                  model.arch == LLM_ARCH_GEMMA4 ||
                  model.arch == LLM_ARCH_QWEN35MOE ||   // hybrid: only full-attn layers carry wv (every full_attention_interval)
                  model.arch == LLM_ARCH_QWEN3NEXT ||    // same Gated-DeltaNet hybrid layout
+                 model.arch == LLM_ARCH_QWEN35 ||      // dense sibling of QWEN35MOE; identical hybrid layout
                  model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
 
     size_t total_size_org = 0;
