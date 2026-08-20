@@ -1113,3 +1113,161 @@ card6 3.5 GiB. No card and no usable pair fits it. The only substantially free
 card is the 1080 Ti, which is both too small **and** the wrong silicon —
 a split ceiling measured on sm_61 would not transfer to the V100+P100 pair the
 seat actually runs on. Needs a window where a seat may be taken down.
+## Updates — 2026-08-17 — the reviewer seat on cards 2,0 measured for the first time
+
+This seat had **never been benchmarked**. Cell: build-srv, PXQ4 + vision, cards 2,0
+(dev0 = card 2 V100 sm_70, dev1 = card 0 P100 sm_60), `-ngl 99 -sm layer -ts 52,48 -c 131072
+-b/-ub 2048 -np 1 -fa on`, fill 8192, n_predict 128, 3 reps/arm, temp 0, fresh server per arm,
+`PXA_ENHANCE=1`, **3 interleaved repeated baselines**.
+
+Geometry from the startup ledger: `arch=qwen35, n_layer 65, n_head 24, n_head_kv 4 (gqa 6),
+n_embd_head_k = n_embd_head_v = 256, n_swa = 0`.
+
+**BASELINE = 388.8 t/s prefill / 21.90 t/s decode** (mean of the 3 interleaved baseline medians;
+baseline-to-baseline band **0.31% prefill / 0.10% decode**).
+
+⚠ **The previously circulated baseline for this seat (~395 pf / ~23.4 tg) does not reproduce on
+decode: 21.90 vs 23.4 is −6.4%, ~64x the baseline band.** Prefill agrees. Use 388.8 / 21.90.
+
+⚠ Within-arm rep spread on prefill is ~3% and it is **systematic, not random** — rep 1 is the
+slowest in every arm on this cell (cold effect). Medians of >=3 absorb it; a single-rep campaign
+on this seat is worthless.
+
+| arm | ts | ctx | prefill | decode | vs base pf | vs base tg | output |
+|---|---|---|---|---|---|---|---|
+| baseline (x3) | 52,48 | 131072 | 388.8 | 21.90 | — | — | sha `e60d5aa9…` |
+| `PXA_P100_FP16_GEMM=0` | 52,48 | 131072 | 376.7 | 21.83 | **−3.1%** | −0.3% | byte-identical |
+| **2-card push to V100** | **58,42** | **65536** | **432.0** | **23.00** | **+11.1%** | **+5.0%** | byte-identical |
+| ts 58,42 @ full ctx | 58,42 | 131072 | — | — | **OOM (real)** | | `cudaMalloc 884.62 MiB on device 0` |
+| ts 64,36 @ 65536 | 64,36 | 65536 | — | — | loads, **dies on first prefill** | | see caveat |
+
+### `PXA_P100_FP16_GEMM` costs this seat only −3.1% prefill — the banner's "+51%" is not this cell
+Engagement proven both ways (`PXA_AUTO: P100_FP16_GEMM=on` / `=off` in the two arms' ledgers).
+The startup banner advertises "+51% gpt-oss prefill measured" — **a different model**. On this
+seat turning the lever OFF costs **3.1% prefill and 0.3% decode**, ~16x smaller than the banner
+implies. Anyone reasoning about this lever from the banner is reasoning about someone else's cell.
+(Its fidelity cost is the separate 94.088% same-top-token reject already recorded above.)
+
+### Shifting layers onto the V100 wins here too, but full context is the price
+`-ts 58,42 @ ctx 65536` is **+11.1% prefill / +5.0% decode with byte-identical output** (3 reps
+x 128 tok) — same direction as the 3-card→2-card result on the other seat, smaller because this
+seat already starts V100-weighted at 52,48. **Cost: max context halves, 131072 → 65536.**
+Not applied — a context reduction is a capability trade for the owner, not a tuning change.
+
+### The `-ts` ceiling on this cell, and where it actually is
+- At **ctx 131072 the seat is already AT dev0's VRAM ceiling**: 58,42 OOMs for real
+  (`allocating 884.62 MiB on device 0: cudaMalloc failed`, exit 139) *after* the per-arm VRAM gate
+  confirmed both cards >=13000 MiB free — so it is a structural verdict, not the environment fault
+  that voided an earlier campaign on this box.
+- At ctx 65536, `64,36` **loads but cannot serve** — it dies on the first real prefill, i.e. the
+  weights fit and the compute buffer does not. ⚠ Not re-run clean after an earlier exit-139 arm,
+  so treat as probable-not-certain. Usable ceiling is **between 58 and 64**; 58,42 is the best
+  measured point and the true optimum was not found.
+
+### Nulls by construction on this seat — recorded so nobody re-chases them
+- **`PXA_FA_SWA_KEEP` is INERT here: `n_swa = 0`.** It cannot engage on this arch. (It remains the
+  +19% decode win on the sliding-window seat — that is a different arch, not a fleet-wide lever.)
+- **MTP is not armed and has no measured row for this arch** — the ledger prints
+  `PXA_AUTO: spec arch=qwen35 -> no measured row, speculation left off`. Any "−1.7% MTP here"
+  claim does not describe this seat as configured.
+- **`PXA_FA_GQA_PACK` can only ever take NH=2 on this cell.** The gate needs NH to divide both the
+  head count (24) and the gqa_ratio (**6**); neither 4 nor 8 divides 6, so the record's NH=4/NH=8
+  rows are unreproducible here in principle.
+
+## Updates — 2026-08-17 — the sm_60 FAST_FP16 carve-out: BUILT, MEASURED, REJECTED
+
+Upstream llama.cpp issue #25593 reports that on sm_60 an fp16 fast path truncates fp32 math, and
+that carving cc 600 out of `fast_fp16_available()` costs nothing. **Both halves of that fail here.**
+
+### What the gate actually controls in THIS tree (read this before touching it again)
+There are **two** sites, not three (`ggml/src/ggml-cuda/common.cuh:151` macro, `:207` function).
+The pattern `ggml_cuda_highest_compiled_arch(cc) != 600` that upstream discussions cite **does not
+exist in this fork.**
+- The `FAST_FP16_AVAILABLE` **macro** is consumed in only two places (`mmq.cuh:1207`,
+  `mmq_id_common.cuh:1624`) and both are the **Q2_K scale unpack** — irrelevant to PXQ-tier weights.
+- The `fast_fp16_available(cc)` **function** is the real gate: it picks the f16 vs f32 FA kernels.
+- **sm_60 decode is ALREADY fp32** via `pxq_use_sm60_vec_f32()` (`fattn.cu:41`, the PR #2144 port),
+  whose own comment says "Prefill and the D=256 vec path stay on vec_f16".
+  **=> the carve-out is a PREFILL-ONLY change on this fleet.** Gate it with a batched KL run; a
+  temp-0 generated-token run is the wrong instrument and would return a clean meaningless number.
+
+### Why it is a large REGRESSION here and not a free fix
+`fattn-tile-f32.cu` supports **only head sizes 64 and 128** (`..._is_supported` → `K->ne[0] == 64 ||
+== 128`). Both seats on this tree are **D=256**, so with the carve-out the `!fast_fp16_available`
+branch sends D=256 prefill to the **single-column `vec_f32`** kernel — precisely the route
+`PXA_FA_TILE256` exists to escape (its comment records that kernel at **52.7% of prefill GPU time**
+on a pre-Volta D=256 rig). Carving out 600 also makes `PXA_FA_MASK_SKIP_TILE` (default ON) a
+**phantom lever fleet-wide**, since sm_60 was the only arch still reaching tile-f16.
+
+**MEASURED (fill 8192, n=3/arm, interleaved repeated baselines, ON/OFF selected per-arm by swapping
+an archived `libggml.so` via `LD_LIBRARY_PATH`, so the arms are interleaved rather than split
+across a rebuild):**
+
+| cell | sm_60 share | baseline pf | carve-out pf | Δ prefill | Δ decode | pf band |
+|---|---|---|---|---|---|---|
+| single P100, 9B-class | 100% | 719.8 | 379.9 | **−47.2%** | no effect (inside 4.25% band) | 0.54% |
+| V100+P100, 27B-class | ~48% | 388.2 | 236.1 | **−39.2%** | no effect (inside 1.6% band) | 0.03% |
+
+Loss scales with sm_60 exposure — a coherence check on the mechanism. **Decode is untouched on both,
+because this tree already fixed sm_60 decode; the upstream "+1.4-1.5% token generation" gain is
+unreachable here for that same reason.** Engagement proof for a compile-time change with no banner:
+the effect itself, at 87x and 1300x the respective prefill bands.
+
+**Status: REJECTED, source reverted, nothing shipped.** The built artifact is archived off-tree at
+`<local-path>` (ONE-BUILD-POLICY: archive, don't fork) purely as
+evidence and as the reference binary for the quality run below.
+
+### The RIGHT fix, scoped but NOT built (do not re-derive this)
+A D=256 **tile-f32** variant will not fit: the f16 D=256 tile is already 43KB static smem at
+ncols=16 and the f32 staging arrays are twice as wide (~84KB) — over the 48KB/block limit. That is
+why the fallback goes to `vec_f32` by design.
+The tractable fix is the PR #2144 pattern applied to the **tile** kernel: in
+`flash_attn_tile_ext_f16` the staging arrays (`KV_tmp`, `Q_h2`) are **shared** and stay half2, while
+`kqmax` / `kqsum` / `VKQ` (`fattn-tile-f16.cu:87,92,94`, plus the rescale block at `:230-246`) are
+**register** accumulators in fp16. Promoting only those to float/float2 gives fp32 accumulation with
+**shared memory unchanged**, keeps D=256 prefill tiled, and keeps `PXA_FA_MASK_SKIP_TILE` alive.
+Cost is registers (VKQ 8 → 16 at D=256/ncols=16) under `__launch_bounds__(..., 1)` — must be
+occupancy-measured. Not attempted: it is a real kernel change in a tree two live seats boot from.
+
+### ⚠ QUALITY — and a warning about the `Same top token` threshold itself
+Batched KL, single-P100 cell, 40 chunks x 512 tok, reference = carve-out OFF (the shipped binary),
+corpus `<local-path>`, perplexity ignored:
+**Same top token 94.127 ± 0.233 %**, median KLD 0.004603, median Δp **0.000%**, mean Δp −0.073%.
+
+**This is statistically indistinguishable from the `PXA_P100_FP16_GEMM` figure (94.088 ± 0.234%,
+median KLD 0.004266) measured on the SAME cell and corpus** — despite being a completely different
+and independent code path (flash attention vs dense cuBLAS GEMM; neither gates the other).
+Two unrelated perturbations landing on the same number, with **median Δp exactly 0.000%**, points at
+**near-tie coin-flips in this model/corpus** rather than at either lever doing equal damage.
+**Consequence: ~94% appears to be the floor for ANY sm_60 numeric change on this cell — including
+the higher-precision one, since the carve-out arm IS the fp32 side and still scores 94.1%.**
+A gate that rejects the more-accurate implementation is measuring the wrong thing. Treat
+`Same top token` as a tripwire here, not a verdict, and **re-read the earlier "REJECT at 94.088%"
+for `PXA_P100_FP16_GEMM` in that light — it is probably overstated.**
+Confound in the 94.127% itself, stated plainly: the two arms differ by kernel (tiled vs
+single-column) as well as by precision, so summation-order noise is included; this **bounds** the
+fp16 leak from above rather than isolating it. Isolating it needs the surgical fix above.
+
+### ⚠ 2026-08-17 — `PXA_P100_FP16_GEMM=0` HANGS THE CHAT ENDPOINT on the single-P100 MTP seat
+Disarming this lever was applied to both seats on this tree and **reverted on the single-P100 seat
+the same night.** Measured cost of OFF was benign (−3.7% prefill there, −3.1% on the 2-card seat),
+but the cost was measured on `POST /completion` and the seats serve `POST /v1/chat/completions`:
+
+| endpoint | that seat with `PXA_P100_FP16_GEMM=0` |
+|---|---|
+| `/completion` | works, returns the expected answer |
+| `/v1/chat/completions` | **hangs, empty body**, while `/health` reports `{"status":"ok","slots_idle":2}` |
+
+The server loads clean (MTP context initialised, slots idle, no log errors) and simply never answers
+a chat request, so the keeper's gen-probe failed on every recreate and the keeper went into a
+**recreate loop**. Recreating without the env fixed it on the first try — causal, not correlated.
+VRAM contention and the binary were both ruled out.
+**The 2-card seat KEEPS the disarm and is fine** — it passes the same chat probe. Seat-specific.
+Untested hypothesis for the morning: that seat is the only one running **MTP**, and the chat path
+adds the jinja template + `reasoning_effort`; the dense-GEMM change plausibly interacts with
+draft/verify on a templated prompt. **Test on a bench container before ever re-applying.**
+
+**Standing lesson for this box, wider than this lever:** a lever can measure clean on `/completion`
+and still break the endpoint production uses. Benchmark harnesses here drive `/completion`; the
+seats serve `/v1/chat/completions`. **Treat a passing keeper `verify_seat` — not a passing
+benchmark — as the gate before any live config change.**
