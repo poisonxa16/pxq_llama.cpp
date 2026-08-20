@@ -1683,6 +1683,7 @@ extern "C" {
     // splitting such a pair into two mul_mat_id would strand these CUDA-only types
     // on the generic mmvq path, which has no PXQ kernels).
     GGML_API bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate);
+    GGML_API bool ggml_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate);
 
     // MoE up + gate + unary
     GGML_API struct ggml_tensor * ggml_moe_up_gate(

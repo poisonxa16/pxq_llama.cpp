@@ -8190,13 +8190,32 @@ struct ggml_tensor * ggml_moe_up_gate_ext(
     return result;
 }
 
+bool ggml_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate) {
+#if !GGML_USE_IQK_MULMAT && !defined(GGML_USE_CUDA)
+    // Dense twin of ggml_moe_up_gate_can_fuse. Nothing in this build can EXECUTE a fused dense
+    // up/gate node: the CPU handler lives in the ik kernels and there is no CUDA backend either.
+    // Refusing here means the node is never created and ggml_fused_up_gate takes the
+    // decomposition it already has for unquantized operands -- two mul_mats plus the standalone
+    // GLU. Slower, identical results.
+    //
+    // This guard was MISSING while the MoE one existed, which is why a no-AVX2 build (where
+    // IQK_IMPLEMENT is undefined, so GGML_USE_IQK_MULMAT is off) built cleanly and then aborted
+    // in llama_decode with "FUSED_UP_GATE has no CPU implementation".
+    (void)type_up; (void)type_gate;
+    return false;
+#else
+    return type_up == type_gate;
+#endif
+}
+
 struct ggml_tensor * ggml_fused_up_gate(
             struct ggml_context * ctx,
             struct ggml_tensor  * up,
             struct ggml_tensor  * gate,
             struct ggml_tensor  * b,
             enum   ggml_unary_op  op) {
-    if (!ggml_is_quantized(up->type) || up->type != gate->type || !ggml_are_same_shape(up, gate)) {
+    if (!ggml_is_quantized(up->type) || up->type != gate->type || !ggml_are_same_shape(up, gate) ||
+        !ggml_up_gate_can_fuse(up->type, gate->type)) {
         struct ggml_tensor * result_up   = ggml_mul_mat(ctx, up,   b);
         struct ggml_tensor * result_gate = ggml_mul_mat(ctx, gate, b);
         return ggml_fused_mul_unary(ctx, result_gate, result_up, op);
