@@ -256,6 +256,18 @@ if (GGML_BLAS)
     endif()
 endif()
 
+# PXA 2026-08-20 — where the ik seam actually is.
+#
+# GGML_IQK_MUL_MAT switches ik's GEMM/flash-attention ACCELERATORS. Those are genuinely
+# optional: every call site is `if (iqk_x(...)) { fast path }` with a stock ggml path beneath.
+#
+# iqk_quantize.cpp / iqk_cpu_ops.cpp are NOT optional and must stay outside that switch. They
+# carry the IMPLEMENTATIONS of ~40 extra quantization types (the _r4 / _ks / _bn family:
+# iq4_ks, q5_k_r4, iq2_bn_r4, q8_0_r8, q1_0_g128, ...) and ggml's type_traits table points
+# straight at them -- dropping them is ~40 undefined references at link, not a fallback.
+# Removing ik entirely therefore means removing those TYPES from the type table first; that is
+# a separate campaign, tracked in docs/, not a build flag. What IS fixed here is that these two
+# files now COMPILE without AVX2, which is what blocked non-AVX2 users.
 set (GGML_SOURCES_IQK iqk/iqk_quantize.cpp iqk/iqk_cpu_ops.cpp)
 set (GGML_HEADERS_IQK iqk/iqk_config.h iqk/iqk_cpu_ops.h)
 if (GGML_IQK_MUL_MAT)
@@ -299,6 +311,12 @@ if (GGML_IQK_MUL_MAT)
     else()
         message(STATUS "Disabling IQK Flash Attention kernels")
     endif()
+else()
+    # ik accelerators OFF: no GEMM/FA translation units, GGML_USE_IQK_MULMAT undefined, so every
+    # guarded call site falls through to stock ggml. The quant-type sources above still build.
+    set (GGML_SOURCES_IQK_MM "")
+    set (GGML_HEADERS_IQK_MM "")
+    message(STATUS "PXA: ik accelerators DISABLED -- stock ggml CPU matmul/FA")
 endif()
 
 if (GGML_CUDA)

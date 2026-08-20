@@ -934,7 +934,7 @@ void quantize_row_q8_0_x4(const float * x, void * vy, int64_t k) {
             }
         }
     }
-#else
+#elif defined(__AVX2__)
     for (int i = 0; i < nb; i++) {
         int i4 = i/4, ir = i%4;
         // Load elements into 4 AVX vectors
@@ -996,6 +996,23 @@ void quantize_row_q8_0_x4(const float * x, void * vy, int64_t k) {
         } else {
             _mm256_storeu_si256((__m256i *)y[i].qs, i0);
         }
+    }
+#else
+    // Portable scalar path -- same reason as quantize_row_q8_1_x4_T below: the branch above was
+    // an #else on __aarch64__, so plain x86-64 without AVX2 landed in AVX2 intrinsics. Semantics
+    // taken from the NEON branch: amax over the block, d = amax/127, round-to-nearest-even
+    // quants written in natural order at qs + 32*ir.
+    for (int i = 0; i < nb; i++) {
+        const int i4 = i/4, ir = i%4;
+        const float * xb = x + i*QK8_0;
+        float amax = 0.f;
+        for (int j = 0; j < QK8_0; ++j) { const float a = fabsf(xb[j]); if (a > amax) amax = a; }
+        const float d  = amax / ((1 << 7) - 1);
+        const float id = d ? 1.0f/d : 0.0f;
+        if (i < nb4) y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+        else         y[i].d       = GGML_FP32_TO_FP16(d);
+        int8_t * qs = (i < nb4) ? (int8_t *)y4[i4].qs + 32*ir : (int8_t *)y[i].qs;
+        for (int j = 0; j < QK8_0; ++j) qs[j] = (int8_t)nearbyintf(xb[j]*id);
     }
 #endif
 }
@@ -1068,7 +1085,7 @@ void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
             }
         }
     }
-#else
+#elif defined(__AVX2__)
     for (int i = 0; i < nb; i++) {
         int i4 = i/4, ir = i%4;
         // Load elements into 4 AVX vectors
@@ -1163,6 +1180,45 @@ void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
         } else {
             _mm256_storeu_si256((__m256i *)y[i].qs, i0);
         }
+    }
+#else
+    // Portable scalar path. The branch above was an #else on __aarch64__, so it was selected on
+    // ANY non-ARM target -- including x86-64 without AVX2, where its intrinsics do not compile.
+    // (Only 6 errors surfaced there because the two-phase lookup failure on hsum_i32_8 stopped
+    // template instantiation before the intrinsic bodies were ever checked.)
+    // Mirrors the vector paths: amax -> d = amax/127 -> round-to-nearest-even quants in NATURAL
+    // order (the AVX2 packs+permutevar exists only to undo SIMD lane shuffling), 32 B per
+    // sub-block at qs + 32*ir. The bf16 arm stores the quant SUM as a RAW int16, as above.
+    for (int i = 0; i < nb; i++) {
+        const int i4 = i/4, ir = i%4;
+        float amax = 0.f;
+        for (int j = 0; j < QK8_1; ++j) { const float a = fabsf(x[j]); if (a > amax) amax = a; }
+        float d = amax/127.f;
+        if constexpr (std::is_same_v<Block, block_q8_1>) {
+            if (i < nb4) y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+            else         y[i].d       = GGML_FP32_TO_FP16(d);
+        } else {
+            auto t = GGML_FP32_TO_BF16(d);
+            d = ggml_bf16_to_fp32(t);
+            if (i < nb4) y4[i4].d[ir] = t.bits;
+            else         y[i].d       = t.bits;
+        }
+        const float id = d > 0 ? 1/d : 0.f;
+        int isum = 0;
+        int8_t * qs = (i < nb4) ? (int8_t *)y4[i4].qs + 32*ir : (int8_t *)y[i].qs;
+        for (int j = 0; j < QK8_1; ++j) {
+            const int q = (int)nearbyintf(x[j]*id);
+            qs[j] = (int8_t)q;
+            isum += q;
+        }
+        if constexpr (std::is_same_v<Block, block_q8_1>) {
+            if (i < nb4) y4[i4].d[ir+4] = GGML_FP32_TO_FP16(d*isum);
+            else         y[i].s         = GGML_FP32_TO_FP16(d*isum);
+        } else {
+            if (i < nb4) { auto i16 = (int16_t *)y4[i4].d; i16[ir+4] = isum; }
+            else         { auto i16 = (int16_t *)&y[i].s;  i16[0]    = isum; }
+        }
+        x += QK8_1;
     }
 #endif
 }
@@ -7225,11 +7281,19 @@ static void repack_q8_KV(int nrows, int n_per_row, const char * cx, char * cy, [
             vst1q_s8_x2(qy + 64 + 128*ib, m2);
             vst1q_s8_x2(qy + 96 + 128*ib, m3);
 #else
-            // TODO
-            for (int l = 0; l < 4; ++l) {
-                for (int k = 0; k < 8; ++k) for (int i = 0; i < 4; ++i) {
-                    y[ib].qs[32*l+4*k+i+  0] = x8[k][ib].qs[i+4*l+ 0];
-                    y[ib].qs[32*l+4*k+i+128] = x8[k][ib].qs[i+4*l+16];
+            // Portable scalar repack. The previous body never compiled: it wrote to `y` (the real
+            // paths write to `qy`) and indexed x8[k][ib] as a struct when x8[k] is `const int8_t*`
+            // -- dead code behind an #else no build target ever selected. Layout read off both
+            // vector paths: a 4x4 32-bit transpose per 128-bit lane, so output register j holds
+            // word j of rows 0-3 in the low lane and rows 4-7 in the high lane, landing at
+            // qy + 128*ib + 32*j. VERIFIED byte-identical to the AVX2 path on random input.
+            for (int j = 0; j < 4; ++j) {
+                for (int r = 0; r < 8; ++r) {
+                    const int lane = r < 4 ? 0 : 1;
+                    const int rr   = r & 3;
+                    for (int i = 0; i < 4; ++i) {
+                        qy[128*ib + 32*j + 16*lane + 4*rr + i] = x8[r][16*ib + 4*j + i];
+                    }
                 }
             }
 #endif

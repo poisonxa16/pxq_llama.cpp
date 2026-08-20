@@ -1,5 +1,19 @@
 #pragma once
 
+// PXA 2026-08-20 — make GGML_USE_IQK_MULMAT mean what it says.
+//
+// The CMake option only says "we WANT the ik kernels". Whether they actually EXIST is decided
+// by iqk_config.h, which defines IQK_IMPLEMENT solely for __AVX2__ / __ARM_FEATURE_DOTPROD.
+// On a plain x86-64 target the option stays ON, every iqk translation unit compiles to nothing,
+// and the ~20 call sites guarded by GGML_USE_IQK_MULMAT become undefined references at link.
+// That is why this fork failed to build on hardware that builds stock llama.cpp fine.
+//
+// Reconciling the two here, once, keeps every guard in the tree consistent and gives us a real
+// no-ik build: -DGGML_IQK_MUL_MAT=OFF, or simply a target ik cannot serve.
+#if defined(GGML_USE_IQK_MULMAT) && !defined(__AVX2__) && !defined(__ARM_FEATURE_DOTPROD)
+#undef GGML_USE_IQK_MULMAT
+#endif
+
 #include "ggml.h"
 
 // GGML internal header

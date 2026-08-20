@@ -10,6 +10,18 @@
 #include "iqk_utils.h"
 #include "iqk_common.h"
 #include "ggml.h"
+// This file is compiled UNCONDITIONALLY (ggml/src/CMakeLists.txt: GGML_SOURCES_IQK), but the
+// #define IQK_IMPLEMENT at the top of it does NOT survive: iqk_config.h #undefs it and only
+// re-defines it under __AVX2__ / __ARM_FEATURE_DOTPROD. So on a non-AVX2 build iqk_common.h
+// silently skips these two headers and the body below loses ggml_half, GGML_FP16_TO_FP32,
+// GGML_BF16_TO_FP32 and MIN. Include them directly, exactly as iqk_quantize.cpp already does.
+#include "ggml-impl.h"
+// ggml_half / ggml_bf16_t are typedef'd under GGML_COMMON_DECL_C. DECL is all this file needs;
+// pulling GGML_COMMON_IMPL_C in as well would add the table DEFINITIONS to this TU, and clearing
+// GGML_COMMON_DECL to get both in one file re-runs the typedef block -> 78 conflicting-typedef
+// errors. One flavour, one include.
+#define GGML_COMMON_DECL_C
+#include "ggml-common.h"
 
 #include <cstdint>
 #include <vector>

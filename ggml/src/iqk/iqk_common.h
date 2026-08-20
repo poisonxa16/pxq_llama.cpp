@@ -11,6 +11,13 @@
 
 #include "iqk_config.h"
 
+// <cstdint> must be visible even when IQK_IMPLEMENT is OFF. iqk_config.h defines it only
+// for __AVX2__ / __ARM_FEATURE_DOTPROD, but the popcount overloads near the bottom of this
+// header are OUTSIDE that guard. Without the fixed-width types all four overloads collapse
+// to the same signature and every translation unit that includes this header fails with
+// "redefinition of constexpr int popcount" -- 49 errors on a plain x86-64 build.
+#include <cstdint>
+
 #if defined IQK_IMPLEMENT
 
 #include <cstring>

@@ -26,6 +26,15 @@
 #if GGML_USE_IQK_MULMAT
 #include "iqk/iqk_mul_mat.h"
 #include "iqk/iqk_config.h"
+#else
+// ik OFF: the accelerators below are all of the shape
+//     if (iqk_something(...)) { ...fast path...; return; }
+// so having them evaluate to false makes every call site fall through to the stock ggml
+// implementation that already sits underneath it. Expressed as macros rather than stub
+// functions because the real signatures are long and would drift; the compiler dead-codes
+// the guarded blocks entirely. This is what lets -DGGML_IQK_MUL_MAT=OFF actually link.
+#define iqk_mul_mat_4d(...)      false
+#define iqk_fused_delta_net(...) false
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -8056,6 +8065,14 @@ struct ggml_tensor * ggml_mul_mat_id(
 }
 
 bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate) {
+#if !GGML_USE_IQK_MULMAT && !defined(GGML_USE_CUDA)
+    // Nothing in this build can EXECUTE a fused MoE up/gate node: the CPU handler lives in the
+    // ik kernels and there is no CUDA backend either. Refusing here means the node is never
+    // created, so the graph falls back to two mul_mat_id ops plus a standalone GLU -- slower,
+    // identical results. Without this the op reaches a CPU dispatch that has to abort.
+    (void)type_up; (void)type_gate;
+    return false;
+#else
     if (type_up == type_gate) return true;
     // PXQ-UNIVERSAL mixed tiers (CUDA-only slab types): the fused CUDA MoE kernels
     // handle mixed up/gate pairs over {PXQ2, PXQ3, PXQ4} with independent per-operand
@@ -8066,6 +8083,7 @@ bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate)
     const bool up_ok   = type_up   == GGML_TYPE_PXQ1 || type_up   == GGML_TYPE_PXQ2 || type_up   == GGML_TYPE_PXQ3 || type_up   == GGML_TYPE_PXQ4;
     const bool gate_ok = type_gate == GGML_TYPE_PXQ1 || type_gate == GGML_TYPE_PXQ2 || type_gate == GGML_TYPE_PXQ3 || type_gate == GGML_TYPE_PXQ4;
     return up_ok && gate_ok;
+#endif
 }
 
 struct ggml_tensor * ggml_moe_up_gate(
@@ -25245,11 +25263,22 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_MOE_FUSED_UP_GATE:
             {
+#if GGML_USE_IQK_MULMAT
                 ggml_compute_forward_mul_mat_id_up_gate(params, tensor);
+#else
+                // Unreachable by construction: ggml_moe_up_gate_can_fuse() refuses without ik, so
+                // the graph never contains this op. Abort rather than silently produce garbage if
+                // that invariant is ever broken.
+                GGML_ABORT("MOE_FUSED_UP_GATE has no CPU implementation without GGML_USE_IQK_MULMAT");
+#endif
             } break;
         case GGML_OP_FUSED_UP_GATE:
             {
+#if GGML_USE_IQK_MULMAT
                 ggml_compute_forward_mul_mat_up_gate(params, tensor);
+#else
+                GGML_ABORT("FUSED_UP_GATE has no CPU implementation without GGML_USE_IQK_MULMAT");
+#endif
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -25339,10 +25368,17 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                     cgraph->nodes[i+0]->type == GGML_TYPE_F32  &&
                     cgraph->nodes[i+4]->type == GGML_TYPE_F32  &&
                     cgraph->nodes[i+3]->type == GGML_TYPE_I32) {
+#if GGML_USE_IQK_MULMAT
                     iqk_topk_moe(cgraph->nodes[i]->ne[0], cgraph->nodes[i+4]->ne[1], cgraph->nodes[i]->ne[1],
                             (const float *)cgraph->nodes[i]->data, (float *)cgraph->nodes[i+4]->data, (int32_t *)cgraph->nodes[i+3]->data,
                             params->ith, params->nth);
                     i += 4;
+#else
+                    // No ik: run the stock soft_max and let the following ARGSORT/VIEW/GET_ROWS
+                    // nodes execute normally. The fusion is a speed optimisation, not semantics,
+                    // so declining it changes timing only -- do NOT advance i here.
+                    ggml_compute_forward_soft_max(params, tensor);
+#endif
                 } else {
                     ggml_compute_forward_soft_max(params, tensor);
                 }
