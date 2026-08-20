@@ -9,6 +9,7 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "pxq-cpu.h"
 #include "ggml-impl.h"
 #if GGML_USE_IQK_MULMAT
 #include "iqk/iqk_config.h"
@@ -5630,8 +5631,16 @@ void ggml_vec_dot_q6_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         return;
     }
 #endif
-    // TODO
-    *s = 0;
+    // Without ik this used to be "// TODO / *s = 0;" -- every Q6_0 row scored zero on any
+    // build ik could not claim. The real implementation lives in our own TU, against STOCK
+    // block_q8_0 activations (see the GGML_TYPE_Q6_0 traits in ggml.c, which already select
+    // GGML_TYPE_Q8_0 when ik is off). Nothing on this path is ik's.
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    pxa_q6_0_dot_q8_0(n, s, vx, vy);
 }
 
 void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {

@@ -12,6 +12,30 @@
 // no-ik build: -DGGML_IQK_MUL_MAT=OFF, or simply a target ik cannot serve.
 #if defined(GGML_USE_IQK_MULMAT) && !defined(__AVX2__) && !defined(__ARM_FEATURE_DOTPROD)
 #undef GGML_USE_IQK_MULMAT
+#define PXA_IQK_UNAVAILABLE 1
+#endif
+
+// PXA 2026-08-20 (later the same day) — refuse to build the ik-off CPU path silently.
+//
+// The reconcile above turned a link error into a successful build. That was the right fix
+// for the link error and the wrong outcome overall: the generic path it exposes had never
+// once been executed on this fork, so it had rotted, and a build that used to fail loudly
+// began producing fluent garbage instead. Known rot found so far on that path: an ik
+// fast-path `return` outside its own guard in ggml_compute_forward_mul_mat (every quantized
+// MUL_MAT returned a zeroed buffer), five type_traits entries naming an ik-only activation
+// layout their vec_dot cannot read, a vec_dot whose body was commented out, and one that
+// was literally `// TODO  *s = 0;`.
+//
+// Those are fixed. The path is still not gauntleted end-to-end, so it stays behind an
+// explicit opt-in until it is. Silent wrong answers are worse than a build that stops and
+// tells you why. Remove this block — not the opt-in flag, the whole block — once the
+// no-AVX2 builds match an AVX2 reference on a real model.
+#if defined(PXA_IQK_UNAVAILABLE) && !defined(PXA_ALLOW_NO_IQK)
+#error "This target has neither AVX2 nor ARM dotprod, so the ik kernels cannot be built, \
+and the fallback CPU path they normally hide is still under repair (it produced incorrect \
+output on such targets in v2026.08.20-rc2). Re-run cmake with -DGGML_ALLOW_NO_IQK=ON to \
+build it anyway and accept unverified CPU results, or build for a target with AVX2 \
+(-DGGML_AVX2=ON, or -DGGML_NATIVE=ON on an AVX2 host), or offload fully to a GPU."
 #endif
 
 #include "ggml.h"

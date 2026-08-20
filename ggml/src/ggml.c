@@ -1032,10 +1032,19 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q4_K,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
         .vec_dot                  = ggml_vec_dot_q4_K_q8_K,
+#if GGML_USE_IQK_MULMAT
 #ifdef __AVX2__
         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
 #else
         .vec_dot_type             = GGML_TYPE_Q8_1_X4,
+#endif
+#else
+        // ik OFF: iqk_mul_mat is not there to intercept, so the generic mul_mat path
+        // quantizes the activations to vec_dot_type and hands them straight to the
+        // .vec_dot above -- which reads block_q8_K. The x4 formats in the ik branch are
+        // ik-only interleaved layouts; feeding one to this function produced NaN on
+        // every non-ik build (test-quantize-fns, no-AVX2).
+        .vec_dot_type             = GGML_TYPE_Q8_K,
 #endif
         .nrows                    = 1,
         .row_meta_size            = 0,
@@ -1062,10 +1071,19 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q5_K,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
         .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
+#if GGML_USE_IQK_MULMAT
 #ifdef __AVX2__
         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
 #else
         .vec_dot_type             = GGML_TYPE_Q8_1_X4,
+#endif
+#else
+        // ik OFF: iqk_mul_mat is not there to intercept, so the generic mul_mat path
+        // quantizes the activations to vec_dot_type and hands them straight to the
+        // .vec_dot above -- which reads block_q8_K. The x4 formats in the ik branch are
+        // ik-only interleaved layouts; feeding one to this function produced NaN on
+        // every non-ik build (test-quantize-fns, no-AVX2).
+        .vec_dot_type             = GGML_TYPE_Q8_K,
 #endif
         .nrows                    = 1,
         .row_meta_size            = 0,
@@ -1092,10 +1110,19 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q6_K,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q6_K_ref,
         .vec_dot                  = ggml_vec_dot_q6_K_q8_K,
+#if GGML_USE_IQK_MULMAT
 #ifdef __AVX2__
         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
 #else
         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+#endif
+#else
+        // ik OFF: iqk_mul_mat is not there to intercept, so the generic mul_mat path
+        // quantizes the activations to vec_dot_type and hands them straight to the
+        // .vec_dot above -- which reads block_q8_K. The x4 formats in the ik branch are
+        // ik-only interleaved layouts; feeding one to this function produced NaN on
+        // every non-ik build (test-quantize-fns, no-AVX2).
+        .vec_dot_type             = GGML_TYPE_Q8_K,
 #endif
 //        .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
@@ -1370,10 +1397,19 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_iq4_nl,
         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_ref,
         .vec_dot                  = ggml_vec_dot_iq4_nl_q8_0,
+#if GGML_USE_IQK_MULMAT
 #if __AVX2__
         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
 #else
         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+#endif
+#else
+        // ik OFF: iqk_mul_mat is not there to intercept, so the generic mul_mat path
+        // quantizes the activations to vec_dot_type and hands them straight to the
+        // .vec_dot above -- which reads block_q8_0. The x4 formats in the ik branch are
+        // ik-only interleaved layouts; feeding one to this function produced NaN on
+        // every non-ik build (test-quantize-fns, no-AVX2).
+        .vec_dot_type             = GGML_TYPE_Q8_0,
 #endif
         .nrows                    = 1,
         .row_meta_size            = 0,
@@ -1400,10 +1436,17 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_mxfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
         .vec_dot                  = vec_dot_mxfp4_q8_0_x4,
+#if GGML_USE_IQK_MULMAT
 #if defined __AVX2__
         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
 #else
         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+#endif
+#else
+        // ik OFF: stock q8_0 activations, and pxa_mxfp4_dot_q8_0 underneath. No ik format,
+        // no ik code path -- the mxfp4 tensors in our own PXQ4 files no longer route through
+        // a dependency we are removing.
+        .vec_dot_type             = GGML_TYPE_Q8_0,
 #endif
         .nrows                    = 1,
         .row_meta_size            = 0,
@@ -1928,8 +1971,17 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_iq5_k,
         .from_float_ref           = (ggml_from_float_t)quantize_row_iq5_k_ref,
         .vec_dot                  = vec_dot_iq5_k_q8_k,
-//#ifdef __AVX2__
+//#if GGML_USE_IQK_MULMAT
+#ifdef __AVX2__
 //        .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+#else
+        // ik OFF: iqk_mul_mat is not there to intercept, so the generic mul_mat path
+        // quantizes the activations to vec_dot_type and hands them straight to the
+        // .vec_dot above -- which reads block_q8_K. The x4 formats in the ik branch are
+        // ik-only interleaved layouts; feeding one to this function produced NaN on
+        // every non-ik build (test-quantize-fns, no-AVX2).
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+#endif
 //#else
         .vec_dot_type             = GGML_TYPE_Q8_K,
 //#endif
@@ -17532,6 +17584,14 @@ static int ggml_compute_forward_mul_mat(
 
     const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
 
+#if GGML_USE_IQK_MULMAT
+    // ik fast path for quantized activations. The `return node_n` at the bottom is
+    // UNCONDITIONAL -- it fires whether or not iqk_mul_mat_4d claimed the work -- so this
+    // whole block has to be compiled out when ik is off. Without ik, iqk_mul_mat_4d is
+    // `#define iqk_mul_mat_4d(...) false` (top of this file): the if never fired, the
+    // return still did, and the generic chunked vec_dot loop below was unreachable. Every
+    // quantized MUL_MAT then handed back its zero-initialised dst buffer, which is why any
+    // build ik could not claim (no AVX2) emitted word salad from a perfectly good model.
     if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
@@ -17561,6 +17621,7 @@ static int ggml_compute_forward_mul_mat(
         }
         return node_n;
     }
+#endif
 
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);

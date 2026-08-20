@@ -26,6 +26,12 @@
 
 #include "pxq-cpu.h"
 
+#define GGML_COMMON_DECL_C
+#define GGML_COMMON_IMPL_C
+#include "ggml-common.h" // block_mxfp4 / QK_MXFP4 / kvalues_mxfp4 for the MXFP4 dot below.
+                          // The tables here expand to file-local statics (GGML_TABLE_BEGIN),
+                          // exactly as in ggml-quants.c -- no duplicate symbols.
+
 #include "ggml-impl.h"   // GGML_COMPUTE_FP16_TO_FP32 / GGML_COMPUTE_FP32_TO_FP16 (self-contained)
 
 #include "ggml-pxq6-tables.h"
@@ -357,4 +363,46 @@ void pxa_pxq_mul_mat_cpu(
             pxa_dst_row(dst, nb1, nb2, rows, iy)[ix] = (float)pxa_dot(w, x, k);
         }
     }
+}
+
+// ---- MXFP4 x q8_0 --------------------------------------------------------------------
+// Semantics from dequantize_row_mxfp4: d = GGML_E8M0_TO_FP32_HALF(e); low nibble -> first
+// half of the block, high nibble -> second half, through the 16-entry kvalues_mxfp4 table.
+void pxa_mxfp4_dot_q8_0(int n, float * s, const void * vx, const void * vy) {
+    const block_mxfp4 * restrict x = (const block_mxfp4 *)vx;
+    const block_q8_0  * restrict y = (const block_q8_0  *)vy;
+    const int nb = n / QK_MXFP4;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_E8M0_TO_FP32_HALF(x[ib].e) * GGML_FP16_TO_FP32(y[ib].d);
+        int suml = 0;
+        for (int j = 0; j < QK_MXFP4/2; ++j) {
+            suml += y[ib].qs[j]              * kvalues_mxfp4[x[ib].qs[j] & 0xf]
+                  + y[ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >>  4];
+        }
+        sumf += d * (float)suml;
+    }
+    *s = sumf;
+}
+
+// ---- Q6_0 x q8_0 ---------------------------------------------------------------------
+// Semantics from dequantize_row_q6_0: element j of the first half takes the low nibble of
+// qs[j] plus bits 4-5 from qh[j % (QK6_0/4)]; element j of the second half takes the high
+// nibble plus bits 4-5 of the same qh byte shifted two more. Both are biased by -32.
+void pxa_q6_0_dot_q8_0(int n, float * s, const void * vx, const void * vy) {
+    const block_q6_0 * restrict x = (const block_q6_0 *)vx;
+    const block_q8_0 * restrict y = (const block_q8_0 *)vy;
+    const int nb = n / QK6_0;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        int suml = 0;
+        for (int j = 0; j < QK6_0/2; ++j) {
+            const uint8_t h  = x[ib].qh[j % (QK6_0/4)] >> (4*(j/(QK6_0/4)));
+            const int     x0 = ((x[ib].qs[j] & 0x0F) | ((h << 4) & 0x30)) - 32;
+            const int     x1 = ((x[ib].qs[j] >>   4) | ((h << 2) & 0x30)) - 32;
+            suml += x0 * y[ib].qs[j] + x1 * y[ib].qs[j + QK6_0/2];
+        }
+        sumf += (float)suml * GGML_FP16_TO_FP32(x[ib].d) * GGML_FP16_TO_FP32(y[ib].d);
+    }
+    *s = sumf;
 }

@@ -73,6 +73,26 @@ void pxa_pxq_moe_up_gate_cpu(
 
 // plain matmul fallback (dense MUL_MAT slice or one expert of MUL_MAT_ID):
 // dst[out_row][ix] = src0_row(ix) . x(iy), addressing as in pxa_pxq_moe_up_gate_cpu.
+
+// MXFP4 dot product against STOCK q8_0 activations (PXA 2026-08-20).
+//
+// MXFP4 is a mainline llama.cpp format, but this fork inherited its CPU vec_dot from ik --
+// where the non-ik body was commented out entirely, so the function returned WITHOUT ever
+// assigning *s and the caller read uninitialized stack (harness: "mxfp4 dot product FAILED
+// (inf)"; inference: non-finite logits). Our own PXQ4 files carry mxfp4 tensors, so we owned
+// the exposure without owning the code.
+//
+// This is the PXA implementation and it takes PLAIN block_q8_0 activations, not ik's x4
+// interleave -- so the mxfp4 path has no ik dependency of any kind.
+void pxa_mxfp4_dot_q8_0(int n, float * s, const void * vx, const void * vy);
+
+// Q6_0 (4-bit nibble + 2-bit high plane) x STOCK block_q8_0 activations.
+// ggml_vec_dot_q6_0_q8_0 in ggml-quants.c was never written -- below its ik
+// early-return it read "// TODO / *s = 0;", so every non-ik build silently
+// scored every Q6_0 row as zero (test-quantize-fns: dot product error 1.090274,
+// which is just the norm of the reference). Layout taken from dequantize_row_q6_0.
+void pxa_q6_0_dot_q8_0(int n, float * s, const void * vx, const void * vy);
+
 void pxa_pxq_mul_mat_cpu(
         enum ggml_type type, const void * a,
         int64_t nr0, int64_t k,

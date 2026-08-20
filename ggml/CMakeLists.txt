@@ -118,6 +118,11 @@ option(GGML_BLAS                            "ggml: use BLAS"                    
 set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
                                             "ggml: BLAS library vendor")
 option(GGML_IQK_MUL_MAT                     "ggml: use optimized iqk matrix multiplications"  ON)
+option(GGML_ALLOW_NO_IQK                    "ggml: build the un-gauntleted no-ik CPU path"    OFF)
+
+if (GGML_ALLOW_NO_IQK)
+    add_compile_definitions(PXA_ALLOW_NO_IQK)
+endif()
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)

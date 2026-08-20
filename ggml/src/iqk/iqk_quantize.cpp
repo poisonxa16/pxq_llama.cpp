@@ -12,6 +12,7 @@
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 #include "iqk_quantize.h"
+#include "../pxq-cpu.h"
 #include "iqk_config.h"
 
 #include "iqk_gemm_ktquants.h"
@@ -4378,6 +4379,28 @@ void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
+
+    // PXA 2026-08-20: this function had NO implementation without ik. The body below the ik
+    // early-return was entirely commented out, so it fell off the end WITHOUT EVER ASSIGNING
+    // *s -- the caller then read an uninitialized stack slot. That is why the quant harness
+    // reported "mxfp4 dot product error: FAILED (inf)" and why a no-AVX2 build produced
+    // non-finite logits: not a wrong answer, no answer at all. Our PXA-Coder-35B-v2 and
+    // PXA-Agent-9B PXQ4 files carry 30 and 24 mxfp4 tensors respectively, so this was reachable
+    // with our own shipped models on any AVX2-less CPU path.
+    //
+    // Semantics taken from dequantize_row_mxfp4 above (the authoritative reference in this file):
+    //   d           = GGML_E8M0_TO_FP32_HALF(e)
+    //   value[j]           = kvalues_mxfp4[qs[j] & 0xf]      (low nibble  -> first half)
+    //   value[j+QK/2]      = kvalues_mxfp4[qs[j] >>  4]      (high nibble -> second half)
+    // The activation side is Q8_0_X4: four blocks interleaved as { half d[4]; int8 qs[4*32] },
+    // with any tail past 4*(nb/4) stored as plain block_q8_0 -- the same split the x4 quantizers
+    // in this file write.
+    // Without ik this routes to OUR implementation in pxq-cpu.c, against STOCK block_q8_0
+    // activations (see the GGML_TYPE_MXFP4 traits in ggml.c). Nothing on this path is ik's:
+    // not the format, not the code. That matters because our own PXQ4 files carry mxfp4
+    // tensors, so we were carrying the exposure for a dependency we are removing.
+    pxa_mxfp4_dot_q8_0(n, s, vx, vy);
+    return;
     //const block_mxfp4 * x = (const block_mxfp4 *)vx;
     //const block_q8_K  * y = (const block_q8_K    *)vy;
     //int nblock = n/QK_MXFP4;
