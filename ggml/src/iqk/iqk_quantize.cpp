@@ -7377,6 +7377,15 @@ void vec_dot_q8_KV_r8_q8_KV(int n, float * s, size_t bs, const void * vx, size_t
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
+    // DELIBERATELY has no scalar body, unlike vec_dot_q8_KV_q8_KV above. This is not the same
+    // format with a different name: q8_KV_r8 interleaves EIGHT logical rows (row_meta_size 4,
+    // eight leading scales, and dequantize_row_q8_KV_r8 just above reads dptr[k] for k in 0..7
+    // with the quants at q8[128*ib + 32*l + 4*k + i]). A vec_dot call carries nrc == 1 and a
+    // single output float, so it structurally cannot express eight rows of result -- pasting the
+    // q8_KV body here would return a confidently wrong number instead of no number. The generic
+    // matmul must not be allowed to reach this at all; refusing at the traits table (see the
+    // no-CPU vec_dot stubs in ggml.c) is the correct place, and a real fallback would have to be
+    // a whole-panel routine, not a per-row dot.
 }
 
 //
@@ -8464,6 +8473,33 @@ void vec_dot_q8_KV_q8_KV(int n, float * s, size_t bs, const void * vx, size_t bx
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
+    // The body used to end here. Without the accelerated matmul the whole #if above vanishes,
+    // both asserts pass (n is a head size, a multiple of 32), and the function returned having
+    // never assigned *s -- the same shape as vec_dot_mxfp4_q8_0_x4 and ggml_vec_dot_q6_0_q8_0.
+    // q8_KV is user-selectable (-ctk q8_KV / -ctv q8_KV, common.cpp), and it is read by BOTH
+    // the generic flash-attention loop -- where the caller's `float s;` is an uninitialized
+    // stack slot that then goes through expf(), so garbage can be inf/NaN and not merely a
+    // wrong logit -- and the generic mul_mat chunk loop against the K cache, where it is a
+    // stale tmp[] instead. No repack and no interleaved layout is involved: q8_KV's
+    // .vec_dot_type is q8_KV itself, so this is a plain per-row int8 dot.
+    //
+    // Note this is NOT only a no-accelerator fix: iqk_mul_mat above returns bool and declines
+    // shapes it does not support, and until now that fell through to the same empty body on an
+    // AVX2 build too. Measured on the AVX2 reference build after this change, calling this
+    // function directly with nrc == 1: n = 32/64/128 now return the correct dot, and the only
+    // code that could have produced it is the scalar body below -- i.e. the accelerated matmul
+    // had been declining those shapes and writing nothing. The scalar body therefore sits below
+    // the #if unconditionally, not inside an #else.
+    //
+    // For n >= 256 the same call does NOT reach here: it aborts inside the accelerated kernel
+    // (GGML_ASSERT(nrc_x%4 == 0), iqk_gemm_kquants.cpp mul_mat_q8_KV_q8_KV) because a vec_dot is
+    // by definition one row. That is a separate, pre-existing defect on the accelerated side and
+    // is reported, not fixed here -- this file cannot reach past the early return.
+    //
+    // The implementation lives in our own translation unit and reads the STOCK row layout
+    // (see pxa_q8_KV_dot_q8_KV in pxq-cpu.c for the layout derivation), so nothing on this
+    // path is ik's -- not the format, not the code.
+    pxa_q8_KV_dot_q8_KV(n, s, vx, vy);
 }
 
 

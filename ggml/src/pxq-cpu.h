@@ -93,6 +93,14 @@ void pxa_mxfp4_dot_q8_0(int n, float * s, const void * vx, const void * vy);
 // which is just the norm of the reference). Layout taken from dequantize_row_q6_0.
 void pxa_q6_0_dot_q8_0(int n, float * s, const void * vx, const void * vy);
 
+// Q8_KV x Q8_KV -- the KV-cache int8 row format selected by -ctk q8_KV / -ctv q8_KV.
+// vec_dot_q8_KV_q8_KV had no body below its ik early-return, so with the accelerated
+// matmul compiled out it asserted and returned WITHOUT ever assigning *s: the generic
+// flash-attention loop then fed an uninitialized stack float into the online softmax,
+// and the generic mul_mat chunk loop fed it stale tmp[]. A silently wrong KV cache, not
+// a crash. Row layout (see pxq-cpu.c) is a flat header, not a block struct.
+void pxa_q8_KV_dot_q8_KV(int n, float * s, const void * vx, const void * vy);
+
 void pxa_pxq_mul_mat_cpu(
         enum ggml_type type, const void * a,
         int64_t nr0, int64_t k,

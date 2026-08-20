@@ -406,3 +406,33 @@ void pxa_q6_0_dot_q8_0(int n, float * s, const void * vx, const void * vy) {
     }
     *s = sumf;
 }
+
+// ---- Q8_KV x Q8_KV -------------------------------------------------------------------
+// Both operands are the same type: GGML_TYPE_Q8_KV's .vec_dot_type is GGML_TYPE_Q8_KV, so
+// this dot feeds itself -- there is no repack and no interleave anywhere on the path.
+//
+// Q8_KV has NO block struct in ggml-common.h; a row is a flat header plus payload, and the
+// layout is fixed by the three functions that read and write it:
+//   iqk_quantize_row_q8_KV (iqk_quantize.cpp:4110) writes
+//       dptr = (float *)vy;  q8 = (int8_t *)(dptr + 2);
+//       dptr[0] = amax/127;  ((int32_t *)(dptr + 1))[0] = sum of the quants;  q8[i] = ...
+//   dequantize_row_q8_KV (iqk_quantize.cpp:8449) reads
+//       d = dptr[0];  q8 = (const int8_t *)(dptr + 2);  y[j] = d * q8[j];
+//   the traits entry (ggml.c, GGML_TYPE_Q8_KV) agrees: blck_size 32, type_size 32,
+//       row_meta_size 8 -- exactly the two leading 4-byte header words.
+// So: [float d][int32 sum of quants][int8 qs[n]], one header per ROW, not per block.
+//
+// The int32 word is the row sum of the quants. It is there for kernels that pair this row
+// with an asymmetric operand; Q8_KV is symmetric (a scale, no zero point and no min), so a
+// Q8_KV x Q8_KV dot does not need it and must not subtract anything.
+void pxa_q8_KV_dot_q8_KV(int n, float * s, const void * vx, const void * vy) {
+    const float  * dx = (const float  *)vx;
+    const float  * dy = (const float  *)vy;
+    const int8_t * qx = (const int8_t *)(dx + 2);
+    const int8_t * qy = (const int8_t *)(dy + 2);
+    int64_t isum = 0;
+    for (int j = 0; j < n; ++j) {
+        isum += (int)qx[j] * (int)qy[j];
+    }
+    *s = dx[0] * dy[0] * (float)isum;
+}
