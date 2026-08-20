@@ -603,14 +603,19 @@ float iqk_exp_with_thresh_impl(int n, float * logits, float max, float min) {
         logits += 8;
     }
     sum = hsum_float_8(vsum);
+    // _CMP_GE_OQ above keeps logits[j] == min; the scalar comparison must be the same
+    // relation or the tail disagrees with the vector arm it is finishing.
     for (int j = 0; j < n - 8*(n/8); ++j) {
-        float p = logits[j] > min ? expf(logits[j] - max) : 0;
+        float p = logits[j] >= min ? expf(logits[j] - max) : 0;
         sum += p;
         logits[j] = p;
     }
 #else
+    // Same relation as the AVX2 arm above (_CMP_GE_OQ), so this whole-array fallback
+    // computes what the vector path computes. NaN is excluded either way: the compare
+    // is ordered, and NaN >= min is false.
     for (int j = 0; j < n; ++j) {
-        float p = logits[j] > min ? expf(logits[j] - max) : 0;
+        float p = logits[j] >= min ? expf(logits[j] - max) : 0;
         sum += p;
         logits[j] = p;
     }
