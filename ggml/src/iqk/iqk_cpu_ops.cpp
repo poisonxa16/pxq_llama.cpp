@@ -122,9 +122,15 @@ inline void biased_sigmoid(int n, const float * x, const float * bias, float * y
         vst1q_f32(z + i, v);
     }
 #endif
+    // The scalar tail must compute the SAME thing the three SIMD arms above compute:
+    //   y = sigmoid(x) + bias, z = sigmoid(x).
+    // It used to read y[i] (never written by anyone) instead of the sigmoid it had just
+    // computed, so y was scratch-plus-bias. Invisible on AVX2/AVX512/NEON because the
+    // vector arms consume every element when n is a multiple of the vector width.
     for (; i < n; ++i) {
-        z[i] = 1/(1 + expf(-x[i]));
-        y[i] = y[i] + bias[i];
+        const float v = 1/(1 + expf(-x[i]));
+        z[i] = v;
+        y[i] = v + bias[i];
     }
 }
 inline void biased_sigmoid(int n, const float * x, const float * bias, float * y) {
