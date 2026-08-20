@@ -4313,7 +4313,8 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     const int  pair = pxa_pxq6_decode_mode();
     const bool vecx = pxa_pxq6_vecx();
-    auto * kern = pxq6_pick_mmv(fmt, pair, vecx);
+    auto * kern = pxq6_pick_mmv_bx(fmt, pair, vecx);       // K9 BOOKX (P6/P6HQ only)
+    if (!kern) kern = pxq6_pick_mmv(fmt, pair, vecx);
     if (!kern) return -1;                           // no instantiation for this format
     int nthr_mmv = 256;
     if (pxa_pxq6_rowx2()) {
@@ -4370,7 +4371,8 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         int S = S_min;               // >= 1; above 1 only when the x stage demands it
         while (S < PXQ6_MMV_SPLIT_MAX && (int64_t)panels*ny*S < target && (S*2)*PXQ4_MMV_KSEG <= kslabs) S *= 2;
         if (S > 1) {
-            auto * ksg = pxq6_pick_mmv_ksplit_gen(fmt, pair, vecx);
+            auto * ksg = pxq6_pick_mmv_ksplit_gen_x(fmt, pair, vecx, pxa_pxq6_mmvx2());
+            if (!ksg) ksg = pxq6_pick_mmv_ksplit_gen(fmt, pair, vecx);
             if (ksg) {
                 const size_t need = (size_t)ny*(size_t)PXQ6_MMV_SPLIT_MAX*(size_t)R;
                 float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
