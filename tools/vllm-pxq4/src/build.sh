@@ -19,13 +19,34 @@ BUILD="${PXQ4_BUILD:-/mnt/models/pxa-vllm-pxq4/build}"
 # Same image as the running service, so the torch/nvcc/gcc it links against are byte-identical
 # to the ones the server will load it into. --rm, no GPU request, no lease: nvcc does not need
 # a device to compile for sm_70.
-IMAGE="$(docker inspect -f '{{.Config.Image}}' vllm-qwen38-27b-cyber-1)"
+# Build against the SAME image the server runs, so torch/nvcc/gcc are byte-identical to what
+# will dlopen the result. PXQ4_IMAGE names it directly; PXQ4_REF_CONTAINER derives it from a
+# running container. The container name below is OUR box's -- it is a fallback, not a
+# requirement, and anyone else must set one of the two variables.
+IMAGE="${PXQ4_IMAGE:-}"
+if [ -z "$IMAGE" ]; then
+  REF="${PXQ4_REF_CONTAINER:-vllm-qwen38-27b-cyber-1}"
+  IMAGE="$(docker inspect -f '{{.Config.Image}}' "$REF" 2>/dev/null || true)"
+fi
+if [ -z "$IMAGE" ]; then
+  echo "ERROR: could not resolve the vLLM image." >&2
+  echo "  set PXQ4_IMAGE=<image>            (e.g. PXQ4_IMAGE=vllm/vllm-openai:v0.x)" >&2
+  echo "  or  PXQ4_REF_CONTAINER=<name>     (a RUNNING vLLM container to copy the image from)" >&2
+  exit 1
+fi
 echo "building against image: $IMAGE"
 
 mkdir -p "$BUILD" "$OUT"
 
+# Mount the common ancestor of SRC/OUT/BUILD rather than a hardcoded /mnt/models, so the
+# script works wherever the tree actually lives.
+MOUNT_ROOT="${PXQ4_MOUNT_ROOT:-$(printf '%s\n%s\n%s\n' "$SRC" "$OUT" "$BUILD" \
+  | sed 's|/[^/]*$||' | sort | awk 'NR==1{p=$0} {while (index($0,p)!=1) sub(/\/[^/]*$/,"",p)} END{print p}')}"
+[ -z "$MOUNT_ROOT" ] && MOUNT_ROOT=/
+echo "mounting: $MOUNT_ROOT"
+
 docker run --rm \
-  -v /mnt/models:/mnt/models \
+  -v "$MOUNT_ROOT":"$MOUNT_ROOT" \
   -w "$BUILD" \
   -e SRC="$SRC" -e OUT="$OUT" \
   --entrypoint /bin/bash \

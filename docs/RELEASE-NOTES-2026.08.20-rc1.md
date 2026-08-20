@@ -111,7 +111,43 @@ two with the reusable finding that the PXQ decode dot is *not* shared-memory-ban
 - 16 upstream ports, including deepstack image-embedding stride OOB, perplexity int overflows,
   uninitialized MROPE/IMROPE sections, CPU-only load crash on a CUDA build.
 
-## vLLM PXQ4 sidecar
+## vLLM PXQ4 sidecar — what ships, and what it needs
+
+**Included in this release: `tools/vllm-pxq4/`** — 160 files. The PXQ4 CUDA kernels, the vLLM
+linear method and quant config, the GGUF→vLLM converter, launch/deploy scripts, a benchmark
+harness, a parity harness with a C reference, and 13 design documents covering the format, the
+kernels, the plugin surface and the sharding/MTP verdicts.
+
+**No vLLM source is shipped or patched.** It attaches through vLLM's documented
+`register_quantization_config` plugin hook — zero lines of vLLM modified — so it survives vLLM
+upgrades instead of fighting them. Apache 2.0, matching vLLM.
+
+⚠ **It requires [1Cat-vLLM](https://github.com/KewaiiGamer/1Cat-vLLM), not upstream vLLM.**
+Upstream does not target compute capability 7.0. That fork carries the sm_70 work this backend
+depends on entirely: the TurboMind sm_70 W4A16 GEMM, the `FLASH_ATTN_V100` attention backend,
+and the Qwen Gated-DeltaNet kernels. PXA contributed to getting that V100 support working; this
+is a continuation of it, not a fork of it. On sm_80+ hardware you do not need any of that, but
+the sm_70 path is what this sidecar was built and measured against.
+
+⚠ **One optional PyTorch patch, for Pascal only.** `tools/patch_sm60_compile.py` lifts a
+hardcoded `device major >= 7` gate in `torch/utils/_triton.py::has_triton()`. That gate is not a
+real capability limit — Triton 3.3 runs pointwise/reduction kernels on sm_60 fine; only `tl.dot`
+is unavailable. It is opt-in, needed only for torch.compile / CUDA graphs on P100, and PXQ4
+itself does not depend on it. Disclosed in `LICENSE-NOTICE.md`.
+
+### Build
+
+`src/build.sh` compiles the kernels inside the same image the server runs, so torch/nvcc/gcc are
+byte-identical to what will load them. Point it at your own setup:
+
+```bash
+PXQ4_IMAGE=vllm/vllm-openai:v0.x PXQ4_SRC=/path/csrc PXQ4_OUT=/path/site/pxq4_vllm/_lib PXQ4_BUILD=/path/build   bash src/build.sh
+```
+
+`PXQ4_REF_CONTAINER=<name>` derives the image from a running container instead. The script
+mounts the common ancestor of SRC/OUT/BUILD; override with `PXQ4_MOUNT_ROOT`.
+
+### Measured
 
 New subsystem since v2026.08.11. sm_70 validated on real hardware, **sm_60 (P100) support
 added**, **CUDA graphs on sm_60: 3.9 → 14.9 tok/s decode**, TP=4 with v3 split mmv **42.3 → 55.9
