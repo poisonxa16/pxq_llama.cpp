@@ -436,3 +436,440 @@ void pxa_q8_KV_dot_q8_KV(int n, float * s, const void * vx, const void * vy) {
     }
     *s = dx[0] * dy[0] * (float)isum;
 }
+
+// =================================================================================================
+// Graph ops and helpers reowned from ggml/src/iqk/iqk_cpu_ops.cpp (PXA 2026-08-21,
+// ik separation phase 2).
+//
+// Everything below used to live in that file. None of it was ever an "accelerator" with a
+// stock ggml path underneath: MUL_MULTI_ADD, HADAMARD and FUSED_RMS_RMS_ADD are fork ops
+// whose ONLY implementation was there (grep for ggml_compute_forward_mul_multi_add /
+// _hadamard / _fused_rms_rms_add returns nothing), SUM_ROWS+DIV was a fusion that fires on
+// every MoE forward, and the two non-op helpers are called from llama.cpp and
+// llama-sampling.cpp. Deleting the file without moving these is a link failure plus three
+// dead fork ops, so they are moved, renamed into our namespace, and cited.
+//
+// The arithmetic is deliberately unchanged. Where ik had a SIMD loop with a scalar tail
+// beneath it, both are carried over verbatim so the AVX2 build keeps producing exactly the
+// bits it produced before. That is not an aspiration: a differential harness ran the old
+// bodies and these side by side, same process, same flags, at nth=1 and nth=4, and required
+// memcmp equality over the whole destination buffer. Every function below came out
+// BIT-IDENTICAL on all three CPU trees (AVX2+FMA, AVX+F16C, pure scalar). So a divergence
+// found by the CPU gauntlet after this commit is a porting mistake, never an intended
+// numerics change.
+//
+// The one SIMD block deliberately NOT carried over is iqk_exp_with_thresh's AVX2 arm, which
+// needed ik's v_expf and hsum_float_8 headers; it is a once-per-token sampler helper over
+// n_vocab, its `#else` branch was already the reference, and dropping it is what makes this
+// file free of ggml/src/iqk. That one agrees to 6.3e-07 relative (libm expf vs ik's
+// polynomial), not to the bit, and is exact on any build without AVX2.
+//
+// Threading contract, inherited and preserved everywhere below: each compute thread calls
+// with its own (ith, nth) and owns rows [ith*npt, MIN(first+npt, nrows)). Getting that
+// arithmetic wrong drops or double-writes rows and shows up only at nth > 1, never in the
+// single-threaded eval-callback dumps.
+// =================================================================================================
+
+#if defined(__AVX2__)
+// Bit-for-bit ik's hsum_float_4/hsum_float_8 (iqk_common.h:230-237). The reduction ORDER of a
+// horizontal float sum is observable in the last ulp, and this one feeds an RMS-norm rsqrt,
+// so it is copied rather than re-derived.
+static inline float pxa_hsum_float_4(__m128 x) {
+    x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+    x = _mm_add_ss(x, _mm_movehdup_ps(x));
+    return _mm_cvtss_f32(x);
+}
+static inline float pxa_hsum_float_8(__m256 x) {
+    return pxa_hsum_float_4(_mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1)));
+}
+#endif
+
+// -------------------------------------------------------------------------------------------------
+// pxa_has_fancy_simd — was iqk_has_fancy_simd (iqk_cpu_ops.cpp:37-43).
+//
+// Not a ggml op; its only caller is src/llama.cpp, which logs whether the host has the
+// AVX512 feature set ik called "fancy SIMD". ik got the answer from HAVE_FANCY_SIMD in
+// iqk/iqk_config.h:46; the five feature macros are written out inline here instead so that
+// nothing outside ggml/src/iqk is needed to answer the question.
+// -------------------------------------------------------------------------------------------------
+bool pxa_has_fancy_simd(void) {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && \
+    defined(__AVX512BW__) && defined(__AVX512DQ__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+// -------------------------------------------------------------------------------------------------
+// pxa_sumrows_div — was iqk_sumrows_div (iqk_cpu_ops.cpp:156-176).
+//
+// The body of the SUM_ROWS+DIV fusion in ggml.c: given a DIV node whose numerator is the
+// SUM_ROWS source and whose denominator is the SUM_ROWS result, compute the row-normalised
+// values in one pass instead of materialising the sums. This is the MoE router softmax
+// normalisation and it runs 40x per forward pass on a 35B-class graph.
+//
+// ik indexed rows as ir*nb[1] over ggml_nrows() with no contiguity check, which is only
+// correct for a contiguous src. It has always been called with one, and the AVX2 build makes
+// the same assumption, so this is not a divergence source -- but an assumption that load-bearing
+// should be stated, so the assert is added here rather than left implied.
+// -------------------------------------------------------------------------------------------------
+void pxa_sumrows_div(struct ggml_tensor * div, int ith, int nth) {
+    const struct ggml_tensor * src = div->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(div->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(div));
+
+    const int ne00  = (int) src->ne[0];
+    const int nrows = (int) ggml_nrows(src);
+    const int npt   = (nrows + nth - 1)/nth;
+    const int first = ith*npt;
+    const int last  = MIN(first + npt, nrows);
+    if (last < first) return;
+
+    for (int ir = first; ir < last; ++ir) {
+        const float * values = (const float *)((const char *)src->data + ir*src->nb[1]);
+        float sum = 0;
+        for (int j = 0; j < ne00; ++j) sum += values[j];
+        const float norm = sum > 0 ? 1/sum : 0.0f;
+        float * result = (float *)((char *)div->data + ir*div->nb[1]);
+        for (int j = 0; j < ne00; ++j) result[j] = values[j]*norm;
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// pxa_mul_multi_add — was iqk_mul_multi_add (iqk_cpu_ops.cpp:442-513).
+//
+// GGML_OP_MUL_MULTI_ADD is a fork op with no stock ggml body: this function IS the op. It
+// collapses "multiply each of ne01 expert outputs by its routing weight, then add them" into
+// one pass, and fires once per MoE layer (the routed_out-N nodes).
+//
+// Two shapes. When src[2] (f32 per-expert scales) and src[3] (i32 per-row expert ids) are
+// both present, each term is additionally scaled by scales[ids[j]]; otherwise the weight in
+// src1 is the whole story. src1 is a column vector (ne[0] == 1) of weights, one per term.
+// -------------------------------------------------------------------------------------------------
+void pxa_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[0] ==  dst->ne[0]);
+    GGML_ASSERT(src0->ne[2] ==  dst->ne[1]);
+    GGML_ASSERT(src0->ne[1] == src1->ne[1]);
+    GGML_ASSERT(src0->ne[2] == src1->ne[2]);
+    GGML_ASSERT(src0->ne[3] == src1->ne[3]);
+    GGML_ASSERT(src0->ne[3] == 1);
+    GGML_ASSERT(src1->ne[0] == 1);
+
+    const int nrows = (int) dst->ne[1];
+    const int npt   = (nrows + nth - 1)/nth;
+    const int first = ith*npt;
+    const int last  = MIN(nrows, first + npt);
+
+    const int ne01 = (int) src0->ne[1];
+    const int ne00 = (int) src0->ne[0];
+
+    const struct ggml_tensor * src2 = dst->src[2];
+    const struct ggml_tensor * src3 = dst->src[3];
+    if (src2 && src3) {
+        GGML_ASSERT(src2->type == GGML_TYPE_F32);
+        GGML_ASSERT(src3->type == GGML_TYPE_I32);
+        GGML_ASSERT(src3->ne[0] == src0->ne[1]);
+
+        const char  * cids   = (const char  *)src3->data;
+        const float * scales = (const float *)src2->data;
+        for (int ir = first; ir < last; ++ir) {
+            const char * c0 = (const char *)src0->data + ir*src0->nb[2];
+            const char * c1 = (const char *)src1->data + ir*src1->nb[2];
+            float * y = (float *)((char *)dst->data + ir*dst->nb[1]);
+            const float * x0 = (const float *)c0;
+            const float * x1 = (const float *)c1;
+            const int   * ids = (const int *)(cids + ir*src3->nb[1]);
+            float s = scales[ids[0]] * x1[0];
+            for (int k = 0; k < ne00; ++k) y[k] = x0[k] * s;
+            for (int j = 1; j < ne01; ++j) {
+                c0 += src0->nb[1];
+                c1 += src1->nb[1];
+                x0 = (const float *)c0;
+                x1 = (const float *)c1;
+                s  = x1[0] * scales[ids[j]];
+                for (int k = 0; k < ne00; ++k) y[k] += x0[k] * s;
+            }
+        }
+        return;
+    }
+
+    for (int ir = first; ir < last; ++ir) {
+        const char * c0 = (const char *)src0->data + ir*src0->nb[2];
+        const char * c1 = (const char *)src1->data + ir*src1->nb[2];
+        float * y = (float *)((char *)dst->data + ir*dst->nb[1]);
+        const float * x0 = (const float *)c0;
+        const float * x1 = (const float *)c1;
+        for (int k = 0; k < ne00; ++k) y[k] = x0[k] * x1[0];
+        for (int j = 1; j < ne01; ++j) {
+            c0 += src0->nb[1];
+            c1 += src1->nb[1];
+            x0 = (const float *)c0;
+            x1 = (const float *)c1;
+            for (int k = 0; k < ne00; ++k) y[k] += x0[k] * x1[0];
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// pxa_hadamard — was iqk_hadamard (iqk_cpu_ops.cpp:534-581), with fast_ht from :516-531.
+//
+// GGML_OP_HADAMARD is a fork op with no stock ggml body: this function IS the op. It applies
+// a fast Walsh-Hadamard transform of length nh (a power of two, from op_params[0]) to every
+// nh-wide chunk of every row, normalising by 2^(-log2(nh)/2) as it goes.
+//
+// ik's popcount() came from iqk/iqk_common.h:960, which sat outside that header's
+// IQK_IMPLEMENT guard specifically so files like this could reach it. That is exactly the
+// kind of hidden thread this campaign is cutting, so the power-of-two check is done here
+// with a three-line portable helper instead.
+// -------------------------------------------------------------------------------------------------
+static inline bool pxa_is_pow2_u32(uint32_t x) {
+    return x != 0 && (x & (x - 1)) == 0;
+}
+
+// In-place fast Walsh-Hadamard transform, length n (power of two). ik had this as a template
+// instantiated only for float; de-templated it is plain C.
+static void pxa_fast_ht_f32(int n, float * values) {
+    const float ksqrt2 = 0.707106781f;
+    float scale = 1;
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += 2*h) {
+            for (int j = i; j < i + h; ++j) {
+                const float x = values[j], y = values[j + h];
+                values[j+0] = x + y;
+                values[j+h] = x - y;
+            }
+        }
+        scale *= ksqrt2;
+    }
+    for (int i = 0; i < n; ++i) values[i] *= scale;
+}
+
+void pxa_hadamard(struct ggml_tensor * dst, int ith, int nth) {
+    const struct ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src, dst));
+    const int nh = dst->op_params[0];
+    GGML_ASSERT(nh > 1 && pxa_is_pow2_u32((uint32_t) nh));
+    GGML_ASSERT(dst->ne[0] % nh == 0);
+
+    const int nc  = (int) (dst->ne[0]/nh);
+    const int nr  = (int) (ggml_nrows(dst) * nc);
+    const int npt = (nr + nth - 1)/nth;
+    const int first = npt*ith;
+    const int last  = MIN(first + npt, nr);
+
+    // ir enumerates (i3, i2, i1, chunk) quadruples; decompose it back into the four indices.
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+
+    if (src->type == GGML_TYPE_F32) {
+        for (int ir = first; ir < last; ++ir) {
+            const int i3 = (int) ( ir / (ne1 * ne2 * nc));
+            const int i2 = (int) ((ir - i3*ne1*ne2*nc) / (ne1 * nc));
+            const int i1 = (int) ((ir - i3*ne1*ne2*nc - i2*ne1*nc) / nc);
+            const int ic = (int) ( ir - i3*ne1*ne2*nc - i2*ne1*nc - i1*nc);
+
+            const float * x = (const float *)((const char *)src->data + i3*src->nb[3] + i2*src->nb[2] + i1*src->nb[1]) + (size_t)ic*nh;
+            float       * y = (      float *)((      char *)dst->data + i3*dst->nb[3] + i2*dst->nb[2] + i1*dst->nb[1]) + (size_t)ic*nh;
+            memcpy(y, x, nh*sizeof(float));
+            pxa_fast_ht_f32(nh, y);
+        }
+        return;
+    }
+
+    // Quantized source: dequantise the chunk into the destination and transform in place.
+    // ggml_internal_get_type_traits is public (ggml.h), so this needs nothing from ik.
+    ggml_type_traits_t traits = ggml_internal_get_type_traits(src->type);
+    GGML_ASSERT(traits.to_float != NULL);
+    const size_t blck_size = traits.blck_size;
+    const size_t type_size = traits.type_size;
+    GGML_ASSERT(blck_size > 0 && (nh % blck_size == 0 || blck_size % nh == 0));
+
+    for (int ir = first; ir < last; ++ir) {
+        const int i3 = (int) ( ir / (ne1 * ne2 * nc));
+        const int i2 = (int) ((ir - i3*ne1*ne2*nc) / (ne1 * nc));
+        const int i1 = (int) ((ir - i3*ne1*ne2*nc - i2*ne1*nc) / nc);
+        const int ic = (int) ( ir - i3*ne1*ne2*nc - i2*ne1*nc - i1*nc);
+
+        const char * x_row  = (const char *)src->data + i3*src->nb[3] + i2*src->nb[2] + i1*src->nb[1];
+        const size_t offset = ((size_t)ic * nh / blck_size) * type_size;
+        float      * y      = (float *)((char *)dst->data + i3*dst->nb[3] + i2*dst->nb[2] + i1*dst->nb[1]) + (size_t)ic*nh;
+        traits.to_float(x_row + offset, y, nh);
+        pxa_fast_ht_f32(nh, y);
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// pxa_exp_with_thresh — was iqk_exp_with_thresh (iqk_cpu_ops.cpp:584-627).
+//
+// Not a ggml op: this is llama-sampling's adaptive-p accumulator. It rewrites logits[] in
+// place as exp(logit - max) for every logit at or above `min`, zeroing the rest, and returns
+// the sum. Called once per sampled token over n_vocab.
+//
+// ik had an AVX2 arm here using v_expf (iqk/iqk_utils.h) and hsum_float_8 (iqk/iqk_common.h),
+// with this loop as its `#else`. The scalar branch was already the reference and the AVX2 arm
+// bought a single vectorised exp per token, so the arm is dropped and the two ik headers with
+// it. The comparison is `>=`, matching what the AVX2 arm's _CMP_GE_OQ did (fixed under
+// separate cover before this move); it is an ordered compare, so a NaN logit scores 0 rather
+// than poisoning the sum.
+// -------------------------------------------------------------------------------------------------
+float pxa_exp_with_thresh(int n, float * logits, float max, float min) {
+    float sum = 0;
+    for (int j = 0; j < n; ++j) {
+        const float p = logits[j] >= min ? expf(logits[j] - max) : 0;
+        sum += p;
+        logits[j] = p;
+    }
+    return sum;
+}
+
+// -------------------------------------------------------------------------------------------------
+// pxa_rms_rms_add — was iqk_rms_rms_add (iqk_cpu_ops.cpp:926-988) with its six helpers
+// (:860-924).
+//
+// GGML_OP_FUSED_RMS_RMS_ADD is a fork op with no stock ggml body: this function IS the op. It
+// computes two independent RMS norms of the same row shape and adds them:
+//
+//     dst[j] = c1[j]*x1[j]/sqrt(mean(x1^2) + eps) + c2[j]*x2[j]/sqrt(mean(x2^2) + eps)
+//
+// x1/x2 (src0/src2) share a type, one of f32/f16/bf16; the gains c1/c2 (src1/src3) are always
+// f32 single rows. Only the f32 flavour had AVX2 loops in ik and both had correct scalar
+// tails, so the no-AVX2 path was already right; both are carried over unchanged so the AVX2
+// build's last ulp does not move.
+// -------------------------------------------------------------------------------------------------
+static inline float pxa_sum_row_squared_f32(int ncols, const float * x) {
+    float sum = 0;
+    int i = 0;
+#ifdef __AVX2__
+    __m256 vsum = _mm256_setzero_ps();
+    for (; i < ncols - 7; i += 8) {
+        const __m256 vx = _mm256_loadu_ps(x + i);
+        vsum = _mm256_fmadd_ps(vx, vx, vsum);
+    }
+    sum = pxa_hsum_float_8(vsum);
+#endif
+    for (; i < ncols; ++i) sum += x[i]*x[i];
+    return sum;
+}
+static inline float pxa_sum_row_squared_f16(int ncols, const ggml_half * x) {
+    float sum = 0;
+    for (int j = 0; j < ncols; ++j) {
+        const float v = GGML_FP16_TO_FP32(x[j]);
+        sum += v*v;
+    }
+    return sum;
+}
+static inline float pxa_sum_row_squared_bf16(int ncols, const ggml_bf16_t * x) {
+    float sum = 0;
+    for (int j = 0; j < ncols; ++j) {
+        const float v = GGML_BF16_TO_FP32(x[j]);
+        sum += v*v;
+    }
+    return sum;
+}
+static inline void pxa_rms_rms_add_f32(int ncols, float scale1, float scale2,
+        const float * x1, const float * x2, const float * c1, const float * c2, float * dst) {
+    int j = 0;
+#ifdef __AVX2__
+    const __m256 vs1 = _mm256_set1_ps(scale1);
+    const __m256 vs2 = _mm256_set1_ps(scale2);
+    for (; j < ncols - 7; j += 8) {
+        const __m256 vx1 = _mm256_loadu_ps(x1 + j);
+        const __m256 vx2 = _mm256_loadu_ps(x2 + j);
+        const __m256 vc1 = _mm256_loadu_ps(c1 + j);
+        const __m256 vc2 = _mm256_loadu_ps(c2 + j);
+        const __m256 vy = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(vs1, vc1), vx1),
+                                        _mm256_mul_ps(_mm256_mul_ps(vs2, vc2), vx2));
+        _mm256_storeu_ps(dst + j, vy);
+    }
+#endif
+    for (; j < ncols; ++j) {
+        dst[j] = scale1 * c1[j] * x1[j] + scale2 * c2[j] * x2[j];
+    }
+}
+static inline void pxa_rms_rms_add_f16(int ncols, float scale1, float scale2,
+        const ggml_half * x1, const ggml_half * x2, const float * c1, const float * c2, float * dst) {
+    for (int j = 0; j < ncols; ++j) {
+        const float v1 = GGML_FP16_TO_FP32(x1[j]);
+        const float v2 = GGML_FP16_TO_FP32(x2[j]);
+        dst[j] = scale1 * c1[j] * v1 + scale2 * c2[j] * v2;
+    }
+}
+static inline void pxa_rms_rms_add_bf16(int ncols, float scale1, float scale2,
+        const ggml_bf16_t * x1, const ggml_bf16_t * x2, const float * c1, const float * c2, float * dst) {
+    for (int j = 0; j < ncols; ++j) {
+        const float v1 = GGML_BF16_TO_FP32(x1[j]);
+        const float v2 = GGML_BF16_TO_FP32(x2[j]);
+        dst[j] = scale1 * c1[j] * v1 + scale2 * c2[j] * v2;
+    }
+}
+
+void pxa_rms_rms_add(struct ggml_tensor * dst, int ith, int nth) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * src2 = dst->src[2];
+    const struct ggml_tensor * src3 = dst->src[3];
+
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src2) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(ggml_are_same_shape(src2, dst));
+    GGML_ASSERT(ggml_nrows(src1) == 1 && ggml_nrows(src3) == 1);
+    GGML_ASSERT(src0->ne[0] == src1->ne[0] && src2->ne[0] == src3->ne[0]);
+    GGML_ASSERT(src0->type == src2->type);
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps > 0.0f);
+
+    const int nrows = (int) ggml_nrows(dst);
+    const int nrows_per_thread = (nrows + nth - 1)/nth;
+    const int first = ith*nrows_per_thread;
+    const int last  = MIN(nrows, first + nrows_per_thread);
+
+    const float * c1 = (const float *) src1->data;
+    const float * c2 = (const float *) src3->data;
+
+    const int ncols = (int) dst->ne[0];
+
+    for (int ir = first; ir < last; ++ir) {
+        float * y = (float *)dst->data + (size_t)ir*ncols;
+
+        float sum1 = 0, sum2 = 0;
+        if (src0->type == GGML_TYPE_F32) {
+            sum1 = pxa_sum_row_squared_f32(ncols, (const float *)src0->data + (size_t)ir*ncols);
+            sum2 = pxa_sum_row_squared_f32(ncols, (const float *)src2->data + (size_t)ir*ncols);
+        } else if (src0->type == GGML_TYPE_F16) {
+            sum1 = pxa_sum_row_squared_f16(ncols, (const ggml_half *)src0->data + (size_t)ir*ncols);
+            sum2 = pxa_sum_row_squared_f16(ncols, (const ggml_half *)src2->data + (size_t)ir*ncols);
+        } else {
+            sum1 = pxa_sum_row_squared_bf16(ncols, (const ggml_bf16_t *)src0->data + (size_t)ir*ncols);
+            sum2 = pxa_sum_row_squared_bf16(ncols, (const ggml_bf16_t *)src2->data + (size_t)ir*ncols);
+        }
+
+        const float mean1  = sum1/ncols;
+        const float mean2  = sum2/ncols;
+        const float scale1 = 1.0f/sqrtf(mean1 + eps);
+        const float scale2 = 1.0f/sqrtf(mean2 + eps);
+        if (src0->type == GGML_TYPE_F32) {
+            pxa_rms_rms_add_f32(ncols, scale1, scale2,
+                    (const float *)src0->data + (size_t)ir*ncols, (const float *)src2->data + (size_t)ir*ncols, c1, c2, y);
+        } else if (src0->type == GGML_TYPE_F16) {
+            pxa_rms_rms_add_f16(ncols, scale1, scale2,
+                    (const ggml_half *)src0->data + (size_t)ir*ncols, (const ggml_half *)src2->data + (size_t)ir*ncols, c1, c2, y);
+        } else {
+            pxa_rms_rms_add_bf16(ncols, scale1, scale2,
+                    (const ggml_bf16_t *)src0->data + (size_t)ir*ncols, (const ggml_bf16_t *)src2->data + (size_t)ir*ncols, c1, c2, y);
+        }
+    }
+}

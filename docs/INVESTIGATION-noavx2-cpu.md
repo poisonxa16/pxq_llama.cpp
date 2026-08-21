@@ -43,10 +43,22 @@ Not on any path we serve (all seats are GPU-resident; full GPU offload is verifi
 - **BF16.** The model carries 2 BF16 tensors and `to_float`/`vec_dot` for BF16 differ by ISA.
   `test-quantize-fns` passes bf16 in isolation but does not exercise its graph use. **Start here.**
 - Core ops on the no-AVX2 path: rms_norm, rope, softmax.
-- `iqk_cpu_ops.cpp` — force-defines `IQK_IMPLEMENT` at the top, which `iqk_config.h` then
-  `#undef`s. Its ops (`iqk_rms_rms_add`, `iqk_mul_multi_add`, `iqk_hadamard`, …) compile
-  unconditionally; confirm each call site has a real stock fallback and none silently no-op
-  onto an uninitialised output buffer.
+- ~~`iqk_cpu_ops.cpp`~~ — **checked and closed, 2026-08-21.** The file is gone; all twelve of
+  its exported symbols were reowned or deleted (ik separation phase 2). The answer to the
+  question asked here is that most of those call sites had NO stock fallback at all:
+  `MUL_MULTI_ADD`, `HADAMARD` and `FUSED_RMS_RMS_ADD` are fork ops whose only body was in that
+  file, and `GROUPED_TOPK` had nothing but a type switch. They could never have silently
+  no-opped, but they also could never have been dropped — they had to be moved, and now live in
+  `ggml/src/pxq-cpu.c` and `ggml/src/pxq-cpu-ops.cpp` as `pxa_*`.
+
+  Nothing in the file was a no-AVX2 defect after the `biased_sigmoid` scalar-tail fix: every
+  SIMD block in it except `iqk_ssm_conv4` already had a correct scalar tail underneath. A
+  differential test (`<local-path>`) ran the old bodies and the reowned ones
+  over the same inputs in the same process at nth=1 and nth=4 and confirmed BIT-IDENTICAL
+  output on all three CPU trees, so this reowning moved no numerics in either direction.
+  `iqk_ssm_conv4` was deleted rather than ported (230 lines of intrinsics over a
+  `#else return false;`); the generic `ggml_compute_forward_ssm_conv` path that every no-AVX2
+  build already ran is now the only path, which costs AVX2/NEON speed and nothing else.
 
 ## Separate real defects found on the way (no-AVX2, NOT our bug — no type below is in the model)
 

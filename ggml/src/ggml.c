@@ -24,7 +24,7 @@
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
 #include "iqk/iqk_quantize.h"
-#include "iqk/iqk_cpu_ops.h"
+#include "pxq-cpu-ops.h" // ARGSORT / GROUPED_TOPK -- the two reowned ops that need the C++ STL
 #include "pxq-cpu.h"     // CPU panel-dequant fallback for the PXQ slab types (A5)
 // iqk_config.h is the IQK_IMPLEMENT / HAVE_FANCY_SIMD oracle and is needed unconditionally;
 // it used to be pulled in only alongside iqk_mul_mat.h, which no longer exists.
@@ -22527,7 +22527,7 @@ static void ggml_compute_forward_argsort(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                iqk_argsort(dst, params->ith, params->nth);
+                pxa_argsort(dst, params->ith, params->nth);
                 //ggml_compute_forward_argsort_f32(params, dst);
             } break;
         default:
@@ -22615,7 +22615,7 @@ static void ggml_compute_forward_grouped_topk(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                iqk_grouped_top_k(dst, params->ith, params->nth);
+                pxa_grouped_top_k(dst, params->ith, params->nth);
             } break;
         default:
             {
@@ -23298,32 +23298,20 @@ static int ggml_compute_forward_ssm_conv_f32(
     // for use with the destination state offset between sequences
     GGML_ASSERT(src2->nb[2] == src2->ne[1]*src2->ne[0]*sizeof(float));
 
-    if (n_kv == 1 && nc == 4 && !src4) { // TODO: implement per token state saving in iqk_ssm_conv4
-        float * dst_silu = NULL;
-        // node is the loop index from ggml_graph_compute_thread, so it is always
-        // <= n_nodes-1 and "node < n_nodes + 2" was a tautology that gated nothing --
-        // nodes[node+1] and nodes[node+2] were read unconditionally. Backend-sched hands
-        // us ggml_graph_view sub-graphs whose nodes pointer indexes into the parent, and
-        // with an eval callback registered those views are a single node, so this read
-        // routinely landed outside the view (and past the allocation at the parent tail).
-        if (node + 2 < cgraph->n_nodes &&
-            cgraph->nodes[node+1]->op == GGML_OP_VIEW && cgraph->nodes[node+1]->src[0] == dst &&
-            cgraph->nodes[node+2]->op == GGML_OP_UNARY && cgraph->nodes[node+2]->src[0] == cgraph->nodes[node+1] &&
-            (enum ggml_unary_op)cgraph->nodes[node+2]->op_params[0] == GGML_UNARY_OP_SILU) {
-            dst_silu = (float *)cgraph->nodes[node+2]->data;
-            const float * x0_begin = (const float *)src1->data;
-            const float * x0_end   = x0_begin + src1->nb[1]*n_t/sizeof(float) - 1;
-            const float * dst_silu_end = dst_silu + nr*n_t - 1;
-            if (!(dst_silu_end < x0_begin || dst_silu > x0_end)) {
-                dst_silu = NULL;
-            }
-        }
-        if (iqk_ssm_conv4(nr, nc, n_t, src0->nb[1], src1->nb[0], src1->nb[1], src2->nb[1],
-                    (const float *)src1->data, (const float *)src0->data, (const float *)src2->data,
-                    (float *)dst->data, dst_silu, ith, nth)) {
-            return node + (dst_silu ? 2 : 0);
-        }
-    }
+    // PXA 2026-08-21, ik separation phase 2: the d_conv == 4 fast path is gone.
+    //
+    // It called iqk_ssm_conv4, 230 lines that were AVX2 intrinsics or NEON intrinsics with
+    // `#else return false;` underneath -- no scalar body to lift, so reowning it meant
+    // rewriting a 4-tap ring-buffer convolution by hand rather than moving it. The generic
+    // loop below IS the reference implementation and is what every non-AVX2 build has always
+    // run; the ivb dump takes it on all 30 SSM_CONV nodes and agrees with the AVX2 build.
+    //
+    // Note for anyone diffing graph dumps across this commit: the fast path also swallowed
+    // the following VIEW and SILU nodes and returned node+2, so on an AVX2 build the node
+    // COUNT grows by two per layer now. Key any diff harness on node NAME, not index.
+    //
+    // What this costs is speed on AVX2/NEON hosts. Nothing else.
+    GGML_UNUSED(cgraph);
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -25480,11 +25468,11 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_MUL_MULTI_ADD:
             {
-                iqk_mul_multi_add(tensor, params->ith, params->nth);
+                pxa_mul_multi_add(tensor, params->ith, params->nth);
             } break;
         case GGML_OP_HADAMARD:
             {
-                iqk_hadamard(tensor, params->ith, params->nth);
+                pxa_hadamard(tensor, params->ith, params->nth);
             } break;
         case GGML_OP_ACC:
             {
@@ -25528,7 +25516,7 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                     cgraph->nodes[i+1]->op == GGML_OP_DIV &&
                     cgraph->nodes[i+1]->src[1] == tensor &&
                     cgraph->nodes[i+1]->src[0] == tensor->src[0]) {
-                    iqk_sumrows_div(cgraph->nodes[i+1], params->ith, params->nth);
+                    pxa_sumrows_div(cgraph->nodes[i+1], params->ith, params->nth);
                     ++i;
                 } else {
                     ggml_compute_forward_sum_rows(params, tensor);
@@ -25576,7 +25564,7 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_FUSED_RMS_RMS_ADD:
             {
-                iqk_rms_rms_add(tensor, params->ith, params->nth);
+                pxa_rms_rms_add(tensor, params->ith, params->nth);
             } break;
         case GGML_OP_FUSED_NORM:
             {
@@ -25802,17 +25790,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_ARGSORT:
             {
-                if (false && i + 5 < cgraph->n_nodes &&
-                    cgraph->nodes[i+1]->op == GGML_OP_VIEW &&
-                    cgraph->nodes[i+2]->op == GGML_OP_GET_ROWS &&
-                    cgraph->nodes[i+3]->op == GGML_OP_RESHAPE &&
-                    cgraph->nodes[i+4]->op == GGML_OP_SOFT_MAX &&
-                    cgraph->nodes[i+5]->op == GGML_OP_RESHAPE) {
-                    iqk_openai_experts(tensor, cgraph->nodes[i+4], params->ith, params->nth);
-                    i += 5;
-                } else {
-                    ggml_compute_forward_argsort(params, tensor);
-                }
+                // PXA 2026-08-21, ik separation phase 2: the openai-experts fusion that used
+                // to sit here was dead code -- its condition began `if (false && ...)`, so
+                // only this else branch could ever run. Deleted along with iqk_openai_experts.
+                ggml_compute_forward_argsort(params, tensor);
             } break;
         case GGML_OP_ARGSORT_THRESH:
             {
@@ -25879,26 +25860,16 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_UNARY:
             {
-                const enum ggml_unary_op unary_op = ggml_get_unary_op(tensor);
-                if (fusion && unary_op == GGML_UNARY_OP_SIGMOID && i + 5 < cgraph->n_nodes &&
-                    cgraph->nodes[i+1]->op == GGML_OP_RESHAPE &&
-                    cgraph->nodes[i+2]->op == GGML_OP_ADD &&
-                    cgraph->nodes[i+3]->op == GGML_OP_ARGSORT &&
-                    cgraph->nodes[i+4]->op == GGML_OP_VIEW &&
-                    cgraph->nodes[i+5]->op == GGML_OP_GET_ROWS) {
-                    iqk_glm45moe_experts(cgraph->nodes[i+5], cgraph->nodes[i+4], params->ith, params->nth);
-                    i += 5;
-                }
-                else if (fusion && unary_op == GGML_UNARY_OP_SIGMOID && i + 4 < cgraph->n_nodes &&
-                    cgraph->nodes[i+1]->op == GGML_OP_RESHAPE &&
-                    cgraph->nodes[i+2]->op == GGML_OP_ADD &&
-                    cgraph->nodes[i+3]->op == GGML_OP_GROUPED_TOPK &&
-                    cgraph->nodes[i+4]->op == GGML_OP_GET_ROWS) {
-                    iqk_bailingmoev2_experts(cgraph->nodes[i+4], cgraph->nodes[i+3], params->ith, params->nth);
-                    i += 4;
-                } else {
-                    ggml_compute_forward_unary(params, tensor);
-                }
+                // PXA 2026-08-21, ik separation phase 2: two SIGMOID-rooted MoE router fusions
+                // used to be recognised here -- glm45moe (SIGMOID+RESHAPE+ADD+ARGSORT+VIEW+
+                // GET_ROWS) and bailingmoev2 (SIGMOID+RESHAPE+ADD+GROUPED_TOPK+GET_ROWS). Both
+                // were `fusion &&`-guarded with this same else branch underneath, i.e. declining
+                // them was always legal, and both computed exactly what the unfused chain
+                // computes: the biased sigmoid decides the ranking, the unbiased sigmoid
+                // supplies the weights, and GET_ROWS gathers the latter by the former's ids.
+                // Running the chain node by node is the same arithmetic in the same order, so
+                // deleting the fusions is cheaper than porting them and loses no correctness.
+                ggml_compute_forward_unary(params, tensor);
             } break;
         case GGML_OP_GLU:
             {

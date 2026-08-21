@@ -31,7 +31,7 @@ void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_conte
 
 // TODO: fix these includes
 #include "iqk/iqk_quantize.h"
-#include "iqk/iqk_cpu_ops.h"
+#include "pxq-cpu.h"
 
 #define IK_PRINT_TIMING 0
 
@@ -3866,7 +3866,7 @@ static bool llm_load_tensors(
         }
     }
 
-    if (iqk_has_fancy_simd()) {
+    if (pxa_has_fancy_simd()) {
         LLAMA_LOG_INFO("======================================= HAVE_FANCY_SIMD is defined\n");
     } else {
         LLAMA_LOG_INFO("======================================= HAVE_FANCY_SIMD is NOT defined\n");

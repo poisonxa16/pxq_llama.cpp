@@ -109,6 +109,44 @@ void pxa_pxq_mul_mat_cpu(
         const struct pxa_pxq_rowmap * rows, int ne11, int64_t ny,
         int ith, int nth);
 
+// -------------------------------------------------------------------------------------------------
+// Graph ops and helpers reowned from ggml/src/iqk/iqk_cpu_ops.cpp (PXA 2026-08-21, ik
+// separation phase 2). See the block comment in pxq-cpu.c for the per-function provenance.
+//
+// Three of these are FORK OPS with no stock ggml body anywhere in the tree -- MUL_MULTI_ADD,
+// HADAMARD and FUSED_RMS_RMS_ADD. They are not accelerators with a fallback beneath them;
+// they are the whole implementation, which is why they had to be moved rather than dropped.
+// The other three are a MoE fusion body (SUM_ROWS+DIV) and two helpers that are not ggml ops
+// at all: pxa_has_fancy_simd is a logging predicate for llama.cpp, and pxa_exp_with_thresh is
+// llama-sampling's adaptive-p accumulator.
+//
+// ARGSORT and GROUPED_TOPK live in pxq-cpu-ops.cpp instead -- they need std::partial_sort.
+//
+// All of these are called from every compute thread with a row split; see pxq-cpu.c.
+// -------------------------------------------------------------------------------------------------
+
+// true when the host has the AVX512 feature set (F + VNNI + VL + BW + DQ). Logging only.
+bool pxa_has_fancy_simd(void);
+
+// SUM_ROWS+DIV fused: div[ir][j] = src[ir][j] / sum_j(src[ir][j]), 0 when the row sums to <= 0.
+void pxa_sumrows_div(struct ggml_tensor * div, int ith, int nth);
+
+// GGML_OP_MUL_MULTI_ADD -- weighted sum of ne01 expert outputs, optionally with a second
+// per-expert scale drawn from src[2] via the ids in src[3]. No stock ggml body exists.
+void pxa_mul_multi_add(struct ggml_tensor * dst, int ith, int nth);
+
+// GGML_OP_HADAMARD -- in-place fast Walsh-Hadamard transform over every op_params[0]-wide
+// chunk of every row, f32 or any quantized source with a to_float. No stock ggml body exists.
+void pxa_hadamard(struct ggml_tensor * dst, int ith, int nth);
+
+// GGML_OP_FUSED_RMS_RMS_ADD -- two independent RMS norms of the same shape, added.
+// src0/src2 are f32/f16/bf16 and share a type; src1/src3 are f32 gain rows. No stock body.
+void pxa_rms_rms_add(struct ggml_tensor * dst, int ith, int nth);
+
+// llama-sampling adaptive-p: rewrite logits[] in place as exp(logit - max) for logits >= min
+// (zero otherwise) and return the sum. Not a ggml op.
+float pxa_exp_with_thresh(int n, float * logits, float max, float min);
+
 #ifdef __cplusplus
 }
 #endif

@@ -261,15 +261,20 @@ endif()
 # ik's GEMM/flash-attention ACCELERATORS were genuinely optional -- every call site is
 # `if (iqk_x(...)) { fast path }` with a stock ggml path beneath -- so they are now gone.
 #
-# iqk_quantize.cpp / iqk_cpu_ops.cpp are NOT optional and never were part of that seam. They
-# carry the IMPLEMENTATIONS of ~40 extra quantization types (the _r4 / _ks / _bn family:
-# iq4_ks, q5_k_r4, iq2_bn_r4, q8_0_r8, q1_0_g128, ...) and ggml's type_traits table points
-# straight at them -- dropping them is ~40 undefined references at link, not a fallback.
-# Removing ik entirely therefore means removing those TYPES from the type table first; that is
-# a separate campaign, tracked in docs/, not a build flag. What IS fixed here is that these two
-# files now COMPILE without AVX2, which is what blocked non-AVX2 users.
-set (GGML_SOURCES_IQK iqk/iqk_quantize.cpp iqk/iqk_cpu_ops.cpp)
-set (GGML_HEADERS_IQK iqk/iqk_config.h iqk/iqk_cpu_ops.h)
+# iqk_cpu_ops.cpp is gone as of phase 2 (2026-08-21). All twelve of its exported symbols were
+# reowned into pxq-cpu.c / pxq-cpu-ops.cpp or deleted outright, so ggml.c no longer names a
+# single iqk_* CPU op. It was never part of the accelerator seam either: three of those symbols
+# (MUL_MULTI_ADD, HADAMARD, FUSED_RMS_RMS_ADD) were fork ops with no stock ggml body at all.
+#
+# iqk_quantize.cpp is still NOT optional and never was part of that seam. It carries the
+# IMPLEMENTATIONS of ~40 extra quantization types (the _r4 / _ks / _bn family: iq4_ks, q5_k_r4,
+# iq2_bn_r4, q8_0_r8, q1_0_g128, ...) and ggml's type_traits table points straight at them --
+# dropping it is ~40 undefined references at link, not a fallback. Removing ik entirely
+# therefore means removing those TYPES from the type table first; that is a separate campaign,
+# tracked in docs/, not a build flag. What IS fixed here is that it COMPILES without AVX2,
+# which is what blocked non-AVX2 users.
+set (GGML_SOURCES_IQK iqk/iqk_quantize.cpp)
+set (GGML_HEADERS_IQK iqk/iqk_config.h)
 
 # ik's GEMM/flash-attention dispatcher is gone (iqk_mul_mat.cpp, iqk_flash_attn.cpp). There is
 # no switch here any more because there is nothing left to switch: GGML_USE_IQK_MULMAT is never
@@ -1503,6 +1508,8 @@ add_library(ggml
             ggml-quants.h
             pxq-cpu.c
             pxq-cpu.h
+            pxq-cpu-ops.cpp
+            pxq-cpu-ops.h
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}

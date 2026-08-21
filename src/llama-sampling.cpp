@@ -2,7 +2,7 @@
 #include "llama-vocab.h"
 #include "llama-grammar.h"
 
-#include "iqk/iqk_cpu_ops.h"
+#include "pxq-cpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1312,7 +1312,7 @@ void llama_prep_adaptive_p_impl(
         orig_prob[j] = candidates->data[j].logit;
         max_logit = std::max(max_logit, orig_prob[j]);
     }
-    adapt_p_ctx->cum_orig_prob = iqk_exp_with_thresh(orig_prob.size(), orig_prob.data(), max_logit, max_logit - kDelta);
+    adapt_p_ctx->cum_orig_prob = pxa_exp_with_thresh(orig_prob.size(), orig_prob.data(), max_logit, max_logit - kDelta);
 
     if (smpl) smpl->t_sample_us += ggml_time_us() - t_start;
 }
