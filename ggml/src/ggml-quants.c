@@ -11,8 +11,8 @@
 #include "ggml-quants.h"
 #include "pxq-cpu.h"
 #include "ggml-impl.h"
-#include "iqk/iqk_config.h"
-#include "iqk/iqk_quantize.h"
+#include "pxq-simd.h"
+#include "pxq-quants.h"
 
 
 #include <math.h>
@@ -706,11 +706,7 @@ void quantize_row_q4_0_ref(const float * restrict x, block_q4_0 * restrict y, in
 }
 
 void quantize_row_q4_0(const float * restrict x, void * restrict y, int64_t k) {
-#if GGML_USE_IQK_MULMAT
-    iqk_quantize_q4_0(x, y, k);
-#else
     quantize_row_q4_0_ref(x, y, k);   // the reference this shadows; identical output, slower
-#endif
 }
 
 
@@ -4005,11 +4001,7 @@ void dequantize_row_q8_K(const block_q8_K * restrict x, float * restrict y, int6
 }
 
 void quantize_row_q8_K(const float * restrict x, void * restrict y, int64_t k) {
-#ifdef GGML_USE_IQK_MULMAT
-    iqk_quantize_row_q8_K(x, y, k);
-#else
     quantize_row_q8_K_ref(x, y, k);
-#endif
 }
 
 //===================================== Dot ptoducts =================================
@@ -4095,11 +4087,6 @@ static inline __m128i get_scale_shuffle(int i) {
 #endif
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q4_0, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -4582,11 +4569,6 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q4_1, vx, bx, GGML_TYPE_Q8_1, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
     const int qk = QK8_1;
     const int nb = n / qk;
 
@@ -4874,16 +4856,6 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q5_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-#ifdef __AVX2__
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_1;
-#else
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_0;
-#endif
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q5_0, vx, bx, vec_dot_type, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -5239,11 +5211,6 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q5_1, vx, bx, GGML_TYPE_Q8_1, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
     const int qk = QK8_1;
     const int nb = n / qk;
 
@@ -5618,16 +5585,6 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q6_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-#ifdef __AVX2__
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_1;
-#else
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_0;
-#endif
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q6_0, vx, bx, vec_dot_type, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
     // Without ik this used to be "// TODO / *s = 0;" -- every Q6_0 row scored zero on any
     // build ik could not claim. The real implementation lives in our own TU, against STOCK
     // block_q8_0 activations (see the GGML_TYPE_Q6_0 traits in ggml.c, which already select
@@ -5641,12 +5598,6 @@ void ggml_vec_dot_q6_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-    enum ggml_type dot_type = GGML_TYPE_Q8_2_X4;
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q8_0, vx, bx, dot_type, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -12016,11 +11967,6 @@ void ggml_vec_dot_iq1_m_q8_K  (int n, float * restrict s, size_t bs, const void 
 }
 
 void ggml_vec_dot_iq4_nl_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_IQ4_NL, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
@@ -15301,7 +15247,6 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     // Who needs this?
-    //if (type != GGML_TYPE_IQ2_TN && type != GGML_TYPE_IQ1_TN && type != GGML_TYPE_IQ4_KS && nbytes % ggml_type_size(type) != 0) {
     //    fprintf(stderr, "%s: invalid size %zu for type %s (type size = %zu)\n", __func__, nbytes, ggml_type_name(type), ggml_type_size(type));
     //    return false;
     //}
@@ -15514,51 +15459,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_MXFP4: break;
         case GGML_TYPE_Q6_0: break;
-        case GGML_TYPE_IQ2_K: break;
-        case GGML_TYPE_IQ2_KS: break;
-        case GGML_TYPE_IQ1_KT: break;
-        case GGML_TYPE_IQ2_KT: break;
-        case GGML_TYPE_IQ3_KT: break;
-        case GGML_TYPE_IQ4_KT: break;
         case GGML_TYPE_Q1_0_G128: break;
-        case GGML_TYPE_IQ3_K: break;
-        case GGML_TYPE_IQ3_KS: break;
-        case GGML_TYPE_IQ2_KL: break;
-        case GGML_TYPE_IQ4_K: break;
-        case GGML_TYPE_IQ5_K: break;
-        case GGML_TYPE_IQ6_K: break;
-        case GGML_TYPE_IQ4_KS: break;
-        case GGML_TYPE_IQ4_KSS: break;
-        case GGML_TYPE_IQ5_KS: break;
-        case GGML_TYPE_IQ4_NL_R4: break;
-        case GGML_TYPE_IQ4_XS_R8: break;
-        case GGML_TYPE_IQ2_XXS_R4: break;
-        case GGML_TYPE_IQ2_XS_R4: break;
-        case GGML_TYPE_IQ3_XXS_R4: break;
-        case GGML_TYPE_IQ3_S_R4: break;
-        case GGML_TYPE_IQ2_S_R4: break;
-        case GGML_TYPE_IQ1_S_R4: break;
-        case GGML_TYPE_IQ1_M_R4: break;
-        case GGML_TYPE_Q4_0_R8: break;
-        case GGML_TYPE_Q5_0_R4: break;
-        case GGML_TYPE_Q6_0_R4: break;
-        case GGML_TYPE_Q8_0_R8: break;
-        case GGML_TYPE_Q2_K_R4: break;
-        case GGML_TYPE_Q3_K_R4: break;
-        case GGML_TYPE_Q4_K_R4: break;
-        case GGML_TYPE_Q5_K_R4: break;
-        case GGML_TYPE_Q6_K_R4: break;
-        case GGML_TYPE_IQ2_K_R4: break;
-        case GGML_TYPE_IQ3_K_R4: break;
-        case GGML_TYPE_IQ4_K_R4: break;
-        case GGML_TYPE_IQ5_K_R4: break;
-        case GGML_TYPE_IQ4_KS_R4:break;
-        case GGML_TYPE_IQ5_KS_R4:break;
-        case GGML_TYPE_Q8_KV_R8: break;
-        case GGML_TYPE_Q8_K_R8:  break;
-        case GGML_TYPE_Q8_K_R16: break;
         case GGML_TYPE_Q8_KV:    break;
-        case GGML_TYPE_BF16_R16: break;
         case GGML_TYPE_Q4_0_4_4:
         case GGML_TYPE_Q4_0_4_8:
             {
@@ -15573,9 +15475,6 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
-        case GGML_TYPE_IQ1_BN:
-        case GGML_TYPE_IQ2_BN:
-        case GGML_TYPE_IQ2_BN_R4:
         case GGML_TYPE_I2_S:
             // nothing to validate
             break;

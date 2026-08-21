@@ -30,7 +30,7 @@
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
 
 // TODO: fix these includes
-#include "iqk/iqk_quantize.h"
+#include "pxq-quants.h"
 #include "pxq-cpu.h"
 
 #define IK_PRINT_TIMING 0
@@ -2707,7 +2707,7 @@ static void llm_requantize_output_tensor(llama_model & model, ggml_type new_type
         std::vector<float> work(t->ne[0]*n_interleaved);
         auto tt_orig = ggml_internal_get_type_traits(t->type);
         auto tt_new  = ggml_internal_get_type_traits(new_type);
-        iqk_quantize_any(int(t->type), int(new_type),
+        pxa_quantize_any(int(t->type), int(new_type),
                 t->ne[0], t->ne[1], t->ne[2], t->ne[3],
                 t->nb[0], t->nb[1], t->nb[2], t->nb[3],
                 tensor_data, new_data, work.data(), tt_orig.to_float, tt_new.from_float, ith, nthread);
@@ -2802,8 +2802,10 @@ static void llm_prepare_mla(llama_model & model, int mla) {
             auto wk_b_f32_t = ggml_cont(ctx, wk_b_f32_tview);
             wk_b_f32_t->data = (char *)wk_b_f32->data + ggml_nbytes(wk_b_f32);
 
-            auto new_type = ggml_is_quantized(wkv_b.type) ?
-                wkv_b.type >= GGML_TYPE_Q4_0_R8 && wkv_b.type <= GGML_TYPE_Q8_K_R8 ? GGML_TYPE_Q8_0_R8 : GGML_TYPE_Q8_0 : wkv_b.type;
+            // The old form picked Q8_0_R8 when wkv_b was itself one of the row-interleaved
+            // repacked types. Those types are gone (ik separation, phase 3), so a quantized
+            // wkv_b always casts to stock Q8_0 now.
+            auto new_type = ggml_is_quantized(wkv_b.type) ? GGML_TYPE_Q8_0 : wkv_b.type;
             auto wk_b = ggml_cast(ctx, wk_b_f32_t, new_type);
             wk_b->data = (char *)wk_b_f32_t->data + ggml_nbytes(wk_b_f32_t);
 
@@ -2889,9 +2891,6 @@ static void llm_prepare_mla(llama_model & model, int mla) {
 
                         const uint8_t * src_bytes = (const uint8_t *)source->data + (size_t)head_offset * head_block_bytes;
                         ggml_backend_tensor_set(rep, src_bytes, 0, slice_bytes);
-                        if (ggml_backend_buffer_is_host(rep->buffer)) {
-                            iqk_modify_tensor(rep);
-                        }
                         split.tensor_splits[id] = rep;
                     }
 
@@ -2913,9 +2912,6 @@ static void llm_prepare_mla(llama_model & model, int mla) {
                     ggml_set_name(computed.get(), tname.c_str());
                     ggml_backend_buffer_set_usage(computed->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     ggml_backend_tensor_set(computed.get(), source->data, 0, ggml_nbytes(source));
-                    if (ggml_backend_buffer_is_host(computed->buffer)) {
-                        iqk_modify_tensor(computed.get());
-                    }
 
                     LLAMA_LOG_INFO("Computed %s as %d x %d x %d of type %s and stored in buffer %s\n",
                             tname.c_str(), (int)source->ne[0], (int)source->ne[1], (int)source->ne[2],
@@ -3137,9 +3133,6 @@ static void llm_prepare_mla(llama_model & model, int mla) {
 
                     const size_t byte_offset = (size_t)head_offsets[id] * per_head_pp_bytes;
                     ggml_backend_tensor_set(rep, (char *)f_q->data + byte_offset, 0, slice_bytes);
-                    if (ggml_backend_buffer_is_host(rep->buffer)) {
-                        iqk_modify_tensor(rep);
-                    }
                     l.split_wk_b_pp.tensor_splits[id] = rep;
                 }
 
@@ -3282,9 +3275,6 @@ static void llm_prepare_mla(llama_model & model, int mla) {
         ggml_set_name(l.computed_wkv_b.get(), name.c_str());
         ggml_backend_buffer_set_usage(l.computed_wkv_b->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_backend_tensor_set(l.computed_wkv_b.get(), wkv_b->data, 0, ggml_nbytes(wkv_b));
-        if (ggml_backend_buffer_is_host(l.computed_wkv_b->buffer)) {
-            iqk_modify_tensor(l.computed_wkv_b.get());
-        }
 
         l.wkv_b = l.computed_wkv_b.get();
         model.tensors_by_name.push_back(std::make_pair(name, l.wkv_b));
@@ -3312,10 +3302,7 @@ static void llm_apply_khad_pretransform(llama_model & model) {
                t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
                t == GGML_TYPE_Q6_0 || t == GGML_TYPE_Q8_0 ||
                t == GGML_TYPE_IQ4_NL ||
-               t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  || t == GGML_TYPE_Q6_K ||
-               t == GGML_TYPE_IQ4_K || t == GGML_TYPE_IQ5_K ||
-               t == GGML_TYPE_IQ4_KS|| t == GGML_TYPE_IQ4_KSS||
-               t == GGML_TYPE_IQ5_KS;
+               t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  || t == GGML_TYPE_Q6_K;
     };
 
     const auto & hparams = model.hparams;
@@ -4535,21 +4522,11 @@ static bool llm_load_tensors(
         }
     }
 
-    if (!ml.use_mmap) {
-        int n_modified = 0;
-        for (auto& it : model.tensors_by_name) {
-            if (ggml_backend_buffer_is_host(it.second->buffer)) {
-                if (iqk_modify_tensor(it.second)) ++n_modified;
-            }
-        }
-        if (n_modified > 0) LLAMA_LOG_INFO("============ Modified %d tensors\n", n_modified);
-    }
-
     if (validate_quants) {
         int nbad = 0;
         for (auto& it : model.tensors_by_name) {
             if (ggml_backend_buffer_is_host(it.second->buffer)) {
-                if (!iqk_validate_tensor(it.second)) ++nbad;
+                if (!pxa_validate_tensor(it.second)) ++nbad;
             }
         }
         if (nbad > 0) {
@@ -4566,17 +4543,18 @@ static bool llm_load_tensors(
                 ml.expert_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
     }
 
-    if (!ml.use_mmap && ml.repack_tensors) {
-        int n_repacked = 0;
-        for (auto& it : model.tensors_by_name) {
-            if (ggml_backend_buffer_is_host(it.second->buffer)) {
-                auto orig_type = it.second->type;
-                if (it.second->view_src) continue;
-                iqk_repack_tensor(it.second);
-                if (it.second->type != orig_type) ++n_repacked;
-            }
-        }
-        if (n_repacked > 0) LLAMA_LOG_INFO("============ Repacked %d tensors\n", n_repacked);
+    if (ml.repack_tensors) {
+        // -rtr / --run-time-repack used to rewrite stock Q4_K / Q5_K / Q6_K / Q8_0 / Q4_0 /
+        // Q5_0 / IQ4_XS tensors into the _R4 / _R8 row-interleaved types at load time, with no
+        // guard of any kind. Those types were only ever implemented inside the accelerator: on
+        // any build that could not claim them their vec_dot returned without assigning *s at
+        // all, so a stock downloadable Q4_K_M plus this one flag produced uninitialised dot
+        // products across the whole model -- not a crash, not zeros, just whatever was on the
+        // stack. The !use_mmap gate that looks like protection is not: the flag turns mmap off
+        // itself. They are all deleted now, so the flag has nothing left to convert and says so
+        // instead of silently doing nothing.
+        LLAMA_LOG_WARN("%s: --run-time-repack ignored: the row-interleaved repack types it "
+                       "produced have been removed\n", __func__);
     }
 
     if (model.arch == LLM_ARCH_BITNET) {
@@ -7625,13 +7603,11 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
         /*.ignore_imatrix_rules        =*/ false,
-        /*.only_repack                 =*/ false,
         /*.dry_run                     =*/ false,
         /*.partial_requant             =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.custom_quants               =*/ nullptr,
-        /*.repack_pattern              =*/ nullptr,
         /*.user_data                   =*/ nullptr,
     };
 

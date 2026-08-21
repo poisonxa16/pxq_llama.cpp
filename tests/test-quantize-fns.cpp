@@ -150,12 +150,6 @@ int main(int argc, char * argv[]) {
         auto test_data_quantize = test_data.data();
         auto test_data_vecdot   = test_data2.data();
         const ggml_type ei = (ggml_type)i;
-        if (ei == GGML_TYPE_IQ1_BN || ei == GGML_TYPE_IQ2_BN) {
-            test_data_quantize = test_data_bitnet.data();
-            test_data_vecdot   = test_data_bitnet.data();
-            //printf("Skipping %s because test data does not satisfy Bitnet requirements\n", ggml_type_name(ei));
-            //continue;
-        }
 
         printf("Testing %s\n", ggml_type_name((ggml_type) i));
         ggml_quantize_init(ei);

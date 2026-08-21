@@ -1039,35 +1039,6 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
     }
     if (!tensor->extra) return;
     static std::map<ggml_type, int> k_map = {
-        { GGML_TYPE_Q4_0_R8   , 8},
-        { GGML_TYPE_Q5_0_R4   , 4},
-        { GGML_TYPE_Q8_0_R8   , 8},
-        { GGML_TYPE_Q2_K_R4   , 4},
-        { GGML_TYPE_Q3_K_R4   , 4},
-        { GGML_TYPE_Q4_K_R4   , 4},
-        { GGML_TYPE_Q5_K_R4   , 4},
-        { GGML_TYPE_Q6_K_R4   , 4},
-        { GGML_TYPE_IQ2_XXS_R4, 4},
-        { GGML_TYPE_IQ2_XS_R4 , 4},
-        { GGML_TYPE_IQ3_XXS_R4, 4},
-        { GGML_TYPE_IQ1_S_R4  , 4},
-        { GGML_TYPE_IQ4_NL_R4 , 4},
-        { GGML_TYPE_IQ3_S_R4  , 4},
-        { GGML_TYPE_IQ2_S_R4  , 4},
-        { GGML_TYPE_IQ4_XS_R8 , 8},
-        { GGML_TYPE_IQ1_M_R4  , 4},
-        { GGML_TYPE_BF16_R16  , 16},
-        { GGML_TYPE_Q6_0_R4   , 4},
-        { GGML_TYPE_IQ2_BN_R4 , 4},
-        { GGML_TYPE_IQ2_K_R4  , 4},
-        { GGML_TYPE_IQ3_K_R4  , 4},
-        { GGML_TYPE_IQ4_K_R4  , 4},
-        { GGML_TYPE_IQ5_K_R4  , 4},
-        { GGML_TYPE_IQ4_KS_R4 , 4},
-        { GGML_TYPE_IQ5_KS_R4 , 4},
-        { GGML_TYPE_Q8_K_R16  , 4},
-        { GGML_TYPE_Q8_KV_R8  , 4},
-        { GGML_TYPE_Q8_K_R8   , 8},
     };
 
     // split tensors must always be set in their entirety at once
@@ -1267,19 +1238,6 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_get_tensor([[maybe_unused]]
     auto extra = (ggml_split_tensor_t *)tensor->extra;
     GGML_ASSERT(extra->n_device <= ggml_backend_cuda_get_device_count());
 
-    // Repacked types are block-de-interleaved by set_tensor; no runtime inverse.
-    {
-        const ggml_type t = tensor->type;
-        const bool is_repacked =
-            t == GGML_TYPE_Q4_0_R8  || t == GGML_TYPE_Q5_0_R4  || t == GGML_TYPE_Q8_0_R8  ||
-            t == GGML_TYPE_Q2_K_R4  || t == GGML_TYPE_Q3_K_R4  || t == GGML_TYPE_Q4_K_R4  ||
-            t == GGML_TYPE_Q5_K_R4  || t == GGML_TYPE_Q6_K_R4  || t == GGML_TYPE_IQ4_NL_R4 ||
-            t == GGML_TYPE_IQ4_XS_R8 || t == GGML_TYPE_Q6_0_R4;
-        if (is_repacked) {
-            GGML_ABORT("%s: get_tensor of repacked type %s is not invertible",
-                       __func__, ggml_type_name(t));
-        }
-    }
 
     // Explicit-ranges form (non-contiguous expert assignments) is not invertible.
     void * extra_ptr = nullptr;
@@ -8090,31 +8048,6 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_PXQ1:
                     case GGML_TYPE_PXQ6:     // ADD
                     case GGML_TYPE_IQ4_XS:
-                    case GGML_TYPE_IQ2_KL:
-                    case GGML_TYPE_IQ3_KS:
-                    case GGML_TYPE_IQ4_KS:
-                    case GGML_TYPE_IQ4_KSS:
-                    case GGML_TYPE_IQ5_KS:
-                    case GGML_TYPE_IQ2_K:
-                    case GGML_TYPE_IQ2_KS:
-                    case GGML_TYPE_IQ1_KT:
-                    case GGML_TYPE_IQ2_KT:
-                    case GGML_TYPE_IQ3_KT:
-                    case GGML_TYPE_IQ4_KT:
-                    case GGML_TYPE_IQ3_K:
-                    case GGML_TYPE_IQ4_K:
-                    case GGML_TYPE_IQ5_K:
-                    case GGML_TYPE_IQ6_K:
-                    case GGML_TYPE_IQ1_BN:
-                    case GGML_TYPE_IQ2_BN:
-                    case GGML_TYPE_IQ2_K_R4:
-                    case GGML_TYPE_IQ3_K_R4:
-                    case GGML_TYPE_IQ4_K_R4:
-                    case GGML_TYPE_IQ4_KS_R4:
-                    case GGML_TYPE_IQ5_K_R4:
-                    case GGML_TYPE_IQ5_KS_R4:
-                    case GGML_TYPE_IQ1_S_R4:
-                    case GGML_TYPE_IQ1_M_R4:
                         return true;
                     default:
                         return false;

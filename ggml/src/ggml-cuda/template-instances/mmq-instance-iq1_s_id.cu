@@ -3,4 +3,3 @@
 #include "../mmq_id_common.cuh"
 
 DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
-DECL_MMQ_CASE(GGML_TYPE_IQ1_S_R4);

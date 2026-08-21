@@ -426,34 +426,43 @@ extern "C" {
         //
         //
         GGML_TYPE_Q8_0_X4 = 97,
-        GGML_TYPE_Q8_1_X4 = 98,
-        GGML_TYPE_Q8_2_X4 = 99,
         GGML_TYPE_Q6_0    = 133,
-        GGML_TYPE_IQ1_BN  = 134,
-        GGML_TYPE_IQ2_BN  = 135,
-        GGML_TYPE_Q8_K64  = 136,
-        GGML_TYPE_IQ2_K   = 137,
-        GGML_TYPE_IQ3_K   = 138,
-        GGML_TYPE_IQ4_K   = 139,
-        GGML_TYPE_IQ5_K   = 140,
-        GGML_TYPE_IQ6_K   = 141,
         // depricated: GGML_TYPE_IQ2_TN  = 142,
         // depricated: GGML_TYPE_IQ1_TN  = 143,
-        GGML_TYPE_IQ4_KS  = 144,
-        GGML_TYPE_IQ2_KS  = 145,
-        GGML_TYPE_IQ4_KSS = 146,
-        GGML_TYPE_Q8_K16  = 147,
-        GGML_TYPE_Q8_K32  = 148,
-        GGML_TYPE_Q8_KR8  = 149,
-        GGML_TYPE_Q8_K128 = 150,
         GGML_TYPE_Q8_KV   = 151,
-        GGML_TYPE_IQ5_KS  = 152,
-        GGML_TYPE_IQ2_KT  = 153,
-        GGML_TYPE_IQ3_KT  = 154,
-        GGML_TYPE_IQ4_KT  = 155,
-        GGML_TYPE_IQ3_KS  = 156,
-        GGML_TYPE_IQ2_KL  = 157,
-        GGML_TYPE_IQ1_KT  = 158,
+
+        // ---------------------------------------------------------------------------------
+        // RETIRED 2026-08-21 (ik separation, phase 3): 53 quant type ids whose only
+        // implementations lived in ggml/src/iqk. Their CPU vec_dots were stubs that returned
+        // without ever assigning *s, so on any build the accelerator could not claim they
+        // scored against uninitialised memory rather than against a number. The ids are
+        // burned, never to be reused; a GGUF that carries one now gets the same clean
+        // "unregistered type id" refusal at load that retired ids 250/251 get, because the
+        // type has no traits entry (see gguf_init_from_file). Recovery for such a file is to
+        // requantize from the source model.
+        //
+        //  98 Q8_1_X4    99 Q8_2_X4                                  (ik activation formats)
+        // 134 IQ1_BN    135 IQ2_BN                                   (ik bitnet)
+        // 136 Q8_K64    147 Q8_K16    148 Q8_K32    149 Q8_KR8   150 Q8_K128
+        //                                              (activation formats for the above)
+        // 137 IQ2_K     138 IQ3_K     139 IQ4_K     140 IQ5_K    141 IQ6_K
+        // 144 IQ4_KS    145 IQ2_KS    146 IQ4_KSS   152 IQ5_KS   156 IQ3_KS   157 IQ2_KL
+        // 153 IQ2_KT    154 IQ3_KT    155 IQ4_KT    158 IQ1_KT        (trellis)
+        // 202 Q4_0_R8   206 Q5_0_R4   208 Q8_0_R8   210 Q2_K_R4  211 Q3_K_R4
+        // 212 Q4_K_R4   213 Q5_K_R4   214 Q6_K_R4   216 IQ2_XXS_R4    217 IQ2_XS_R4
+        // 218 IQ3_XXS_R4 219 IQ1_S_R4 220 IQ4_NL_R4 221 IQ3_S_R4 222 IQ2_S_R4
+        // 223 IQ4_XS_R8 229 IQ1_M_R4  230 BF16_R16  233 Q6_0_R4  335 IQ2_BN_R4
+        // 337 IQ2_K_R4  338 IQ3_K_R4  339 IQ4_K_R4  340 IQ5_K_R4 344 IQ4_KS_R4
+        // 352 IQ5_KS_R4 397 Q8_K_R16  398 Q8_KV_R8  399 Q8_K_R8       (row-interleaved repacks)
+        //
+        // NOT retired, deliberately, though they came from the same place:
+        //   Q8_0_X4 = 97  -- still the .vec_dot_type of Q1_0_G128 (Bonsai), whose scalar dot
+        //                    reads block_q8_0_x4 directly. A live dependency, not dead code.
+        //   Q8_KV   = 151 -- user-selectable KV cache (-ctk/-ctv q8_KV) and its dot is ours
+        //                    now (pxa_q8_KV_dot_q8_KV, pxq-cpu.c). Its _R8 sibling is gone.
+        //   Q6_0    = 133 -- ik-invented but reowned; stock q8_0 activations, our dot.
+        //   I2_S    = 36  -- reads Microsoft BitNet files; real scalar dequant.
+        // ---------------------------------------------------------------------------------
 
         // 250 RESERVED — retired GGML_TYPE_PXQ4_LEGACY (MXFP4-repack legacy type, pre-2026-07-19
         // name "PXQ4"), removed 2026-07-21; never reuse this id.
@@ -501,35 +510,6 @@ extern "C" {
         // llama.h) is a DIFFERENT namespace — no conflict with this ggml type id.
         GGML_TYPE_PXQ6     = 256,
 
-        GGML_TYPE_Q4_0_R8   = 202,
-        GGML_TYPE_Q5_0_R4   = 206,
-        GGML_TYPE_Q8_0_R8   = 208,
-        GGML_TYPE_Q2_K_R4   = 210,
-        GGML_TYPE_Q3_K_R4   = 211,
-        GGML_TYPE_Q4_K_R4   = 212,
-        GGML_TYPE_Q5_K_R4   = 213,
-        GGML_TYPE_Q6_K_R4   = 214,
-        GGML_TYPE_IQ2_XXS_R4= 216,
-        GGML_TYPE_IQ2_XS_R4 = 217,
-        GGML_TYPE_IQ3_XXS_R4= 218,
-        GGML_TYPE_IQ1_S_R4  = 219,
-        GGML_TYPE_IQ4_NL_R4 = 220,
-        GGML_TYPE_IQ3_S_R4  = 221,
-        GGML_TYPE_IQ2_S_R4  = 222,
-        GGML_TYPE_IQ4_XS_R8 = 223,
-        GGML_TYPE_IQ1_M_R4  = 229,
-        GGML_TYPE_BF16_R16  = 230,
-        GGML_TYPE_Q6_0_R4   = 233,
-        GGML_TYPE_IQ2_BN_R4 = 335,
-        GGML_TYPE_IQ2_K_R4  = 337,
-        GGML_TYPE_IQ3_K_R4  = 338,
-        GGML_TYPE_IQ4_K_R4  = 339,
-        GGML_TYPE_IQ5_K_R4  = 340,
-        GGML_TYPE_IQ4_KS_R4 = 344,
-        GGML_TYPE_IQ5_KS_R4 = 352,
-        GGML_TYPE_Q8_K_R16  = 397,
-        GGML_TYPE_Q8_KV_R8  = 398,
-        GGML_TYPE_Q8_K_R8   = 399,
 
         // PINNED, deliberately, to 400 -- do NOT let this go back to taking
         // last-declared+1. GGML_TYPE_COUNT is the only implicitly-valued enumerator in this
@@ -588,56 +568,10 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0_128 = 29, // except 1d tensors
         //
         GGML_FTYPE_MOSTLY_Q6_0    = 127, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ1_BN  = 128, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_BN  = 129, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_K   = 130, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ3_K   = 131, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_K   = 132, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ5_K   = 133, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ6_K   = 134, // except 1d tensors
         // depricated: GGML_FTYPE_MOSTLY_IQ2_TN  = 135, // except 1d tensors
         // depricated: GGML_FTYPE_MOSTLY_IQ1_TN  = 136, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_KS  = 137, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_KS  = 138, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_KSS = 139, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_KV   = 140, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ5_KS  = 141, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_KT  = 142, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ3_KT  = 143, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_KT  = 144, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ3_KS  = 145, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_KL  = 146, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ1_KT  = 147, // except 1d tensors
                                          //
-        GGML_FTYPE_MOSTLY_Q4_0_R8   = 202, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q8_0_R8   = 207, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q5_0_R4   = 208, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q2_K_R4   = 210, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q3_K_R4   = 211, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q4_K_R4   = 212, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q5_K_R4   = 213, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q6_K_R4   = 214, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_XXS_R4= 215, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_XS_R4 = 216, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ3_XXS_R4= 217, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ1_S_R4  = 218, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_NL_R4 = 219, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ3_S_R4  = 220, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_S_R4  = 221, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_XS_R8 = 222, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ1_M_R4  = 223, // except 1d tensors
-        GGML_FTYPE_MOSTLY_BF16_R16  = 224, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q6_0_R4   = 227, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_BN_R4 = 329, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ2_K_R4  = 330, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ3_K_R4  = 331, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_K_R4  = 332, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ5_K_R4  = 333, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ4_KS_R4 = 337, // except 1d tensors
-        GGML_FTYPE_MOSTLY_IQ5_KS_R4 = 341, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q8_K_R16  = 397, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q8_KV_R8  = 398, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q8_K_R8   = 399, // except 1d tensors
     };
 
     // available tensor operations:

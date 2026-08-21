@@ -7,7 +7,6 @@
 
 #pragma once
 #include "mmvq.cuh"
-#include "iqk_mmvq.cuh"
 #include "vecdotq.cuh"
 #include <type_traits>
 #include "pxq-mmvq.cuh"

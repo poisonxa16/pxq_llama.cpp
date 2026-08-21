@@ -273,8 +273,8 @@ endif()
 # therefore means removing those TYPES from the type table first; that is a separate campaign,
 # tracked in docs/, not a build flag. What IS fixed here is that it COMPILES without AVX2,
 # which is what blocked non-AVX2 users.
-set (GGML_SOURCES_IQK iqk/iqk_quantize.cpp)
-set (GGML_HEADERS_IQK iqk/iqk_config.h)
+set (GGML_SOURCES_IQK pxq-quants.cpp)
+set (GGML_HEADERS_IQK pxq-quants.h pxq-simd.h)
 
 # ik's GEMM/flash-attention dispatcher is gone (iqk_mul_mat.cpp, iqk_flash_attn.cpp). There is
 # no switch here any more because there is nothing left to switch: GGML_USE_IQK_MULMAT is never
