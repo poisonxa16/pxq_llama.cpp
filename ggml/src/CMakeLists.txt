@@ -280,8 +280,7 @@ set (GGML_HEADERS_IQK pxq-quants.h pxq-simd.h)
 # no switch here any more because there is nothing left to switch: GGML_USE_IQK_MULMAT is never
 # defined, so every `if (iqk_x(...)) { fast path }` call site compiles out and the stock ggml
 # path underneath it is the only path. The per-type GEMM kernels (iqk_gemm_*.cpp) and the FA
-# kernels (iqk/fa/*.cpp) are still on disk but no longer reachable from anything -- they were
-# only ever called by the dispatcher -- so they are not compiled either.
+# kernels (iqk/fa/*.cpp) have since been deleted from the tree as well.
 set (GGML_SOURCES_IQK_MM "")
 set (GGML_HEADERS_IQK_MM "")
 

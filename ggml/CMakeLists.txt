@@ -141,13 +141,6 @@ set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
-# Both of these are INERT. They only ever gated iqk/fa/*.cpp, which the ik dispatcher was the
-# sole caller of; with the dispatcher deleted those kernels are no longer compiled at all. The
-# options survive so that existing build scripts passing -DGGML_IQK_FA_ALL_QUANTS=ON do not
-# trip cmake's unused-variable warning. Delete them when iqk/fa/ is deleted.
-option(GGML_IQK_FLASH_ATTENTION             "ggml: (inert) IQK FlashAttention CPU kernels"    ON)
-option(GGML_IQK_FA_ALL_QUANTS               "ggml: (inert) all quants for IQK FlashAttention" ON)
-
 option(GGML_CURL                            "ggml: use libcurl to download model from an URL" OFF)
 option(GGML_HIPBLAS                         "ggml: use hipBLAS"                               OFF)
 option(GGML_HIP_UMA                         "ggml: use HIP unified memory architecture"       OFF)

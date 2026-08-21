@@ -378,11 +378,6 @@ void dequantize_row_q8_KV(const void * x, float * y, int64_t k) {
 }
 
 void vec_dot_q8_KV_q8_KV(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(1, 1, n, GGML_TYPE_Q8_KV, vx, 0, GGML_TYPE_Q8_KV, vy, 0, s, 0, 0, 1)) {
-        return;
-    }
-#endif
     GGML_ASSERT(n%QK4_NL == 0);
     GGML_ASSERT(nrc == 1);
     GGML_UNUSED(bs);
@@ -576,11 +571,6 @@ void dequantize_row_mxfp4(const block_mxfp4 * x, float * y, int64_t k) {
 }
 
 void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
-#if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(1, 1, n, GGML_TYPE_MXFP4, vx, 0, GGML_TYPE_Q8_K, vy, 0, s, 0, 0, 1)) {
-        return;
-    }
-#endif
     GGML_ASSERT(n%QK_MXFP4 == 0);
     GGML_ASSERT(nrc == 1);
     GGML_UNUSED(bs);

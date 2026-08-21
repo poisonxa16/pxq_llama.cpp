@@ -7404,9 +7404,9 @@ static void ggml_split_merged_up_gate(
 }
 
 bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate) {
-#if !GGML_USE_IQK_MULMAT && !defined(GGML_USE_CUDA)
-    // No fused MoE up/gate kernel exists ANYWHERE in this build: the CPU handler lives in the ik
-    // kernels and there is no CUDA backend either. This is the pure build-capability answer, and
+#if !defined(GGML_USE_CUDA)
+    // No fused MoE up/gate kernel exists ANYWHERE in this build: the only CPU implementation
+    // ever written lived in the ik kernels, which are gone, and there is no CUDA backend either. This is the pure build-capability answer, and
     // it is what src/llama-load-tensors.cpp probes before it merges ffn_up/gate_exps. When CUDA is
     // compiled in this returns true and the per-tensor ggml_fused_up_gate_placement_ok() check at
     // the call sites below decides whether the node may actually be built.
@@ -7569,10 +7569,10 @@ struct ggml_tensor * ggml_moe_up_gate_ext(
 }
 
 bool ggml_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate) {
-#if !GGML_USE_IQK_MULMAT && !defined(GGML_USE_CUDA)
+#if !defined(GGML_USE_CUDA)
     // Dense twin of ggml_moe_up_gate_can_fuse: the pure build-capability answer. No fused dense
-    // up/gate kernel exists anywhere in this build -- the CPU handler lives in the ik kernels and
-    // there is no CUDA backend either -- so ggml_fused_up_gate() takes the decomposition it
+    // up/gate kernel exists anywhere in this build -- the only CPU implementation ever written
+    // lived in the ik kernels, which are gone, and there is no CUDA backend either -- so ggml_fused_up_gate() takes the decomposition it
     // already has for unquantized operands: two mul_mats plus the standalone GLU. Slower,
     // identical results.
     //
@@ -23968,11 +23968,13 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                 // Unreachable by construction: ggml_moe_up_gate_can_fuse() refuses without ik, so
                 // the graph never contains this op. Abort rather than silently produce garbage if
                 // that invariant is ever broken.
-                GGML_ABORT("MOE_FUSED_UP_GATE has no CPU implementation without GGML_USE_IQK_MULMAT");
+                GGML_ABORT("MOE_FUSED_UP_GATE has no CPU implementation; this node should not have been built "
+                          "(see ggml_moe_up_gate_can_fuse)");
             } break;
         case GGML_OP_FUSED_UP_GATE:
             {
-                GGML_ABORT("FUSED_UP_GATE has no CPU implementation without GGML_USE_IQK_MULMAT");
+                GGML_ABORT("FUSED_UP_GATE has no CPU implementation; this node should not have been built "
+                          "(see ggml_up_gate_can_fuse)");
             } break;
         case GGML_OP_OUT_PROD:
             {
