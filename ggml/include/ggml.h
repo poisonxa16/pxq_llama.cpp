@@ -530,7 +530,17 @@ extern "C" {
         GGML_TYPE_Q8_K_R16  = 397,
         GGML_TYPE_Q8_KV_R8  = 398,
         GGML_TYPE_Q8_K_R8   = 399,
-        GGML_TYPE_COUNT,
+
+        // PINNED, deliberately, to 400 -- do NOT let this go back to taking
+        // last-declared+1. GGML_TYPE_COUNT is the only implicitly-valued enumerator in this
+        // enum; every type id above carries an explicit `= N`, so deleting a type can never
+        // renumber another one, but it CAN move COUNT. COUNT is the bound of
+        // type_traits[GGML_TYPE_COUNT] and, more dangerously, the upper limit of the
+        // load-time range check in gguf_tensor_info_sanitize(). Our own shipped ids run up to
+        // PXQ6 = 256, so a COUNT that tracks declaration order would leave every PXQ6 GGUF one
+        // reordering away from being rejected at load. Pinning it decouples both the array
+        // bound and the file-validity check from whatever happens to be declared last.
+        GGML_TYPE_COUNT = 400,
     };
 
     // precision
