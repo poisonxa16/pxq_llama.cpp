@@ -4,9 +4,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-#if GGML_USE_IQK_MULMAT
-#include "iqk_mul_mat.h"
-#endif
 #include "ggml-quants.h"
 #include "ggml-impl.h"
 #define GGML_COMMON_IMPL_C

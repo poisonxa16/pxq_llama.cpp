@@ -26,19 +26,9 @@
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #include "pxq-cpu.h"     // CPU panel-dequant fallback for the PXQ slab types (A5)
-#if GGML_USE_IQK_MULMAT
-#include "iqk/iqk_mul_mat.h"
+// iqk_config.h is the IQK_IMPLEMENT / HAVE_FANCY_SIMD oracle and is needed unconditionally;
+// it used to be pulled in only alongside iqk_mul_mat.h, which no longer exists.
 #include "iqk/iqk_config.h"
-#else
-// ik OFF: the accelerators below are all of the shape
-//     if (iqk_something(...)) { ...fast path...; return; }
-// so having them evaluate to false makes every call site fall through to the stock ggml
-// implementation that already sits underneath it. Expressed as macros rather than stub
-// functions because the real signatures are long and would drift; the compiler dead-codes
-// the guarded blocks entirely. This is what lets -DGGML_IQK_MUL_MAT=OFF actually link.
-#define iqk_mul_mat_4d(...)      false
-#define iqk_fused_delta_net(...) false
-#endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -23681,13 +23671,6 @@ static void ggml_compute_forward_delta_net_f32(
     if (src6) {
         GGML_ASSERT(src6->type == GGML_TYPE_F32);
         GGML_ASSERT(src6->ne[0] >= (n_tokens - 1)*state_step_stride);
-    }
-
-    if (iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
-                src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
-                q_data, k_data, v_data, g_data, beta_data, state_in,
-                out_data, state_working, saved_steps, (int) state_step_stride, ith, nth)) {
-        return;
     }
 
     const int64_t total_heads = n_heads * n_seqs;

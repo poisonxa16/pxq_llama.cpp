@@ -2011,7 +2011,7 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
 // the kernels write step-major blocks of the BATCH's sequences, NOT of the s_l rows:
 //   - delta-net (ssm): saved_states + batch_idx*HEAD_DIM^2*n_heads + t*state_step_stride, with
 //     state_step_stride = HEAD_DIM^2*n_heads*n_seqs (ggml-cuda/delta-net.cu kernel; identical
-//     strides in ggml.c ggml_compute_forward_delta_net_f32 and iqk_fused_delta_net). t is the
+//     strides in ggml.c ggml_compute_forward_delta_net_f32). t is the
 //     token index WITHIN its sequence; only t < n_seq_tokens-1 steps are written.
 //   - ssm_conv: saved + (step*n_seqs + batch_pos)*(d_conv-1)*conv_dim, step = within-seq token
 //     index, batch_pos = local gathered seq column (ggml-cuda/ssm-conv.cu, ggml.c).

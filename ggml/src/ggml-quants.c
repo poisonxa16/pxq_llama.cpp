@@ -11,11 +11,8 @@
 #include "ggml-quants.h"
 #include "pxq-cpu.h"
 #include "ggml-impl.h"
-#if GGML_USE_IQK_MULMAT
 #include "iqk/iqk_config.h"
-#include "iqk/iqk_mul_mat.h"
 #include "iqk/iqk_quantize.h"
-#endif
 
 
 #include <math.h>

@@ -258,10 +258,10 @@ endif()
 
 # PXA 2026-08-20 — where the ik seam actually is.
 #
-# GGML_IQK_MUL_MAT switches ik's GEMM/flash-attention ACCELERATORS. Those are genuinely
-# optional: every call site is `if (iqk_x(...)) { fast path }` with a stock ggml path beneath.
+# ik's GEMM/flash-attention ACCELERATORS were genuinely optional -- every call site is
+# `if (iqk_x(...)) { fast path }` with a stock ggml path beneath -- so they are now gone.
 #
-# iqk_quantize.cpp / iqk_cpu_ops.cpp are NOT optional and must stay outside that switch. They
+# iqk_quantize.cpp / iqk_cpu_ops.cpp are NOT optional and never were part of that seam. They
 # carry the IMPLEMENTATIONS of ~40 extra quantization types (the _r4 / _ks / _bn family:
 # iq4_ks, q5_k_r4, iq2_bn_r4, q8_0_r8, q1_0_g128, ...) and ggml's type_traits table points
 # straight at them -- dropping them is ~40 undefined references at link, not a fallback.
@@ -270,54 +270,15 @@ endif()
 # files now COMPILE without AVX2, which is what blocked non-AVX2 users.
 set (GGML_SOURCES_IQK iqk/iqk_quantize.cpp iqk/iqk_cpu_ops.cpp)
 set (GGML_HEADERS_IQK iqk/iqk_config.h iqk/iqk_cpu_ops.h)
-if (GGML_IQK_MUL_MAT)
-    message(STATUS "Using optimized iqk matrix multiplications")
-    add_compile_definitions(GGML_USE_IQK_MULMAT)
-    set(GGML_SOURCES_IQK_MM iqk/iqk_mul_mat.cpp
-                            iqk/iqk_flash_attn.cpp
-                            iqk/fa/iqk_fa_576_512.cpp
-                            iqk/fa/iqk_fa_512_512.cpp
-                            iqk/fa/iqk_fa_320_256.cpp
-                            iqk/fa/iqk_fa_192_128.cpp
-                            iqk/fa/iqk_fa_192_192.cpp
-                            iqk/fa/iqk_fa_256_256.cpp
-                            iqk/fa/iqk_fa_128_128.cpp
-                            iqk/fa/iqk_fa_96_96.cpp
-                            iqk/fa/iqk_fa_64_64.cpp
-                            iqk/iqk_gemm_floats.cpp
-                            iqk/iqk_gemm_kquants.cpp
-                            iqk/iqk_gemm_ktquants.cpp
-                            iqk/iqk_gemm_iquants.cpp
-                            iqk/iqk_gemm_iqk_quants.cpp
-                            iqk/iqk_gemm_1bit.cpp
-                            iqk/iqk_gemm_legacy_quants.cpp)
-    set(GGML_HEADERS_IQK_MM iqk/iqk_mul_mat.h
-                            iqk/iqk_flash_impl.h
-                            iqk/fa/iqk_fa_templates.h
-                            iqk/iqk_gemm_floats.h
-                            iqk/iqk_gemm_kquants.h
-                            iqk/iqk_gemm_ktquants.h
-                            iqk/iqk_gemm_iquants.h
-                            iqk/iqk_gemm_iqk_quants.h
-                            iqk/iqk_gemm_1bit.h
-                            iqk/iqk_gemm_legacy_quants.h)
-    if (GGML_IQK_FLASH_ATTENTION)
-        message(STATUS "Enabling IQK Flash Attention kernels")
-        add_compile_definitions(GGML_IQK_FLASH_ATTENTION)
-        if (GGML_IQK_FA_ALL_QUANTS)
-            message(STATUS "Including all IQK FA kernels")
-            add_compile_definitions(GGML_IQK_FA_ALL_QUANTS)
-        endif()
-    else()
-        message(STATUS "Disabling IQK Flash Attention kernels")
-    endif()
-else()
-    # ik accelerators OFF: no GEMM/FA translation units, GGML_USE_IQK_MULMAT undefined, so every
-    # guarded call site falls through to stock ggml. The quant-type sources above still build.
-    set (GGML_SOURCES_IQK_MM "")
-    set (GGML_HEADERS_IQK_MM "")
-    message(STATUS "PXA: ik accelerators DISABLED -- stock ggml CPU matmul/FA")
-endif()
+
+# ik's GEMM/flash-attention dispatcher is gone (iqk_mul_mat.cpp, iqk_flash_attn.cpp). There is
+# no switch here any more because there is nothing left to switch: GGML_USE_IQK_MULMAT is never
+# defined, so every `if (iqk_x(...)) { fast path }` call site compiles out and the stock ggml
+# path underneath it is the only path. The per-type GEMM kernels (iqk_gemm_*.cpp) and the FA
+# kernels (iqk/fa/*.cpp) are still on disk but no longer reachable from anything -- they were
+# only ever called by the dispatcher -- so they are not compiled either.
+set (GGML_SOURCES_IQK_MM "")
+set (GGML_HEADERS_IQK_MM "")
 
 if (GGML_CUDA)
     cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
