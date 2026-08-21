@@ -1835,18 +1835,32 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
 
     if (arg == "-fa" || arg == "--flash-attn") {
-        CHECK_ARG
-        std::string next_arg{argv[i]};
-        for (auto& c : next_arg) c = std::tolower(c);
-        if (next_arg == "auto" || next_arg == "1" || next_arg == "on") {
-            params.flash_attn = true;
+        // PEEK, do not consume. CHECK_ARG takes the next argv unconditionally, which made a bare
+        // `-fa` an error and made `-fa -ngl 99` swallow "-ngl" as the value and then reject it.
+        // Every llama.cpp command line in the wild writes a bare -fa, so this one option was the
+        // whole incompatibility surface: of the value-taking args in this parser it is the only
+        // one a user reasonably expects to be a boolean flag.
+        //
+        // A following token is treated as this option's value only when it is not itself an
+        // option. That keeps -fa on/off/auto/0/1 working, makes a bare -fa mean on, and still
+        // reports `-fa yes` as the typo it is instead of silently ignoring it.
+        if (i + 1 < argc && argv[i + 1][0] != '-') {
+            std::string next_arg{argv[i + 1]};
+            for (auto& c : next_arg) c = std::tolower(c);
+            if (next_arg == "auto" || next_arg == "1" || next_arg == "on") {
+                params.flash_attn = true;
+                ++i;
+            }
+            else if (next_arg == "off" || next_arg == "0") {
+                params.flash_attn = false;
+                ++i;
+            }
+            else {
+                invalid_param = true;
+            }
+            return true;
         }
-        else if (next_arg == "off" || next_arg == "0") {
-            params.flash_attn = false;
-        }
-        else {
-            invalid_param = true;
-        }
+        params.flash_attn = true;
         return true;
     }
     if (arg == "-mla" || arg == "--mla-use") {
@@ -2978,7 +2992,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --keep N",               "number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep });
     options.push_back({ "*",           "       --chunks N",             "max number of chunks to process (default: %d, -1 = all)", params.n_chunks });
     options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
-    options.push_back({ "*",           "-fa, --flash-attn (auto|on|off|0|1)", "set Flash Attention (default: %s)", params.flash_attn ? "on" : "off" });
+    options.push_back({ "*",           "-fa, --flash-attn [auto|on|off|0|1]", "set Flash Attention; bare -fa means on (default: %s)", params.flash_attn ? "on" : "off" });
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
