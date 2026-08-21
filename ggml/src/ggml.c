@@ -18,6 +18,9 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "ggml.h"
+// ggml_backend_buffer_is_host(): the fusion guards below need to know whether a weight lives
+// on a device or on the host, because that is what decides which backend runs its node.
+#include "ggml-backend.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
 #include "iqk/iqk_quantize.h"
@@ -8243,12 +8246,92 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fusion legality for the up/gate ops.
+//
+// Two independent questions, previously conflated into one compile-time #if:
+//
+//   1. TYPE -- can any fused kernel in this build express this (type_up, type_gate) pair? That is
+//      what ggml_moe_up_gate_can_fuse() / ggml_up_gate_can_fuse() answer. They are also called by
+//      ggml_backend_cuda_supports_op(), so they must keep answering on behalf of the CUDA backend
+//      and must NOT be narrowed into "can the CPU do it".
+//
+//   2. PLACEMENT -- will the node land on a backend that actually has an implementation?
+//      ggml_backend_sched runs an op on the backend that owns its weight tensor, so this is a
+//      property of the weight's buffer, not of the build. The CPU handlers
+//      (ggml_compute_forward_mul_mat_id_up_gate / ggml_compute_forward_mul_mat_up_gate, PXQ
+//      panel-dequant arms included) live entirely inside #if GGML_USE_IQK_MULMAT; with ik off the
+//      CPU has nothing to run and ggml_compute_forward() aborts. Having a CUDA backend compiled in
+//      is not a substitute unless the weight actually lives on the device.
+//
+// Answering only (1) is what let a CUDA build on a no-AVX2 host die with
+//   "FUSED_UP_GATE has no CPU implementation without GGML_USE_IQK_MULMAT"
+// the moment any FFN/expert tensor stayed on the CPU (-ngl below n_layer, --cpu-moe,
+// --override-tensor, VRAM spill). Answering (2) with a blanket "ik is off, never fuse" would have
+// thrown the CUDA fused kernels away on every non-AVX2 host instead. So it is asked per tensor.
+static bool ggml_fused_up_gate_placement_ok(const struct ggml_tensor * w0, const struct ggml_tensor * w1) {
+#if GGML_USE_IQK_MULMAT
+    // The CPU can execute the fused op, so every placement is executable.
+    GGML_UNUSED(w0);
+    GGML_UNUSED(w1);
+    return true;
+#else
+    // No CPU implementation here. Fuse only when every weight operand already sits in a device
+    // (non-host) buffer -- that is what makes the scheduler place the node on that device. A
+    // weight with no buffer yet (graph built before allocation) counts as host-resident: the
+    // decomposition is always correct and only ever slower, so the conservative answer is safe.
+    if (!w0 || !w0->buffer || ggml_backend_buffer_is_host(w0->buffer)) {
+        return false;
+    }
+    if (w1 && (!w1->buffer || ggml_backend_buffer_is_host(w1->buffer))) {
+        return false;
+    }
+    return true;
+#endif
+}
+
+// SILU/GELU/RELU go through GGML_OP_FUSED_MUL_UNARY. SWIGLU_OAI is not one of the three ops
+// ggml_fused_mul_unary_impl() accepts (it asserts GELU/RELU/SILU), so decomposing a SWIGLU_OAI
+// up/gate node has to use ggml_swiglu_oai(). The fused kernels hard-code alpha = 1.702 and
+// limit = 7 for SWIGLU_OAI (ggml/src/iqk/iqk_mul_mat.cpp), and ggml_compute_forward_swiglu_oai_f32()
+// computes exactly that same function from op_params, so the decomposed graph is numerically the
+// fused one. Without this the decomposition traded a loud abort for an assert.
+static struct ggml_tensor * ggml_up_gate_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        enum   ggml_unary_op  op) {
+    if (op == GGML_UNARY_OP_SWIGLU_OAI) {
+        return ggml_swiglu_oai(ctx, gate, up, 1.702f, 7.0f);
+    }
+    return ggml_fused_mul_unary(ctx, gate, up, op);
+}
+
+// Merged up/gate expert tensor packing, as fixed by the fused kernel itself and by the loader
+// (create_tensors_helper::merge_up_gate_exps): rows [0, ne1/2) are gate, rows [ne1/2, ne1) are up.
+// Both halves are whole rows, so no quantisation block is ever split and nb[0] stays the type size
+// that ggml_mul_mat_id() requires.
+static void ggml_split_merged_up_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * merged,
+        struct ggml_tensor ** gate,
+        struct ggml_tensor ** up) {
+    GGML_ASSERT(merged->ne[1] % 2 == 0);
+    GGML_ASSERT(merged->nb[0] == ggml_type_size(merged->type));
+    const int64_t nff = merged->ne[1]/2;
+    *gate = ggml_view_3d(ctx, merged, merged->ne[0], nff, merged->ne[2],
+                         merged->nb[1], merged->nb[2], 0);
+    *up   = ggml_view_3d(ctx, merged, merged->ne[0], nff, merged->ne[2],
+                         merged->nb[1], merged->nb[2], nff*merged->nb[1]);
+}
+
 bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate) {
 #if !GGML_USE_IQK_MULMAT && !defined(GGML_USE_CUDA)
-    // Nothing in this build can EXECUTE a fused MoE up/gate node: the CPU handler lives in the
-    // ik kernels and there is no CUDA backend either. Refusing here means the node is never
-    // created, so the graph falls back to two mul_mat_id ops plus a standalone GLU -- slower,
-    // identical results. Without this the op reaches a CPU dispatch that has to abort.
+    // No fused MoE up/gate kernel exists ANYWHERE in this build: the CPU handler lives in the ik
+    // kernels and there is no CUDA backend either. This is the pure build-capability answer, and
+    // it is what src/llama-load-tensors.cpp probes before it merges ffn_up/gate_exps. When CUDA is
+    // compiled in this returns true and the per-tensor ggml_fused_up_gate_placement_ok() check at
+    // the call sites below decides whether the node may actually be built.
     (void)type_up; (void)type_gate;
     return false;
 #else
@@ -8272,10 +8355,24 @@ struct ggml_tensor * ggml_moe_up_gate(
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids,
             enum   ggml_unary_op  op) {
-    if (as_gate && (!ggml_moe_up_gate_can_fuse(as_up->type, as_gate->type) || !ggml_are_same_shape(as_up, as_gate))) {
+    if (as_gate && (!ggml_moe_up_gate_can_fuse(as_up->type, as_gate->type) || !ggml_are_same_shape(as_up, as_gate) ||
+                    !ggml_fused_up_gate_placement_ok(as_up, as_gate))) {
         struct ggml_tensor * result_up   = ggml_mul_mat_id(ctx, as_up,   b, ids);
         struct ggml_tensor * result_gate = ggml_mul_mat_id(ctx, as_gate, b, ids);
-        return ggml_fused_mul_unary(ctx, result_gate, result_up, op);
+        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
+    }
+    // Merged single-tensor layout (as_gate == NULL, i.e. blk.N.ffn_gate_up_exps or -muge). The
+    // guard above is conditioned on as_gate, so on this leg it could never fire: the node was
+    // built unconditionally and then aborted at execution time on any build that cannot run it.
+    // Split the merged tensor into its two halves and decompose exactly like the two-tensor case.
+    if (!as_gate && (!ggml_moe_up_gate_can_fuse(as_up->type, as_up->type) ||
+                     !ggml_fused_up_gate_placement_ok(as_up, NULL))) {
+        struct ggml_tensor * gate_h = NULL;
+        struct ggml_tensor * up_h   = NULL;
+        ggml_split_merged_up_gate(ctx, as_up, &gate_h, &up_h);
+        struct ggml_tensor * result_up   = ggml_mul_mat_id(ctx, up_h,   b, ids);
+        struct ggml_tensor * result_gate = ggml_mul_mat_id(ctx, gate_h, b, ids);
+        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
     }
     GGML_ASSERT(!ggml_is_transposed(as_up));
     GGML_ASSERT(!as_gate || !ggml_is_transposed(as_gate));
@@ -8325,7 +8422,8 @@ struct ggml_tensor * ggml_moe_up_gate_ext(
         return ggml_moe_up_gate(ctx, as_up, as_gate, b, ids, op);
     }
 
-    if (as_gate && (!ggml_moe_up_gate_can_fuse(as_up->type, as_gate->type) || !ggml_are_same_shape(as_up, as_gate))) {
+    if (as_gate && (!ggml_moe_up_gate_can_fuse(as_up->type, as_gate->type) || !ggml_are_same_shape(as_up, as_gate) ||
+                    !ggml_fused_up_gate_placement_ok(as_up, as_gate))) {
         struct ggml_tensor * result_up   = ggml_mul_mat_id(ctx, as_up,   b, ids);
         if (as_up_b) {
             result_up = ggml_add_id(ctx, result_up, as_up_b, ids);
@@ -8334,7 +8432,30 @@ struct ggml_tensor * ggml_moe_up_gate_ext(
         if (as_gate_b) {
             result_gate = ggml_add_id(ctx, result_gate, as_gate_b, ids);
         }
-        return ggml_fused_mul_unary(ctx, result_gate, result_up, op);
+        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
+    }
+    // Merged single-tensor layout -- see the twin comment in ggml_moe_up_gate(). The bias mirrors
+    // the weight packing: one row per expert holding the gate half first, then the up half, and
+    // as_gate_b is unused on this leg.
+    if (!as_gate && (!ggml_moe_up_gate_can_fuse(as_up->type, as_up->type) ||
+                     !ggml_fused_up_gate_placement_ok(as_up, NULL))) {
+        GGML_ASSERT(!as_gate_b);
+        struct ggml_tensor * gate_h = NULL;
+        struct ggml_tensor * up_h   = NULL;
+        ggml_split_merged_up_gate(ctx, as_up, &gate_h, &up_h);
+        struct ggml_tensor * result_up   = ggml_mul_mat_id(ctx, up_h,   b, ids);
+        struct ggml_tensor * result_gate = ggml_mul_mat_id(ctx, gate_h, b, ids);
+        if (as_up_b) {
+            GGML_ASSERT(as_up_b->ne[0] % 2 == 0);
+            const int64_t nb0 = as_up_b->ne[0]/2;
+            struct ggml_tensor * gate_b_h = ggml_view_2d(ctx, as_up_b, nb0, as_up_b->ne[1],
+                                                         as_up_b->nb[1], 0);
+            struct ggml_tensor * up_b_h   = ggml_view_2d(ctx, as_up_b, nb0, as_up_b->ne[1],
+                                                         as_up_b->nb[1], nb0*as_up_b->nb[0]);
+            result_up   = ggml_add_id(ctx, result_up,   up_b_h,   ids);
+            result_gate = ggml_add_id(ctx, result_gate, gate_b_h, ids);
+        }
+        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
     }
 
     GGML_ASSERT(!ggml_is_transposed(as_up));
@@ -8371,15 +8492,18 @@ struct ggml_tensor * ggml_moe_up_gate_ext(
 
 bool ggml_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate) {
 #if !GGML_USE_IQK_MULMAT && !defined(GGML_USE_CUDA)
-    // Dense twin of ggml_moe_up_gate_can_fuse. Nothing in this build can EXECUTE a fused dense
-    // up/gate node: the CPU handler lives in the ik kernels and there is no CUDA backend either.
-    // Refusing here means the node is never created and ggml_fused_up_gate takes the
-    // decomposition it already has for unquantized operands -- two mul_mats plus the standalone
-    // GLU. Slower, identical results.
+    // Dense twin of ggml_moe_up_gate_can_fuse: the pure build-capability answer. No fused dense
+    // up/gate kernel exists anywhere in this build -- the CPU handler lives in the ik kernels and
+    // there is no CUDA backend either -- so ggml_fused_up_gate() takes the decomposition it
+    // already has for unquantized operands: two mul_mats plus the standalone GLU. Slower,
+    // identical results.
     //
     // This guard was MISSING while the MoE one existed, which is why a no-AVX2 build (where
     // IQK_IMPLEMENT is undefined, so GGML_USE_IQK_MULMAT is off) built cleanly and then aborted
     // in llama_decode with "FUSED_UP_GATE has no CPU implementation".
+    //
+    // When CUDA IS compiled in this returns true; whether the node may actually be built is then
+    // decided per tensor by ggml_fused_up_gate_placement_ok() in ggml_fused_up_gate() below.
     (void)type_up; (void)type_gate;
     return false;
 #else
@@ -8394,10 +8518,10 @@ struct ggml_tensor * ggml_fused_up_gate(
             struct ggml_tensor  * b,
             enum   ggml_unary_op  op) {
     if (!ggml_is_quantized(up->type) || up->type != gate->type || !ggml_are_same_shape(up, gate) ||
-        !ggml_up_gate_can_fuse(up->type, gate->type)) {
+        !ggml_up_gate_can_fuse(up->type, gate->type) || !ggml_fused_up_gate_placement_ok(up, gate)) {
         struct ggml_tensor * result_up   = ggml_mul_mat(ctx, up,   b);
         struct ggml_tensor * result_gate = ggml_mul_mat(ctx, gate, b);
-        return ggml_fused_mul_unary(ctx, result_gate, result_up, op);
+        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
     }
     GGML_ASSERT(!ggml_is_transposed(up));
     GGML_ASSERT(!ggml_is_transposed(gate));

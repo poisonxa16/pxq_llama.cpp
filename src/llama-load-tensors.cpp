@@ -4057,6 +4057,18 @@ bool create_tensors_helper::create_smollm3_tensors(const LLM_TN & tn) {
 }
 
 bool create_tensors_helper::merge_up_gate_exps(const LLM_TN & tn, int i, int bias) {
+    // Merging ffn_up_exps + ffn_gate_exps into one tensor is only ever useful to the fused
+    // GGML_OP_MOE_FUSED_UP_GATE kernel, and it flips llm_build_moe_ffn onto the merged branch
+    // (src/llama-build-context.cpp), which builds that node. In a build that has neither the ik
+    // CPU kernel nor a CUDA backend the node is unexecutable, so -muge converted a working, if
+    // slower, graph into one that used to abort at decode. ggml_moe_up_gate_can_fuse() returns
+    // false for EVERY type pair in such a build, so a same-type probe is a sound capability test
+    // -- and it costs nothing to decline, since the merge is a pure speed optimisation of a kernel
+    // that is not present.
+    if (!ggml_moe_up_gate_can_fuse(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)) {
+        LLAMA_LOG_INFO("%s: not merging up/gate -- this build has no fused MoE up/gate implementation\n", __func__);
+        return false;
+    }
     ggml_context * ctx_split = ctx_for_layer_split(i);
 
     auto & layer = model.layers[i];
