@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import shutil
 import sys
@@ -99,6 +100,9 @@ class Emit:
     #: it on every tensor with a v-head axis: an unpermuted GDN checkpoint loads cleanly and
     #: generates fluent garbage, so "we forgot" has to be a hard failure, not a silence.
     perm: str = ""
+    #: >=0 iff this emit is one expert's slice of a 3-D ggml expert stack. The writer needs it
+    #: to know WHICH sub-tensor of ``src`` to cut, since E emits share one source name.
+    expert: int = -1
 
 
 @dataclass
@@ -215,6 +219,43 @@ def build_plan(gg: G.GGUFFile | G.GGUFHeaderOnly, policy: str, ref_hf: str | Non
             plan.skipped.append((name, "MTP / not mapped in P1-P2 (plan §3, P3 work)"))
             continue
 
+        # --- 3-D expert stacks fan out to E per-expert emits -------------------------------
+        if "{e}" in hf:
+            n_exp = NM.n_experts(kv)
+            if n_exp <= 0:
+                raise SystemExit(
+                    f"{name} is an expert stack but the GGUF declares no expert_count under "
+                    f"arch {kv.get('general.architecture')!r}. Refusing to guess E.")
+            if len(ti.dims) != 3 or ti.dims[2] != n_exp:
+                raise SystemExit(
+                    f"{name}: expert stack expected ne=(K, N, {n_exp}) but the file says "
+                    f"ne={tuple(ti.dims)}.")
+            module = NM.HF_MODULE_OF(hf.format(e=0))
+            if not NM.is_pxq4_module(module, policy):
+                raise SystemExit(
+                    f"policy {policy} does not serve {module!r} as PXQ4, so the {n_exp} experts "
+                    f"of {name} would be emitted DENSE as fp16. For this model that is the "
+                    f"3.4x-over-VRAM failure documented in 122B-VLLM-FINDINGS.md §4 -- "
+                    f"refusing rather than writing a checkpoint that cannot be loaded. Use a "
+                    f"policy whose module list contains {NM.module_suffix(module)!r}.")
+            if ti.type_id != G.GGML_PXQ4:
+                raise SystemExit(
+                    f"{name} is ggml type {ti.type} and only native pxq4 (252) expert stacks "
+                    f"are supported today. Re-encoding an expert stack is milestone 2 work.")
+            N, K = ti.ne1, ti.ne0
+            L.assert_geometry(N, K)
+            P_, S_ = N // 64, K // 32
+            for e_ in range(n_exp):
+                sl_name, an_name = _pxq4_emit_names(hf.format(e=e_))
+                plan.emits.append(Emit(sl_name, "pxq4", "U8", (P_, S_, 1088),
+                                       P_ * S_ * 1088, name, "native pxq4 expert slice",
+                                       expert=e_))
+                plan.emits.append(Emit(an_name, "pxq4", "F16", (P_, 64), P_ * 64 * 2,
+                                       name, "native pxq4 expert slice", expert=e_))
+            plan.module_types.setdefault(module, set()).add("pxq4")
+            continue
+        # -----------------------------------------------------------------------------------
+
         module = NM.HF_MODULE_OF(hf)
         want_pxq4 = NM.is_pxq4_module(module, policy)
         perm = gdn_perm_for(name, ti, geom)
@@ -252,7 +293,16 @@ def build_plan(gg: G.GGUFFile | G.GGUFHeaderOnly, policy: str, ref_hf: str | Non
             plan.module_types.setdefault(module, set()).add("pxq4")
         else:
             shape = ti.logical_shape
-            if hf.endswith("conv1d.weight"):
+            if hf.endswith("shared_expert_gate.weight"):
+                # ggml stores the shared-expert gate as a 1-D vector, ne=(2048,), because it
+                # is a single output row. vLLM builds it as ReplicatedLinear(hidden_size, 1)
+                # whose weight is 2-D [1, hidden] (confirmed against the reference checkpoint:
+                # shape [1, 2048]). Emitting the bare 1-D vector gives
+                #   AssertionError: Tried to load weights of size torch.Size([2048])
+                #                   to a parameter of size torch.Size([1, 2048])
+                # at default_weight_loader. This is a pure reshape -- no values move.
+                shape = (1, int(shape[0]))
+            elif hf.endswith("conv1d.weight"):
                 # ggml ne=(4, 10240) -> HF [10240, 1, 4]. The middle axis is the depthwise
                 # conv's in-channels-per-group of 1; HF stores conv1d weights as
                 # [out_channels, in_channels/groups, kernel]. See the ASSUMPTION in namemap.py.
@@ -478,6 +528,32 @@ def _ref_tensor_f32(ref_hf: str, key: str, wm: dict[str, str] | None = None
                      f"refusing to guess")
 
 
+#: Relative half-ULP of each storage dtype a reference checkpoint may use. This is the floor on
+#: how well ANY correct converter can reproduce a reference tensor: the reference itself only
+#: preserves this many bits, so a residual at this scale is the reference's rounding, not ours.
+#:
+#:   F32  2^-24 = 5.96e-08     F16  2^-11 = 4.88e-04     BF16 2^-8 = 3.91e-03
+#:
+#: BF16 is COARSER than F16 despite the wider exponent -- 8 mantissa bits against 11 -- which is
+#: why this is a table and not a "16-bit vs 32-bit" branch.
+_REF_HALF_ULP: dict[str, float] = {"F32": 2.0 ** -24, "F16": 2.0 ** -11, "BF16": 2.0 ** -8}
+
+
+def _ref_dtype(ref_hf: str, key: str, wm: dict[str, str]) -> str | None:
+    """The on-disk dtype string of one reference tensor, or None if it is not there."""
+    fname = wm.get(key)
+    if fname is None:
+        return None
+    path = os.path.join(ref_hf, fname)
+    if not os.path.exists(path):
+        return None
+    hdr = ST.read_header(path)
+    ent = hdr.get(key)
+    if not isinstance(ent, dict):
+        return None
+    return ent.get("dtype")
+
+
 # ---------------------------------------------------------------------------------------------
 # THE GDN HEAD-ORDER GATE (the reviewer's G5, promoted to a run-stopping check)
 # ---------------------------------------------------------------------------------------------
@@ -518,6 +594,7 @@ def gate_gdn_head_order(gg, ref_hf: str, geom, layers: int = 0) -> list[str]:
             ti = gg.tensors[gname]
             ours = D.dequant_any(gg.raw(gname), ti.type_id, ti.dims).reshape(-1)
             theirs = _ref_tensor_f32(ref_hf, hf_pref + hf_key, wm)
+            ref_dt = _ref_dtype(ref_hf, hf_pref + hf_key, wm)
             if theirs is None:
                 problems.append(f"layer {layer}: reference has no {hf_pref + hf_key}")
                 continue
@@ -529,12 +606,23 @@ def gate_gdn_head_order(gg, ref_hf: str, geom, layers: int = 0) -> list[str]:
             ours_t = fn(ours) if fn is not None else NM.VALUE_TRANSFORMS["ssm_a"][0](ours)
             d_perm = float(np.abs(ours_t[gather] - theirs).max())
             d_ident = float(np.abs(ours_t - theirs).max())
-            tol = 1e-5 * max(1.0, float(np.abs(theirs).max()))
+            # The tolerance is set by the REFERENCE's storage precision, not by a constant.
+            # The old fixed 1e-5 silently assumed an F32 reference (which the dense 27B twin
+            # had, and where log(-ssm_a) reproduced A_log to 5e-7). The qwen35moe references
+            # store A_log/dt_bias as F16, whose half-ULP is 2.44e-4 RELATIVE -- 24x the old
+            # tolerance -- so a bit-perfect converter fails a fixed 1e-5 on them. Measured on
+            # PXA-Coder-35B-v2 layer 0: relative residual 1.64e-4, i.e. UNDER one F16 half-ULP,
+            # while the wrong (identity) order sits at 7.64 absolute. The discriminator that
+            # actually catches a mis-read head order is ``d_perm < d_ident``, and it has four
+            # orders of magnitude of headroom here; the tolerance only guards against both
+            # orders being wrong together.
+            rel = _REF_HALF_ULP.get(ref_dt or "F32", _REF_HALF_ULP["F32"])
+            tol = max(1e-5, 4.0 * rel) * max(1.0, float(np.abs(theirs).max()))
             if not (d_perm < d_ident and d_perm <= tol):
                 problems.append(
                     f"layer {layer} {suffix} -> {hf_key}: max|diff| permuted {d_perm:.6g} vs "
-                    f"identity {d_ident:.6g} (tol {tol:.2g}) — the v-head gather does not "
-                    f"reproduce the reference checkpoint")
+                    f"identity {d_ident:.6g} (tol {tol:.2g}, reference dtype {ref_dt}) — the "
+                    f"v-head gather does not reproduce the reference checkpoint")
         checked += 1
     if not checked:
         problems.append("gdn head-order gate: no GDN layers found (no blk.*.ssm_dt.bias)")
@@ -591,6 +679,27 @@ def _native_pxq4_pair(gg, ggml_name: str, N: int, K: int, perm=None
     if perm is not None:
         slabs, anchor = _apply_perm_pxq4(slabs, anchor, perm)
     return slabs, anchor
+
+
+def _native_pxq4_expert(gg, ggml_name: str, e: int, N: int, K: int
+                        ) -> tuple[np.ndarray, np.ndarray]:
+    """Split expert ``e`` out of a 3-D PXQ4 expert stack.
+
+    Experts are the SLOWEST-varying ggml axis and each expert slice is a complete,
+    independently addressable PXQ4 tensor (pxq6.cuh:520-526 addresses a panel as
+    ``W + (e*panels + p)*panel_bytes``), so this is the 2-D split applied to one expert's
+    byte range -- not a gather, not a re-encode, and it touches only that expert's bytes.
+
+    Deliberately NOT ``L.split_blob_3d``: that materialises all E experts at once, and at
+    E=256 the largest stack here is 143 MB which the ShardWriter would then pin until its
+    next flush. Cutting one expert at a time keeps peak extra memory at one expert.
+    """
+    per = L.tensor_bytes(N, K)
+    blob = gg.raw(ggml_name)
+    if len(blob) % per:
+        raise SystemExit(f"{ggml_name}: {len(blob)} B is not a whole multiple of the "
+                         f"{per} B per-expert PXQ4 size for N={N} K={K}")
+    return L.split_blob(blob[e * per:(e + 1) * per], N, K)
 
 
 def _pxq4_payload(gg, ggml_name: str, N: int, K: int, enc, ti,
@@ -820,6 +929,7 @@ def run_convert(args) -> int:
                                 metadata={"format": "pt", "pxq4_policy": args.policy})
 
         done_pxq4: set[str] = set()
+        done_expert: set[tuple[str, int]] = set()
         for e in plan.emits:
             if e.kind == "copy":
                 src_file = e.src.split("/", 1)[1]
@@ -840,6 +950,34 @@ def run_convert(args) -> int:
                     writer.add(ST.Tensor(e.name, "F16", e.shape,
                                          lambda t=ti, s=e.shape, p=pm, x=xf:
                                          _dense_payload(gg, t.name, t, s, p, x)))
+            elif e.expert >= 0:
+                # One expert's slice of a 3-D stack. Both emits of a (slabs, anchor) pair carry
+                # the same (src, expert), so dedupe on the pair, not on src alone.
+                key = (e.src, e.expert)
+                if key in done_expert:
+                    continue
+                done_expert.add(key)
+                ti = gg.tensors[e.src]
+                N, K = ti.ne1, ti.ne0
+                hf_t = _hf_of(e.src, gg.kv)
+                sl_name, an_name = _pxq4_emit_names(hf_t.format(e=e.expert))
+                if args.verify and e.expert == 0:
+                    # Verifying all 256 experts of all 40 layers would re-read the whole file
+                    # ~10x for no new information: the split is the same code on every expert
+                    # and differs only in the byte offset. Expert 0 of every stack proves the
+                    # geometry; a mis-sliced expert 7 would be an offset bug, which
+                    # _expert_offsets_gate below checks directly and cheaply.
+                    sl0, an0 = _native_pxq4_expert(gg, e.src, 0, N, K)
+                    _verify_expert_slice(e.src, gg, ti, sl0, an0, 0, N, K)
+                P_, S_ = N // 64, K // 32
+                writer.add(ST.Tensor(
+                    sl_name, "U8", (P_, S_, 1088),
+                    lambda src=e.src, x=e.expert, n=N, k=K:
+                    _native_pxq4_expert(gg, src, x, n, k)[0].tobytes()))
+                writer.add(ST.Tensor(
+                    an_name, "F16", (P_, 64),
+                    lambda src=e.src, x=e.expert, n=N, k=K:
+                    _native_pxq4_expert(gg, src, x, n, k)[1].tobytes()))
             else:
                 if e.src in done_pxq4:
                     continue
@@ -882,6 +1020,20 @@ def run_convert(args) -> int:
         return 0
     finally:
         gg.close()
+
+
+def _verify_expert_slice(ggml_name: str, gg, ti, slabs: np.ndarray, anchor: np.ndarray,
+                         e: int, N: int, K: int) -> None:
+    """The expert-stack twin of ``verify_pxq4_roundtrip``: rejoining expert ``e``'s split must
+    reproduce exactly that expert's byte range from the file. Proves the split AND the offset.
+    """
+    per = L.tensor_bytes(N, K)
+    want = np.frombuffer(gg.raw(ggml_name), dtype=np.uint8)[e * per:(e + 1) * per]
+    got = np.frombuffer(L.join_blob(slabs, anchor), dtype=np.uint8)
+    if got.size != want.size or not np.array_equal(got, want):
+        raise SystemExit(
+            f"{ggml_name} expert {e}: the PXQ4 split does not rejoin to the original bytes. "
+            f"An expert-stack offset or panel-geometry error -- refusing to write.")
 
 
 def verify_pxq4_roundtrip(ggml_name: str, gg, ti, slabs: np.ndarray,
@@ -992,6 +1144,32 @@ def _collapse_awq(name: str) -> str:
     return name
 
 
+#: ``...experts.7.gate_proj.weight`` -> ``(...experts, gate)``.
+_EXPERT_KEY = re.compile(r"^(.*\.experts)\.\d+\.(gate|up|down)_proj\.weight$")
+
+
+def _collapse_experts(name: str) -> str:
+    """Fold our per-expert key back onto the reference's stacked spelling.
+
+    The reference checkpoint stores each layer's experts as TWO stacked tensors,
+    ``experts.gate_up_proj`` [E, 2I, H] and ``experts.down_proj`` [E, I, H] (verified: 7 keys
+    under ``layers.0.mlp``). We deliberately emit E*3 separate per-expert tensors instead --
+    see the ``_MOE_EXPERT_MAP`` note in namemap.py: the per-expert spelling is the one
+    ``FusedMoE.make_expert_params_mapping`` rewrites by a pure ``name.replace``, whereas the
+    stacked spelling takes vLLM's ``is_fused_expert`` branch whose ``chunk(2, dim=-2)`` would
+    cut a panel-major PXQ4 slab array along its K-slab axis and silently corrupt every expert.
+
+    So the two key sets differ BY DESIGN, and this collapse is what lets the gate still check
+    the thing it exists to check -- that no expert is missing, duplicated or misnamed -- rather
+    than being switched off wholesale with --allow-key-diff.
+    """
+    m = _EXPERT_KEY.match(name)
+    if not m:
+        return name
+    stem, which = m.group(1), m.group(2)
+    return f"{stem}.down_proj" if which == "down" else f"{stem}.gate_up_proj"
+
+
 def keyset_diff(plan: Plan, ref_hf: str) -> dict:
     """Compare our emitted key set to the reference checkpoint's, collapsing AWQ's four-tensor
     encoding to a single ``.weight`` and our two-tensor PXQ4 encoding likewise.
@@ -1014,16 +1192,24 @@ def keyset_diff(plan: Plan, ref_hf: str) -> dict:
     ref_logical = {k for k in ref_logical if not k.startswith("mtp.")}
 
     ours: set[str] = set()
+    n_expert_emits = 0
     for e in plan.emits:
         if e.name.endswith(".pxq4_slabs"):
-            ours.add(e.name[: -len(".pxq4_slabs")] + ".weight")
+            logical = e.name[: -len(".pxq4_slabs")] + ".weight"
         elif e.name.endswith(".pxq4_anchor"):
             continue
         else:
-            ours.add(e.name)
+            logical = e.name
+        collapsed = _collapse_experts(logical)
+        if collapsed is not logical and collapsed != logical:
+            n_expert_emits += 1
+        ours.add(collapsed)
 
     missing = sorted(ref_logical - ours)
     extra = sorted(ours - ref_logical)
+    if n_expert_emits:
+        print(f"  (collapsed {n_expert_emits} per-expert emits onto the reference's stacked "
+              f"experts.gate_up_proj / experts.down_proj spelling)", file=sys.stderr)
     return {
         "n_ref": len(ref_logical), "n_ours": len(ours),
         "missing": missing, "extra": extra,

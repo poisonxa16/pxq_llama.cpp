@@ -51,6 +51,26 @@ from typing import Any, Callable
 
 HF_LM = "model.language_model"
 
+
+def arch_kv(kv: dict[str, Any], *suffixes: str, default: Any = None) -> Any:
+    """Look up a model KV by its arch-namespaced name without hardcoding the arch.
+
+    ggml namespaces model KVs under ``general.architecture``: the dense 27B writes
+    ``qwen35.ssm.group_count`` and its MoE siblings write ``qwen35moe.ssm.group_count``.
+    Hardcoding either spelling makes the converter silently arch-specific -- and it fails
+    LOUDLY rather than subtly only because ``gdn_geometry`` refuses to guess, which is how
+    the qwen35moe artifacts were caught. Every model-namespaced KV read goes through here.
+    """
+    arch = kv.get("general.architecture")
+    for suf in suffixes:
+        if arch:
+            k = f"{arch}.{suf}"
+            if k in kv:
+                return kv[k]
+        if suf in kv:
+            return kv[suf]
+    return default
+
 # ---------------------------------------------------------------------------------------------
 # vLLM module suffixes (what get_quant_method sees as `prefix`), per policy. Plan §3, §5.5.
 # ---------------------------------------------------------------------------------------------
@@ -107,7 +127,25 @@ PXQ4_MODULES_P2B = frozenset(PXQ4_MODULES_P2A)
 #: LM head is servable, which is why P2b is blocked rather than quietly dropped.
 PXQ4_MODULES_P2C = PXQ4_MODULES_P2B | {"self_attn.qkv_proj"}
 
+#: The MoE policy. Serves exactly what a qwen35moe PXQ4 artifact already carries as type 252,
+#: and nothing that would break the §3.1 uniformity invariant.
+#:
+#: ``self_attn.qkv_proj`` is deliberately ABSENT even though ``attn_q`` is pxq4: its fused
+#: partners ``attn_k``/``attn_v`` are q8_0 in the artifact, so the fused module is mixed-type
+#: and must be served dense. This is the same call P1 makes on the dense sibling.
+#:
+#: ``linear_attn.out_proj`` is absent because ``ssm_out`` is MXFP4, not PXQ4 -- re-encoding it
+#: is the P2A lever and is orthogonal to MoE support.
+PXQ4_MODULES_M1: frozenset[str] = frozenset({
+    "mlp.experts",                      # <- ggml ffn_{gate,up,down}_exps, all pxq4
+    "mlp.shared_expert.gate_up_proj",   # <- ggml ffn_{gate,up}_shexp, both pxq4
+    "mlp.shared_expert.down_proj",      # <- ggml ffn_down_shexp, pxq4
+    "self_attn.o_proj",                 # <- ggml attn_output, pxq4
+    "linear_attn.in_proj_qkvz",         # <- ggml attn_qkv + attn_gate, both pxq4
+})
+
 POLICY_MODULES: dict[str, frozenset[str]] = {
+    "m1": PXQ4_MODULES_M1,
     "p1": PXQ4_MODULES_P1,
     "p2a": frozenset(PXQ4_MODULES_P2A),
     "p2b": frozenset(PXQ4_MODULES_P2B),
@@ -161,6 +199,9 @@ BASE_IGNORE: tuple[str, ...] = (
 #: ``get_quant_method`` returns ``UnquantizedLinearMethod`` for it. ``model.visual`` covers the
 #: 333 BF16 vision tensors copied verbatim from the AWQ twin.
 _ALL_LINEAR_MODULES: tuple[str, ...] = (
+    "mlp.experts",
+    "mlp.shared_expert.gate_up_proj",
+    "mlp.shared_expert.down_proj",
     "mlp.gate_up_proj", "mlp.down_proj", "self_attn.o_proj", "self_attn.qkv_proj",
     "linear_attn.in_proj_qkvz", "linear_attn.out_proj", "lm_head",
 )
@@ -178,6 +219,10 @@ def ignore_list(policy: str) -> list[str]:
 # ggml -> HF name mapping
 # ---------------------------------------------------------------------------------------------
 _BLK = re.compile(r"^blk\.(\d+)\.(.+)$")
+
+#: ``...mlp.experts.7.gate_proj`` -> group(1) == ``...mlp.experts``. Anchored on the numeric
+#: expert index so a shared_expert (which has no index) is never swallowed by it.
+_EXPERT_MOD = re.compile(r"^(.*\.experts)\.\d+\.(?:gate|up|down)_proj$")
 
 #: GDN-block suffixes. ``in_proj_qkv`` and ``in_proj_z`` are separate on disk in BOTH
 #: checkpoints (verified in the AWQ index), so the NAME side is a 1:1 rename — but the VALUES
@@ -245,6 +290,53 @@ _COMMON_MAP: dict[str, str] = {
     "ffn_down.weight": "mlp.down_proj.weight",
 }
 
+#: MoE block suffixes.
+#:
+#: Target names verified against the module tree the fork actually builds, not guessed:
+#: ``Qwen3NextSparseMoeBlock`` (qwen3_next.py:319-418) constructs ``self.gate``
+#: (ReplicatedLinear, quant_config=None), ``self.shared_expert_gate`` (ReplicatedLinear
+#: hidden->1, quant_config=None), ``self.shared_expert`` (a Qwen3NextMLP with the usual
+#: gate/up/down_proj) and ``self.experts`` (FusedMoE). qwen3_5.py:364 installs that block as
+#: ``self.mlp``.
+#:
+#: The two gates are built with ``quant_config=None`` -- so they are ALWAYS unquantized
+#: regardless of policy, which matches the artifact (both are f32 in the GGUF).
+_MOE_MAP: dict[str, str] = {
+    "ffn_gate_inp.weight": "mlp.gate.weight",
+    "ffn_gate_inp_shexp.weight": "mlp.shared_expert_gate.weight",
+    "ffn_gate_shexp.weight": "mlp.shared_expert.gate_proj.weight",
+    "ffn_up_shexp.weight": "mlp.shared_expert.up_proj.weight",
+    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
+}
+
+#: Expert STACKS. These ggml tensors are 3-D (ne = (K, N, E)); each maps to E separate HF
+#: tensors, one per expert. The ``{e}`` placeholder is filled by ``build_plan``.
+#:
+#: Per-expert naming is deliberate and is the reason this works with stock vLLM plumbing:
+#: ``FusedMoE.make_expert_params_mapping`` (fused_moe/layer.py:1333-1376) builds
+#: ``(param="experts.w13_", weight="experts.{e}.gate_proj.", expert_id, shard_id)`` and
+#: qwen3_5.py:571 applies it as a pure ``name.replace(weight_name, param_name)``. That rewrite
+#: is dtype- and shape-agnostic, so ``experts.7.gate_proj.pxq4_slabs`` becomes
+#: ``experts.w13_pxq4_slabs`` with no model-side change at all. Emitting a pre-stacked
+#: ``experts.gate_up_proj`` instead would take the ``is_fused_expert`` branch
+#: (qwen3_5.py:583-590), which does ``loaded_weight.chunk(2, dim=-2)`` -- valid on a dense
+#: [E, 2I, H] tensor and WRONG on a panel-major PXQ4 slab array, where dim -2 is the K-slab
+#: axis, not the output-row axis.
+_MOE_EXPERT_MAP: dict[str, str] = {
+    "ffn_gate_exps.weight": "mlp.experts.{e}.gate_proj.weight",
+    "ffn_up_exps.weight": "mlp.experts.{e}.up_proj.weight",
+    "ffn_down_exps.weight": "mlp.experts.{e}.down_proj.weight",
+}
+
+#: ggml suffixes whose tensor is an expert stack (3-D, slowest axis = expert).
+EXPERT_STACK_SUFFIXES: frozenset[str] = frozenset(_MOE_EXPERT_MAP)
+
+
+def n_experts(kv: dict[str, Any]) -> int:
+    """``expert_count`` from the GGUF, or 0 for a dense model."""
+    return int(arch_kv(kv, "expert_count", default=0) or 0)
+
+
 _GLOBAL_MAP: dict[str, str] = {
     "token_embd.weight": f"{HF_LM}.embed_tokens.weight",
     "output.weight": "lm_head.weight",
@@ -260,8 +352,8 @@ def mtp_block_range(kv: dict[str, Any]) -> range:
     [0, 64) and block 64 is MTP. Confirmed against the artifact: blk.64 is the only block
     carrying ``nextn.*`` tensors.
     """
-    n_block = int(kv.get("qwen35.block_count", kv.get("block_count", 0)))
-    n_mtp = int(kv.get("qwen35.nextn_predict_layers", kv.get("nextn_predict_layers", 0)))
+    n_block = int(arch_kv(kv, "block_count", default=0))
+    n_mtp = int(arch_kv(kv, "nextn_predict_layers", default=0))
     return range(n_block - n_mtp, n_block)
 
 
@@ -284,7 +376,7 @@ def GGML_TO_HF(name: str, kv: dict[str, Any]) -> str | None:
         return None
 
     prefix = f"{HF_LM}.layers.{layer}"
-    for table in (_COMMON_MAP, _ATTN_MAP, _GDN_MAP):
+    for table in (_COMMON_MAP, _ATTN_MAP, _GDN_MAP, _MOE_MAP, _MOE_EXPERT_MAP):
         if suffix in table:
             return f"{prefix}.{table[suffix]}"
     raise KeyError(f"namemap: no HF name for ggml tensor {name!r} (suffix {suffix!r}). "
@@ -342,18 +434,19 @@ class GdnGeometry:
 
 
 def gdn_geometry(kv: dict[str, Any]) -> GdnGeometry:
-    def need(*keys: str) -> int:
-        for k in keys:
-            if k in kv:
-                return int(kv[k])
-        raise SystemExit(
-            f"the GGUF carries none of {keys}. The GDN v-head permutation cannot be derived "
-            f"without it, and emitting an unpermuted GDN checkpoint is the defect this refuses "
-            f"to reintroduce.")
-    n_k = need("qwen35.ssm.group_count", "ssm.group_count")
-    n_v = need("qwen35.ssm.time_step_rank", "ssm.time_step_rank")
-    head = need("qwen35.ssm.state_size", "ssm.state_size")
-    inner = need("qwen35.ssm.inner_size", "ssm.inner_size")
+    def need(suffix: str) -> int:
+        v = arch_kv(kv, suffix)
+        if v is None:
+            raise SystemExit(
+                f"the GGUF carries no {suffix!r} under arch "
+                f"{kv.get('general.architecture')!r} or bare. The GDN v-head permutation "
+                f"cannot be derived without it, and emitting an unpermuted GDN checkpoint is "
+                f"the defect this refuses to reintroduce.")
+        return int(v)
+    n_k = need("ssm.group_count")
+    n_v = need("ssm.time_step_rank")
+    head = need("ssm.state_size")
+    inner = need("ssm.inner_size")
     if n_k <= 0 or n_v <= 0 or n_v % n_k:
         raise SystemExit(f"GDN head counts are not a repeat structure: {n_v} v-heads over "
                          f"{n_k} k-heads")
@@ -476,6 +569,10 @@ def ggml_suffix(ggml_name: str) -> str:
 _FUSE: tuple[tuple[str, str], ...] = (
     ("mlp.gate_proj", "mlp.gate_up_proj"),
     ("mlp.up_proj", "mlp.gate_up_proj"),
+    # The shared expert is a plain Qwen3NextMLP, so vLLM fuses its gate/up exactly as it does
+    # a dense mlp's (qwen3_next.py:380-388 -> Qwen3NextMLP builds a MergedColumnParallelLinear).
+    ("mlp.shared_expert.gate_proj", "mlp.shared_expert.gate_up_proj"),
+    ("mlp.shared_expert.up_proj", "mlp.shared_expert.gate_up_proj"),
     ("linear_attn.in_proj_qkv", "linear_attn.in_proj_qkvz"),
     ("linear_attn.in_proj_z", "linear_attn.in_proj_qkvz"),
     ("linear_attn.in_proj_b", "linear_attn.in_proj_ba"),
@@ -500,6 +597,13 @@ def HF_MODULE_OF(hf_name: str) -> str:
         if mod.endswith("." + leaf):
             mod = mod[: -(len(leaf) + 1)]
             break
+    # An expert's projection is not its own vLLM module. All E*3 of them live inside ONE
+    # FusedMoE built at prefix ``...mlp.experts`` (qwen3_next.py:402), and that prefix is what
+    # get_quant_method is handed. Collapsing here is what makes the policy allow-list and the
+    # runtime dispatch agree on a single key.
+    m_exp = _EXPERT_MOD.match(mod)
+    if m_exp:
+        return m_exp.group(1)
     for src, dst in _FUSE:
         if mod == src or mod.endswith("." + src):
             return mod[: len(mod) - len(src)] + dst
