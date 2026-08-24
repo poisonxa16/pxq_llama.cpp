@@ -396,18 +396,79 @@ ENGINE_DIR_CANDIDATES = [
 ]
 
 
+def engine_ld_path(E):
+    """These builds link libllama / libggml / libmtmd out of the build tree, not
+    a system prefix. Without them on LD_LIBRARY_PATH the binary exists, is
+    executable, and dies instantly on a missing .so -- which is exactly the
+    "runnable-looking command that cannot run" this launcher exists to prevent.
+    Caught by an end-to-end launch: build-engine/bin/llama-server could not find
+    libmtmd.so. --explain would never have found it."""
+    parts = [f"{E}/bin", f"{E}/src", f"{E}/ggml/src", f"{E}/examples/mtmd",
+             f"{E}/common", f"{E}/ggml/src/ggml-cuda"]
+    existing = [p for p in parts if os.path.isdir(p)]
+    prior = os.environ.get("LD_LIBRARY_PATH", "")
+    return ":".join(existing + ([prior] if prior else []))
+
+
+def engine_runs(E):
+    """Does this build actually START? Presence of the file proves nothing."""
+    exe = f"{E}/bin/llama-server"
+    if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+        return False, "no executable bin/llama-server"
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = engine_ld_path(E)
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                           timeout=25, env=env)
+    except Exception as e:
+        return False, f"{e.__class__.__name__} invoking --version"
+    # llama-server prints version to stderr and may exit non-zero on --version
+    blob = (r.stdout or "") + (r.stderr or "")
+    if "error while loading shared libraries" in blob:
+        missing = blob.split("error while loading shared libraries:")[-1].strip().split(":")[0]
+        # Distinguish "this build is broken" from "this HOST has no CUDA runtime".
+        # On the Unraid box the engine builds are run inside a CUDA container with
+        # the build bind-mounted; the host itself has no libcudart. Reporting that
+        # as a broken build sends the reader to debug the wrong thing.
+        if missing.startswith(("libcudart", "libcuda.", "libcublas", "libnvrtc")):
+            return False, f"NO CUDA RUNTIME ON THIS HOST ({missing})"
+        return False, f"cannot load {missing} (even with the build's own lib dirs on LD_LIBRARY_PATH)"
+    if r.returncode != 0 and not blob.strip():
+        return False, f"--version exited {r.returncode} with no output"
+    return True, "starts"
+
+
 def resolve_engine_dir():
-    """-> (dir, note). Honour PXA_ENGINE_DIR, else first candidate that exists."""
+    """-> (dir, note). Honour PXA_ENGINE_DIR, else the first candidate that
+    ACTUALLY RUNS. Picking one that merely exists emits a broken command and
+    then blames the engine for it."""
+    tried = []
     env = os.environ.get("PXA_ENGINE_DIR")
     if env:
-        return env, ("PXA_ENGINE_DIR" if os.path.isfile(f"{env}/bin/llama-server")
-                     else "PXA_ENGINE_DIR (no llama-server there)")
+        ok, why = engine_runs(env)
+        return env, ("PXA_ENGINE_DIR" if ok else f"PXA_ENGINE_DIR -- WILL NOT START: {why}")
     for d in ENGINE_DIR_CANDIDATES:
-        if os.path.isfile(f"{d}/bin/llama-server"):
-            return d, "auto-detected"
+        if not os.path.isfile(f"{d}/bin/llama-server"):
+            continue
+        ok, why = engine_runs(d)
+        if ok:
+            note = "auto-detected" if not tried else f"auto-detected (skipped {len(tried)} broken)"
+            return d, note
+        tried.append(f"{d} ({why})")
     onpath = shutil.which("llama-server")
     if onpath:
-        return os.path.dirname(os.path.dirname(onpath)), "found on PATH"
+        d = os.path.dirname(os.path.dirname(onpath))
+        ok, why = engine_runs(d)
+        if ok:
+            return d, "found on PATH"
+        tried.append(f"{d} on PATH ({why})")
+    if tried:
+        # Do not call the builds broken when the host is the problem.
+        if all("NO CUDA RUNTIME ON THIS HOST" in t for t in tried):
+            head = "this host has no CUDA runtime, so no build here can start:"
+        else:
+            head = "every candidate build is present but will not start:"
+        return None, head + "\n      " + "\n      ".join(tried)
     return None, "no llama-server found"
 
 
@@ -415,9 +476,18 @@ def build_cmd(engine, a, sel, kind, prof):
     if engine == "llama":
         E, note = resolve_engine_dir()
         if E is None:
-            print("  REFUSING - no llama-server binary found. Looked at "
-                  f"{', '.join(ENGINE_DIR_CANDIDATES)} and $PATH.")
-            print("    Set PXA_ENGINE_DIR=/path/to/build (the dir containing bin/llama-server).")
+            print(f"  REFUSING - no WORKING llama-server found. {note}")
+            if "NO CUDA RUNTIME ON THIS HOST" in note:
+                print("    Every candidate build is FINE - this host just has no CUDA runtime.")
+                print("    These builds are meant to run inside a CUDA container with the build")
+                print("    bind-mounted. Run pxa-launch in there, e.g.:")
+                print("      docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=<cards> \\")
+                print("        -v <build>:/w -v <local-path>:/m nvidia/cuda:12.8.1-devel-ubuntu24.04 \\")
+                print("        bash -c 'LD_LIBRARY_PATH=/w/bin:/w/src:/w/ggml/src:/w/examples/mtmd \\")
+                print("                 /w/bin/llama-server -m /m/<model>.gguf ...'")
+                print("    Or set PXA_ENGINE_DIR to a build whose CUDA libs resolve here.")
+            else:
+                print("    Set PXA_ENGINE_DIR=/path/to/build (the dir containing bin/llama-server).")
             sys.exit(4)
         if note != "auto-detected":
             print(f"  engine dir: {E}  [{note}]")
@@ -431,7 +501,8 @@ def build_cmd(engine, a, sel, kind, prof):
             cmd += ["--spec-type", a.spec if ":" in a.spec else f"{a.spec}:n_max=4,n_min=2"]
         if a.mmproj:
             cmd += ["--mmproj", a.mmproj]
-        env = {"PXA_ENHANCE": "1", "GGML_CUDA_NO_PINNED": "1"}
+        env = {"PXA_ENHANCE": "1", "GGML_CUDA_NO_PINNED": "1",
+               "LD_LIBRARY_PATH": engine_ld_path(E)}
         return cmd, env, ",".join(str(g[0]) for g in sel) if sel else ""
 
     # ---- vLLM
