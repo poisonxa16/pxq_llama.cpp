@@ -460,7 +460,21 @@ not a failure, and the composition prints before the abort:
 | `PXQ3` default | pxq4hq 53.1% | unchanged |
 | `PXQ2`/`PXQ3`/`PXQ6` `=core` | pxq4 51.7% (all three identical) | core reaches every tier |
 | `PXQ1` `=core` | mxfp4 64.7% | silent no-op -- needs `core,universal`; now warns |
-| `PXQ1` `=core,universal` | pxq4 51.7% | works |
+| `PXQ1` `=core,universal` | pxq4 51.7% | the BACKBONE allocates correctly — but read the next line before using this |
+
+> ⚠ **`works` above means the backbone, NOT the tier.** Measured 2026-08-24 by the PXQ
+> type-coverage sweep: on a DENSE model `PXQ1` produces **zero bytes of `pxq1`** even with
+> the `universal` opt-in — the 51.7% is the pxq4 backbone, and the composition assertion
+> then aborts the write. PXQ1 is an EXPERT-tier codec and has no dense path; that is a
+> designed limit correctly caught by the assertion, not a bug. On a real MoE the native
+> codec does fire on the routed expert stacks (measured: 80.9% pxq1, rc=0).
+> Two further cautions on this tier: it has **no CPU codec** (GPU-only; a CPU-only or
+> partially-offloaded run aborts), and every MoE artifact containing `pxq1` in that sweep
+> generated incoherent output while every artifact without it was fine — isolated across
+> six controls, with a missing imatrix as the only uncontrolled variable. Not enough to
+> call the codec defective, and enough that PXQ1 should not be shipped to anyone until
+> that is resolved. See pxa-stack/docs/baselines-20260824/PXQ-TYPE-MATRIX.md.
+
 | `PXQ4` `=pxq6` | pxq6 56.9% | byte-identical to the PXQ6 default: rollback holds |
 | `PXQ4` `=hq` | pxq4hq 53.1% | identical to the PXQ3 default |
 
