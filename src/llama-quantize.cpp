@@ -1467,6 +1467,37 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     const bool pxq2_out = ftype == LLAMA_FTYPE_MOSTLY_PXQ2;
     const bool pxq3_out = ftype == LLAMA_FTYPE_MOSTLY_PXQ3;
     const bool pxqu_out = ftype == LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL;
+
+    // PXQ_UNIVERSAL IS NOTHING WITHOUT ITS TIER MAP. The whole meaning of this ftype is
+    // "a per-tensor mix defined by --pxq-universal". Given no map, every tensor falls to the
+    // backbone default and the run emits a UNIFORM PXQ4-HQ file that claims to be
+    // PXQ_UNIVERSAL -- with rc=0 and no warning. Nothing downstream can catch it: the
+    // end-of-run composition assertion sets spec_type = -1 for this ftype precisely because
+    // the mix is map-defined, which disables its named-tier check; and every PXQ file carries
+    // the same general.file_type, so the result is byte-indistinguishable from a real
+    // PXQ4-HQ build. An operator would ship a mislabelled model and have no way to notice.
+    //
+    // Refuse HERE, before the write loop, rather than after hours of quantization. A tier map
+    // is authored per-tensor and cannot be guessed on the operator's behalf.
+    if (pxqu_out) {
+        // CustomQ is a function-local alias at every other use site (see the two
+        // `using CustomQ = ...` declarations above); it is not a file-scope type.
+        using CustomQ = std::pair<std::string, ggml_type>;
+        const auto * rules = params->custom_quants
+            ? static_cast<const std::vector<CustomQ>*>(params->custom_quants) : nullptr;
+        if (!rules || rules->empty()) {
+            throw std::runtime_error(
+                "PXQ_UNIVERSAL requires a per-tensor tier map and none was supplied. "
+                "This ftype has no meaning on its own: without a map every tensor would take "
+                "the backbone default and the output would be a UNIFORM PXQ4-HQ file labelled "
+                "PXQ_UNIVERSAL -- indistinguishable from a real one, and undetectable by the "
+                "composition assertion (which disables its named-tier check for this ftype "
+                "because the mix is map-defined). Pass --pxq-universal /path/to/map.tiers "
+                "(or a bare <name> resolved under $PXA_PXQU_DIR), or pick a uniform tier such "
+                "as PXQ4 / PXQ4-HQ / PXQ3 / PXQ2 if a single tier is what you actually want.");
+        }
+    }
+
     if (pxq2_out || pxq3_out || pxqu_out) {
         ftype = LLAMA_FTYPE_MOSTLY_MXFP4;
     }
