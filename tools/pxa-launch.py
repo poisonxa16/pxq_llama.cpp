@@ -20,8 +20,9 @@ WHAT CHANGED (2026-08-24) — THE DECISION IS NO LONGER JUST ABOUT THE HARDWARE
 
     MoE 35B PXQ4, 2x P100 -- SPLIT SEAT, this is the important branch
       single decode   llama.cpp 95.6   vs vLLM 30.4    (llama.cpp 3.14x)
-      agg decode @4   llama.cpp 75.93  vs vLLM 65.8    (llama.cpp +14%)
-      agg decode @8   vLLM 88.7        vs llama.cpp 64 (vLLM +39%)
+      agg decode @5   llama.cpp 79.49  vs vLLM 64.32   (llama.cpp +23.6%)
+      agg decode @6   vLLM 75.60       vs llama.cpp 69.58 (vLLM +8.7%)
+      agg decode @8   vLLM 95.81       vs llama.cpp 62.42 (vLLM +53.5%)
       long-doc prefill llama.cpp ~1136 vs vLLM ~568    (llama.cpp ~1.9x)
 
   Root cause of that whole shape, one sentence: llama.cpp `-sm layer` is a
@@ -60,10 +61,22 @@ BYTES_PER_GIB = 1024 ** 3
 # than interpolating and pretending. When MOE-CROSSOVER.md lands, set
 # MOE_CROSSOVER_NP to the measured value and flip MOE_CROSSOVER_MEASURED — that
 # is the only edit required.
-MOE_LLAMA_MAX_NP       = 4      # llama.cpp measured winner at and below this
-MOE_VLLM_MIN_NP        = 8      # vLLM measured winner at and above this
-MOE_CROSSOVER_NP       = None   # set to the measured crossover when known
-MOE_CROSSOVER_MEASURED = False
+# MEASURED 2026-08-24, 11 boots, cards 0+6, every boot gated on short-prompt
+# correctness before its number was kept. See baselines/MOE-CROSSOVER.md.
+#   np4  llama 75.93  vLLM 64.82   llama +17.1%
+#   np5  llama 79.49  vLLM 64.32   llama +23.6%   <- llama PEAKS here
+#   np6  llama 69.58  vLLM 75.60   vLLM  +8.7%    <- crossover
+#   np7  llama 67.74  vLLM 87.03   vLLM  +28.5%
+#   np8  llama 62.42  vLLM 95.81   vLLM  +53.5%
+# Neither curve is monotonic and the flip is SHARP, not gradual: llama.cpp peaks at
+# np5 ABOVE its np4 value, then drops 12.5% in one step while vLLM climbs. The margin
+# swings 32 points between np5 and np6. Interpolating np4->np8 would have placed the
+# threshold too early and mispriced np5 by ~14% - which is exactly why this shipped as
+# an explicit UNMEASURED band rather than a straight line.
+MOE_LLAMA_MAX_NP       = 5      # llama.cpp measured winner at and below this
+MOE_VLLM_MIN_NP        = 6      # vLLM measured winner at and above this
+MOE_CROSSOVER_NP       = 5      # llama.cpp wins through np=5; vLLM from np=6
+MOE_CROSSOVER_MEASURED = True
 
 # vLLM's PXQ4 backend implements exactly one PXQ type. Everything else in the
 # family must go to llama.cpp. Silently serving the wrong kernel would be worse
