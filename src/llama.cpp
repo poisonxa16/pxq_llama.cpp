@@ -3874,17 +3874,57 @@ static bool llm_load_tensors(
 
 #ifdef GGML_USE_CUDA
     // PXA_ENHANCE topology footgun guard: on a multi-GPU box with no NVLink/P2P (PHB topology),
-    // '-sm layer' serializes a per-token host-bridge round-trip and cripples decode (~17 t/s),
-    // whereas '-sm graph' keeps full decode (~93 t/s on the same hardware). We WARN only — an
-    // explicit '-sm layer' is respected, never silently overridden. (split_mode == LAYER here
-    // already implies the user did not select '-sm graph'.)
+    // '-sm layer' costs a per-token host-bridge round-trip which bounds single-stream decode.
+    // The '~17 vs ~93 t/s' figure this comment used to cite was NOT measured on the DeltaNet
+    // hybrid arches, where graph split is guarded off entirely; on those the graph-split guard
+    // above records +64%% prefill / -17%% decode (4x P100). The advisory below is therefore
+    // arch-aware and phase-aware. We WARN only — an explicit '-sm layer' is respected, never
+    // silently overridden. (split_mode == LAYER here already implies the user did not ask for graph.)
     if (model.devices.size() > 1 && split_mode == LLAMA_SPLIT_MODE_LAYER && !ggml_backend_cuda_all_pairs_can_peer()) {
+        // PXA 2026-08-24 — ARCH-AWARE + PHASE-AWARE. This advisory previously recommended
+        // '-sm graph' unconditionally "for full multi-GPU decode speed". That was wrong twice over:
+        //
+        //   (1) ARCH. '-sm graph' is HARD-GUARDED above for the DeltaNet hybrid arches
+        //       (QWEN35MOE / QWEN3NEXT / QWEN35): it produces degenerate output because the
+        //       cross-device reduce is never delivered. So on those models the recommendation is
+        //       silently downgraded back to 'layer' and the user changes nothing — or forces it
+        //       with PXA_ALLOW_GRAPH_SPLIT_HYBRID=1 and gets garbage.
+        //
+        //   (2) PHASE. Where graph split DOES work, it is a PREFILL win and a DECODE LOSS:
+        //       measured +64% prefill (255.6 -> 419.0 t/s) but -17% decode (26.73 -> 22.17 t/s)
+        //       on 4x P100, -31% decode on 2x V100, -4.6x decode on an 8x V100 node
+        //       (see the graph-split guard comment above). Recommending it "for decode speed" is
+        //       the opposite of what was measured on those boxes.
+        //
+        // Say what is true for THIS model. A warning that sends the reader somewhere useless is
+        // worse than no warning: it costs them a restart and their confidence in the next one.
+        const bool graph_split_guarded =
+            (model.arch == LLM_ARCH_QWEN35MOE ||
+             model.arch == LLM_ARCH_QWEN3NEXT ||
+             model.arch == LLM_ARCH_QWEN35);
+
         LLAMA_LOG_WARN("\n============================================================================\n");
         LLAMA_LOG_WARN("PXA_ENHANCE: multi-GPU with NO NVLink/P2P peer access (PHB topology) detected,\n");
-        LLAMA_LOG_WARN("and split mode is 'layer'. On this topology '-sm layer' serializes a per-token\n");
-        LLAMA_LOG_WARN("host-bridge round-trip and severely limits decode throughput.\n");
-        LLAMA_LOG_WARN("  => RECOMMENDED: '-sm graph -ts 1,1' for full multi-GPU decode speed.\n");
-        LLAMA_LOG_WARN("     (Keeping your explicit '-sm layer' choice as requested — this is a warning only.)\n");
+        LLAMA_LOG_WARN("and split mode is 'layer'. On this topology '-sm layer' costs a per-token\n");
+        LLAMA_LOG_WARN("host-bridge round-trip, which bounds single-stream decode.\n");
+        if (graph_split_guarded) {
+            LLAMA_LOG_WARN("\n");
+            LLAMA_LOG_WARN("  This architecture is a DeltaNet hybrid: '-sm graph' is GUARDED OFF for it\n");
+            LLAMA_LOG_WARN("  (measured degenerate output — cross-device reduce never delivered), so\n");
+            LLAMA_LOG_WARN("  '-sm layer' is the correct and only supported split mode here.\n");
+            LLAMA_LOG_WARN("  Do NOT set PXA_ALLOW_GRAPH_SPLIT_HYBRID=1 to serve traffic: it bypasses the\n");
+            LLAMA_LOG_WARN("  guard, not the defect. It exists for debugging only.\n");
+            LLAMA_LOG_WARN("  => No split-mode change will help. The host-bridge hop is inherent to layer\n");
+            LLAMA_LOG_WARN("     split on PHB; look to batching (-np), prompt caching and per-arch levers.\n");
+        } else {
+            LLAMA_LOG_WARN("\n");
+            LLAMA_LOG_WARN("  '-sm graph -ts 1,1' is available for this architecture, but it is a PHASE\n");
+            LLAMA_LOG_WARN("  TRADE, not a free win: measured +64%% prefill and -17%% decode on 4x P100\n");
+            LLAMA_LOG_WARN("  (-31%% on 2x V100). Prefer it for prefill/long-document workloads; keep\n");
+            LLAMA_LOG_WARN("  '-sm layer' for chat/decode-latency workloads.\n");
+            LLAMA_LOG_WARN("  => Measure both on YOUR traffic before switching.\n");
+        }
+        LLAMA_LOG_WARN("     (Keeping your explicit '-sm layer' choice as requested — warning only.)\n");
         LLAMA_LOG_WARN("============================================================================\n\n");
     }
 #endif // GGML_USE_CUDA
