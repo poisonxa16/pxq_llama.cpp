@@ -128,6 +128,9 @@ static void usage(const char * executable) {
     printf("  --hide-imatrix: do not store imatrix details in the quantized model\n");
     printf("  --ignore-imatrix-rules: ignore importance matrix rules when quantizing\n");
     printf("  --dry-run: show what would be quantized without actually writing the output file\n");
+    printf("  --pxq-name-override: write a NON-PXQ type to a PXQ-named output file. Without this the\n");
+    printf("        quantizer refuses that combination up front, because it is nearly always a number\n");
+    printf("        from the wrong space: stock ftypes are 0-38, the PXQ tiers are 248 and 252-257.\n");
     printf("  --include-weights tensor_name: use importance matrix for this/these tensor(s)\n");
     printf("  --exclude-weights tensor_name: use importance matrix for this/these tensor(s)\n");
     printf("  --output-tensor-type ggml_type: use this ggml_type for the output.weight tensor.\n");
@@ -372,6 +375,7 @@ int main(int argc, char ** argv) {
 
 
     bool hide_imatrix = false;
+    bool pxq_name_guard_override = false;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
         if (strcmp(argv[arg_idx], "--pxq-composition-override") == 0) {
@@ -384,6 +388,8 @@ int main(int argc, char ** argv) {
             params.ignore_imatrix_rules = true;
         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
             params.dry_run = true;
+        } else if (strcmp(argv[arg_idx], "--pxq-name-override") == 0) {
+            pxq_name_guard_override = true;
         } else if (strcmp(argv[arg_idx], "--symmetric-q40") == 0) {
             user_data.symmetric_q4_0 = true;
         } else if (strcmp(argv[arg_idx], "--slow-iq2ks") == 0) {
@@ -671,6 +677,61 @@ int main(int argc, char ** argv) {
     }
 
     print_build_info();
+
+    // ---------------------------------------------------------------------------------
+    // PXQ NAME/TYPE MISMATCH GUARD (2026-08-25).
+    // Real user report: `llama-quantize --allow-requantize in.gguf out-PXQ4.gguf 12`
+    // ran for twelve minutes and produced a Q3_K. `12` is stock Q3_K_M; PXQ4 is 252.
+    // Two numbering spaces overlap in one positional argument - every llama.cpp doc,
+    // tutorial and older --help in the world hands people a number from 0..38, and we
+    // accepted it silently while the output filename said PXQ4.
+    // The filename is the user's stated intent. When it disagrees with the type, stop
+    // BEFORE doing the work rather than after.
+    {
+        const bool ftype_is_pxq =
+            params.ftype == (llama_ftype) 248 || params.ftype == (llama_ftype) 252 ||
+            params.ftype == (llama_ftype) 253 || params.ftype == (llama_ftype) 254 ||
+            params.ftype == (llama_ftype) 255 || params.ftype == (llama_ftype) 256 ||
+            params.ftype == (llama_ftype) 257;
+
+        std::string base = fname_out;
+        const size_t slash = base.find_last_of("/\\");
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        for (auto & ch : base) ch = (char) std::toupper((unsigned char) ch);
+        const bool name_says_pxq = base.find("PXQ") != std::string::npos;
+
+        if (name_says_pxq && !ftype_is_pxq && !pxq_name_guard_override) {
+            fprintf(stderr,
+                "\n"
+                "REFUSING: the output filename says PXQ but the requested type is %s (ftype %d),\n"
+                "which is NOT a PXQ tier. Nothing has been written.\n"
+                "\n"
+                "  you asked for : %s   (ftype %d)\n"
+                "  you named     : %s\n"
+                "\n"
+                "This is almost always a number from the WRONG numbering space. Stock llama.cpp\n"
+                "ftypes run 0-38; the PXQ tiers are 248 and 252-257. Pass the NAME, not a number:\n"
+                "\n"
+                "  PXQ4  PXQ4-HQ  PXQ6  PXQ3  PXQ2  PXQ1  PXQ_UNIVERSAL\n"
+                "\n"
+                "On a MoE, a bare PXQ4 is the whole command - the native expert path claims\n"
+                "ffn_{down,gate,up}_exps itself, no --custom-q needed.\n"
+                "\n"
+                "If you really do want %s written to a PXQ-named file, pass --pxq-name-override.\n"
+                "\n",
+                ftype_str.c_str(), (int) params.ftype,
+                ftype_str.c_str(), (int) params.ftype,
+                fname_out.c_str(),
+                ftype_str.c_str());
+            return 1;
+        }
+        if (ftype_is_pxq && !name_says_pxq) {
+            fprintf(stderr,
+                "%s: note: writing %s to '%s' - the filename does not carry the tier. "
+                "Naming it *-%s.gguf saves the next person a header dump.\n",
+                __func__, ftype_str.c_str(), fname_out.c_str(), ftype_str.c_str());
+        }
+    }
 
     fprintf(stderr, "%s: quantizing '%s' to '%s' as %s", __func__, fname_inp.c_str(), fname_out.c_str(), ftype_str.c_str());
     if (params.nthread > 0) {
