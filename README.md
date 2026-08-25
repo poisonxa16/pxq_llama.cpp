@@ -389,25 +389,43 @@ reproducible chart, and the big-model wins are measured but not yet charted here
 
 ## Build (CUDA)
 
-Requires the NVIDIA container toolkit (or a local CUDA 12.x toolchain). The canonical arch list
-sm_60;61;70;86;89 covers P100 / 1080 Ti / V100 / 3090-class (sm_86) / 4090-class (sm_89); trim it
-to just your card for a faster build.
+**Full instructions, with every trap and its exact error: [`BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md).**
+The short version, on a machine with the cards in it:
 
 ```bash
 git clone https://github.com/poisonxa16/pxq_llama && cd pxq_llama
-# inside an nvidia/cuda:12.8.1-devel image (or a matching local toolchain):
-cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES="60;61;70;86;89" -DGGML_CUDA=ON
-cmake --build build --target llama-server llama-quantize llama-perplexity llama-imatrix -j
-# (or plain `cmake --build build -j` to build everything, llama-imatrix included)
-# NOTE: linking needs the CUDA driver lib (run under --runtime=nvidia, or have libcuda on the link path).
+
+docker run --rm -it --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all \
+  -v "$PWD":/src -w /src nvidia/cuda:12.8.1-devel-ubuntu24.04 bash
+# (--gpus all is the modern equivalent; it needs the container toolkit out of legacy mode)
+
+# --- inside the container ---
+# the stock CUDA image ships nvcc/gcc/make but NOT cmake and NOT git:
+apt-get update && apt-get install -y --no-install-recommends cmake git
+
+cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;70"
+cmake --build build --target llama-server llama-cli llama-bench llama-quantize -j"$(nproc)"
+# add llama-perplexity / llama-imatrix if you want them, or drop --target to build everything
 ```
 
+`CMAKE_CUDA_ARCHITECTURES` is the build-time lever — every entry is a full recompile of the CUDA
+sources. `"60;70"` is P100 + V100, the pair this release is about. Use `"60;61;70;86;89"` for the
+wide list (adds 10-series, 3090-class, 4090-class); `"60"` alone if all you have is a P100.
+There is no Makefile in this tree — CMake only.
+
+> **Building where the build machine has no GPU** (CI, or a container started without GPU access)
+> fails at the *link* step with `undefined reference to cuMemCreate` and a dozen siblings —
+> `libggml.so` needs `libcuda.so.1`, which ships with the driver, not the toolkit. The toolkit's
+> stub is named `libcuda.so`, so putting the stubs directory on the link path is **not** enough
+> on its own. Both halves, symlink and search path, are in
+> [`BUILD-FROM-SOURCE.md` §3](BUILD-FROM-SOURCE.md).
+
 > **CUDA stub trap (runtime).** If you added `/usr/local/cuda/lib64/stubs` to `LIBRARY_PATH`
-> or `LD_LIBRARY_PATH` to satisfy the *link* (common inside build containers without
-> `--runtime=nvidia`), **remove it before running**. The stub `libcuda.so` shadows the real
-> driver at runtime: every binary silently falls back to CPU-only execution with no error —
-> it looks exactly like a broken GPU tier and costs an afternoon. Link with the stub, run
-> without it.
+> or `LD_LIBRARY_PATH` to satisfy the *link*, **remove it before running**. The stub `libcuda.so`
+> shadows the real driver at runtime: every binary silently falls back to CPU-only execution
+> with no error — you get `offloaded 0/N layers to GPU` instead of `N/N`, correct output at
+> ~50x the latency, and it looks exactly like a broken GPU tier. Link with the stub, run
+> without it. **Check the `offloaded N/N layers to GPU` line every time.**
 
 ## Run
 

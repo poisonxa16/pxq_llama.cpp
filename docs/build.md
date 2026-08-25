@@ -1,5 +1,16 @@
 # Build ik_llama.cpp locally
 
+> **Building this fork on a CUDA box? Go to [`../BUILD-FROM-SOURCE.md`](../BUILD-FROM-SOURCE.md)
+> instead.** That is the verified, start-to-finish recipe for pxq_llama: which container image,
+> which packages the image is missing, the CUDA arch list, the driver-stub link trap and its
+> runtime twin, and how to check the binary actually landed on the GPU.
+>
+> This page is the general build reference inherited from upstream `ik_llama.cpp`. It is still
+> useful for non-CUDA backends and for platforms not covered above, but it is **not** specific to
+> this fork: it points at the upstream repository, and its `make` instructions no longer apply —
+> **there is no Makefile in this tree**, CMake is the only build system, and `make` fails with
+> `make: *** No targets specified and no makefile found.  Stop.`
+
 `ik_llama.cpp` requires has a very minimal set of dependencies: `cmake`, a functional C++-17 compiler, and, if building with Nvidia GPU support, the CUDA toolkit. All these are available from the system package manager on Linux. If you are building on Windows and are worried about messing up your main OS, you may consider building in a virtual machine (VM). In that case, make sure you can copy files between the host OS and the VM.  
 
 **To get the Code:**
@@ -9,31 +20,10 @@ git clone https://github.com/ikawrakow/ik_llama.cpp
 cd ik_llama.cpp
 ```
 
-In order to build `ik_llama.cpp` you have four different options.
+> For **this** fork the clone URL is `https://github.com/poisonxa16/pxq_llama`.
 
-- Using `make`:
-  - On Linux or MacOS:
-
-      ```bash
-      make
-      ```
-
-  - On Windows (x86/x64 only, arm64 requires cmake):
-
-    1. Download the latest fortran version of [w64devkit](https://github.com/skeeto/w64devkit/releases).
-    2. Extract `w64devkit` on your pc.
-    3. Run `w64devkit.exe`.
-    4. Use the `cd` command to reach the `llama.cpp` folder.
-    5. From here you can run:
-        ```bash
-        make
-        ```
-
-  - Notes:
-    - For `Q4_0_4_4` quantization type build, add the `GGML_NO_LLAMAFILE=1` flag. For example, use `make GGML_NO_LLAMAFILE=1`.
-    - For faster compilation, add the `-j` argument to run multiple jobs in parallel. For example, `make -j 8` will run 8 jobs in parallel.
-    - For faster repeated compilation, install [ccache](https://ccache.dev/).
-    - For debug builds, run `make LLAMA_DEBUG=1`
+In order to build `ik_llama.cpp` you have the options below. (The `make` option listed in the
+upstream version of this page has been removed — this tree has no Makefile.)
 
 - Using `CMake`:
 
@@ -370,16 +360,16 @@ cc==6.1, `PXA_PXQ6_WMMA` cc==7.0) simply fall through to the safe generic paths 
 
 For Jetson user, if you have Jetson Orin, you can try this: [Offical Support](https://www.jetson-ai-lab.com/tutorial_text-generation.html). If you are using an old model(nano/TX2), need some additional operations before compiling.
 
-- Using `make`:
-  ```bash
-  make GGML_CUDA=1
-  ```
-- Using `CMake`:
+CMake only — this tree has no Makefile, so `make GGML_CUDA=1` does not work here:
 
   ```bash
-  cmake -B build -DGGML_CUDA=ON
-  cmake --build build --config Release
+  cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;70"
+  cmake --build build --target llama-server llama-cli llama-bench llama-quantize -j"$(nproc)"
   ```
+
+  If the build machine has no GPU visible, this link step fails with `undefined reference to
+  cuMemCreate`. The fix, and the runtime stub trap that follows it, are in
+  [`../BUILD-FROM-SOURCE.md`](../BUILD-FROM-SOURCE.md).
 
 The environment variable [`CUDA_VISIBLE_DEVICES`](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#env-vars) can be used to specify which GPU(s) will be used.
 

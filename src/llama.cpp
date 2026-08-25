@@ -2513,7 +2513,7 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
     }
 
     LLAMA_LOG_INFO("%s: model type       = %s\n",     __func__, llama_model_type_name(model.type));
-    LLAMA_LOG_INFO("%s: model ftype      = %s\n",     __func__, llama_model_ftype_name(model.ftype).c_str());
+    LLAMA_LOG_INFO("%s: model ftype      = %s\n",     __func__, llama_model_ftype_name_from_content(model).c_str());
     if (ml.n_elements >= 1e12) {
         LLAMA_LOG_INFO("%s: model params     = %.3f T\n", __func__, ml.n_elements*1e-12);
     } else if (ml.n_elements >= 1e9) {
@@ -9236,7 +9236,7 @@ int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t bu
     return snprintf(buf, buf_size, "%s %s %s",
             llama_model_arch_name(model->arch),
             llama_model_type_name(model->type),
-            llama_model_ftype_name(model->ftype).c_str());
+            llama_model_ftype_name_from_content(*model).c_str());
 }
 
 uint64_t llama_model_size(const struct llama_model * model) {

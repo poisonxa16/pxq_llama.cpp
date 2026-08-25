@@ -1912,6 +1912,51 @@ void llama_model::set_tensor_overrides(const llama_model_params& params) {
     tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
+// PXQ files report general.file_type = 38 (MOSTLY_MXFP4) ON DISK, and that is deliberate:
+// llama-quantize.cpp overwrites ftype for every PXQ tier so third-party loaders see a type
+// they can reason about. The side effect was that llama-bench and the load banner printed
+// "MXFP4 - 4.25 bpw" for a PXQ4 file. On a release whose headline is PXQ4-vs-K-quant, a
+// benchmark tool labelling our own artifacts MXFP4 is a screenshot waiting to happen.
+//
+// The ftype enum cannot answer this - it was overwritten. The TENSORS can. Report the PXQ
+// tier that actually dominates the file by bytes, exactly the signal the loader dispatches
+// on and the same one tools/pxa-launch.py uses. Falls through to the enum for everything
+// that is genuinely not PXQ.
+std::string llama_model_ftype_name_from_content(const llama_model & model) {
+    size_t by_type[GGML_TYPE_COUNT] = {0};
+    for (const auto & kv : model.tensors_by_name) {
+        if (kv.second) {
+            by_type[kv.second->type] += ggml_nbytes(kv.second);
+        }
+    }
+    struct { ggml_type t; const char * name; } pxq[] = {
+        { GGML_TYPE_PXQ4,  "PXQ4 - 4.27 bpw" },
+        { GGML_TYPE_PXQ6,  "PXQ6 - 5.27 bpw" },
+        { GGML_TYPE_PXQ3,  "PXQ3 - 3.27 bpw" },
+        { GGML_TYPE_PXQ2,  "PXQ2 - 2.27 bpw" },
+        { GGML_TYPE_PXQ1,  "PXQ1 - 1.26 bpw" },
+    };
+    size_t best = 0; const char * best_name = nullptr;
+    size_t pxq_total = 0;
+    for (const auto & e : pxq) {
+        pxq_total += by_type[e.t];
+        if (by_type[e.t] > best) { best = by_type[e.t]; best_name = e.name; }
+    }
+    if (best_name) {
+        size_t total = 0;
+        for (size_t i = 0; i < GGML_TYPE_COUNT; ++i) total += by_type[i];
+        // Name the dominant tier, and say plainly when the file is a MIXTURE of tiers so a
+        // PXQ-UNIVERSAL artifact is never passed off as a uniform one.
+        const bool mixed = pxq_total > best;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s (%.0f%% PXQ%s)", best_name,
+                 total ? 100.0 * (double) pxq_total / (double) total : 0.0,
+                 mixed ? ", mixed" : "");
+        return std::string(buf);
+    }
+    return llama_model_ftype_name(model.ftype);
+}
+
 std::string llama_model_ftype_name(llama_ftype ftype) {
     if (ftype & LLAMA_FTYPE_GUESSED) {
         return llama_model_ftype_name((enum llama_ftype) (ftype & ~LLAMA_FTYPE_GUESSED)) + " (guessed)";
