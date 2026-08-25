@@ -72,9 +72,10 @@ static inline bool pxq_tie_take_hi(int64_t row, int64_t blk) {
 //   PXA_PXQ_SMIN=1     hard representability floor in the sub-scale search: sub candidates that
 //                      cannot represent the block peak within half a top book step are excluded
 //                      (search [s_min,15] instead of [0,15]).
-//   PXA_PXQ_KQW=1      k-quant error weighting on the IMATRIX PATH ONLY:
-//                      w_i = imx_i * sqrt(mean(x_row^2) + x_i^2). No imatrix => w = 1 exactly,
-//                      so imatrix-free artifacts do not move.
+//   PXA_PXQ_KQW        k-quant error weighting on the IMATRIX PATH ONLY (DEFAULT ON since
+//                      2026-08-24): w_i = imx_i * sqrt(mean(x_row^2) + x_i^2). Set =0 for the
+//                      legacy raw-imx weighting (measured ppl regression; A/B use only).
+//                      No imatrix => w = 1 exactly, so imatrix-free artifacts do not move.
 // ---------------------------------------------------------------------------------------------
 static inline bool pxq_fix_env_on(const char * name) {
     const char * e = getenv(name);
@@ -96,10 +97,48 @@ static inline bool pxq_smin_enabled() {
     }();
     return on;
 }
-static inline bool pxq_kqw_enabled() {
+// PXA_PXQ_IMX (DEFAULT OFF, 2026-08-24): whether PXQ tiers consume an offered imatrix AT ALL.
+// Measured on Ornith-9B (580 chunks, wiki.test, clean A/B, P100, cross-card-verified): EVERY
+// consumption path is net-negative for PXQ4 —
+//   no-imatrix 8.3076 | kqw+SMIN 8.3317 | kqw 8.3420 | kqw+anchor-fit 8.3491 | raw 8.3542
+// (and the MXFP4-backbone exponent-search path carries ~0.019 of that damage on its own),
+// while the SAME imatrix file improves Q4_K_M by -0.0766. The PXQ lattice (fixed absmax
+// anchor, 16-step sub-scale) cannot express per-column importance without clamping
+// cold-column outliers. Until a codec-level design exists, an offered imatrix is IGNORED
+// for PXQ tiers (loud notice, once) so --imatrix cannot silently degrade a PXQ artifact;
+// PXA_PXQ_IMX=1 re-enables consumption (KQW form by default; PXA_PXQ_KQW=0 for raw).
+static inline bool pxq_imx_optin_enabled() {
     static const bool on = [](){
-        const bool v = pxq_fix_env_on("PXA_PXQ_KQW");
-        if (v) fprintf(stderr, "PXA_PXQ_KQW ARMED: k-quant imatrix weighting w = imx * sqrt(sigma2_row + x^2)\n");
+        const char * e = getenv("PXA_PXQ_IMX");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+static inline const float * pxq_imx_gate(const float * imx) {
+    if (!imx || pxq_imx_optin_enabled()) return imx;
+    static const bool warned = [](){
+        fprintf(stderr, "PXQ tiers: imatrix IGNORED (measured net-negative on the PXQ lattice; PXA_PXQ_IMX=1 to consume it — see pxq6-quantize.inc.cpp)\n");
+        return true;
+    }();
+    (void)warned;
+    return nullptr;
+}
+static inline bool pxq_kqw_enabled() {
+    // DEFAULT ON since 2026-08-24. The prior default (raw imatrix values as MSE weights) was
+    // MEASURED to make PXQ4 WORSE than no imatrix at all (Ornith-9B, 580 chunks, clean A/B:
+    // no-imx 8.3076 vs raw-imx 8.3542), while the SAME imatrix file improves Q4_K_M by -0.0766
+    // under stock llama.cpp weighting w = imx * sqrt(sigma2_row + x^2). Mechanism: raw imatrix
+    // columns span orders of magnitude, so inside a 16/8-wide sub-block the weighted argmin fits
+    // only the hottest columns and the coarse 16-candidate sub-scale then clamps the block's
+    // large-|x| entries on cold columns; the sqrt(sigma2+x^2) factor keeps per-element magnitude
+    // in the objective so the block scale still respects outliers. PXA_PXQ_KQW=0 restores the
+    // raw-imx weighting for A/B archaeology. No-imatrix artifacts are unaffected either way
+    // (w = 1 exactly on that path).
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ_KQW");
+        const bool v = !e || atoi(e) != 0;
+        if (v) fprintf(stderr, "PXQ imatrix weighting: k-quant form w = imx * sqrt(sigma2_row + x^2) (default; PXA_PXQ_KQW=0 for legacy raw-imx)\n");
+        else   fprintf(stderr, "PXA_PXQ_KQW=0: LEGACY raw-imatrix MSE weights (measured ppl REGRESSION vs no-imatrix on PXQ4; A/B use only)\n");
         return v;
     }();
     return on;
@@ -365,7 +404,7 @@ static void pxq3_quantize_tensor(const float * src, uint8_t * dst, int64_t R, in
     const int64_t exp_elems = R*K;
     const int64_t exp_bytes = (R/64)*(PXQ3_HDR_BYTES + (K/32)*(int64_t)PXQ3_SLAB_BYTES);
     auto imx_for = [&](int64_t e) -> const float * {
-        if (!imx) return nullptr;
+        if (!pxq_imx_gate(imx)) return nullptr;
         // dead-column guard (llama-quantize.cpp): an all-zero / non-finite imatrix column
         // makes every candidate score 0.0, degenerating the weighted argmin into a tie-break
         const float * w = nullptr;

@@ -858,7 +858,10 @@ static bool pxq4_legacy_native_class(const std::string & name) {
 //   dense ffn_{up,gate,down}             PXQ4      PXQ4HQ    PXQ6          PXQ6
 //   token_embd                           Q6_K      Q6_K      Q6_K          Q6_K   (row gather, not a GEMM)
 //   output (head)                        Q8_0 via pxa_pxq_head_type() — unchanged
-//   ssm_* / nextn.* / router / norms     unchanged (legacy pipeline)
+//   ssm_out                              backbone tier (2026-08-25; was the last flat-MXFP4
+//                                        landing in a passing PXQ run — see the class list)
+//   ssm_alpha / ssm_beta / nextn.*       Q8_0 (below the 64-row PXQ panel / MTP companions)
+//   router / norms                       unchanged (legacy pipeline)
 //   anything failing the slab geometry   Q8_0 fallback (never a silent MXFP4 demotion)
 //
 // Cost on Laguna-S-2.1: +0.45 GiB on a 62.0 GiB PXQ4 file (+0.73%).
@@ -971,6 +974,21 @@ static bool pxa_pxq_backbone_native_class(const std::string & name, const ggml_t
         pxa_name_is(name, "ffn_down.weight")) {
         return true;
     }
+    // DeltaNet output projection. Claimed 2026-08-25 — it was the LAST class still landing on
+    // flat MXFP4 in a passing PXQ4 run (30 tensors / 127.50 MiB / 0.7% of a 35B build, every
+    // one of them blk.N.ssm_out.weight at {4096, 2048}), which is exactly the landing the
+    // zero-MXFP4 rule exists to remove. It is not a codec limitation: {4096, 2048} clears the
+    // slab geometry with room to spare, the PXQ decode path already covers it (PXA_PXQ4_2D
+    // lists ssm_out among the 2D PXQ classes and has defaulted ON since BACKBONE_REV 2), and
+    // the SHIPPED 35B recipe already builds it as PXQ4 by hand via
+    // --custom-q '(ssm_out\.weight)=pxq4' — so the default recipe was the odd one out, not the
+    // ship recipe. At the PXQ4 backbone this is byte-parity with the MXFP4 it replaces
+    // (4.2526 vs 4.2500 bpw). ⚠ The direction is reasoned + byte-neutral, NOT measured on a
+    // paired perplexity: no ssm_out fidelity arm exists in this tree. PXA_PXQ_BACKBONE=lite
+    // (or =legacy) still leaves it on MXFP4, and an explicit --custom-q rule still wins.
+    if (pxa_name_is(name, "ssm_out.weight")) {
+        return true;
+    }
     return false;
 }
 
@@ -1025,11 +1043,12 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     if (pxa_name_is(name, "ssm_alpha.weight") || pxa_name_is(name, "ssm_beta.weight")) {
         return GGML_TYPE_Q8_0;
     }
-    // ssm_out (DeltaNet output projection, geometry-eligible): measured on Fusion4-35B
-    // 2026-07-28 — see the measurement note at this table's header. Left on the legacy landing
-    // until that measurement says otherwise; use --custom-q '(ssm_out\.weight)=pxq4' to build
-    // the native arm.
-    if (pxa_name_is(name, "ssm_out.weight"))            return GGML_TYPE_COUNT;   // DeltaNet: legacy in v1
+    // ssm_out (DeltaNet output projection) used to return GGML_TYPE_COUNT here, i.e. "leave it
+    // to the legacy pipeline" — and the legacy landing is flat MXFP4. Because the tensor is
+    // geometry-ELIGIBLE, the "geometry failure -> q8_0, never a silent MXFP4 demotion" rule
+    // below never covered it, so it was the one class that kept violating the zero-MXFP4 rule
+    // in an otherwise-passing PXQ run. It is now a backbone class like any other; see the note
+    // in pxa_pxq_backbone_native_class().
 
     // token embeddings: a row GATHER, never a GEMM, so the P100 "k-quants are slow" rule does
     // not apply. Q6_K kills 0.121 relative RMS + the MXFP4 gain bias for ~+0.08 GiB on Laguna.
@@ -1225,6 +1244,65 @@ static bool pxq4_tensor_eligible(const std::string & name, const ggml_tensor * t
     }
     const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
     return cfg.mode != PXA_BB_LEGACY && !cfg.lite && pxa_pxq_backbone_native_class(name, t);
+}
+
+// The type/size the write loop's native-PXQ dispatch will ACTUALLY produce for this tensor,
+// given the type the rules pipeline resolved (`rules_type`) and the whole-file tier. Returns
+// `rules_type` unchanged wherever no PXQ dispatch applies.
+//
+// This exists because three places need the same answer and only one of them used to have it:
+// the write loop (which had it inline), the --dry-run size projection, and the pre-flight
+// guard below. The dry-run branch sits in the `if (params->dry_run)` arm and the native PXQ
+// dispatch sits in the `else` arm, so a dry run accounted EVERY routed expert stack as its
+// MXFP4 default. On a MoE model that projects a few percent of PXQ-family bytes and trips the
+// end-of-run composition assertion — a failure the equivalent real run does not have. Any
+// reasoning done from `--dry-run` output about a PXQ target was reasoning about a path the
+// real run never takes.
+static ggml_type pxa_pxq_landing_type(const std::string & name, const ggml_tensor * t,
+                                      ggml_type rules_type, pxa_pxq_tier tier) {
+    const bool want_pxq = rules_type == GGML_TYPE_PXQ1 || rules_type == GGML_TYPE_PXQ2 ||
+                          rules_type == GGML_TYPE_PXQ3 || rules_type == GGML_TYPE_PXQ4 ||
+                          rules_type == GGML_TYPE_PXQ4HQ || rules_type == GGML_TYPE_PXQ6;
+    if (!pxq4_tensor_geometry_ok(t)) {
+        // mirrors the geometry-demote arm: an explicit PXQ target that geometry cannot honour
+        if (want_pxq) {
+            return pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
+        }
+        return rules_type;
+    }
+    if (want_pxq) {
+        return rules_type;                       // per-tensor target wins, geometry allows it
+    }
+    // an untouched MXFP4 default resolves to the whole-file tier. PXA_TIER_PXQU is NOT in this
+    // set on purpose: the write loop excludes pxqu_out from the same upgrade, because a
+    // UNIVERSAL mix is defined by its map, not by a whole-file tier.
+    if (rules_type != GGML_TYPE_MXFP4 || !pxq4_legacy_native_class(name)) {
+        return rules_type;
+    }
+    switch (tier) {
+        case PXA_TIER_PXQ1:   return GGML_TYPE_PXQ1;
+        case PXA_TIER_PXQ2:   return GGML_TYPE_PXQ2;
+        case PXA_TIER_PXQ3:   return GGML_TYPE_PXQ3;
+        case PXA_TIER_PXQ6:   return GGML_TYPE_PXQ6;
+        case PXA_TIER_PXQ4HQ: return GGML_TYPE_PXQ4HQ;
+        case PXA_TIER_PXQ4:   return GGML_TYPE_PXQ4;
+        default:              return rules_type;   // PXA_TIER_NONE / PXA_TIER_PXQU
+    }
+}
+
+// Byte size of a PXQ slab tensor. The slab layout is 64-row panels with an fp16 anchor header,
+// so it is NOT ggml_row_size() x nrows; these are the same expressions the write loop uses.
+// Returns 0 for a non-PXQ type.
+static size_t pxa_pxq_slab_size(ggml_type t, int64_t K, int64_t R, int64_t E) {
+    switch (t) {
+        case GGML_TYPE_PXQ1:   return (size_t) E*(R/64)*(PXQ1_HDR_BYTES  + (K/32)*(int64_t)PXQ1_SLAB_BYTES);
+        case GGML_TYPE_PXQ2:   return (size_t) E*(R/64)*(PXQ2_HDR_BYTES  + (K/32)*(int64_t)PXQ2_SLAB_BYTES);
+        case GGML_TYPE_PXQ3:   return (size_t) E*(R/64)*(PXQ3_HDR_BYTES  + (K/32)*(int64_t)PXQ3_SLAB_BYTES);
+        case GGML_TYPE_PXQ6:   return (size_t) E*(R/64)*(PXQ6R_HDR_BYTES + (K/32)*(int64_t)PXQ6R_SLAB_BYTES);
+        case GGML_TYPE_PXQ4:   return (size_t) E*(R/64)*(PXQ6_HDR_BYTES  + (K/32)*(int64_t)PXQ6_SLAB_BYTES);
+        case GGML_TYPE_PXQ4HQ: return (size_t) E*(R/64)*(PXQ6_HDR_BYTES  + (K/32)*(int64_t)PXQ6HQ_SLAB_BYTES);
+        default:               return 0;
+    }
 }
 
 // ============================================================================
@@ -1571,6 +1649,76 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     struct quantize_state_internal qs(model, params);
     // PXQ ftypes (incl. UNIVERSAL): flag so the output head defaults to q8_0 (pxa_pxq_head_type)
     qs.is_pxq = pxq6_out || pxq6hq_out || pxq6r_out || pxq1_out || pxq2_out || pxq3_out || pxqu_out;
+
+    // ---------------------------------------------------------------------------------------
+    // PXQ MoE PRE-FLIGHT (2026-08-25). A uniform PXQ target takes the overwhelming majority of
+    // its bytes from the routed expert stacks. If those cannot land on a PXQ type, the run
+    // still does the ENTIRE quantize, then the end-of-run composition assertion deletes every
+    // file it wrote and reports a bare percentage. On a large MoE that is hours of work for a
+    // number and no output, and nothing in the message says which flag would have helped.
+    //
+    // Every input to that verdict is in the loader's tensor metadata before the first byte is
+    // written, so refuse HERE and name the flag. Deliberately narrow: it fires only when NO
+    // routed expert stack can be claimed, which is the case the assertion is certain to catch.
+    // A partial shortfall is a warning, not a refusal -- the tier map / --custom-q may well
+    // make up the difference and only the real composition can settle it.
+    if (pxq_tier != PXA_TIER_NONE && pxq_tier != PXA_TIER_PXQU) {
+        // CustomQ is a function-local alias at every use site, not a file-scope type.
+        using CustomQ = std::pair<std::string, ggml_type>;
+        const auto * rules = params->custom_quants
+            ? static_cast<const std::vector<CustomQ>*>(params->custom_quants) : nullptr;
+        const bool have_rules = rules && !rules->empty();
+
+        int  n_exps = 0, n_exps_ok = 0;
+        std::string bad_example;
+        for (const auto & w : ml.weights) {
+            const std::string tname(ggml_get_name(w.tensor));
+            if (!pxa_name_ends(tname, "_exps.weight")) {
+                continue;
+            }
+            ++n_exps;
+            if (pxq4_tensor_geometry_ok(w.tensor)) {
+                ++n_exps_ok;
+            } else if (bad_example.empty()) {
+                bad_example = format("%s [%" PRId64 " x %" PRId64 " x %" PRId64 "]", tname.c_str(),
+                                     w.tensor->ne[0], w.tensor->ne[1], w.tensor->ne[2]);
+            }
+        }
+
+        const int n_expert = (int) model.hparams.n_expert;
+        if (n_expert > 1 && n_exps == 0 && !have_rules) {
+            // The model declares routed experts but NOTHING matches the name the PXQ expert
+            // path keys on. Every expert byte would ride the backbone's MXFP4 default and the
+            // composition assertion would refuse the result -- after the full run. This is the
+            // one case a --custom-q rule genuinely fixes, so name it.
+            throw std::runtime_error(format(
+                "PXQ pre-flight: this model declares %d routed experts, but NONE of its tensors "
+                "match the '*_exps.weight' name the PXQ native expert path claims. Every expert "
+                "stack would fall to the backbone's MXFP4 default, and the end-of-run "
+                "composition assertion would then delete the output -- after the whole quantize. "
+                "Claim the stacks explicitly, e.g. "
+                "--custom-q '(ffn_down_exps|ffn_gate_exps|ffn_up_exps)\\.weight=pxq3' with the "
+                "names this model actually uses (llama-gguf / gguf_dump on the source lists "
+                "them), or pick a stock ftype instead of a PXQ tier.", n_expert));
+        }
+        if (n_exps > 0 && n_exps_ok == 0) {
+            // Named correctly, but no stack clears the slab geometry, so no PXQ tier can encode
+            // them at all and no flag changes that. Say so now rather than after the run.
+            throw std::runtime_error(format(
+                "PXQ pre-flight: all %d routed expert stacks fail PXQ slab geometry (need "
+                "rows %% 64 == 0 and K %% 32 == 0); first offender %s. No PXQ tier can encode "
+                "them, so this target would produce a file that is almost entirely non-PXQ and "
+                "the end-of-run composition assertion would delete it. Quantize this model to a "
+                "stock ftype (e.g. Q4_K_M / MXFP4) instead.",
+                n_exps, bad_example.c_str()));
+        }
+        if (n_exps > 0 && n_exps_ok < n_exps) {
+            LLAMA_LOG_WARN("%s: PXQ pre-flight: %d of %d routed expert stacks fail PXQ slab "
+                           "geometry and will land on q8_0 (first: %s). The rest still take the "
+                           "%s tier.\n", __func__, n_exps - n_exps_ok, n_exps, bad_example.c_str(),
+                           llama_model_ftype_name(params->ftype).c_str());
+        }
+    }
 
     if (params->only_copy) {
         ftype = model.ftype;
@@ -2238,7 +2386,19 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             fflush(stdout);
 
             if (params->dry_run) {
-                new_size = tensor->ne[2] * tensor->ne[1] * ggml_row_size(new_type, tensor->ne[0]);
+                // Project the SAME landing the else-arm below would produce. Without this the
+                // dry run reported every PXQ-eligible tensor as its MXFP4 default, which on a
+                // MoE model made the composition summary (and the assertion that reads it)
+                // describe a file the real run never writes.
+                const ggml_type landing = pxa_pxq_landing_type(name, tensor, new_type, pxq_tier);
+                if (landing != new_type) {
+                    LLAMA_LOG_INFO("[dry-run: PXQ dispatch -> %s] ", ggml_type_name(landing));
+                    new_type = landing;
+                }
+                const size_t slab = pxa_pxq_slab_size(new_type, tensor->ne[0], tensor->ne[1],
+                                                      tensor->ne[2]*tensor->ne[3]);
+                new_size = slab ? slab
+                                : tensor->ne[2] * tensor->ne[1] * ggml_row_size(new_type, tensor->ne[0]);
             } else {
                 float * f32_data;
 

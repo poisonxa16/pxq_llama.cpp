@@ -543,6 +543,20 @@ void quantize_row_mxfp4(const float * x, void * y, int64_t k) {
 
 size_t quantize_mxfp4(const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix,
          [[maybe_unused]] const quantize_user_data * user_data) {
+    // PXA_PXQ_IMX (DEFAULT OFF, 2026-08-24): the MXFP4 weighted-exponent imatrix path is
+    // measured net-negative under the PXQ backbone (bisect: removing it alone recovered
+    // 8.3420 -> 8.3231 on Ornith-9B, still above the 8.3076 no-imatrix artifact). An offered
+    // imatrix is ignored unless PXA_PXQ_IMX=1 (same opt-in as the PXQ tiers; notice printed
+    // once by the PXQ gate or here, whichever consumes first).
+    if (imatrix && !(getenv("PXA_PXQ_IMX") && atoi(getenv("PXA_PXQ_IMX")) != 0)) {
+        static const bool warned = [](){
+            fprintf(stderr, "mxfp4: imatrix IGNORED (measured net-negative under the PXQ backbone; PXA_PXQ_IMX=1 to consume it)\n");
+            return true;
+        }();
+        (void)warned;
+        imatrix = nullptr;
+    }
+
     constexpr int kBlockSize = QK_MXFP4;
     GGML_ASSERT(n_per_row%kBlockSize == 0);
     auto row_size = ggml_row_size(GGML_TYPE_MXFP4, n_per_row);

@@ -540,6 +540,17 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // Totals as they appear in the SOURCE GGUF, captured from the loader at load time.
+    // NOT derived from tensors_by_name: a tied output head is materialised by
+    // llama_model_loader::create_tensor_for(..., duplicated = true), which ggml_dup_tensor()s
+    // a SECOND tensor carrying the same name and the same data. Walking the model contexts
+    // therefore sees the token embedding twice, so llama_model_size() / llama_model_n_params()
+    // -- what llama-bench prints as model_size / n_params -- counted a tied embedding twice.
+    // These fields make both accessors report the file's own totals, which is also what
+    // upstream reports, so a side-by-side lines up.
+    uint64_t n_elements = 0;
+    size_t   n_bytes    = 0;
+
     int64_t t_load_us = 0;
     int64_t t_start_us = 0;
 

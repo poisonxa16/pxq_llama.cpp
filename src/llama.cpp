@@ -4672,6 +4672,13 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
 
+        // Capture the SOURCE GGUF totals before any tensor is created. llama_model_size() /
+        // llama_model_n_params() report these rather than summing tensors_by_name, which
+        // double-counts a tied output head (the loader ggml_dup_tensor()s a second copy of the
+        // token embedding for it, so the model contexts genuinely hold two tensors).
+        model.n_elements = (uint64_t) ml.n_elements;
+        model.n_bytes    = ml.n_bytes;
+
         llm_load_print_meta(ml, model);
 
         // PXA model profile (2026-07-29): register the loaded model's identity with ggml so
@@ -9233,6 +9240,15 @@ int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t bu
 }
 
 uint64_t llama_model_size(const struct llama_model * model) {
+    // The source GGUF's own byte total (see llama_model::n_bytes). Summing tensors_by_name
+    // instead counts a TIED output head twice: the loader materialises it with
+    // create_tensor_for(..., duplicated = true), i.e. a second ggml tensor holding the same
+    // token-embedding data, and both live in the model contexts that tensors_by_name walks.
+    // llama-bench prints this as model_size, so the double count showed up in every
+    // side-by-side against upstream (which reports the loader total).
+    if (model->n_bytes > 0) {
+        return model->n_bytes;
+    }
     uint64_t size = 0;
     for (const auto & it : model->tensors_by_name) {
         size += ggml_nbytes(it.second);
@@ -9259,6 +9275,11 @@ const char* llama_model_chat_template(const struct llama_model* model, const cha
 }
 
 uint64_t llama_model_n_params(const struct llama_model * model) {
+    // Same accounting as llama_model_size(): the file's own element total. A tied output head
+    // is one set of parameters, not two -- see llama_model::n_elements.
+    if (model->n_elements > 0) {
+        return model->n_elements;
+    }
     uint64_t nparams = 0;
     for (const auto & it : model->tensors_by_name) {
         nparams += ggml_nelements(it.second);

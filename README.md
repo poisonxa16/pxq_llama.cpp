@@ -397,9 +397,17 @@ to just your card for a faster build.
 git clone https://github.com/poisonxa16/pxq_llama && cd pxq_llama
 # inside an nvidia/cuda:12.8.1-devel image (or a matching local toolchain):
 cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES="60;61;70;86;89" -DGGML_CUDA=ON
-cmake --build build --target llama-server llama-quantize llama-perplexity -j
+cmake --build build --target llama-server llama-quantize llama-perplexity llama-imatrix -j
+# (or plain `cmake --build build -j` to build everything, llama-imatrix included)
 # NOTE: linking needs the CUDA driver lib (run under --runtime=nvidia, or have libcuda on the link path).
 ```
+
+> **CUDA stub trap (runtime).** If you added `/usr/local/cuda/lib64/stubs` to `LIBRARY_PATH`
+> or `LD_LIBRARY_PATH` to satisfy the *link* (common inside build containers without
+> `--runtime=nvidia`), **remove it before running**. The stub `libcuda.so` shadows the real
+> driver at runtime: every binary silently falls back to CPU-only execution with no error —
+> it looks exactly like a broken GPU tier and costs an afternoon. Link with the stub, run
+> without it.
 
 ## Run
 
