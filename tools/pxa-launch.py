@@ -275,23 +275,50 @@ VLLM_IMAGES = {
         "caps": {60}, "status": "MEASURED",
         "why": "produced every MoE-crossover vLLM number (MOE-CROSSOVER.md:77-82; "
                "libpxq4_sm60_v8.so, --attention-backend PASCAL_SDPA)"},
+    # The fat image's sm_70 half was carried here as caps_inferred={70}. That inference is
+    # now DISPROVEN, so it is gone: 8 boot attempts on a Tesla V100, 8 failures, gated
+    # 2026-08-25 (RELEASE-GATE.md 3.7). Root cause is structural, not configuration -
+    # VLLM_SKIP_C_STABLE=1 is required to build against torch 2.7.1 (the last torch with
+    # sm_60 cubins) and it drops csrc/libtorch_stable/, where an op the V100 serving path
+    # calls unconditionally lives. sm_60 is unaffected and still MEASURED.
     "1cat-vllm:fat6070": {
-        "caps": {60}, "caps_inferred": {70}, "status": "MEASURED",
-        "why": "live container fat-smoke-588671 healthy on sm_60 TP=2; the sm_70 half of the "
-               "fat build is [INFERRED] - no throughput number exists for it"},
+        "caps": {60}, "status": "MEASURED",
+        "why": "live container fat-smoke-588671 healthy on sm_60 TP=2. sm_70 was INFERRED here "
+               "and is now DISPROVEN: 8/8 boot failures on V100 (RELEASE-GATE.md 3.7). Never "
+               "route a Volta card to this image"},
+    "pxa-vllm:sm60-sm70": {
+        "caps": {60}, "status": "MEASURED",
+        "why": "same build as 1cat-vllm:fat6070. THE TAG OVERSTATES IT - sm_70 does not boot. "
+               "Retagged or withdrawn before release; sm_60 half is sound"},
+
+    # The two-image split (scripts/build-images.sh). Both built from our own tree - no
+    # third-party image is in this table's eligible set any more.
+    "pxa-vllm:sm60": {
+        "caps": {60}, "status": "MEASURED",
+        "why": "Pascal variant: torch 2.7.1 (last torch shipping sm_60 cubins), "
+               "VLLM_SKIP_C_STABLE=1, arch 6.0;7.0. Same build the sm_60 gate passed on"},
+    "pxa-vllm:sm70": {
+        "caps": set(), "caps_inferred": {70}, "status": "INFERRED",
+        "why": "Volta variant: torch 2.10 (the tree's own pins), libtorch_stable BUILT, no "
+               "compat shim - so the three torch-2.7.1 failures cannot occur by construction. "
+               "NOT YET GATED. caps is deliberately EMPTY until a V100 smoke passes: this "
+               "launcher does not route traffic to an image on the strength of an argument"},
+
     "kewaii/vllm:latest": {
         "caps": set(), "status": "INELIGIBLE",
-        "why": "silently overrides cudagraph_mode back to FULL_AND_PIECEWISE from its own SM70 "
-               "compile policy, and the knob it honours crash-loops 3/3 at warmup "
-               "(DGX-FDO-FAILURE.md). Not eligible for any seat this launcher declares healthy "
-               "until a derived image lands (task #86)"},
+        "why": "THIRD-PARTY image. Everything we ship must be buildable from our own tree, and "
+               "pxa-vllm:sm70 replaces this. Technically it also silently overrode "
+               "cudagraph_mode from its own SM70 compile policy, and the knob it honours "
+               "crash-loops 3/3 at warmup (DGX-FDO-FAILURE.md)"},
 }
 # MEASURED per-class attention backend.
 ATTN_BACKEND = {
     60: ("PASCAL_SDPA", "MEASURED - the arm that produced every MoE-crossover vLLM cell "
                         "(MOE-CROSSOVER.md:81)"),
     70: ("FLASH_ATTN_V100", "[INFERRED] - from launch-v100b.sh / alina-launch.sh recipes; no "
-                            "engine-vs-engine number was ever taken on sm_70"),
+                            "engine-vs-engine number was ever taken on sm_70, and as of "
+                            "2026-08-25 no vLLM image in this table has a GATED sm_70 seat "
+                            "at all (RELEASE-GATE.md 3.7)"),
 }
 
 

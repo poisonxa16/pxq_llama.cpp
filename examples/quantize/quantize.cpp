@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cctype>
 #include <vector>
 #include <string>
@@ -523,6 +524,8 @@ int main(int argc, char ** argv) {
     int m_last_call = prepare_imatrix(imatrix_file, imatrix_dataset, included_weights, excluded_weights, imatrix_data);
     if (!imatrix_data.empty()) {
         params.imatrix = &imatrix_data;
+    }
+    if (!imatrix_data.empty()) {
         {
             llama_model_kv_override kvo;
             std::strcpy(kvo.key, LLM_KV_QUANTIZE_IMATRIX_FILE);
@@ -746,6 +749,91 @@ int main(int argc, char ** argv) {
     // load the model
     {
         const int64_t t_start_us = llama_time_us();
+
+    // -------------------------------------------------------------------------------------
+    // IMATRIX PROVENANCE MUST DESCRIBE WHAT WAS CONSUMED, NOT WHAT WAS SUPPLIED.
+    //
+    // The imatrix KVs above are assembled from the mere presence of --imatrix, and they are
+    // assembled BEFORE params.ftype is parsed from argv - so the target type is not knowable
+    // at that point. (A first attempt at this fix put the check up there and it silently
+    // never fired, because params.ftype was still its default.) The decision therefore has
+    // to happen here, once the target IS known and before llama_model_quantize consumes
+    // params.kv_overrides.
+    //
+    // Why it matters: since 2026-08-25 the PXQ tiers IGNORE an offered imatrix by default
+    // (measured net-negative on the PXQ lattice, 8.3076 without vs 8.3542 with). A PXQ4 file
+    // built with --imatrix was therefore advertising provenance it did not have - the
+    // imatrix touched zero tensors and payloads were byte-identical to a no-imatrix build,
+    // yet quantize.imatrix.file was written. This tree's own audit tooling reads that key to
+    // decide whether an artifact was imatrix-quantized, so it false-positived on our files.
+    //
+    // Narrow by construction: only a PXQ TARGET with the gate on. K-quant targets untouched,
+    // and params.imatrix is still passed through - the library gate decides per tier, and a
+    // Q6_K output head can legitimately consume an imatrix on a PXQ target.
+    {
+        const bool pxq_target =
+            params.ftype == (llama_ftype) 248 || params.ftype == (llama_ftype) 252 ||
+            params.ftype == (llama_ftype) 253 || params.ftype == (llama_ftype) 254 ||
+            params.ftype == (llama_ftype) 255 || params.ftype == (llama_ftype) 256 ||
+            params.ftype == (llama_ftype) 257;
+        const char * e = getenv("PXA_PXQ_IMX");
+        const bool optin = e && atoi(e) != 0;
+        if (pxq_target && !optin && !imatrix_data.empty()) {
+            static const char * drop[] = {
+                LLM_KV_QUANTIZE_IMATRIX_FILE, LLM_KV_QUANTIZE_IMATRIX_DATASET,
+                LLM_KV_QUANTIZE_IMATRIX_N_ENTRIES, LLM_KV_QUANTIZE_IMATRIX_N_CHUNKS,
+            };
+            // drop the sentinel first; it must stay LAST after we are done editing
+            if (!kv_overrides.empty() && kv_overrides.back().key[0] == 0) {
+                kv_overrides.pop_back();
+            }
+            kv_overrides.erase(
+                std::remove_if(kv_overrides.begin(), kv_overrides.end(),
+                    [&](const llama_model_kv_override & o) {
+                        for (const char * d : drop) {
+                            if (std::strcmp(o.key, d) == 0) return true;
+                        }
+                        return false;
+                    }),
+                kv_overrides.end());
+            // Removing our own overrides is NOT enough. A requantize INHERITS the source
+            // GGUF's imatrix KVs, so dropping ours just exposes the previous quantizer's
+            // claim - measured: a PXQ4 built from an Unsloth Q8_0 came out advertising
+            // 'Qwen3-0.6B-GGUF/imatrix_unsloth.dat', an imatrix this run never opened.
+            // (That inheritance is a pre-existing bug in its own right and is not limited
+            // to PXQ: any K-quant requantize re-asserts its source's provenance too.)
+            // So OVERRIDE the keys with truthful values rather than deleting them - an
+            // auditor reading entries_count gets 0, which is the honest answer.
+            auto push_str = [&](const char * k, const char * v) {
+                llama_model_kv_override o;
+                std::memset(&o, 0, sizeof(o));
+                std::strcpy(o.key, k);
+                o.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+                strncpy(o.val_str, v, 127);
+                o.val_str[127] = '\0';
+                kv_overrides.emplace_back(std::move(o));
+            };
+            push_str(LLM_KV_QUANTIZE_IMATRIX_FILE,    "");
+            push_str(LLM_KV_QUANTIZE_IMATRIX_DATASET, "");
+            {
+                llama_model_kv_override o;
+                std::memset(&o, 0, sizeof(o));
+                std::strcpy(o.key, LLM_KV_QUANTIZE_IMATRIX_N_ENTRIES);
+                o.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+                o.val_i64 = 0;
+                kv_overrides.emplace_back(std::move(o));
+            }
+            push_str("quantize.imatrix.ignored_by", "pxq-tiers (PXA_PXQ_IMX unset)");
+            kv_overrides.emplace_back();
+            kv_overrides.back().key[0] = 0;
+            params.kv_overrides = &kv_overrides;
+            fprintf(stderr,
+                "main: NOTE: --imatrix supplied, but the PXQ tiers ignore it by default. "
+                "Writing quantize.imatrix.ignored_by instead of the standard provenance keys, "
+                "which would claim a consumption that did not happen. PXA_PXQ_IMX=1 to "
+                "consume it.\n");
+        }
+    }
 
         if (llama_model_quantize(fname_inp.c_str(), fname_out.c_str(), &params)) {
             fprintf(stderr, "%s: failed to quantize model from '%s'\n", __func__, fname_inp.c_str());
