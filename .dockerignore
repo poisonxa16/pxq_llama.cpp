@@ -1,0 +1,55 @@
+/.venv
+/build
+dist
+vllm/*.so
+vllm/*.so.*
+vllm/*.abi3.so
+vllm/*.abi3.so.*
+vllm/vllm-rs
+
+# Local generated artifacts. These can be very large and are not needed for
+# source builds inside Docker.
+/.deps
+/bench_results
+/flash-attention-v100/build
+/flash-attention-v100/*.so
+/flash-attention-v100/*.so.*
+/install
+/.pytest_cache
+/.ruff_cache
+/.serena
+/.gemini
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+.mypy_cache
+
+# Distribution / packaging
+.Python
+/build/
+cmake-build-*/
+CMakeUserPresets.json
+develop-eggs/
+/dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+rust/target/
+
+# Local wheel output dirs; a stale wheel here would satisfy the install step's find.
+dist-cu128-sm70
+build6070

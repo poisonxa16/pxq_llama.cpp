@@ -1,0 +1,444 @@
+--- a/csrc/flash_attn/flash_api_torch_lib.cpp
++++ b/csrc/flash_attn/flash_api_torch_lib.cpp
+@@ -22,6 +22,17 @@
+     double softmax_scale,
+     bool causal);
+
++at::Tensor sm70_d256_splitd_dense_splitkv3_fwd(
++    const at::Tensor &q,
++    const at::Tensor &k,
++    const at::Tensor &v,
++    at::Tensor &partial_out,
++    at::Tensor &partial_max,
++    at::Tensor &partial_sum,
++    at::Tensor &out,
++    double softmax_scale,
++    bool causal);
++
+ at::Tensor sm70_d256_splitd_paged_fwd(
+     const at::Tensor &q,
+     const at::Tensor &k,
+@@ -87,6 +98,13 @@
+     ops.impl("sm70_d256_splitd_n32_dense_fwd", torch::kCUDA,
+              make_pytorch_shim(&sm70_d256_splitd_dense_fwd));
+
++    ops.def("sm70_d256_splitd_n32_dense_splitkv3_fwd(Tensor q, Tensor k, "
++            "Tensor v, Tensor(a!) partial_out, Tensor(b!) partial_max, "
++            "Tensor(c!) partial_sum, Tensor(d!) out, float softmax_scale, "
++            "bool causal) -> Tensor(d!)");
++    ops.impl("sm70_d256_splitd_n32_dense_splitkv3_fwd", torch::kCUDA,
++             make_pytorch_shim(&sm70_d256_splitd_dense_splitkv3_fwd));
++
+     ops.def("sm70_d256_splitd_n32_paged_fwd(Tensor q, Tensor k, Tensor v, "
+             "Tensor block_table, Tensor(a!) out, int kv_len, float softmax_scale, "
+             "bool causal) -> Tensor(a!)");
+--- a/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
++++ b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
+@@ -362,7 +362,7 @@
+         + (tid % kThreadsPerRow) * kElemsPerLoad;
+ }
+
+-template <typename Element, bool PagedKV>
++template <typename Element, bool PagedKV, bool SplitKV3 = false>
+ __global__ __launch_bounds__(Sm70D256SplitDTraits::kNThreads, 1)
+ void sm70_d256_splitd_dense_kernel(
+     const Element *__restrict__ q,
+@@ -385,7 +385,10 @@
+     float softmax_scale_log2,
+     const int *__restrict__ block_table,
+     int page_size,
+-    int block_table_batch_stride) {
++    int block_table_batch_stride,
++    float *__restrict__ partial_out,
++    float *__restrict__ partial_max,
++    float *__restrict__ partial_sum) {
+     using Traits = Sm70D256SplitDTraits;
+     constexpr int kBlockM = Traits::kBlockM;
+     constexpr int kBlockN = Traits::kBlockN;
+@@ -396,7 +399,8 @@
+     const int mma_group = warp / Traits::kWarpsPerGroup;
+     const int lane = tid % Traits::kMmaThreads;
+     const int m_block = blockIdx.x;
+-    const int batch = blockIdx.y;
++    const int split = SplitKV3 ? blockIdx.y % 3 : 0;
++    const int batch = SplitKV3 ? blockIdx.y / 3 : blockIdx.y;
+     const int head_q = blockIdx.z;
+     const int head_kv = head_q / (heads_q / heads_kv);
+     const int query_row_base = m_block * kBlockM;
+@@ -473,7 +477,13 @@
+     const int n_block_limit = max_kv_for_tile < kv_len
+         ? max_kv_for_tile
+         : kv_len;
+-    const int n_block_max = cute::ceil_div(n_block_limit, kBlockN) - 1;
++    const int visible_n_blocks = cute::ceil_div(n_block_limit, kBlockN);
++    int n_block_min = 0;
++    int n_block_max = visible_n_blocks - 1;
++    if constexpr (SplitKV3) {
++        n_block_min = visible_n_blocks * split / 3;
++        n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
++    }
+
+     const int64_t k_batch_offset = PagedKV
+         ? 0
+@@ -508,7 +518,7 @@
+     copy_even_tile(gmem_k_copy, tKgKFirst, tKsK);
+     __syncthreads();
+
+-    for (int n_block = n_block_max; n_block >= 0; --n_block) {
++    for (int n_block = n_block_max; n_block >= n_block_min; --n_block) {
+         const int n_warp = warp & 1;
+         const int group_row_base = mma_group * Traits::kGroupRows;
+         const int qk_row_base = group_row_base
+@@ -704,7 +714,7 @@
+                 store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
+                 store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
+                 __syncthreads();
+-                if (n_block > 0) {
++                if (n_block > n_block_min) {
+                     auto gKNextBlock = local_tile(
+                         mK,
+                         Shape<Int<kBlockN>, Int<kDChunk>>{},
+@@ -731,7 +741,7 @@
+                 }
+             }
+         }
+-        if (n_block > 0) {
++        if (n_block > n_block_min) {
+             cute::copy(tKrKNext, tKsK);
+             __syncthreads();
+         }
+@@ -749,56 +759,144 @@
+         row_sum[slot] = FLASH_NAMESPACE::sm70_row_allreduce_8(
+             row_sum[slot], sum_op);
+     }
+-    if ((lane & 0x0e) == 0) {
+-#pragma unroll
+-        for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
+-            const int row = FLASH_NAMESPACE::sm70_row_slot<
+-                Traits::kQkWarpRows>(slot, lane);
+-            row_sum_exchange[
+-                mma_group * Traits::kGroupRows
+-                + n_warp * Traits::kQkWarpRows + row] = row_sum[slot];
++    if constexpr (SplitKV3) {
++        const int64_t split_row_stride =
++            static_cast<int64_t>(gridDim.y / 3) * query_len * heads_q;
++        if ((lane & 0x0e) == 0) {
++#pragma unroll
++            for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
++                const int row = FLASH_NAMESPACE::sm70_row_slot<
++                    Traits::kQkWarpRows>(slot, lane);
++                const int query_row = query_row_base
++                    + group_row_base + n_warp * Traits::kQkWarpRows + row;
++                const int64_t row_offset =
++                    (static_cast<int64_t>(batch) * query_len + query_row)
++                        * heads_q
++                    + head_q;
++                const int64_t partial_row =
++                    split * split_row_stride + row_offset;
++                partial_max[partial_row] = row_max[slot];
++                partial_sum[partial_row] = row_sum[slot];
++            }
+         }
+-    }
+-    __syncthreads();
+
+-    const int64_t out_batch_offset =
+-        static_cast<int64_t>(batch) * query_len * heads_q * Traits::kHeadDim;
+ #pragma unroll
+-    for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
+-        auto acc_o = make_tensor(
+-            make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
+-        auto acc_o_rc = make_tensor(
+-            acc_o.data(),
+-            FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+-#pragma unroll
+-        for (int row = 0; row < Traits::kOutputRowsPerThread; ++row) {
+-            const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
+-                Traits::kGroupRows>(row, lane);
+-            const float inv_sum = 1.0f / row_sum_exchange[
+-                mma_group * Traits::kGroupRows + logical_row];
++        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
++            auto acc_o = make_tensor(
++                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
++            auto cO = make_identity_tensor(
++                Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
++            auto tOcO = pv_mma_thread.partition_C(cO);
++#pragma unroll
++            for (int i = 0; i < size(acc_o); ++i) {
++                const int row = get<0>(tOcO(i));
++                const int col = get<1>(tOcO(i));
++                const int query_row = query_row_base + group_row_base + row;
++                const int64_t row_offset =
++                    (static_cast<int64_t>(batch) * query_len + query_row)
++                        * heads_q
++                    + head_q;
++                const int64_t partial_row =
++                    split * split_row_stride + row_offset;
++                const int d =
++                    (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
++                partial_out[partial_row * Traits::kHeadDim + d] = acc_o(i);
++            }
++        }
++    } else {
++        if ((lane & 0x0e) == 0) {
+ #pragma unroll
+-            for (int col = 0; col < size<1>(acc_o_rc); ++col) {
+-                acc_o_rc(row, col) *= inv_sum;
++            for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
++                const int row = FLASH_NAMESPACE::sm70_row_slot<
++                    Traits::kQkWarpRows>(slot, lane);
++                row_sum_exchange[
++                    mma_group * Traits::kGroupRows
++                    + n_warp * Traits::kQkWarpRows + row] = row_sum[slot];
+             }
+         }
++        __syncthreads();
+
+-        auto cO = make_identity_tensor(
+-            Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
+-        auto tOcO = pv_mma_thread.partition_C(cO);
+-#pragma unroll
+-        for (int i = 0; i < size(acc_o); ++i) {
+-            const int row = get<0>(tOcO(i));
+-            const int col = get<1>(tOcO(i));
+-            const int query_row = query_row_base + group_row_base + row;
+-            const int64_t offset = out_batch_offset
+-                + static_cast<int64_t>(query_row) * heads_q * Traits::kHeadDim
+-                + head_q * Traits::kHeadDim
+-                + (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
+-            out[offset] = Element(acc_o(i));
++        const int64_t out_batch_offset = static_cast<int64_t>(batch)
++            * query_len * heads_q * Traits::kHeadDim;
++#pragma unroll
++        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
++            auto acc_o = make_tensor(
++                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
++            auto acc_o_rc = make_tensor(
++                acc_o.data(),
++                FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
++#pragma unroll
++            for (int row = 0; row < Traits::kOutputRowsPerThread; ++row) {
++                const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
++                    Traits::kGroupRows>(row, lane);
++                const float inv_sum = 1.0f / row_sum_exchange[
++                    mma_group * Traits::kGroupRows + logical_row];
++#pragma unroll
++                for (int col = 0; col < size<1>(acc_o_rc); ++col) {
++                    acc_o_rc(row, col) *= inv_sum;
++                }
++            }
++
++            auto cO = make_identity_tensor(
++                Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
++            auto tOcO = pv_mma_thread.partition_C(cO);
++#pragma unroll
++            for (int i = 0; i < size(acc_o); ++i) {
++                const int row = get<0>(tOcO(i));
++                const int col = get<1>(tOcO(i));
++                const int query_row = query_row_base + group_row_base + row;
++                const int64_t offset = out_batch_offset
++                    + static_cast<int64_t>(query_row) * heads_q
++                        * Traits::kHeadDim
++                    + head_q * Traits::kHeadDim
++                    + (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk
++                    + col;
++                out[offset] = Element(acc_o(i));
++            }
+         }
+     }
+ }
+
++template <typename Element>
++__global__ __launch_bounds__(Sm70D256SplitDTraits::kHeadDim, 1)
++void sm70_d256_splitkv3_merge_kernel(
++    const float *__restrict__ partial_out,
++    const float *__restrict__ partial_max,
++    const float *__restrict__ partial_sum,
++    Element *__restrict__ out,
++    int64_t rows,
++    float softmax_scale_log2) {
++    const int64_t row = blockIdx.x;
++    const int d = threadIdx.x;
++    __shared__ float merge[4];
++    if (d == 0) {
++        const float max0 = partial_max[row];
++        const float max1 = partial_max[rows + row];
++        const float max2 = partial_max[2 * rows + row];
++        const float global_max = fmaxf(fmaxf(max2, max1), max0);
++        const float scale2 = exp2f((max2 - global_max) * softmax_scale_log2);
++        const float scale1 = exp2f((max1 - global_max) * softmax_scale_log2);
++        const float scale0 = exp2f((max0 - global_max) * softmax_scale_log2);
++        const float denominator =
++            (partial_sum[2 * rows + row] * scale2
++             + partial_sum[rows + row] * scale1)
++            + partial_sum[row] * scale0;
++        merge[0] = scale0;
++        merge[1] = scale1;
++        merge[2] = scale2;
++        merge[3] = 1.0f / denominator;
++    }
++    __syncthreads();
++
++    const int64_t element = row * Sm70D256SplitDTraits::kHeadDim + d;
++    const int64_t split_stride = rows * Sm70D256SplitDTraits::kHeadDim;
++    const float numerator =
++        (partial_out[2 * split_stride + element] * merge[2]
++         + partial_out[split_stride + element] * merge[1])
++        + partial_out[element] * merge[0];
++    out[element] = Element(numerator * merge[3]);
++}
++
+ at::Tensor sm70_d256_splitd_dense_fwd(
+     const at::Tensor &q,
+     const at::Tensor &k,
+@@ -881,7 +979,137 @@
+         static_cast<float>(softmax_scale * M_LOG2E),
+         nullptr,
+         0,
+-        0);
++        0,
++        nullptr,
++        nullptr,
++        nullptr);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return out;
++}
++
++at::Tensor sm70_d256_splitd_dense_splitkv3_fwd(
++    const at::Tensor &q,
++    const at::Tensor &k,
++    const at::Tensor &v,
++    at::Tensor &partial_out,
++    at::Tensor &partial_max,
++    at::Tensor &partial_sum,
++    at::Tensor &out,
++    double softmax_scale,
++    bool causal) {
++    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda()
++                    && partial_out.is_cuda() && partial_max.is_cuda()
++                    && partial_sum.is_cuda() && out.is_cuda(),
++                "split-KV3 inputs and workspaces must be CUDA tensors");
++    TORCH_CHECK(q.scalar_type() == at::ScalarType::Half
++                    && k.scalar_type() == q.scalar_type()
++                    && v.scalar_type() == q.scalar_type()
++                    && out.scalar_type() == q.scalar_type(),
++                "split-KV3 requires FP16 q, k, v, and out");
++    TORCH_CHECK(partial_out.scalar_type() == at::ScalarType::Float
++                    && partial_max.scalar_type() == at::ScalarType::Float
++                    && partial_sum.scalar_type() == at::ScalarType::Float,
++                "split-KV3 workspaces must use FP32");
++    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
++                "split-KV3 q, k, and v must be rank four");
++    TORCH_CHECK(q.size(0) == k.size(0) && k.sizes() == v.sizes(),
++                "split-KV3 batch and K/V shapes must match");
++    TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous(),
++                "split-KV3 out must be contiguous and match q");
++    TORCH_CHECK(q.size(3) == Sm70D256SplitDTraits::kHeadDim
++                    && k.size(3) == Sm70D256SplitDTraits::kHeadDim,
++                "split-KV3 requires D256");
++    TORCH_CHECK(q.size(2) % k.size(2) == 0,
++                "split-KV3 query heads must be divisible by KV heads");
++    TORCH_CHECK(k.size(1) > q.size(1),
++                "split-KV3 requires prefix prefill");
++    TORCH_CHECK(q.size(1) % Sm70D256SplitDTraits::kBlockM == 0
++                    && k.size(1) % Sm70D256SplitDTraits::kBlockN == 0,
++                "split-KV3 lengths must match the exact N32 tiles");
++    TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
++                "split-KV3 requires unit inner strides");
++    TORCH_CHECK(q.stride(0) <= std::numeric_limits<int>::max()
++                    && q.stride(1) <= std::numeric_limits<int>::max()
++                    && q.stride(2) <= std::numeric_limits<int>::max()
++                    && k.stride(0) <= std::numeric_limits<int>::max()
++                    && k.stride(1) <= std::numeric_limits<int>::max()
++                    && k.stride(2) <= std::numeric_limits<int>::max()
++                    && v.stride(0) <= std::numeric_limits<int>::max()
++                    && v.stride(1) <= std::numeric_limits<int>::max()
++                    && v.stride(2) <= std::numeric_limits<int>::max(),
++                "split-KV3 strides exceed int32 addressing");
++    TORCH_CHECK(causal, "split-KV3 exact path requires causal attention");
++
++    const int64_t rows = q.size(0) * q.size(1) * q.size(2);
++    TORCH_CHECK(partial_out.is_contiguous()
++                    && partial_out.numel()
++                        == 3 * rows * Sm70D256SplitDTraits::kHeadDim,
++                "split-KV3 partial_out shape is invalid");
++    TORCH_CHECK(partial_max.is_contiguous() && partial_sum.is_contiguous()
++                    && partial_max.numel() == 3 * rows
++                    && partial_sum.numel() == 3 * rows,
++                "split-KV3 partial stats shapes are invalid");
++    TORCH_CHECK(q.get_device() == k.get_device()
++                    && q.get_device() == v.get_device()
++                    && q.get_device() == out.get_device()
++                    && q.get_device() == partial_out.get_device()
++                    && q.get_device() == partial_max.get_device()
++                    && q.get_device() == partial_sum.get_device(),
++                "split-KV3 tensors must be on one CUDA device");
++
++    const at::cuda::OptionalCUDAGuard device_guard(q.device());
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const dim3 block(Sm70D256SplitDTraits::kNThreads);
++    const dim3 grid(
++        q.size(1) / Sm70D256SplitDTraits::kBlockM,
++        q.size(0) * 3,
++        q.size(2));
++    auto partial_kernel =
++        sm70_d256_splitd_dense_kernel<cutlass::half_t, false, true>;
++    C10_CUDA_CHECK(cudaFuncSetAttribute(
++        partial_kernel,
++        cudaFuncAttributeMaxDynamicSharedMemorySize,
++        Sm70D256SplitDTraits::kSmemBytes));
++    const float softmax_scale_log2 =
++        static_cast<float>(softmax_scale * M_LOG2E);
++    partial_kernel<<<grid, block, Sm70D256SplitDTraits::kSmemBytes, stream>>>(
++        reinterpret_cast<const cutlass::half_t *>(q.data_ptr()),
++        reinterpret_cast<const cutlass::half_t *>(k.data_ptr()),
++        reinterpret_cast<const cutlass::half_t *>(v.data_ptr()),
++        reinterpret_cast<cutlass::half_t *>(out.data_ptr()),
++        static_cast<int>(q.stride(0)),
++        static_cast<int>(q.stride(1)),
++        static_cast<int>(q.stride(2)),
++        static_cast<int>(k.stride(0)),
++        static_cast<int>(k.stride(1)),
++        static_cast<int>(k.stride(2)),
++        static_cast<int>(v.stride(0)),
++        static_cast<int>(v.stride(1)),
++        static_cast<int>(v.stride(2)),
++        q.size(1),
++        k.size(1),
++        q.size(2),
++        k.size(2),
++        softmax_scale_log2,
++        nullptr,
++        0,
++        0,
++        partial_out.data_ptr<float>(),
++        partial_max.data_ptr<float>(),
++        partial_sum.data_ptr<float>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++
++    sm70_d256_splitkv3_merge_kernel<cutlass::half_t>
++        <<<static_cast<unsigned>(rows),
++           Sm70D256SplitDTraits::kHeadDim,
++           0,
++           stream>>>(
++            partial_out.data_ptr<float>(),
++            partial_max.data_ptr<float>(),
++            partial_sum.data_ptr<float>(),
++            reinterpret_cast<cutlass::half_t *>(out.data_ptr()),
++            rows,
++            softmax_scale_log2);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return out;
+ }
+@@ -980,7 +1208,10 @@
+         static_cast<float>(softmax_scale * M_LOG2E),
+         block_table.data_ptr<int>(),
+         k.size(1),
+-        block_table.stride(0));
++        block_table.stride(0),
++        nullptr,
++        nullptr,
++        nullptr);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return out;
+ }

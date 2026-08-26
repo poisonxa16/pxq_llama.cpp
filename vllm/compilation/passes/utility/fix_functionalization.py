@@ -1,0 +1,506 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import operator
+from collections.abc import Iterable
+
+import torch
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
+
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
+from ..fx_utils import is_func
+from ..vllm_inductor_pass import VllmInductorPass
+
+logger = init_logger(__name__)
+
+
+def _get_c_op(name: str) -> torch._ops.OpOverload | None:
+    if not hasattr(torch.ops._C, name):
+        return None
+    return getattr(torch.ops._C, name).default
+
+
+class FixFunctionalizationPass(VllmInductorPass):
+    """
+    This pass defunctionalizes certain nodes to avoid redundant tensor copies.
+    After this pass, DCE (dead-code elimination) should never be run,
+    as de-functionalized nodes may appear as dead code.
+
+    To add new nodes to defunctionalize, add to the if-elif chain in __call__.
+    """
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        # XPU does not support auto-functionalization yet.
+        # Will enable this when switch to vllm-xpu-kernels.
+        if current_platform.is_xpu():
+            logger.debug(
+                "XPU platform does not support fix functionalizationpass currently."
+            )
+            return
+
+        self.nodes_to_remove: list[torch.fx.Node] = []
+        count = 0
+
+        rope_targets = []
+        rotary_embedding = _get_c_op("rotary_embedding")
+        if rotary_embedding is not None:
+            rope_targets.append(rotary_embedding)
+
+        if hasattr(torch.ops.vllm, "rocm_aiter_triton_rotary_embedding"):
+            rope_targets.append(
+                torch.ops.vllm.rocm_aiter_triton_rotary_embedding.default
+            )
+
+        awq_sm70_single_token_stage_targets = []
+        if hasattr(torch.ops._C, "awq_moe_single_token_dense_stage_sm70_out"):
+            awq_sm70_single_token_stage_targets.append(
+                torch.ops._C.awq_moe_single_token_dense_stage_sm70_out.default
+            )
+        if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_stage_sm70_out"):
+            awq_sm70_single_token_stage_targets.append(
+                torch.ops._C.awq_moe_single_token_indexed_dense_stage_sm70_out.default
+            )
+
+        awq_sm70_single_token_w13_targets = []
+        if hasattr(torch.ops._C, "awq_moe_single_token_dense_w13_sm70_out"):
+            awq_sm70_single_token_w13_targets.append(
+                torch.ops._C.awq_moe_single_token_dense_w13_sm70_out.default
+            )
+        if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_w13_sm70_out"):
+            awq_sm70_single_token_w13_targets.append(
+                torch.ops._C.awq_moe_single_token_indexed_dense_w13_sm70_out.default
+            )
+
+        fused_add_rms_norm = _get_c_op("fused_add_rms_norm")
+        fused_add_rms_norm_static_fp8_quant = _get_c_op(
+            "fused_add_rms_norm_static_fp8_quant"
+        )
+        rms_norm_dynamic_per_token_quant = _get_c_op(
+            "rms_norm_dynamic_per_token_quant"
+        )
+        rms_norm_targets = [
+            op
+            for op in (
+                _get_c_op("rms_norm"),
+                _get_c_op("rms_norm_static_fp8_quant"),
+            )
+            if op is not None
+        ]
+        silu_and_mul = _get_c_op("silu_and_mul")
+        silu_and_mul_quant = _get_c_op("silu_and_mul_quant")
+        fused_qk_norm_rope = _get_c_op("fused_qk_norm_rope")
+
+        for node in graph.nodes:
+            if not is_func(node, auto_functionalized):
+                continue  # Avoid deep if-elif nesting
+
+            kwargs = node.kwargs
+            at_target = node.args[0]
+
+            if at_target in rope_targets:
+                query = kwargs["query"]
+                key = kwargs["key"]
+                getitem_nodes = self.getitem_users(node)
+
+                if (
+                    is_func(query, operator.getitem)
+                    and is_func(key, operator.getitem)
+                    and query.args[0] == key.args[0]
+                    and is_func(query.args[0], torch.ops.aten.split_with_sizes.default)
+                    and all(
+                        is_func(user, torch.ops.aten.slice_scatter.default)
+                        for getitem_node in getitem_nodes.values()
+                        for user in getitem_node.users
+                    )
+                ):
+                    # Pattern where query and key are slices of an mm_node.
+                    # While functionalized, results at [1] and [2] are scattered
+                    # back into mm_node. So after de-functionalization, we can
+                    # just use mm_node directly.
+
+                    mm_node = query.args[0].args[0]
+                    for user in getitem_nodes.values():
+                        for user_of_getitem in user.users:
+                            if is_func(
+                                user_of_getitem, torch.ops.aten.slice_scatter.default
+                            ):
+                                user_of_getitem.replace_all_uses_with(mm_node)
+                                self._remove(user_of_getitem)
+                        self._remove(user)
+
+                    self.insert_defunctionalized(graph, node)
+                    self._remove(node)
+
+                else:
+                    # Directly replace the auto_functionalize(rotary_embedding)
+                    # with the inplace rotary_embedding. In theory, we shouldn't
+                    # do this blindly, but in practice in vLLM it's ok. The best
+                    # solution is to use auto_functionalization_v2 and then use
+                    # inductor's builtin defunctionalization (reinplacing) pass.
+                    mutated_args = {1: "query", 2: "key"}
+                    self.defunctionalize(graph, node, mutated_args)
+
+            # rms_norm replacements avoid the most copies for LLaMa.
+            elif fused_add_rms_norm is not None and at_target == fused_add_rms_norm:
+                mutated_args = {1: "input", 2: "residual"}
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
+                fused_add_rms_norm_static_fp8_quant is not None
+                and at_target == fused_add_rms_norm_static_fp8_quant
+            ):
+                mutated_args = {1: "result", 2: "residual"}
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
+                rms_norm_dynamic_per_token_quant is not None
+                and at_target == rms_norm_dynamic_per_token_quant
+            ):
+                mutated_args = {1: "result", 2: "scale", 3: "residual"}
+                self.defunctionalize(graph, node, mutated_args)
+            elif at_target in rms_norm_targets:
+                mutated_args = {1: "result"}
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
+                hasattr(torch.ops.vllm, "flashinfer_trtllm_fused_allreduce_norm")
+                and at_target
+                == torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default
+            ):
+                mutated_args = {
+                    1: "allreduce_in",
+                    2: "residual",
+                    3: "norm_out",
+                    4: "quant_out",
+                    5: "scale_out",
+                }
+                self.defunctionalize(graph, node, mutated_args)
+            # For some reason we need to specify the args for both
+            # silu_and_mul and silu_and_mul_quant. The kwargs
+            # pathway gets the wrong answer.
+            elif silu_and_mul is not None and at_target == silu_and_mul:
+                mutated_args = {1: "result"}
+                self.defunctionalize(
+                    graph, node, mutated_args, args=("result", "input")
+                )
+            elif at_target in awq_sm70_single_token_stage_targets:
+                mutated_args = {1: "out"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "out",
+                        "input",
+                        "expert_offsets",
+                        "sorted_expert_ids",
+                        "ptrs_w",
+                        "ptrs_s",
+                        "top_k",
+                        "k",
+                        "n",
+                        "group_size",
+                    ),
+                )
+            elif at_target in awq_sm70_single_token_w13_targets:
+                mutated_args = {
+                    1: "gate_up",
+                    2: "compact_input",
+                    3: "expert_offsets",
+                    4: "expert_offsets64",
+                    5: "inv_permuted_idx",
+                    6: "sorted_expert_ids",
+                }
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "gate_up",
+                        "compact_input",
+                        "x",
+                        "topk_ids",
+                        "w13_ptrs_w",
+                        "w13_ptrs_s",
+                        "expert_offsets",
+                        "expert_offsets64",
+                        "inv_permuted_idx",
+                        "sorted_expert_ids",
+                        "w13_k",
+                        "w13_n",
+                        "group_size",
+                        "hidden_logical_size",
+                    ),
+                )
+            elif (
+                hasattr(torch.ops._C, "awq_moe_single_token_compact_dense_w13_sm70_out")
+                and at_target
+                == torch.ops._C.awq_moe_single_token_compact_dense_w13_sm70_out.default
+            ):
+                mutated_args = {
+                    1: "gate_up",
+                    2: "compact_input",
+                    3: "compact_w13_ptrs_w",
+                    4: "compact_w13_ptrs_s",
+                    5: "expert_offsets",
+                    6: "expert_offsets64",
+                    7: "inv_permuted_idx",
+                    8: "sorted_expert_ids",
+                }
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "gate_up",
+                        "compact_input",
+                        "x",
+                        "topk_ids",
+                        "w13_ptrs_w",
+                        "w13_ptrs_s",
+                        "compact_w13_ptrs_w",
+                        "compact_w13_ptrs_s",
+                        "expert_offsets",
+                        "expert_offsets64",
+                        "inv_permuted_idx",
+                        "sorted_expert_ids",
+                        "w13_k",
+                        "w13_n",
+                        "group_size",
+                        "hidden_logical_size",
+                    ),
+                )
+            elif (
+                hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out")
+                and at_target
+                == torch.ops._C.awq_moe_single_token_weighted_reduce_out.default
+            ):
+                mutated_args = {1: "out"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "sorted_output",
+                        "topk_weights",
+                        "inv_permuted_idx",
+                        "out",
+                        "top_k",
+                        "hidden_logical_size",
+                    ),
+                )
+            elif silu_and_mul_quant is not None and at_target == silu_and_mul_quant:
+                mutated_args = {1: "result"}
+                self.defunctionalize(
+                    graph, node, mutated_args, args=("result", "input", "scale")
+                )
+            elif (
+                hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant")
+                and at_target == torch.ops._C.silu_and_mul_nvfp4_quant.default
+            ):
+                mutated_args = {1: "result", 2: "result_block_scale"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "result",
+                        "result_block_scale",
+                        "input",
+                        "input_global_scale",
+                    ),
+                )
+            # Defunctionalize fused_qk_norm_rope to remove higher-order wrapper.
+            elif fused_qk_norm_rope is not None and at_target == fused_qk_norm_rope:
+                mutated_args = {1: "qkv"}
+                args = (
+                    "qkv",
+                    "num_heads_q",
+                    "num_heads_k",
+                    "num_heads_v",
+                    "head_dim",
+                    "eps",
+                    "q_weight",
+                    "k_weight",
+                    "cos_sin_cache",
+                    "is_neox",
+                    "position_ids",
+                    "forced_token_heads_per_warp",
+                )
+                self.defunctionalize(graph, node, mutated_args=mutated_args, args=args)
+            elif (
+                hasattr(torch.ops.vllm, "fused_rope_and_unified_kv_cache_update")
+                and at_target
+                == torch.ops.vllm.fused_rope_and_unified_kv_cache_update.default
+            ):
+                mutated_args = {
+                    1: "query",
+                    2: "key",
+                }
+                self.defunctionalize(graph, node, mutated_args=mutated_args)
+            elif (
+                hasattr(torch.ops.vllm, "fused_rope_unified_mla_kv_cache_update")
+                and at_target
+                == torch.ops.vllm.fused_rope_unified_mla_kv_cache_update.default
+            ):
+                # AOTAutograd functionalizes `q[..., nope_dim:] = rope_result` into
+                # a sequence of aten ops on q: view+slice+copy+slice_scatter.
+                # Since the fused MLA RoPE op mutates q_pe in-place, we can remove
+                # the redundant copy and slice_scatter ops during defunctionalization.
+                getitem_nodes = self.getitem_users(node)
+                q_pe_out = getitem_nodes[1]
+
+                for user in list(q_pe_out.users):
+                    if is_func(user, torch.ops.aten.copy.default):
+                        copy_temp = user
+                slice_temp = copy_temp.args[0]
+                for user in list(copy_temp.users):
+                    if is_func(user, torch.ops.aten.slice_scatter.default):
+                        slice_scatter_temp = user
+                view_temp = slice_scatter_temp.args[0]
+
+                view_orig = slice_temp.args[0]
+                slice_scatter_temp.replace_all_uses_with(view_orig)
+                self._remove(slice_scatter_temp)
+                self._remove(copy_temp)
+                self._remove(slice_temp)
+                self._remove(view_temp)
+                self._remove(q_pe_out)
+
+                # defunctionalize k_pe manually; self.replace_users_with_mutated_args
+                # does not support only replacing specific kwargs
+                k_pe_in = node.kwargs["k_pe"]
+                k_pe_out = getitem_nodes[2]
+                k_pe_out.replace_all_uses_with(k_pe_in)
+                self._remove(k_pe_out)
+
+                self.insert_defunctionalized(graph, node)
+                self._remove(node)
+
+            # only used for test_functionalization::TestFunctionWithMutatedArgsAndReturn
+            elif (
+                hasattr(torch.ops.vllm, "function_with_mutated_args_and_return")
+                and at_target
+                == torch.ops.vllm.function_with_mutated_args_and_return.default
+            ):
+                mutated_args = {1: "x"}
+                self.defunctionalize(graph, node, mutated_args=mutated_args)
+            else:
+                continue  # skip the count
+
+            count += 1
+
+        self.dump_graph(graph, "before_cleanup")
+
+        # Remove the nodes all at once
+        count_removed = len(self.nodes_to_remove)
+        for node in self.nodes_to_remove:
+            graph.erase_node(node)
+
+        logger.debug(
+            "De-functionalized %s nodes, removed %s nodes", count, count_removed
+        )
+        self.nodes_to_remove.clear()
+
+    def _remove(self, node_or_nodes: torch.fx.Node | Iterable[torch.fx.Node]) -> None:
+        """
+        Stage a node (or nodes) for removal at the end of the pass.
+        """
+        if isinstance(node_or_nodes, torch.fx.Node):
+            self.nodes_to_remove.append(node_or_nodes)
+        else:
+            self.nodes_to_remove.extend(node_or_nodes)
+
+    def defunctionalize(
+        self,
+        graph: torch.fx.Graph,
+        node: torch.fx.Node,
+        mutated_args: dict[int, torch.fx.Node | str],
+        args: tuple[torch.fx.Node | str, ...] | None = None,
+    ) -> None:
+        """
+        De-functionalize a node by replacing it with a call to the original.
+        It also replaces the getitem users with the mutated arguments.
+        See replace_users_with_mutated_args and insert_defunctionalized.
+        """
+        self.replace_users_with_mutated_args(node, mutated_args)
+        self.insert_defunctionalized(graph, node, args=args)
+        self._remove(node)
+
+    def replace_users_with_mutated_args(
+        self, node: torch.fx.Node, mutated_args: dict[int, torch.fx.Node | str]
+    ) -> None:
+        """
+        Replace mutated getitem users of the auto-functionalized node with the
+        mutated arguments.
+        :param node: The auto-functionalized node
+        :param mutated_args: The mutated arguments, indexed by getitem index.
+        If the value of an arg is a string, `node.kwargs[arg]` is used.
+        """
+        for idx, user in self.getitem_users(node).items():
+            # Some functionalized nodes may return both a result at getitem[0]
+            # as well as mutated args at getitem[1:...]
+            if idx == 0:
+                assert idx not in mutated_args, (
+                    f"result at getitem[0] should not be in mutated_args for {node}"
+                )
+                continue
+            arg = mutated_args[idx]
+            arg = node.kwargs[arg] if isinstance(arg, str) else arg
+            user.replace_all_uses_with(arg)
+            self._remove(user)
+
+    def getitem_users(self, node: torch.fx.Node) -> dict[int, torch.fx.Node]:
+        """
+        Returns the operator.getitem users of the auto-functionalized node,
+        indexed by the index they are getting.
+        """
+        users = {}
+        for user in node.users:
+            if is_func(user, operator.getitem):
+                idx = user.args[1]
+                users[idx] = user
+        return users
+
+    def insert_defunctionalized(
+        self,
+        graph: torch.fx.Graph,
+        node: torch.fx.Node,
+        args: tuple[torch.fx.Node | str, ...] | None = None,
+    ) -> None:
+        """
+        Insert a new defunctionalized node into the graph before node.
+        If one of the kwargs is 'out', provide args directly,
+        as node.kwargs cannot be used.
+        See https://github.com/pytorch/pytorch/blob/a00faf440888ffb724bad413f329a49e2b6388e7/torch/_inductor/lowering.py#L351
+
+        :param graph: Graph to insert the defunctionalized node into
+        :param node: The auto-functionalized node to defunctionalize
+        :param args: If we cannot use kwargs, specify args directly.
+        If an arg is a string, `node.kwargs[arg]` is used.
+        """  # noqa: E501
+        assert is_func(node, auto_functionalized), (
+            f"node must be auto-functionalized, is {node} instead"
+        )
+
+        # Create a new call to the original function
+        with graph.inserting_before(node):
+            function = node.args[0]
+            if args is None:
+                fn_node = graph.call_function(function, kwargs=node.kwargs)
+            else:
+                # Args passed as strings refer to items in node.kwargs
+                args = tuple(
+                    node.kwargs[arg] if isinstance(arg, str) else arg for arg in args
+                )
+                fn_node = graph.call_function(function, args=args)
+
+        # If the function returns a value as well as mutating args inplace,
+        # the functionalized node will have a getitem[0] user that holds this value
+        # Replace getitem[0] user of the auto-functionalized node
+        # with the new defunctionalized node directly if it exists
+        users = self.getitem_users(node)
+        if 0 in users:
+            user = users[0]
+            user.replace_all_uses_with(fn_node)
+            self._remove(user)

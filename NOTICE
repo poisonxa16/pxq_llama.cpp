@@ -1,0 +1,35 @@
+PXA vLLM
+Copyright (c) PXA Network
+
+This product includes software developed as part of the following projects.
+Both are licensed under the Apache License, Version 2.0.
+
+------------------------------------------------------------------------------
+vLLM
+  https://github.com/vllm-project/vllm
+  Copyright (c) the vLLM contributors
+  Licensed under the Apache License, Version 2.0.
+
+1Cat-vLLM
+  https://github.com/KewaiiGamer/1Cat-vLLM
+  A vLLM engineering fork focused on SM70 / Tesla V100.
+  Licensed under the Apache License, Version 2.0.
+
+  This distribution is derived from 1Cat-vLLM. The Volta/SM70 work this fork
+  builds on - AWQ paths on Volta, the FLASH_ATTN_V100 attention backend, the
+  SM70 TurboMind kernels, long-context and MTP speculative-decoding support -
+  originates there, not here. Where this repository extends or corrects that
+  work, the change is described in the commit that makes it.
+------------------------------------------------------------------------------
+
+WHAT PXA NETWORK ADDS
+
+  * Pascal / SM60 (Tesla P100) support, which the upstream fork does not target:
+    a torch-2.7.1 build variant, the PASCAL_SDPA and pascal_decode_attn backends,
+    and the compat shims those require.
+  * PXQ4 quantization - format, kernels, and the serving path for it.
+  * A two-variant build (scripts/build-images.sh) so sm_60 and sm_70 each get the
+    torch they actually need instead of one compromise build.
+
+Renaming this distribution to pxa-vllm is a statement about WHOSE DISTRIBUTION
+IT IS, not a claim over the upstream work. The attribution above travels with it.
