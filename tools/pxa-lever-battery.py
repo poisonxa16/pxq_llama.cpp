@@ -142,9 +142,18 @@ CASES = [
     ("--gmu 0.80",        VD + ["--engine", "vllm", "--gmu", "0.80"],
                                                                ["0.80", "0.8"],
                           r"gpu-memory-utilization|gmu"),
-    ("--vllm-image sm70", VD + ["--engine", "vllm", "--vllm-image", "pxa-vllm:sm70"],
-                                                               ["pxa-vllm:sm70"],
-                          r"pxa-vllm:sm70"),
+    # --vllm-image never appears in the emitted command: the launcher emits a bare
+    # `vllm serve` and runs in whatever container it is already inside. The flag is a
+    # PREMISE for the eligibility decision, not an instruction. It must therefore be
+    # ANNOUNCED - a flag that reads like it selects a runtime and silently does not is
+    # how a measurement gets attributed to an image that was never involved.
+    ("--vllm-image (must ANNOUNCE the container contract)",
+                          VD + ["--engine", "vllm"],           ["__never__"],
+                          r"CONTAINER CONTRACT"),
+    ("--vllm-image sm70 on sm_60 cards (must refuse)",
+                          VD[:-2] + ["--engine", "vllm", "--vllm-image", "pxa-vllm:sm70"],
+                                                               ["__never__"],
+                          r"R-07|REFUS"),
     # A3 at the CLI, not in the synthetic table: a non-FDO capture mode must be REFUSED.
     ("--cudagraph-mode PIECEWISE (must refuse)",
                           VD + ["--engine", "vllm", "--cudagraph-mode", "PIECEWISE"],

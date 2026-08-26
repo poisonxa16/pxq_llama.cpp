@@ -2159,6 +2159,24 @@ def main():
         sys.exit(3)
     envs = " ".join(f"{k}={v}" for k, v in env.items())
     print(f"  env:     CUDA_VISIBLE_DEVICES={cv} {envs}")
+    if plan.engine == "vllm":
+        # THE IMAGE IS A PREMISE, NOT AN INSTRUCTION. The emitted command is a bare
+        # `vllm serve` - there is no `docker run` in it and the image name appears
+        # nowhere. --vllm-image (and PXA_VLLM_IMAGE) decide only WHICH CARDS ARE
+        # ELIGIBLE; the process then runs in whatever container this launcher is
+        # already inside. Name that out loud, because the flag reads like it selects a
+        # runtime, and a reader who believes it will attribute a measurement to an
+        # image that was never involved.
+        img = os.environ.get("PXA_VLLM_IMAGE") or getattr(a, "vllm_image", None)
+        if img:
+            print(f"  CONTAINER CONTRACT: eligibility was decided against {img!r}, and this "
+                  f"command is NOT run in it.")
+            print(f"    `vllm serve` execs HERE. Run this launcher inside {img} - or accept "
+                  f"that the seat you get is whatever this container holds, which is not "
+                  f"what the decision above was based on.")
+        else:
+            print("  CONTAINER CONTRACT: no image was named, so eligibility came from the "
+                  "importable vllm_pxq4 in THIS interpreter. `vllm serve` execs here.")
     print(f"  command: {' '.join(cmd)}")
     print_post_boot_contract(plan.engine, cv)
     print("=" * 78)
