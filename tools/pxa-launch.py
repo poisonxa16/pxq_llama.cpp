@@ -274,7 +274,42 @@ VLLM_IMAGES = {
     "pxa-sm60-dev": {
         "caps": {60}, "status": "MEASURED",
         "why": "produced every MoE-crossover vLLM number (MOE-CROSSOVER.md:77-82; "
-               "libpxq4_sm60_v8.so, --attention-backend PASCAL_SDPA)"},
+               "libpxq4_sm60_v8.so, --attention-backend PASCAL_SDPA)",
+        # NOT A SELF-CONTAINED IMAGE. `pip list` inside it shows pip and nothing else:
+        # it is a bare CUDA runtime, and torch, vllm and the PXQ4 plugin all live on the
+        # HOST and are bind-mounted at run time. Every number attributed to this tag was
+        # really produced by the image PLUS these paths. Recording that is not pedantry -
+        # without it the launcher declares the image eligible on a box where the venv has
+        # moved, and emits `vllm serve`, which is not even on PATH in this container.
+        "host_env": {
+            "mounts": {"<local-path>": "/c"},
+            # Presence is checked with lexists, not exists. venv/bin/python is a symlink
+            # to /usr/bin/python3, which exists INSIDE the container and nowhere on this
+            # host - so exists() calls a perfectly good venv missing and refuses a seat
+            # that would have served. lexists asks the question we can actually answer
+            # from here: is the entry there.
+            "requires": ["<local-path>",
+                         "<local-path>",
+                         "<local-path>",
+                         "<local-path>",
+                         "<local-path>",
+                         "<local-path>"],
+            "python": "/c/pxq4-sm60/venv/bin/python",
+            "env": {"PYTHONPATH": "/c/moe-branch/site",
+                    "PXQ4_LIB": "/c/moe-branch/libpxq4_sm60_v8.so"},
+            "why": "traced 2026-08-26 through the last boot on this tag "
+                   "(xover-vllm-boot1) and confirmed by importing inside it: torch is "
+                   "/c/pxq4-sm60/venv/lib/python3.12/site-packages/torch (2.7.1+cu126) "
+                   "and vllm is /c/pxq4-sm60/1cat/vllm/__init__.py",
+            # THE PART THAT MATTERS. vllm is an EDITABLE install
+            # (__editable__.1cat_vllm-....pth) resolving to the 1cat WORKING TREE. The
+            # seat does not run a built artifact; it imports whatever is checked out
+            # there right now. Edit that repo and the running engine changes. Switch its
+            # branch and the seat serves a different engine with no redeploy and no
+            # version change to notice. Every sm_60 number in the corpus was taken this
+            # way, which is why they cannot be reproduced from an image alone.
+            "editable_source": "<local-path>",
+        }},
     # THE FAT IMAGE IS WITHDRAWN. One image spanning sm_60+sm_70 was tried and does
     # not work: 8 boot attempts on a Tesla V100, 8 failures (RELEASE-GATE.md 3.7). The
     # cause is structural, not configuration - VLLM_SKIP_C_STABLE=1 is required to build
@@ -842,6 +877,16 @@ def vllm_eligibility(sel, image_arg):
             return set(), img, trail
         if rec["status"] == "INELIGIBLE":
             trail.append(f"probe 1: image {img!r} is INELIGIBLE: {rec['why']}")
+            return set(), img, trail
+        missing = [q for q in (rec.get("host_env") or {}).get("requires", [])
+                   if not os.path.lexists(q)]
+        if missing:
+            # An image whose runtime lives on the host is only as present as those paths.
+            # Declaring it eligible when they are gone routes traffic to a container that
+            # cannot import torch, and the failure surfaces minutes later as a boot crash
+            # instead of here as a sentence.
+            trail.append(f"probe 1: image {img!r} needs host paths that are NOT PRESENT, so "
+                         f"no card is eligible under it: " + ", ".join(missing))
             return set(), img, trail
         caps = set(rec["caps"])
         inf = set(rec.get("caps_inferred") or ())
@@ -1583,10 +1628,41 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
               f"cards; card(s) {[g[0] for g in used[deg:]]} will NOT be used.")
         used = used[:deg]
 
-    cmd = ["vllm", "serve", model, "--host", a.host, "--port", str(a.port),
-           "--quantization", "pxq4", "--dtype", "float16",
-           "--max-model-len", str(ctx), "--max-num-seqs", str(a.np),
-           "--gpu-memory-utilization", str(a.gmu)]
+    # `vllm serve` is correct for a self-contained image. It is WRONG for one whose
+    # python lives on the host: vllm is not on PATH in pxa-sm60-dev, so the emitted
+    # command could not start, and in non-explain mode this file exits 4 on the
+    # shutil.which check - after printing a full, confident plan. An image that declares
+    # a host python gets invoked through it, the same way the boot that produced the
+    # measurements did.
+    hostenv = (VLLM_IMAGES.get(image) or {}).get("host_env") or {}
+    hpy = hostenv.get("python")
+    if hpy:
+        # The model path has to be translated through the same mount the interpreter
+        # came through. This launcher runs INSIDE the container, where <local-path> does
+        # not exist - only /c does. Emitting the host path produces a command that is
+        # correct on paper and cannot find its weights, which surfaces as a load failure
+        # minutes in rather than as a sentence here.
+        for hsrc, hdst in sorted(hostenv.get("mounts", {}).items(),
+                                 key=lambda kv: -len(kv[0])):
+            if model.startswith(hsrc.rstrip("/") + "/"):
+                mapped = hdst.rstrip("/") + model[len(hsrc.rstrip("/")):]
+                print(f"  model path mapped for {image}: {model} -> {mapped} "
+                      f"(via -v {hsrc}:{hdst})")
+                model = mapped
+                break
+        else:
+            if hostenv.get("mounts"):
+                print(f"  ** {model} is OUTSIDE every mount {image} declares "
+                      f"({', '.join(hostenv['mounts'])}). The command below names a path "
+                      f"that will not exist in that container - mount it, or serve a model "
+                      f"that is under one of those roots.")
+        cmd = [hpy, "-m", "vllm.entrypoints.openai.api_server", "--model", model,
+               "--host", a.host, "--port", str(a.port)]
+    else:
+        cmd = ["vllm", "serve", model, "--host", a.host, "--port", str(a.port)]
+    cmd += ["--quantization", "pxq4", "--dtype", "float16",
+            "--max-model-len", str(ctx), "--max-num-seqs", str(a.np),
+            "--gpu-memory-utilization", str(a.gmu)]
     if backend:
         cmd += ["--attention-backend", backend]
         print(f"  --attention-backend {backend}: {backend_ev}")
@@ -1663,6 +1739,11 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
 
     env = {"TORCHDYNAMO_DISABLE": "1",           # MEASURED arm B env, MOE-CROSSOVER.md:80
            "VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}  # MEASURED arm B env, MOE-CROSSOVER.md:80
+    # An image whose runtime lives on the host also carries the env that makes that
+    # runtime importable. setdefault, not assignment: an explicit value already in the
+    # measured arm above wins over the image's default.
+    for _k, _v in hostenv.get("env", {}).items():
+        env.setdefault(_k, _v)
     if cc == 70:
         # The sm_70 recipes carry this; the sm_60 arm does NOT - it carries
         # SITE=<site> LIB=libpxq4_sm60_v8.so PACKED=1 instead (MOE-CROSSOVER.md:78).
@@ -2171,9 +2252,35 @@ def main():
         if img:
             print(f"  CONTAINER CONTRACT: eligibility was decided against {img!r}, and this "
                   f"command is NOT run in it.")
-            print(f"    `vllm serve` execs HERE. Run this launcher inside {img} - or accept "
-                  f"that the seat you get is whatever this container holds, which is not "
-                  f"what the decision above was based on.")
+            print(f"    The command below execs HERE. Run this launcher inside {img} - or "
+                  f"accept that the seat you get is whatever this container holds, which "
+                  f"is not what the decision above was based on.")
+            he = (VLLM_IMAGES.get(img) or {}).get("host_env") or {}
+            if he:
+                print(f"    {img} is NOT self-contained: its python, torch and vllm are on "
+                      f"the HOST. It needs these mounts, or nothing starts:")
+                for hsrc, hdst in he.get("mounts", {}).items():
+                    print(f"      -v {hsrc}:{hdst}")
+                print(f"      [{he.get('why', 'host dependency')}]")
+                es = he.get("editable_source")
+                if es:
+                    import subprocess as _sp
+                    try:
+                        br = _sp.run(["git", "-C", es, "rev-parse", "--abbrev-ref", "HEAD"],
+                                     capture_output=True, text=True, timeout=10).stdout.strip()
+                        sha = _sp.run(["git", "-C", es, "rev-parse", "--short", "HEAD"],
+                                      capture_output=True, text=True, timeout=10).stdout.strip()
+                        dirty = _sp.run(["git", "-C", es, "status", "--porcelain"],
+                                        capture_output=True, text=True, timeout=15).stdout.strip()
+                    except Exception:
+                        br = sha = ""; dirty = ""
+                    print(f"    vllm is an EDITABLE install of {es} - the seat imports that "
+                          f"WORKING TREE, not a built artifact.")
+                    if br or sha:
+                        print(f"      right now that tree is {br} @ {sha}"
+                              + ("  *** WITH UNCOMMITTED CHANGES ***" if dirty else ""))
+                    print(f"      Editing or switching branches there changes what this seat "
+                          f"serves, with no redeploy and no version to notice it by.")
         else:
             print("  CONTAINER CONTRACT: no image was named, so eligibility came from the "
                   "importable vllm_pxq4 in THIS interpreter. `vllm serve` execs here.")
