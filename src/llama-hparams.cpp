@@ -1183,13 +1183,13 @@ void llm_load_hparams(
                         hparams.n_rot != 64) {
                         LLAMA_LOG_ERROR("==========================================================================\n");
                         LLAMA_LOG_ERROR("Detected incompatible DeepSeek model without a known way to fix it.\n");
-                        LLAMA_LOG_ERROR("Consider making your own ik_llama.cpp compatible model or\n");
+                        LLAMA_LOG_ERROR("Consider making your own pxq_llama compatible model or\n");
                         LLAMA_LOG_ERROR("ask the model provider to make one for you,\n\n");
                         LLAMA_LOG_ERROR("Sorry, uknown model => cannot fix it => bailing out\n");
                         LLAMA_LOG_ERROR("==========================================================================\n");
                         GGML_ABORT("Fatal error");
                     }
-                    LLAMA_LOG_INFO("================= Adjusted mainline llama.cpp MLA tensors to ik_llama.cpp\n");
+                    LLAMA_LOG_INFO("================= Adjusted mainline llama.cpp MLA tensors to pxq_llama\n");
                     for (auto& item : hparams.n_head_kv_arr) item = n_nead_kv;
                     hparams.n_embd_head_k_full = 192;
                     hparams.n_embd_head_v_full = 128;
@@ -1776,7 +1776,7 @@ void llm_load_hparams(
                         LLAMA_LOG_ERROR("==========================================================================\n");
                         GGML_ABORT("Fatal error");
                     }
-                    LLAMA_LOG_INFO("================= Adjusted mainline llama.cpp MLA tensors to ik_llama.cpp\n");
+                    LLAMA_LOG_INFO("================= Adjusted mainline llama.cpp MLA tensors to pxq_llama\n");
                     for (auto& item : hparams.n_head_kv_arr) item = n_nead_kv;
                     hparams.n_embd_head_k_full = 192;
                     hparams.n_embd_head_v_full = 128;

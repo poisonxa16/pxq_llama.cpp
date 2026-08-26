@@ -478,7 +478,7 @@ const SETTING_SECTIONS = (
         label: (
           <>
             Custom JSON config (For more info, refer to{' '}
-            <OpenInNewTab href="https://github.com/ikawrakow/ik_llama.cpp/tree/main/examples/server/README.md">
+            <OpenInNewTab href="https://github.com/poisonxa16/pxq_llama.cpp/tree/main/examples/server/README.md">
               server documentation
             </OpenInNewTab>
             )
@@ -506,7 +506,7 @@ const SETTING_SECTIONS = (
               <br />
               <br />
               If you encounter any problems, create a{' '}
-              <OpenInNewTab href="https://github.com/ikawrakow/ik_llama.cpp/issues/new?template=019-bug-misc.yml">
+              <OpenInNewTab href="https://github.com/poisonxa16/pxq_llama.cpp/issues/new?template=019-bug-misc.yml">
                 Bug (misc.)
               </OpenInNewTab>{' '}
               report on Github. Please also specify <b>webui/experimental</b> on

@@ -8,7 +8,7 @@ json server_chat_convert_responses_to_chatcmpl(const json& response_body) {
         throw std::runtime_error("'input' is required");
     }
     if (!json_value(response_body, "previous_response_id", std::string{}).empty()) {
-        throw std::runtime_error("ik_llama.cpp does not support 'previous_response_id'.");
+        throw std::runtime_error("pxq_llama does not support 'previous_response_id'.");
     }
 
     const json input_value = response_body.at("input");
@@ -78,7 +78,7 @@ json server_chat_convert_responses_to_chatcmpl(const json& response_body) {
                         });
                     }
                     else if (type == "input_file") {
-                        throw std::runtime_error("'input_file' is not supported by ik_llama.cpp at this moment");
+                        throw std::runtime_error("'input_file' is not supported by pxq_llama at this moment");
                     }
                     else {
                         throw std::runtime_error("'type' must be one of 'input_text', 'input_image', or 'input_file'");

@@ -1,4 +1,4 @@
-# Build and use ik_llama.cpp with CPU or CPU+CUDA
+# Build and use pxq_llama with CPU or CPU+CUDA
 
 Built on top of [ikawrakow/ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) and [llama-swap](https://github.com/mostlygeek/llama-swap)
 
@@ -17,7 +17,7 @@ CPU or CUDA sections under [Prebuilt](#Prebuilt)/[Build](#Build) and [Run]($Run)
 
 ## Prebuilt Docker images
 
-Pull one of the available images from `ghcr.io`. [View all tags](https://github.com/ikawrakow/ik_llama.cpp/pkgs/container/ik-llama-cpp/versions?filters%5Bversion_type%5D=tagged)
+Pull one of the available images from `ghcr.io`. [View all tags](https://github.com/poisonxa16/pxq_llama.cpp/pkgs/container/pxq-llama-cpp)
 
 ```bash
 docker pull ghcr.io/ikawrakow/ik-llama-cpp:cpu-swap
@@ -33,7 +33,7 @@ docker pull ghcr.io/ikawrakow/ik-llama-cpp:cu12-full
 
 The project uses Docker Bake for building multiple targets efficiently.
 
-Clone the repository: `git clone https://github.com/ikawrakow/ik_llama.cpp`
+Clone the repository: `git clone https://github.com/poisonxa16/pxq_llama.cpp`
 
 Use `docker-bake`.
 
@@ -57,7 +57,7 @@ REPO_OWNER=yourname VARIANT=cpu docker buildx bake --builder ik-llama-builder --
 
 ### CUDA Variant
 
-First, set the CUDA version and GPU architecture in `ik_llama-cuda.Containerfile`:
+First, set the CUDA version and GPU architecture in `pxq_llama-cuda.Containerfile`:
 - `CUDA_DOCKER_ARCH`: Your GPU's compute capability (e.g., `86` for RTX 30*, `89` for RTX 40*, `12.0` for RTX 50*)
 - `CUDA_VERSION`: CUDA Toolkit version (e.g., `12.6.2`, `13.1.1`)
 
@@ -82,11 +82,11 @@ Builds two image tags per variant:
 ### CPU
 
 ```bash
-podman run -it --name ik_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro localhost/ik_llama-cpu:swap
+podman run -it --name pxq_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro localhost/pxq_llama-cpu:swap
 ```
 
 ```bash
-docker run -it --name ik_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro localhost/ik_llama-cpu:swap
+docker run -it --name pxq_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro localhost/pxq_llama-cpu:swap
 ```
 
 ### CUDA
@@ -99,11 +99,11 @@ docker run -it --name ik_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models
   - [CUDA Toolkit supported version](https://developer.nvidia.com/cuda-toolkit-archive)
 
 ```bash
-podman run -it --name ik_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro --device nvidia.com/gpu=all --security-opt=label=disable localhost/ik_llama-cuda:swap
+podman run -it --name pxq_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro --device nvidia.com/gpu=all --security-opt=label=disable localhost/pxq_llama-cuda:swap
 ```
 
 ```bash
-docker run -it --name ik_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro --runtime nvidia localhost/ik_llama-cuda:swap
+docker run -it --name pxq_llama --rm -p 9292:8080 -v /my_local_files/gguf:/models:ro --runtime nvidia localhost/pxq_llama-cuda:swap
 ```
 
 ## Troubleshooting
@@ -123,7 +123,7 @@ docker buildx bake --builder ik-llama-builder --set full.args.BUILD_COMMIT=1ec12
 - **Using the tools in the `full` image**:
 
 ```bash
-$ podman run -it --name ik_llama_full --rm -v /my_local_files/gguf:/models:ro --entrypoint bash localhost/ik_llama-cpu:full
+$ podman run -it --name ik_llama_full --rm -v /my_local_files/gguf:/models:ro --entrypoint bash localhost/pxq_llama-cpu:full
 # ./llama-quantize ...
 # python3 gguf-py/scripts/gguf_dump.py ...
 # ./llama-perplexity ...
@@ -131,7 +131,7 @@ $ podman run -it --name ik_llama_full --rm -v /my_local_files/gguf:/models:ro --
 ```
 
 ```bash
-docker run -it --name ik_llama_full --rm -v /my_local_files/gguf:/models:ro --runtime nvidia --entrypoint bash localhost/ik_llama-cuda:full
+docker run -it --name ik_llama_full --rm -v /my_local_files/gguf:/models:ro --runtime nvidia --entrypoint bash localhost/pxq_llama-cuda:full
 # ./llama-quantize ...
 # python3 gguf-py/scripts/gguf_dump.py ...
 # ./llama-perplexity ...

@@ -1047,7 +1047,7 @@ int main(int argc, char ** argv) {
 
     std::atomic<server_state> state{SERVER_STATE_LOADING_MODEL};
 
-    svr->set_default_headers({{"Server", "ik_llama.cpp"}});
+    svr->set_default_headers({{"Server", "pxq_llama"}});
 
     svr->set_logger(log_server_request);
 

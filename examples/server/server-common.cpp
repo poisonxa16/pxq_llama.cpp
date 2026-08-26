@@ -720,7 +720,7 @@ json oaicompat_chat_params_parse(
                     // download remote image
                     // TODO @ngxson : maybe make these params configurable
                     common_remote_params params;
-                    params.headers.push_back("User-Agent: ik_llama.cpp/");
+                    params.headers.push_back("User-Agent: pxq_llama/");
                     params.max_size = 1024 * 1024 * 10; // 10MB
                     params.timeout = 10; // seconds
                     LOG_INFO("downloading image from '%s'\n", url.c_str());

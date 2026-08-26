@@ -1,4 +1,4 @@
-# Build ik_llama.cpp locally
+# Build pxq_llama locally
 
 > **Building this fork on a CUDA box? Go to [`../BUILD-FROM-SOURCE.md`](../BUILD-FROM-SOURCE.md)
 > instead.** That is the verified, start-to-finish recipe for pxq_llama: which container image,
@@ -11,18 +11,18 @@
 > **there is no Makefile in this tree**, CMake is the only build system, and `make` fails with
 > `make: *** No targets specified and no makefile found.  Stop.`
 
-`ik_llama.cpp` requires has a very minimal set of dependencies: `cmake`, a functional C++-17 compiler, and, if building with Nvidia GPU support, the CUDA toolkit. All these are available from the system package manager on Linux. If you are building on Windows and are worried about messing up your main OS, you may consider building in a virtual machine (VM). In that case, make sure you can copy files between the host OS and the VM.  
+`pxq_llama` requires has a very minimal set of dependencies: `cmake`, a functional C++-17 compiler, and, if building with Nvidia GPU support, the CUDA toolkit. All these are available from the system package manager on Linux. If you are building on Windows and are worried about messing up your main OS, you may consider building in a virtual machine (VM). In that case, make sure you can copy files between the host OS and the VM.  
 
 **To get the Code:**
 
 ```bash
-git clone https://github.com/ikawrakow/ik_llama.cpp
-cd ik_llama.cpp
+git clone https://github.com/poisonxa16/pxq_llama.cpp
+cd pxq_llama.cpp
 ```
 
 > For **this** fork the clone URL is `https://github.com/poisonxa16/pxq_llama`.
 
-In order to build `ik_llama.cpp` you have the options below. (The `make` option listed in the
+In order to build `pxq_llama` you have the options below. (The `make` option listed in the
 upstream version of this page has been removed — this tree has no Makefile.)
 
 - Using `CMake`:
@@ -60,7 +60,7 @@ upstream version of this page has been removed — this tree has no Makefile.)
  </li>
  <li> In Visual Studio Build Tools installer, click "Individual components" tab during customization and enter "clang" in filter prompt to pick related tools (since clang is not a default option, add two extra items in this prompt).
  </li>
- <li> Download Portable git from https://git-scm.com/install/windows to C:\Downloads and <code>git.exe clone https://github.com/ggml-org/llama.cpp "C:\Downloads\ik_llama.cpp_git"</code> from cmd and <code>cd "C:\Downloads\ik_llama.cpp_git"</code>
+ <li> Download Portable git from https://git-scm.com/install/windows to C:\Downloads and <code>git.exe clone https://github.com/ggml-org/llama.cpp "C:\Downloads\pxq_llama_git"</code> from cmd and <code>cd "C:\Downloads\pxq_llama_git"</code>
  </li>
  <li> <code>set VS_DIR=c:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools</code>
  </li>
@@ -74,7 +74,7 @@ upstream version of this page has been removed — this tree has no Makefile.)
  </li>
  <li> <code>"c:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" ^
     -G Ninja ^
-    -S "C:/Downloads/ik_llama.cpp_git" ^
+    -S "C:/Downloads/pxq_llama_git" ^
     -B "C:/Downloads/output_compilations" ^
     -DCMAKE_C_COMPILER="%LLVM_DIR%/bin/clang-cl.exe" ^
     -DCMAKE_CXX_COMPILER="%LLVM_DIR%/bin/clang-cl.exe" ^
