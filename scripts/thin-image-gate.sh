@@ -24,6 +24,13 @@
 # actually ship. Do not drop the mode from this file: without it a PASSING battery does
 # not prove short raw prompts.
 #
+# SELF-CONTAINED IMAGES ONLY. This gate runs `docker run <image>` and expects torch and
+# vllm to be INSIDE it. pxa-sm60-dev is not that shape: it is a bare CUDA image with the
+# python environment bind-mounted from <local-path> at run time (pip list inside it shows
+# pip and nothing else). Pointed at one of those, phase 1 correctly reports that torch is
+# missing - that is the gate working, not a false negative. The two thin images exist
+# precisely so a seat is one artifact instead of an image plus a host directory.
+#
 # CARD 3 IS PRODUCTION. It carries the VLM + embedding seats the email archiver depends
 # on. This script resolves every requested index to a GPU UUID and refuses to run if the
 # card-3 UUID is in the set, then passes UUIDs -- not indices -- to the runtime, so no
@@ -110,6 +117,18 @@ done
 docker image inspect "$IMAGE" >/dev/null 2>&1 \
   || { echo "FAIL: image $IMAGE does not exist. Build it first: ./scripts/build-images.sh $VARIANT"; exit 1; }
 echo "  image     $IMAGE  ($(docker images --format '{{.Size}}' "$IMAGE" | head -1))"
+
+# Find the interpreter BEFORE any GPU check. Hardcoding "python" made an image that
+# only ships "python3" fail phase 1 with "torch cannot execute on this GPU" - a
+# container that never started, reported as a missing-cubin problem. A gate that
+# misnames a failure is worse than one that has no opinion: it sends the reader to
+# audit kernels over a PATH.
+PY=""
+for cand in python python3; do
+  if docker run --rm --entrypoint "$cand" "$IMAGE" -c "pass" >/dev/null 2>&1; then PY=$cand; break; fi
+done
+[ -n "$PY" ] || { echo "FAIL: neither python nor python3 runs in $IMAGE - this is not a servable image"; exit 1; }
+echo "  python    $PY"
 echo "  tp        $TP   gmu $GMU   backend $ATTN_BACKEND"
 
 hostmodel=${MODEL/#\/c/<local-path>}
@@ -120,6 +139,7 @@ echo "  model     $MODEL"
 echo "  site      $SITE   lib=${PXQ4_LIB:-<bundled>}"
 fi
 : "${UUIDS:=$CARDS}"
+: "${PY:=python}"
 
 # ---- phase 1: torch dispatches ---------------------------------------------------
 # 5 seconds, and it is the single highest-value check in the file: on 2026-08-24 an
@@ -127,15 +147,29 @@ fi
 # inside torch's OWN kernels, because torch 2.10/cu128 wheels ship no sm_60.
 if phase_on 1; then
 say "phase 1: torch dispatches on the target card(s)"
-docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$UUIDS" --entrypoint python "$IMAGE" -c '
+p1out=$(docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$UUIDS" --entrypoint "$PY" "$IMAGE" -c '
 import torch
 x = torch.ones(8, device="cuda"); assert float(x.sum()) == 8.0
 y = (torch.randn(256,256,device="cuda",dtype=torch.float16) @ torch.randn(256,256,device="cuda",dtype=torch.float16))
 assert torch.isfinite(y).all(), "fp16 matmul produced non-finite values"
 cc = torch.cuda.get_device_capability(0)
 print("  torch", torch.__version__, "|", torch.cuda.get_device_name(0), "| sm_%d%d" % cc, "| devices", torch.cuda.device_count())
-' 2>&1 | tee "$RESULTS/phase1.log" \
-  || { echo "PHASE 1 FAILED: torch cannot execute here -- the image is dead on this card regardless of what cubins it contains"; exit 1; }
+ ' 2>&1); rc=$?
+printf '%s\n' "$p1out" | tee "$RESULTS/phase1.log"
+if [ $rc -ne 0 ]; then
+  # Say WHICH failure this is. "no kernel image" means the cubins really are missing for
+  # this card; anything from the runtime means the container never got as far as torch.
+  case "$p1out" in
+    *"no kernel image"*)
+      echo "PHASE 1 FAILED: torch has NO CUBIN for this card. The image is dead here regardless of what the extension gates said." ;;
+    *"OCI runtime"*|*"executable file not found"*|*"runc"*|*"nvidia-container"*)
+      echo "PHASE 1 FAILED: the CONTAINER never started -- this is a runtime/PATH problem, NOT a GPU or cubin problem. Read the line above before touching any kernel." ;;
+    *"CUDA driver"*|*"no CUDA-capable device"*)
+      echo "PHASE 1 FAILED: no CUDA device visible in the container. Check --runtime=nvidia and NVIDIA_VISIBLE_DEVICES, not the image." ;;
+    *) echo "PHASE 1 FAILED: torch could not complete a trivial op on this card. Cause above." ;;
+  esac
+  exit 1
+fi
 
 grep -q "torch $WANT_TORCH" "$RESULTS/phase1.log" \
   || { echo "PHASE 1 FAILED: expected torch $WANT_TORCH in $IMAGE; see $RESULTS/phase1.log"; exit 1; }
@@ -152,7 +186,7 @@ if phase_on 2; then
 say "phase 2: variant-defining ops are actually in the image"
 docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$UUIDS" \
   -e PYTHONPATH="$SITE" ${PXQ4_LIB:+-e PXQ4_LIB="$PXQ4_LIB"} \
-  -v <local-path>:/c --entrypoint python "$IMAGE" -c "
+  -v <local-path>:/c --entrypoint "$PY" "$IMAGE" -c "
 import torch, vllm  # noqa
 want_stable = ${FUSED_LONG_PREFILL_EXPECT:-$([ "$VARIANT" = sm70 ] && echo 1 || echo 0)}
 ops = set(dir(torch.ops._C)) if hasattr(torch.ops, '_C') else set()
@@ -192,7 +226,7 @@ serve() {   # serve <extra-env-as-repeated -e args...>
     -e PYTHONPATH="$SITE" ${PXQ4_LIB:+-e PXQ4_LIB="$PXQ4_LIB"} \
     "$@" \
     -v <local-path>:/c -p 127.0.0.1:$PORT:$PORT --shm-size=16g --ipc=host \
-    "$IMAGE" python -m vllm.entrypoints.openai.api_server \
+    "$IMAGE" "$PY" -m vllm.entrypoints.openai.api_server \
       --model "$MODEL" --quantization pxq4 \
       --attention-backend "$ATTN_BACKEND" --tensor-parallel-size $TP --dtype float16 \
       --host 0.0.0.0 --port $PORT --served-model-name m --trust-remote-code \
