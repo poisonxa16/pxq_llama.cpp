@@ -275,24 +275,17 @@ VLLM_IMAGES = {
         "caps": {60}, "status": "MEASURED",
         "why": "produced every MoE-crossover vLLM number (MOE-CROSSOVER.md:77-82; "
                "libpxq4_sm60_v8.so, --attention-backend PASCAL_SDPA)"},
-    # The fat image's sm_70 half was carried here as caps_inferred={70}. That inference is
-    # now DISPROVEN, so it is gone: 8 boot attempts on a Tesla V100, 8 failures, gated
-    # 2026-08-25 (RELEASE-GATE.md 3.7). Root cause is structural, not configuration -
-    # VLLM_SKIP_C_STABLE=1 is required to build against torch 2.7.1 (the last torch with
-    # sm_60 cubins) and it drops csrc/libtorch_stable/, where an op the V100 serving path
-    # calls unconditionally lives. sm_60 is unaffected and still MEASURED.
-    "1cat-vllm:fat6070": {
-        "caps": {60}, "status": "MEASURED",
-        "why": "live container fat-smoke-588671 healthy on sm_60 TP=2. sm_70 was INFERRED here "
-               "and is now DISPROVEN: 8/8 boot failures on V100 (RELEASE-GATE.md 3.7). Never "
-               "route a Volta card to this image"},
-    "pxa-vllm:sm60-sm70": {
-        "caps": {60}, "status": "MEASURED",
-        "why": "same build as 1cat-vllm:fat6070. THE TAG OVERSTATES IT - sm_70 does not boot. "
-               "Retagged or withdrawn before release; sm_60 half is sound"},
+    # THE FAT IMAGE IS WITHDRAWN. One image spanning sm_60+sm_70 was tried and does
+    # not work: 8 boot attempts on a Tesla V100, 8 failures (RELEASE-GATE.md 3.7). The
+    # cause is structural, not configuration - VLLM_SKIP_C_STABLE=1 is required to build
+    # against torch 2.7.1 (the last torch with sm_60 cubins) and it drops
+    # csrc/libtorch_stable/, where an op the V100 serving path calls unconditionally
+    # lives. You cannot have sm_60 cubins and that op in the same build. Hence two thin
+    # images, each pinned to the torch its cards need. Do not reintroduce a fat tag.
 
-    # The two-image split (scripts/build-images.sh). Both built from our own tree - no
-    # third-party image is in this table's eligible set any more.
+    # THE SHIPPING SET: two thin images (scripts/build-images.sh), each built from our
+    # own tree, each pinned to the torch its cards need. No third-party image is
+    # eligible.
     "pxa-vllm:sm60": {
         "caps": {60}, "status": "MEASURED",
         "why": "Pascal variant: torch 2.7.1 (last torch shipping sm_60 cubins), "
