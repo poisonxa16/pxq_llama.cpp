@@ -1,6 +1,6 @@
 # Function Calling Support
 
-This document describes the function calling format supported by the ik_llama.cpp server implementation.
+This document describes the function calling format supported by the pxq_llama server implementation.
 
 ## Overview
 
