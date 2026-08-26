@@ -287,9 +287,13 @@ VLLM_IMAGES = {
     # own tree, each pinned to the torch its cards need. No third-party image is
     # eligible.
     "pxa-vllm:sm60": {
-        "caps": {60}, "status": "MEASURED",
+        "caps": set(), "caps_inferred": {60}, "status": "INFERRED",
         "why": "Pascal variant: torch 2.7.1 (last torch shipping sm_60 cubins), "
-               "VLLM_SKIP_C_STABLE=1, arch 6.0;7.0. Same build the sm_60 gate passed on"},
+               "VLLM_SKIP_C_STABLE=1, arch 6.0;7.0. The sm_60 gate that produced the "
+               "MEASURED numbers ran against the WITHDRAWN FAT IMAGE, not this tag - "
+               "identical build arguments is an argument, not a boot. caps stays EMPTY "
+               "until scripts/thin-image-gate.sh sm60 passes on a P100 pair against "
+               "THIS tag"},
     "pxa-vllm:sm70": {
         "caps": set(), "caps_inferred": {70}, "status": "INFERRED",
         "why": "Volta variant: torch 2.10 (the tree's own pins), libtorch_stable BUILT, no "
@@ -788,6 +792,14 @@ def find_mmproj(model_path, kind):
     return cands, f"{len(cands)} mmproj*.gguf sibling(s) in {d}"
 
 
+def docker_has_image(tag):
+    """True iff docker actually holds this tag. Advisory only: a missing or broken
+    docker degrades to "not present", never to a traceback, because this is called
+    while EXPLAINING a decision and an explanation that crashes is worse than a
+    vague one. _run() already swallows non-zero exit and timeout and returns None."""
+    return _run(["docker", "image", "inspect", "-f", "ok", tag], timeout=10) == "ok"
+
+
 def has_vllm_pxq4():
     try:
         import vllm_pxq4  # noqa: F401
@@ -851,8 +863,19 @@ def vllm_eligibility(sel, image_arg):
                      "eligible. Set PXA_VLLM_IMAGE or PXA_PXQ4_LIB=libpxq4_sm<cc>_v<n>.so")
     else:
         trail.append("probe 3: vllm_pxq4 is not importable in this interpreter")
-    trail.append(f"known-eligible images on this box: "
-                 f"{', '.join(k for k, v in VLLM_IMAGES.items() if v['status'] == 'MEASURED')}")
+    # "on this box" has to MEAN on this box. This line previously printed every
+    # MEASURED row in the table, so an image that had never been built was advertised
+    # as available and the operator was sent to build a command around a tag docker
+    # does not have. The table says what an image WOULD be good for; only docker says
+    # whether it exists. Print both, and never let a missing docker turn an advisory
+    # line into a crash.
+    meas = [k for k, v in VLLM_IMAGES.items() if v["status"] == "MEASURED"]
+    present = [k for k in meas if docker_has_image(k)]
+    absent = [k for k in meas if k not in present]
+    trail.append("gated images PRESENT on this box: " + (", ".join(present) or "NONE"))
+    if absent:
+        trail.append("gated images NOT BUILT here (build them before use): "
+                     + ", ".join(absent))
     return set(), None, trail
 
 
@@ -2046,6 +2069,26 @@ def main():
 
     # ---- mmproj resolution --------------------------------------------------
     mmproj = a.mmproj
+    if plan.engine == "llama" and not mmproj and a.no_mmproj:
+        # --no-mmproj SUPPRESSES resolution, so this branch emits no projector. It still
+        # has to SAY that: "REFUSES rather than silently dropping" cuts both ways, and an
+        # operator who suppresses a projector on a model that has three sitting beside it
+        # deserves to see that the flag was read and what it turned off. Previously this
+        # path printed nothing at all - the flag and the candidates both vanished.
+        cands, _why = find_mmproj(a.model, kind)
+        if cands:
+            print(f"  mmproj: SUPPRESSED by --no-mmproj. {len(cands)} projector(s) are "
+                  f"sitting next to this model and none will be attached:")
+            for c in cands:
+                print(f"            {c}")
+            print("          This seat serves TEXT-ONLY. Drop --no-mmproj, or pass "
+                  "--mmproj <path>, to take images.")
+        elif prof.get("vision"):
+            print("  mmproj: SUPPRESSED by --no-mmproj although this model carries vision "
+                  "tensors. Serving TEXT-ONLY.")
+        else:
+            print("  mmproj: --no-mmproj accepted; nothing to suppress (no projector beside "
+                  "this model, no vision tensors in it). Serving TEXT-ONLY either way.")
     if plan.engine == "llama" and not mmproj and not a.no_mmproj:
         cands, why = find_mmproj(a.model, kind)
         if prof.get("vision"):
