@@ -91,6 +91,51 @@ class SafeTensorsStore:
     def shape(self, name): return tuple(self.index[name][2]["shape"])
 
 
+QK8_0 = 32
+BLOCK_Q8_0_BYTES = 2 + QK8_0        # ggml_half d + int8 qs[32]
+
+
+def quantize_q8_0(x: np.ndarray) -> np.ndarray:
+    """f32 -> ggml block_q8_0 bytes. Rows must be a multiple of 32 elements.
+
+    Matches ggml: d = max|x| / 127 in f32, stored as f16; quants use the f32 d.
+    """
+    b = np.ascontiguousarray(x, dtype=np.float32).reshape(-1, QK8_0)
+    amax = np.abs(b).max(axis=1)
+    d = amax / 127.0
+    idd = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0).astype(np.float32)
+    q = np.rint(b * idd[:, None]).astype(np.int8)
+    out = np.empty((b.shape[0], BLOCK_Q8_0_BYTES), dtype=np.uint8)
+    out[:, 0:2] = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = q.view(np.uint8)
+    return out
+
+
+class ShardStreamQ8:
+    """per_layer_token_embd, quantized to Q8_0 one checkpoint shard at a time.
+
+    The gather table is quantized HERE rather than by llama-quantize because
+    that quantizer dequantizes a whole tensor into one f32 buffer -- 51.2B
+    parameters is ~205 GB, far past this host. Q8_0 is also block-32, so it is
+    legal at ne0=160; Q4_K is not (it needs ne0 % 256 == 0)."""
+
+    def __init__(self, store, names, nbytes, row_len):
+        self.store, self.names, self.nbytes, self.row_len = store, names, nbytes, row_len
+
+    def tofile(self, fout):
+        written = 0
+        for i, nm in enumerate(self.names):
+            a = self.store.raw_u16(nm)
+            blocks = quantize_q8_0(bf16_bits_to_f32(a))
+            blocks.tofile(fout)
+            written += blocks.nbytes
+            del a, blocks
+            if (i + 1) % 16 == 0 or i + 1 == len(self.names):
+                print(f"      per_layer_token_embd -> Q8_0: shard {i+1}/{len(self.names)} "
+                      f"({written / 2**30:.1f} GiB)", flush=True)
+        assert written == self.nbytes, (written, self.nbytes)
+
+
 class Lazy:
     """Duck-types just enough of np.ndarray for GGUFWriter.write_tensors_to_file
     (.nbytes and .tofile). Nothing is read or transformed until the writer asks
@@ -207,6 +252,8 @@ def main():
     ap.add_argument("--gguf-py", type=Path, default=None)
     ap.add_argument("--tokenizer-dir", type=Path, default=None,
                     help="where tokenizer.json lives (default: model_dir)")
+    ap.add_argument("--ple-type", choices=["q8_0", "bf16"], default="q8_0",
+                    help="codec for per_layer_token_embd (default q8_0: block-32,\n                          legal at ne0=160, ~54 GiB instead of 95 GiB bf16)")
     ap.add_argument("--name", default="Qwen3.8 Flash Next")
     ap.add_argument("--size-label", default="56B")
     args = ap.parse_args()
@@ -443,12 +490,24 @@ def main():
         add_bf16(gg, sh(c), lambda c=c: store.raw_u16(c))
 
     # the streamed PLE table
-    ple_nbytes = ple_rows * ple_dim * 2
-    w.add_tensor_info("per_layer_token_embd.weight", (ple_rows, ple_dim),
-                      np.dtype(np.uint16), ple_nbytes,
-                      raw_dtype=GGMLQuantizationType.BF16)
-    w.tensors[-1]["per_layer_token_embd.weight"].tensor = ShardStream(
-        store, [src(x) for x in shard_names], ple_nbytes)
+    _pn = [src(x) for x in shard_names]
+    if args.ple_type == "q8_0":
+        assert ple_dim % QK8_0 == 0, (ple_dim, QK8_0)
+        ple_nbytes = (ple_rows * ple_dim // QK8_0) * BLOCK_Q8_0_BYTES
+        w.add_tensor_info("per_layer_token_embd.weight", (ple_rows, ple_dim),
+                          np.dtype(np.float32), ple_nbytes,
+                          raw_dtype=GGMLQuantizationType.Q8_0)
+        w.tensors[-1]["per_layer_token_embd.weight"].tensor = ShardStreamQ8(
+            store, _pn, ple_nbytes, ple_dim)
+    else:
+        ple_nbytes = ple_rows * ple_dim * 2
+        w.add_tensor_info("per_layer_token_embd.weight", (ple_rows, ple_dim),
+                          np.dtype(np.uint16), ple_nbytes,
+                          raw_dtype=GGMLQuantizationType.BF16)
+        w.tensors[-1]["per_layer_token_embd.weight"].tensor = ShardStream(
+            store, _pn, ple_nbytes)
+    print(f"per_layer_token_embd codec: {args.ple_type} "
+          f"({ple_nbytes / 2**30:.1f} GiB)")
     stats["bf16"] += 1
 
     n_kv_in = t["linear_num_key_heads"] * t["linear_key_head_dim"]

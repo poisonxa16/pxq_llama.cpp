@@ -2223,6 +2223,18 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         // do not quantize Mamba's small yet 2D weights
         // NOTE: can't use LLM_TN here because the layer number is not known
+        // A row-gather (GET_ROWS) table must not be touched by this quantizer at
+        // all. Two independent reasons, both load-bearing:
+        //   * its codecs are panel codecs -- a row is spread across a panel with
+        //     shared state, so such a table loads cleanly and gathers nonsense.
+        //   * the fallback could not be Q4_K anyway: that needs ne0 % 256 == 0 and
+        //     per_layer_token_embd has ne0 = 160. Block-32 codecs are the only
+        //     legal choice there.
+        //   * the dequantize path sizes one f32 buffer to the WHOLE tensor. For
+        //     51.2B parameters that is ~205 GB; it OOMs long before it quantizes.
+        // The table is quantized where it is created, by the converter, with a
+        // block-32 codec. Copy it through untouched.
+        quantize &= !pxa_is_row_gather_tensor(tensor);
         quantize &= name.find("ssm_conv1d.weight") == std::string::npos;
         quantize &= name.find("ssm_x.weight")      == std::string::npos;
         quantize &= name.find("ssm_dt.weight")     == std::string::npos;
