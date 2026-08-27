@@ -91,9 +91,28 @@ class SafeTensorsStore:
     def shape(self, name): return tuple(self.index[name][2]["shape"])
 
 
+class Lazy:
+    """Duck-types just enough of np.ndarray for GGUFWriter.write_tensors_to_file
+    (.nbytes and .tofile). Nothing is read or transformed until the writer asks
+    for the bytes, so exactly one tensor is resident at a time.
+
+    Without this the writer holds every tensor in memory until the first byte is
+    written -- ~257 GiB of anonymous memory for this model, on a host with 188 GB
+    and no swap."""
+
+    def __init__(self, nbytes, produce, note=None):
+        self.nbytes = nbytes
+        self._produce = produce
+        self._note = note
+
+    def tofile(self, fout):
+        a = self._produce()
+        assert a.nbytes == self.nbytes, (self._note, a.nbytes, self.nbytes)
+        a.tofile(fout)
+
+
 class ShardStream:
-    """Duck-types just enough of np.ndarray for GGUFWriter.write_tensors_to_file:
-    it exposes .nbytes and .tofile(), streaming N shards back-to-back."""
+    """per_layer_token_embd: 128 checkpoint shards written back-to-back."""
 
     def __init__(self, store, names, nbytes):
         self.store = store
@@ -106,11 +125,11 @@ class ShardStream:
             a = self.store.raw_u16(nm)
             a.tofile(fout)
             written += a.nbytes
+            del a
             if (i + 1) % 16 == 0 or i + 1 == len(self.names):
                 print(f"      per_layer_token_embd: shard {i+1}/{len(self.names)} "
                       f"({written / 2**30:.1f} GiB)", flush=True)
         assert written == self.nbytes, (written, self.nbytes)
-
 
 
 def add_vocab(w, model_dir, n_vocab, tcfg_text, gguf):
@@ -179,6 +198,8 @@ def main():
                     help="bytes per output shard (0 = single file)")
     ap.add_argument("--kv-only", type=Path, default=None,
                     help="build only the KV header and diff it against this reference GGUF")
+    ap.add_argument("--self-test", type=Path, default=None,
+                    help="materialise every tensor thunk and compare against this reference GGUF")
     ap.add_argument("--dry-run", action="store_true",
                     help="build the full tensor plan and KV header, write nothing")
     ap.add_argument("--gguf-py", type=Path, default=None)
@@ -361,17 +382,21 @@ def main():
     stats = {"f32": 0, "bf16": 0, "skipped_visual": 0, "skipped_mtp": 0}
     claimed = set()
 
-    def add_f32(name, arr):
-        a = np.ascontiguousarray(arr, dtype=np.float32)
-        w.add_tensor(name, a)
+    def add_f32(name, shape, produce):
+        n = int(np.prod(shape)) * 4
+        w.add_tensor_info(name, tuple(shape), np.dtype(np.float32), n,
+                          raw_dtype=GGMLQuantizationType.F32)
+        w.tensors[-1][name].tensor = Lazy(
+            n, lambda p=produce: np.ascontiguousarray(p(), dtype=np.float32), name)
         stats["f32"] += 1
 
-    def add_bf16(name, u16):
-        a = np.ascontiguousarray(u16)
+    def add_bf16(name, shape, produce):
+        n = int(np.prod(shape)) * 2
         # NB: write_ti_data_to_file reverses shape itself -- pass numpy order.
-        w.add_tensor_info(name, a.shape, np.dtype(np.uint16),
-                          a.nbytes, raw_dtype=GGMLQuantizationType.BF16)
-        w.tensors[-1][name].tensor = a
+        w.add_tensor_info(name, tuple(shape), np.dtype(np.uint16), n,
+                          raw_dtype=GGMLQuantizationType.BF16)
+        w.tensors[-1][name].tensor = Lazy(
+            n, lambda p=produce: np.ascontiguousarray(p()), name)
         stats["bf16"] += 1
 
     def src(name):
@@ -379,27 +404,38 @@ def main():
         return name
 
     def norm(name, hf_name, plus_one=True):
-        v = store.f32(src(hf_name)).astype(np.float32)
-        add_f32(name, v + 1.0 if (plus_one and NORM_PLUS_ONE) else v)
+        h = src(hf_name)
+        off = 1.0 if (plus_one and NORM_PLUS_ONE) else 0.0
+        add_f32(name, store.shape(h),
+                lambda h=h, off=off: store.f32(h).astype(np.float32) + off)
 
     LM = "model.language_model."
+    sh = store.shape
 
     # globals
     for cand in (LM + "embed_tokens.weight", "model.embed_tokens.weight"):
         if store.has(cand):
-            add_bf16("token_embd.weight", store.raw_u16(src(cand))); break
+            c = src(cand)
+            add_bf16("token_embd.weight", sh(c), lambda c=c: store.raw_u16(c)); break
     else:
-        raise SystemExit("embed_tokens not found")
+        if args.self_test is None:
+            raise SystemExit("embed_tokens not found")
+        print("  (self-test: embed_tokens not downloaded yet, skipping)")
     for cand in ("lm_head.weight", LM + "lm_head.weight"):
         if store.has(cand):
-            add_bf16("output.weight", store.raw_u16(src(cand))); break
+            c = src(cand)
+            add_bf16("output.weight", sh(c), lambda c=c: store.raw_u16(c)); break
     else:
-        raise SystemExit("lm_head not found")
+        if args.self_test is None:
+            raise SystemExit("lm_head not found")
+        print("  (self-test: lm_head not downloaded yet, skipping)")
 
     HCM = LM + "hyper_connection_mixer."
     norm("output_hc_norm.weight", HCM + "hc_norm.weight")
-    add_bf16("output_hc_down.weight", store.raw_u16(src(HCM + "input_mix_weight_down.weight")))
-    add_bf16("output_hc_up.weight",   store.raw_u16(src(HCM + "input_mix_weight_up.weight")))
+    for gg, hf_n in (("output_hc_down.weight", "input_mix_weight_down.weight"),
+                     ("output_hc_up.weight",   "input_mix_weight_up.weight")):
+        c = src(HCM + hf_n)
+        add_bf16(gg, sh(c), lambda c=c: store.raw_u16(c))
 
     # the streamed PLE table
     ple_nbytes = ple_rows * ple_dim * 2
@@ -407,79 +443,205 @@ def main():
                       np.dtype(np.uint16), ple_nbytes,
                       raw_dtype=GGMLQuantizationType.BF16)
     w.tensors[-1]["per_layer_token_embd.weight"].tensor = ShardStream(
-        store, [src(s) for s in shard_names], ple_nbytes)
+        store, [src(x) for x in shard_names], ple_nbytes)
     stats["bf16"] += 1
 
+    n_kv_in = t["linear_num_key_heads"] * t["linear_key_head_dim"]
+    conv_k  = t["linear_conv_kernel_dim"]
+
+    def perm_v(a, n_lead):
+        """permute the value-head block of a row-major [n_lead + 48*128, ...]."""
+        head, tail = a[:n_lead], a[n_lead:]
+        tail = tail.reshape(n_v_heads, v_head_d, -1)[PERM48].reshape(tail.shape[0], -1)
+        return np.concatenate([head, tail.reshape(tail.shape[0], *a.shape[1:])], 0)
+
+    skipped_layers = []
     for il in range(n_layer):
         L = f"{LM}layers.{il}."
         B = f"blk.{il}."
 
+        if args.self_test is not None:
+            # only gate layers whose source tensors are all actually on disk
+            need = [L + f"{pfx}.{leaf}"
+                    for pfx in ("attn_hyper_connection", "mlp_hyper_connection")
+                    for leaf in ("hc_norm.weight", "input_mix_weight_down.weight",
+                                 "input_mix_weight_up.weight", "block_inject_weight.weight")]
+            need += [L + "mlp." + x for x in
+                     ("gate.weight", "shared_expert_gate.weight",
+                      "experts.gate_up_proj", "experts.down_proj",
+                      "shared_expert.gate_proj.weight", "shared_expert.up_proj.weight",
+                      "shared_expert.down_proj.weight")]
+            if layer_types[il] == "linear_attention":
+                need += [L + "linear_attn." + x for x in
+                         ("in_proj_qkv.weight", "in_proj_z.weight", "out_proj.weight",
+                          "A_log", "dt_bias", "in_proj_a.weight", "in_proj_b.weight",
+                          "conv1d.weight", "norm.weight")]
+            else:
+                need += [L + "self_attn." + x for x in
+                         ("q_proj.weight", "k_proj.weight", "v_proj.weight",
+                          "o_proj.weight", "q_norm.weight", "k_norm.weight",
+                          "indexer.index_qk_proj.weight",
+                          "indexer.q_layernorm.weight", "indexer.k_layernorm.weight")]
+            if il == ple_il:
+                need += [P + x for x in ("key_proj.weight", "value_proj.weight",
+                                         "conv1d.weight", "norm_conv.weight",
+                                         "norm_key.weight", "norm_query.weight")]
+            if not all(store.has(x) for x in need):
+                skipped_layers.append(il)
+                continue
+
         for hf_pfx, gg_pfx in (("attn_hyper_connection.", "hc_attn_"),
                                ("mlp_hyper_connection.",  "hc_ffn_")):
             norm(B + gg_pfx + "norm.weight", L + hf_pfx + "hc_norm.weight")
-            add_bf16(B + gg_pfx + "down.weight",
-                     store.raw_u16(src(L + hf_pfx + "input_mix_weight_down.weight")))
-            add_bf16(B + gg_pfx + "up.weight",
-                     store.raw_u16(src(L + hf_pfx + "input_mix_weight_up.weight")))
-            add_f32(B + gg_pfx + "inject.weight",
-                    store.f32(src(L + hf_pfx + "block_inject_weight.weight")))
+            for gg_s, hf_s in (("down", "input_mix_weight_down.weight"),
+                               ("up",   "input_mix_weight_up.weight")):
+                c = src(L + hf_pfx + hf_s)
+                add_bf16(B + gg_pfx + gg_s + ".weight", sh(c), lambda c=c: store.raw_u16(c))
+            c = src(L + hf_pfx + "block_inject_weight.weight")
+            add_f32(B + gg_pfx + "inject.weight", sh(c), lambda c=c: store.f32(c))
 
-        # MoE
-        add_f32(B + "ffn_gate_inp.weight", store.f32(src(L + "mlp.gate.weight")))
-        add_f32(B + "ffn_gate_inp_shexp.weight",
-                store.f32(src(L + "mlp.shared_expert_gate.weight")).reshape(-1))
-        gu = store.raw_u16(src(L + "mlp.experts.gate_up_proj"))
-        half = gu.shape[1] // 2
-        add_bf16(B + "ffn_gate_exps.weight", gu[:, :half, :])
-        add_bf16(B + "ffn_up_exps.weight",   gu[:, half:, :])
-        add_bf16(B + "ffn_down_exps.weight", store.raw_u16(src(L + "mlp.experts.down_proj")))
-        for a, b in (("gate", "gate"), ("up", "up"), ("down", "down")):
-            add_bf16(B + f"ffn_{a}_shexp.weight",
-                     store.raw_u16(src(L + f"mlp.shared_expert.{b}_proj.weight")))
+        # ---- MoE
+        c = src(L + "mlp.gate.weight")
+        add_f32(B + "ffn_gate_inp.weight", sh(c), lambda c=c: store.f32(c))
+        c = src(L + "mlp.shared_expert_gate.weight")
+        add_f32(B + "ffn_gate_inp_shexp.weight", (n_embd,),
+                lambda c=c: store.f32(c).reshape(-1))
+
+        gu = src(L + "mlp.experts.gate_up_proj")
+        n_e, n_gu, n_in = sh(gu)
+        half = n_gu // 2
+        add_bf16(B + "ffn_gate_exps.weight", (n_e, half, n_in),
+                 lambda c=gu, h=half: store.raw_u16(c)[:, :h, :])
+        add_bf16(B + "ffn_up_exps.weight", (n_e, half, n_in),
+                 lambda c=gu, h=half: store.raw_u16(c)[:, h:, :])
+        c = src(L + "mlp.experts.down_proj")
+        add_bf16(B + "ffn_down_exps.weight", sh(c), lambda c=c: store.raw_u16(c))
+        for nm in ("gate", "up", "down"):
+            c = src(L + f"mlp.shared_expert.{nm}_proj.weight")
+            add_bf16(B + f"ffn_{nm}_shexp.weight", sh(c), lambda c=c: store.raw_u16(c))
 
         if layer_types[il] == "linear_attention":
             A = L + "linear_attn."
-            qkv = store.raw_u16(src(A + "in_proj_qkv.weight"))
-            n_kv = t["linear_num_key_heads"] * t["linear_key_head_dim"]
-            v = qkv[2 * n_kv:].reshape(n_v_heads, v_head_d, -1)[PERM48].reshape(-1, qkv.shape[1])
-            add_bf16(B + "attn_qkv.weight", np.concatenate([qkv[:2 * n_kv], v], 0))
-            add_bf16(B + "attn_gate.weight",
-                     store.raw_u16(src(A + "in_proj_z.weight"))
-                          .reshape(n_v_heads, v_head_d, -1)[PERM48].reshape(-1, n_embd))
-            out = store.raw_u16(src(A + "out_proj.weight"))
-            add_bf16(B + "ssm_out.weight",
-                     out.reshape(n_embd, n_v_heads, v_head_d)[:, PERM48, :].reshape(n_embd, -1))
+            c = src(A + "in_proj_qkv.weight")
+            add_bf16(B + "attn_qkv.weight", sh(c),
+                     lambda c=c: perm_v(store.raw_u16(c), 2 * n_kv_in))
+            c = src(A + "in_proj_z.weight")
+            add_bf16(B + "attn_gate.weight", sh(c),
+                     lambda c=c: store.raw_u16(c).reshape(n_v_heads, v_head_d, -1)[PERM48]
+                                      .reshape(n_v_heads * v_head_d, -1))
+            c = src(A + "out_proj.weight")
+            add_bf16(B + "ssm_out.weight", sh(c),
+                     lambda c=c: store.raw_u16(c).reshape(n_embd, n_v_heads, v_head_d)[:, PERM48, :]
+                                      .reshape(n_embd, -1))
             # A_log -> -exp(A_log), then permute
-            add_f32(B + "ssm_a", (-np.exp(store.f32(src(A + "A_log")).astype(np.float32)))[PERM48])
-            add_f32(B + "ssm_dt.bias", store.f32(src(A + "dt_bias")).astype(np.float32)[PERM48])
-            add_f32(B + "ssm_alpha.weight", store.f32(src(A + "in_proj_a.weight"))[PERM48])
-            add_f32(B + "ssm_beta.weight",  store.f32(src(A + "in_proj_b.weight"))[PERM48])
-            conv = store.f32(src(A + "conv1d.weight")).reshape(-1, t["linear_conv_kernel_dim"])
-            cv = conv[2 * n_kv:].reshape(n_v_heads, v_head_d, -1)[PERM48].reshape(-1, conv.shape[1])
-            add_f32(B + "ssm_conv1d.weight", np.concatenate([conv[:2 * n_kv], cv], 0))
+            c = src(A + "A_log")
+            add_f32(B + "ssm_a", sh(c),
+                    lambda c=c: (-np.exp(store.f32(c).astype(np.float32)))[PERM48])
+            c = src(A + "dt_bias")
+            add_f32(B + "ssm_dt.bias", sh(c),
+                    lambda c=c: store.f32(c).astype(np.float32)[PERM48])
+            for gg, hf_n in (("ssm_alpha", "in_proj_a"), ("ssm_beta", "in_proj_b")):
+                c = src(A + hf_n + ".weight")
+                add_f32(B + gg + ".weight", sh(c), lambda c=c: store.f32(c)[PERM48])
+            c = src(A + "conv1d.weight")
+            add_f32(B + "ssm_conv1d.weight", (sh(c)[0], conv_k),
+                    lambda c=c: perm_v(store.f32(c).reshape(-1, conv_k), 2 * n_kv_in))
             # the sole norm that is NOT offset by one
             norm(B + "ssm_norm.weight", A + "norm.weight", plus_one=False)
         else:
             S = L + "self_attn."
             for gg, hf_n in (("attn_q", "q_proj"), ("attn_k", "k_proj"),
                              ("attn_v", "v_proj"), ("attn_output", "o_proj")):
-                add_bf16(B + gg + ".weight", store.raw_u16(src(S + hf_n + ".weight")))
+                c = src(S + hf_n + ".weight")
+                add_bf16(B + gg + ".weight", sh(c), lambda c=c: store.raw_u16(c))
             norm(B + "attn_q_norm.weight", S + "q_norm.weight")
             norm(B + "attn_k_norm.weight", S + "k_norm.weight")
-            qk = store.raw_u16(src(S + "indexer.index_qk_proj.weight"))
+            c = src(S + "indexer.index_qk_proj.weight")
             n_iq = t["indexer_n_heads"] * t["indexer_head_dim"]
-            add_bf16(B + "indexer.q_proj.weight", qk[:n_iq])
-            add_bf16(B + "indexer.k_proj.weight", qk[n_iq:])
+            n_ik = sh(c)[0] - n_iq
+            add_bf16(B + "indexer.q_proj.weight", (n_iq, sh(c)[1]),
+                     lambda c=c, n=n_iq: store.raw_u16(c)[:n])
+            add_bf16(B + "indexer.k_proj.weight", (n_ik, sh(c)[1]),
+                     lambda c=c, n=n_iq: store.raw_u16(c)[n:])
             norm(B + "indexer.q_norm.weight", S + "indexer.q_layernorm.weight")
             norm(B + "indexer.k_norm.weight", S + "indexer.k_layernorm.weight")
 
         if il == ple_il:
-            add_bf16(B + "ple_key.weight",   store.raw_u16(src(P + "key_proj.weight")))
-            add_bf16(B + "ple_value.weight", store.raw_u16(src(P + "value_proj.weight")))
-            add_f32(B + "ple_conv1d.weight",
-                    store.f32(src(P + "conv1d.weight")).reshape(-1, t["ple_conv_kernel_size"]))
+            for gg, hf_n in (("ple_key", "key_proj"), ("ple_value", "value_proj")):
+                c = src(P + hf_n + ".weight")
+                add_bf16(B + gg + ".weight", sh(c), lambda c=c: store.raw_u16(c))
+            c = src(P + "conv1d.weight")
+            add_f32(B + "ple_conv1d.weight", (sh(c)[0], t["ple_conv_kernel_size"]),
+                    lambda c=c, k=t["ple_conv_kernel_size"]: store.f32(c).reshape(-1, k))
             for nm in ("conv", "key", "query"):
                 norm(B + f"ple_norm_{nm}.weight", P + f"norm_{nm}.weight")
+
+    if args.self_test is not None:
+        from gguf.quants import dequantize
+        ref = gguf.GGUFReader(str(args.self_test))
+        RT = {tt.name: tt for tt in GGMLQuantizationType}
+        rmap = {x.name: x for x in ref.tensors}
+        # loose bounds: pure quantisation noise for the reference's own type.
+        TOL = {"F32": 1e-6, "BF16": 1e-6, "Q8_0": 0.02, "Q6_K": 0.05, "Q5_K": 0.08,
+               "IQ4_NL": 0.15, "IQ4_XS": 0.15, "IQ2_XXS": 0.9, "IQ1_S": 0.9, "Q4_K": 0.10}
+        ok = bad = skip = 0
+        checked = []
+        for shard in w.tensors:
+            for name, ti in shard.items():
+                rt = rmap.get(name)
+                if rt is None or name == "per_layer_token_embd.weight":
+                    skip += 1; continue
+                mine = ti.tensor._produce() if isinstance(ti.tensor, Lazy) else None
+                if mine is None:
+                    skip += 1; continue
+                if mine.dtype == np.uint16:
+                    mine = bf16_bits_to_f32(mine)
+                mine = np.asarray(mine, dtype=np.float32).ravel()
+                tyn = rt.tensor_type.name
+                # For the 3-D expert stacks, compare ONE expert: dequantising
+                # 838M IQ1_S elements per tensor buys no extra signal and takes
+                # ~500x longer. The expert axis is slowest-moving, so expert 0
+                # is a contiguous prefix of both the raw blocks and my array.
+                rd, n_exp = rt.data, 1
+                if len(ti.shape) == 3:
+                    n_exp = ti.shape[0]
+                    if rd.shape[0] % n_exp == 0:
+                        rd = rd[: rd.shape[0] // n_exp]
+                        mine = mine[: mine.size // n_exp]
+                    else:
+                        n_exp = 1
+                if rt.tensor_type == GGMLQuantizationType.F32:
+                    r = np.array(rd, dtype=np.float32).ravel()
+                elif rt.tensor_type == GGMLQuantizationType.BF16:
+                    r = bf16_bits_to_f32(np.frombuffer(rd.tobytes(), dtype="<u2")).ravel()
+                else:
+                    r = dequantize(rd, rt.tensor_type).astype(np.float32).ravel()
+                if r.size != mine.size:
+                    print(f"  SIZE  {name:<34} ref {r.size} vs mine {mine.size}")
+                    bad += 1; continue
+                rel = float(np.abs(mine - r).mean()) / (float(np.abs(r).mean()) + 1e-12)
+                tol = TOL.get(tyn, 0.2)
+                if rel <= tol:
+                    ok += 1
+                else:
+                    bad += 1
+                    print(f"  FAIL  {name:<34} [{tyn}] rel_err={rel:.4f} > {tol}")
+                checked.append((name, tyn, rel))
+                if len(checked) % 25 == 0:
+                    print(f"  ...{len(checked)} tensors checked, worst so far "
+                          f"{max(checked, key=lambda x: x[2])[2]:.4f}", flush=True)
+                del mine, r
+        print(f"\n=== self-test vs {args.self_test.name} ===")
+        if skipped_layers:
+            print(f"  layers not yet on disk, not gated: {len(skipped_layers)} "
+                  f"({skipped_layers[:6]}{'...' if len(skipped_layers)>6 else ''})")
+        worst = sorted(checked, key=lambda x: -x[2])[:8]
+        for n, tyn, rel in worst:
+            print(f"  worst: {n:<36} [{tyn}] rel_err={rel:.4f}")
+        print(f"  passed {ok}, failed {bad}, skipped {skip} (not in reference / streamed)")
+        if bad:
+            raise SystemExit("self-test FAILED")
+        return
 
     # ------------------------------------------------------- coverage report
     for k in store.index:
