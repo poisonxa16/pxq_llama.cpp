@@ -5711,6 +5711,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 GGML_ABORT("qwen4exp PLE: this build carries the conv history per context, so a "
                            "batch spanning %zu sequences cannot be served correctly", seqs.size());
             }
+            if (getenv("PXA_QWEN4EXP_PLE_DEBUG")) {
+                fprintf(stderr, "PLE_DBG fill: inp=%p buffer=%p n_tokens=%lld\n",
+                        (void *) lctx.inp_ple_conv_hist,
+                        (void *) (lctx.inp_ple_conv_hist ? lctx.inp_ple_conv_hist->buffer : nullptr),
+                        (long long) n_tokens);
+            }
             if (lctx.inp_ple_conv_hist && lctx.inp_ple_conv_hist->buffer) {
                 const size_t need = ggml_nelements(lctx.inp_ple_conv_hist);
                 auto & hv = lctx.ple_conv_hist[seqs.empty() ? 0 : *seqs.begin()];
@@ -5718,7 +5724,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 // prefix convolves to
                 if (hv.size() != need) hv.assign(need, 0.0f);
                 ggml_backend_tensor_set(lctx.inp_ple_conv_hist, hv.data(), 0, need * sizeof(float));
+                if (getenv("PXA_QWEN4EXP_PLE_DEBUG")) {
+                    double n2 = 0; for (size_t i = 0; i < hv.size(); ++i) n2 += (double) hv[i] * hv[i];
+                    fprintf(stderr, "PLE_DBG fill: wrote %zu floats, L2=%.6f\n", hv.size(), sqrt(n2));
+                }
                 lctx.ple_conv_hist_seq = seqs.empty() ? 0 : *seqs.begin();
+                lctx.ple_conv_n_tokens = (int32_t) n_tokens;
             }
         }
 
@@ -6047,11 +6058,21 @@ static void llama_graph_compute(
         for (int i = gf->n_nodes - 1; i >= 0; --i) {
             if (strcmp(gf->nodes[i]->name, "ple_conv_in") == 0) { src = gf->nodes[i]; break; }
         }
+        if (getenv("PXA_QWEN4EXP_PLE_DEBUG")) {
+            fprintf(stderr, "PLE_DBG read: src=%s\n", src ? src->name : "<NOT FOUND IN GRAPH>");
+        }
         if (src) {
             ggml_backend_sched_synchronize(lctx.sched);
 
             const int64_t hc_dim = src->ne[0];
-            const int64_t n_tok  = src->ne[1];
+            // NOT src->ne[1]: that is the PADDED ubatch width. Using it takes the last columns
+            // of the padding instead of the last real tokens, and since the window is carried
+            // into the next call the corruption compounds - output stays clean for ~30 tokens
+            // and then collapses. Isolated by A/B on 2026-08-27: with the conv branch disabled
+            // the same greedy prompt named twelve capitals correctly with no degradation.
+            const int64_t n_pad  = src->ne[1];
+            const int64_t n_tok  = lctx.ple_conv_n_tokens > 0
+                                 ? std::min<int64_t>(lctx.ple_conv_n_tokens, n_pad) : n_pad;
             const int64_t hist   = lctx.inp_ple_conv_hist->ne[1];
 
             auto & hv = lctx.ple_conv_hist[lctx.ple_conv_hist_seq];
@@ -6073,6 +6094,12 @@ static void llama_graph_compute(
                 }
             }
             std::copy(tail.begin(), tail.end(), hv.end() - (int64_t) tail.size());
+            if (getenv("PXA_QWEN4EXP_PLE_DEBUG")) {
+                double n2 = 0; for (size_t i = 0; i < hv.size(); ++i) n2 += (double) hv[i] * hv[i];
+                double t2 = 0; for (size_t i = 0; i < tail.size(); ++i) t2 += (double) tail[i] * tail[i];
+                fprintf(stderr, "PLE_DBG read: n_pad=%lld n_tok=%lld take=%lld tailL2=%.6f histL2=%.6f\n",
+                        (long long) n_pad, (long long) n_tok, (long long) take, sqrt(t2), sqrt(n2));
+            }
             lctx.ple_conv_hist_prev = hv;
         }
     }

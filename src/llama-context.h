@@ -392,6 +392,12 @@ struct llama_context {
     std::map<llama_seq_id, std::vector<float>> ple_conv_hist;
     std::vector<float> ple_conv_hist_prev;
     llama_seq_id       ple_conv_hist_seq = 0;
+    // The graph's token dimension is the PADDED ubatch width, not how many tokens this call
+    // actually carries. The conv-history readback must take the last REAL columns; taking the
+    // last columns of the padded tensor feeds padding into the window, and because the window
+    // is then carried forward the error compounds with every step. Recorded in
+    // llama_set_inputs, which is the only place that sees the batch.
+    int32_t            ple_conv_n_tokens = 0;
 
     // The n-gram window reaches back past the ubatch, so the last (n_gram - 1) tokens of
     // each sequence are carried here. next_pos is the position this history is contiguous

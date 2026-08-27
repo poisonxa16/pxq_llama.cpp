@@ -173,6 +173,17 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
         conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
     }
 
+    // A/B switch for attribution. The PLE conv is the one path here whose history is
+    // carried across calls by hand (read back from a named node after the graph runs),
+    // and with 11 graph splits across 6 GPUs that readback is the least-proven code in
+    // this port - the single-GPU fixture could never exercise it. Setting
+    // PXA_QWEN4EXP_NO_PLE_CONV=1 drops the conv branch entirely, leaving the rest of the
+    // PLE side path intact, so a run with and without it isolates the carry.
+    static const bool pxa_no_ple_conv = getenv("PXA_QWEN4EXP_NO_PLE_CONV") != nullptr;
+    if (pxa_no_ple_conv) {
+        conv_out = ggml_scale(ctx0, conv_out, 0.0f);
+    }
+
     conv_out = ggml_silu(ctx0, conv_out);
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
@@ -235,7 +246,14 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
-        if (has_ple && hparams.is_ple(il)) {
+        // Second A/B rung for attribution: PXA_QWEN4EXP_NO_PLE=1 skips the whole PLE side
+        // path, not just its conv. If the output collapse survives BOTH this and
+        // PXA_QWEN4EXP_NO_PLE_CONV, then PLE is exonerated and the fault is in the other
+        // state-carrying path - the delta-net recurrent state running under hc_mode on 36
+        // of the 48 layers. Diagnostic only: the logits are wrong with PLE off, since the
+        // shipped model genuinely has the side path.
+        static const bool pxa_no_ple = getenv("PXA_QWEN4EXP_NO_PLE") != nullptr;
+        if (has_ple && hparams.is_ple(il) && !pxa_no_ple) {
             res_hc = build_qwen4exp_ple(gf, res_hc, il);
         }
 
