@@ -783,6 +783,29 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
 
+                // PLE hash constants. The tensor-loader scope deliberately skipped these -
+                // shapes do not need them - but the forward graph does, so they are read here.
+                {
+                    std::vector<uint64_t> mult, off, voc;
+                    ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, mult, false);
+                    ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,      off,  false);
+                    ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,  voc,  false);
+                    if (mult.size() > llama_hparams::PLE_MAX_NGRAM ||
+                        off.size()  > llama_hparams::PLE_MAX_HEADS ||
+                        voc.size()  > llama_hparams::PLE_MAX_HEADS) {
+                        throw std::runtime_error(format(
+                            "qwen4exp: PLE tables larger than this build allows (multipliers %zu/%zu, offsets %zu/%zu, vocab %zu/%zu)",
+                            mult.size(), llama_hparams::PLE_MAX_NGRAM,
+                            off.size(),  llama_hparams::PLE_MAX_HEADS,
+                            voc.size(),  llama_hparams::PLE_MAX_HEADS));
+                    }
+                    std::copy(mult.begin(), mult.end(), hparams.ple_layer_multipliers.begin());
+                    std::copy(off.begin(),  off.end(),  hparams.ple_head_offsets.begin());
+                    std::copy(voc.begin(),  voc.end(),  hparams.ple_head_vocab_sizes.begin());
+                }
+                ml.get_key(LLM_KV_PLE_EOS_TOKEN_ID,      hparams.ple_eos_token_id,      false);
+                ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,    hparams.ple_image_token_id,    false);
+
                 // PLE n-gram hash embeddings. Absent key group => no PLE at all.
                 {
                     hparams.ple_layer_arr.fill(false);

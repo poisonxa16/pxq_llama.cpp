@@ -760,8 +760,10 @@ bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & resul
         case GGUF_TYPE_UINT32:
         case GGUF_TYPE_BOOL:
         case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
+        case GGUF_TYPE_UINT64:
+        case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same_v<T,  int64_t>) || (std::is_same_v<T, uint64_t>));  break;
         default:
-            throw std::runtime_error(format("%s is not a float32, int32, uint32 or bool array", key.c_str()));
+            throw std::runtime_error(format("%s is not a float32, int32, uint32, int64, uint64 or bool array", key.c_str()));
     }
 
     result.resize(arr_info.length);
@@ -795,8 +797,10 @@ bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> &
         case GGUF_TYPE_UINT32:
         case GGUF_TYPE_BOOL:
         case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
+        case GGUF_TYPE_UINT64:
+        case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same_v<T,  int64_t>) || (std::is_same_v<T, uint64_t>));  break;
         default:
-            throw std::runtime_error(format("%s is not a float32, int32 array", key.c_str()));
+            throw std::runtime_error(format("%s is not a float32, int32, int64 or uint64 array", key.c_str()));
     }
 
     if (arr_info.length > N_MAX) {
@@ -1615,5 +1619,7 @@ template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama
 // n_layer (the 0731 Flash release ships 46 for 43 blocks), which get_key_or_arr() rejects
 // by design. Both overloads are needed: the llm_kv one forwards to the string one.
 template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::vector<uint32_t> &, bool);
+template bool llama_model_loader::get_arr<uint64_t>(const std::string &, std::vector<uint64_t> &, bool);
 template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv, std::vector<uint32_t> &, bool);
+template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv, std::vector<uint64_t> &, bool);
 

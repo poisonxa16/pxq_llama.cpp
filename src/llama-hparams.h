@@ -164,6 +164,22 @@ struct llama_hparams {
     uint32_t ple_head_dim        = 0;
     std::array<bool, LLAMA_MAX_LAYERS> ple_layer_arr = {};
 
+    // PLE hash constants. The row for head h at position p is
+    //     mixed = (t[p]*m[0]) ^ (t[p-1]*m[1]) ^ ... ; row = mixed % vocab[h] + offset[h]
+    // computed HOST-side in llama_set_inputs, because ggml has neither int64 nor xor.
+    // These are UINT64 arrays in the GGUF - reading them needed a UINT64 case in
+    // llama_model_loader::get_arr, which both overloads previously threw on.
+    // Fixed-size, because llama_hparams must stay trivially copyable (static_assert below).
+    // n_gram is 3 and the head count is (n_gram-1)*heads_per_ngram = 16 in the shipped
+    // model; these caps leave generous headroom and are checked at load.
+    static constexpr size_t PLE_MAX_NGRAM = 16;
+    static constexpr size_t PLE_MAX_HEADS = 128;
+    std::array<uint64_t, PLE_MAX_NGRAM> ple_layer_multipliers = {};
+    std::array<uint64_t, PLE_MAX_HEADS> ple_head_offsets      = {};
+    std::array<uint64_t, PLE_MAX_HEADS> ple_head_vocab_sizes  = {};
+    uint32_t ple_eos_token_id   = 0;
+    uint32_t ple_image_token_id = 0;
+
     // gemma4 separate assistant MTP
     uint32_t mtp_backbone_n_embd = 0;
     bool     mtp_use_ordered_embeddings = false;
