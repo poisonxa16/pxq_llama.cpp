@@ -11,10 +11,20 @@ if [ "$(hostname)" != "the box" ]; then echo "WRONG HOST: $(hostname)"; exit 1; 
 REPO=<local-path>
 OUT=<local-path>
 BF16=$OUT/Qwen3.8-Flash-Next-BF16.gguf
-PXQ4=$OUT/Qwen3.8-Flash-Next-PXQ4.gguf
+# PXQ4 lands on a DIFFERENT SPINDLE from the BF16 source: quantize reads ~354 GB
+# and writes ~100 GB, and doing both on one spindle roughly halves throughput.
+QOUT=<local-path>
+PXQ4=$QOUT/Qwen3.8-Flash-Next-PXQ4.gguf
+mkdir -p "$QOUT"
+[ "$(stat -c %d <local-path>)" != "$(stat -c %d <local-path>)" ] || { echo "disk6 and disk7 are the SAME device"; exit 1; }
+# shard 00001 is metadata-only (0 tensors); 00002 carries the weights
 REF=<local-path>
 LOGD=$OUT/logs
 mkdir -p "$LOGD"
+
+# The engine binaries carry no RPATH, so libllama.so / libggml.so are not found
+# without this. Exported so run-flashnext.sh inherits it too.
+export LD_LIBRARY_PATH="$REPO/build-cuda/src:$REPO/build-cuda/ggml/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 step() { echo; echo "=== [$(date -u +%H:%M:%S)] $* ==="; }
 
 step "BF16 structural check"

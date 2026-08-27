@@ -6516,6 +6516,19 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_NEG:
                     ggml_cuda_op_neg(ctx, dst);
                     break;
+                // PXA: ABS and SGN had working CUDA kernels in unary.cu but were
+                // never registered here or in supports_op, so the scheduler placed
+                // them on the CPU. In qwen4exp that is not cosmetic: the PLE gate
+                // computes sigmoid(sgn(x) * sqrt(clamp(abs(x), eps, inf))), so two
+                // 8 KB unaries dragged a whole D2H/H2D round trip into the middle of
+                // layer 1 and shattered the CUDA0 graph segment into extra splits.
+                // Both ops are exactly representable, so this is bit-identical.
+                case GGML_UNARY_OP_ABS:
+                    ggml_cuda_op_abs(ctx, dst);
+                    break;
+                case GGML_UNARY_OP_SGN:
+                    ggml_cuda_op_sgn(ctx, dst);
+                    break;
                 case GGML_UNARY_OP_SIGMOID:
                     if (fusion && i + 5 < cgraph->n_nodes &&
                         cgraph->nodes[i+1]->op == GGML_OP_RESHAPE &&
@@ -7973,6 +7986,8 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 case GGML_UNARY_OP_EXP:
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_NEG:
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_SGN:
                     return ggml_is_contiguous(op->src[0]);
                 default:
                     return false;

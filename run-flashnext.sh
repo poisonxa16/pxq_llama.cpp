@@ -35,6 +35,9 @@ for d in ${CUDA_VISIBLE_DEVICES:-0,1,2,4,5,6}; do
   [ "$d" = "3" ] && { echo "REFUSING: card 3 is the production 1080 Ti"; exit 1; }
 done
 
+# the engine binaries carry no RPATH
+export LD_LIBRARY_PATH=<local-path>:<local-path>${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,4,5,6}
 

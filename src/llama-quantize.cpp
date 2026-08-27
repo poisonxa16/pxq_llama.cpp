@@ -2235,6 +2235,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // The table is quantized where it is created, by the converter, with a
         // block-32 codec. Copy it through untouched.
         quantize &= !pxa_is_row_gather_tensor(tensor);
+        // Every codec here has a block of at least 32 and ASSERTS
+        // n_per_row % block == 0 -- it aborts the process rather than falling
+        // back. Conv kernels are 4 elements wide (ssm_conv1d and ple_conv1d are
+        // both [4, 10240]), so a short row must be left alone structurally, not
+        // by remembering to name each one. Turns a crash into a copy.
+        quantize &= (tensor->ne[0] % 32 == 0);
         quantize &= name.find("ssm_conv1d.weight") == std::string::npos;
         quantize &= name.find("ssm_x.weight")      == std::string::npos;
         quantize &= name.find("ssm_dt.weight")     == std::string::npos;
