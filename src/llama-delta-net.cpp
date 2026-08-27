@@ -484,14 +484,16 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
 }
 
 ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context * ctx0, ggml_tensor * ssm_norm, ggml_tensor * ssm_out, ggml_tensor * output, ggml_tensor * z,
-        int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb) {
+        int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, bool sigmoid_gate) {
 
     ggml_tensor * attn_out_2d = ggml_reshape_2d(ctx0, output, head_v_dim, num_v_heads * n_tok);
     ggml_tensor * z_2d        = ggml_reshape_2d(ctx0, z,      head_v_dim, num_v_heads * n_tok);
 
     ggml_tensor * attn_out_norm = llm_build_context::llm_build_norm(ctx0, attn_out_2d, lctx.model.hparams, ssm_norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(attn_out_norm, "attn_rms_norm", il);
-    attn_out_norm = ggml_fused_mul_unary(ctx0, z_2d, attn_out_norm, GGML_UNARY_OP_SILU);
+    attn_out_norm = sigmoid_gate
+                  ? ggml_mul(ctx0, attn_out_norm, ggml_sigmoid(ctx0, z_2d))
+                  : ggml_fused_mul_unary(ctx0, z_2d, attn_out_norm, GGML_UNARY_OP_SILU);
     cb(attn_out_norm, "attn_out_norm", il);
 
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim*num_v_heads, n_tok);
@@ -524,7 +526,8 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
 
 ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * delta_input, ggml_tensor * state_row_idx, ggml_tensor * conv_seq_map, ggml_tensor * state_mask, ggml_tensor * inp_out_ids,
-            int64_t n_seqs, bool reset_state_local, int il, const llm_build_cb & cb, int64_t pxa_static_slot) const {
+            int64_t n_seqs, bool reset_state_local, int il, const llm_build_cb & cb, int64_t pxa_static_slot,
+            bool hc_mode) const {
 
     const int64_t n_tok = delta_input->ne[1];
     GGML_ASSERT(n_seqs > 0 && n_tok % n_seqs == 0);
@@ -560,6 +563,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             GGML_ASSERT(split_smm_in->n_device == n_device);
         }
         GGML_ASSERT(n_device > 1);
+        GGML_ASSERT(!hc_mode && "qwen4exp hyper-connections have no split-device linear path yet");
         std::vector<ggml_tensor *> results(n_device, nullptr);
         bool input_added = false;
         // PXA_REPLICATE_RECURRENT (Lever C): when set, every device holds a FULL mirror of the
@@ -678,8 +682,14 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             input->view_src = input->src[idx];
         }
     }
-    auto norm = model.layers[il].attn_norm->extra ? ((ggml_split_tensor_t *)model.layers[il].attn_norm->extra)->splits[idx] : model.layers[il].attn_norm;
-    auto cur = llm_build_context::llm_build_norm(ctx0, input, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
+    ggml_tensor * cur;
+    if (hc_mode) {
+        // the hyper-connection mixer is this layer's norm; there is no attn_norm tensor to apply
+        cur = input;
+    } else {
+        auto norm = model.layers[il].attn_norm->extra ? ((ggml_split_tensor_t *)model.layers[il].attn_norm->extra)->splits[idx] : model.layers[il].attn_norm;
+        cur = llm_build_context::llm_build_norm(ctx0, input, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
+    }
 
     auto [qkv_mixed, z] = build_qkvz(lctx, ctx0, model.layers[il].wqkv, model.layers[il].wqkv_gate, model.layers[il].ssm_in,
             head_k_dim, num_k_heads, head_v_dim, num_v_heads, cur, il, cb, gf);
@@ -702,19 +712,19 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         n_seqs, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv, pxa_static_slot);
 
-    auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb);
+    auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, hc_mode);
     if (inp_out_ids) {
         gated_output = ggml_get_rows(ctx0, gated_output, inp_out_ids);
         input        = ggml_get_rows(ctx0, input, inp_out_ids);
     }
-    output = ggml_add(ctx0, gated_output, input);
+    output = hc_mode ? gated_output : ggml_add(ctx0, gated_output, input);
     cb(output, "ssm_output", il);
     return output;
 
 }
 
 ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
-        ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const {
+        ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb, bool hc_mode) const {
     GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
 
     auto & model = lctx.model;
@@ -754,7 +764,7 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
         // slot for the all_same case, so graph reuse is invalidated if the active slot changes.
         int64_t pxa_static_slot = token_seq_ids.empty() ? 0 : (int64_t) token_seq_ids.front();
         if (pxa_static_slot < 0) pxa_static_slot = 0;
-        return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, 1, reset_state, il, cb, pxa_static_slot);
+        return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, 1, reset_state, il, cb, pxa_static_slot, hc_mode);
     }
 
     // PXA_LLAMA_MTP_FIX: generalized mixed/MTP path. The batch is decomposed into n_seqs DISTINCT
@@ -779,6 +789,6 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     GGML_ASSERT(conv_seq_map->ne[0] == n_seqs && conv_seq_map->ne[1] == n_tok);
     ggml_tensor * state_mask = make_state_mask(n_seqs);
 
-    return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, n_seqs, /*reset_state_local*/ false, il, cb);
+    return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, n_seqs, /*reset_state_local*/ false, il, cb, -1, hc_mode);
 }
 

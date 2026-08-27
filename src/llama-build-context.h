@@ -232,6 +232,18 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen35moe();
 
+    // Qwen3.8-Flash-Next. Implementation in src/graphs/build_qwen4exp.cpp
+    ggml_cgraph * build_qwen4exp();
+
+    // Low-rank hyper-connection mixer: collapses the hc wide-residual streams into one
+    // [n_embd, n_tokens] block input and, when `inject` is non-null, produces the per-stream
+    // scatter weights that build_qwen4exp_hc_combine puts the block output back with.
+    ggml_tensor * build_qwen4exp_hc_mix(ggml_tensor * x, ggml_tensor * w_norm, ggml_tensor * w_down,
+            ggml_tensor * w_up, ggml_tensor * w_inject, ggml_tensor ** inject, int il);
+
+    ggml_tensor * build_qwen4exp_hc_combine(ggml_tensor * residual, ggml_tensor * block_out,
+            ggml_tensor * inject, int il);
+
     ggml_cgraph * build_qwen35();
 
     ggml_cgraph * build_phi2();
