@@ -267,7 +267,7 @@ static ggml_type pxa_pxq_head_type() {
     return head;
 }
 
-static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
+static ggml_type llama_tensor_get_type_inner(quantize_state_internal & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
     const std::string name = ggml_get_name(tensor);
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
@@ -587,6 +587,71 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
 
     return new_type;
 }
+
+// ------------------------------------------------------------------------------------------
+// ROW-GATHER GUARD.
+//
+// The PXQ codecs and MXFP4 lay a row out across a panel with shared per-panel state. That is
+// what makes them fast in a GEMM, and it is exactly what makes a single row unreadable in
+// isolation. A tensor that is only ever consumed by GET_ROWS is read ONE ROW AT A TIME, so
+// encoding it with a panel codec produces a file that quantizes and loads cleanly and then
+// gathers nonsense.
+//
+// The quantizer cannot see the graph, so the test is structural: a gather table is enormous
+// along ne[1] (rows) because it is indexed by a hash or a token id. qwen4exp's
+// per_layer_token_embd is 160 x 320,001,536 - 51.2B of the model's 180B parameters - and
+// gemma3n carries the same tensor under the same name.
+//
+// On a match the panel codec is refused and the tensor falls back to a block-quantized type
+// whose rows stand alone. This is a CORRECTNESS gate, not a preference: it is not overridable
+// by --custom-q, because a file that gathers nonsense is not a tradeoff.
+// ------------------------------------------------------------------------------------------
+static bool pxa_is_row_gather_tensor(const ggml_tensor * tensor) {
+    const std::string name = ggml_get_name(tensor);
+
+    // named gather tables, independent of size
+    if (name.find("per_layer_token_embd") != std::string::npos) {
+        return true;
+    }
+
+    // structural: a row count this large only happens for a hash/id-indexed table
+    return tensor->ne[1] >= 1000000;
+}
+
+static bool pxa_is_panel_codec(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_PXQ1:
+        case GGML_TYPE_PXQ2:
+        case GGML_TYPE_PXQ3:
+        case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ:
+        case GGML_TYPE_PXQ6:
+        case GGML_TYPE_MXFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
+    ggml_type chosen = llama_tensor_get_type_inner(qs, new_type, tensor, ftype);
+
+    if (pxa_is_panel_codec(chosen) && pxa_is_row_gather_tensor(tensor)) {
+        // Q4_K keeps whole rows independently decodable and is already the fallback the
+        // stock rules use for oversized embedding tables.
+        const ggml_type safe = GGML_TYPE_Q4_K;
+        LLAMA_LOG_WARN("%s: %s is a row-gather table (%lld x %lld); %s is a panel codec and "
+                       "cannot be read one row at a time - using %s instead\n",
+                       __func__, ggml_get_name(tensor),
+                       (long long) tensor->ne[0], (long long) tensor->ne[1],
+                       ggml_type_name(chosen), ggml_type_name(safe));
+        return safe;
+    }
+
+    return chosen;
+}
+
+
 
 static size_t llama_tensor_quantize_internal(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row,
         const float * imatrix, const quantize_user_data * user_data, std::vector<std::thread> & workers, const int nthread) {
