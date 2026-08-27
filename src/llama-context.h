@@ -389,6 +389,16 @@ struct llama_context {
     // F32 [hc_dim, (conv_kernel-1)*ngram_size]: the PLE conv input of the positions just
     // before this ubatch, carried across calls because it cannot be recomputed from the cache.
     struct ggml_tensor * inp_ple_conv_hist;
+    // Destination for the conv-input capture. It lives in its OWN backend buffer, NOT in
+    // the graph arena. Marking a mid-graph tensor ggml_set_output does not keep it
+    // materialised: the scheduler still reuses that memory across splits (11 of them here,
+    // over 6 cards), so reading it after compute returned clobbered data. Writing into a
+    // pre-allocated tensor with a ggml_cpy node is the idiom the KV cache already uses, and
+    // the scheduler never aliases such a tensor. Sized to the padded ubatch width so the
+    // host-side windowing that picks the last REAL columns needs no change.
+    struct ggml_context * ctx_ple_capture = nullptr;
+    ggml_backend_buffer_t buf_ple_capture = nullptr;
+    struct ggml_tensor  * ple_conv_capture = nullptr;
     std::map<llama_seq_id, std::vector<float>> ple_conv_hist;
     std::vector<float> ple_conv_hist_prev;
     llama_seq_id       ple_conv_hist_seq = 0;

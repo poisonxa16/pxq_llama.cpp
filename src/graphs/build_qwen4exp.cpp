@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "../llama-build-context.h"
 #include "../llama-model.h"
 #include "../llama-context.h"
@@ -144,8 +146,20 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
     // the residual at those positions, which is gone. So it is carried across calls explicitly -
     // read as an input, written back host-side after the eval from this named output.
     ggml_set_name(normalized, "ple_conv_in");
-    ggml_set_output(normalized);
     ggml_build_forward_expand(gf, normalized);
+
+    // Copy the conv input of THIS ubatch into the persistent capture buffer. ggml_set_output
+    // on `normalized` was not enough: it lives in the graph arena, the scheduler reuses that
+    // memory across splits, and the post-compute read came back clobbered -- decode capture
+    // RMS 1.35 against a prefill 0.028, mostly zeros. Because the window is carried forward,
+    // that error compounded and the output collapsed after ~30 tokens.
+    if (lctx.ple_conv_capture != nullptr) {
+        GGML_ASSERT(lctx.ple_conv_capture->ne[0] == hc_dim);
+        GGML_ASSERT(lctx.ple_conv_capture->ne[1] >= n_tokens);
+        ggml_tensor * cap = ggml_view_2d(ctx0, lctx.ple_conv_capture, hc_dim, n_tokens,
+                lctx.ple_conv_capture->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, normalized, cap));
+    }
 
     // [hc_dim, hist + n_tokens] with the carried history in front
     ggml_tensor * padded = ggml_concat(ctx0, lctx.inp_ple_conv_hist, normalized, 1);
@@ -235,6 +249,25 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         lctx.inp_ple_conv_hist = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, hist);
         cb(lctx.inp_ple_conv_hist, "inp_ple_conv_hist", -1);
         ggml_set_input(lctx.inp_ple_conv_hist);
+
+        // One-time persistent capture buffer (see llama-context.h). Sized to the largest
+        // padded ubatch so the existing host-side windowing needs no change.
+        if (lctx.ple_conv_capture == nullptr) {
+            const int64_t cap_cols = std::max<int64_t>(n_tokens, lctx.cparams.n_ubatch);
+            ggml_init_params cap_params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            lctx.ctx_ple_capture = ggml_init(cap_params);
+            lctx.ple_conv_capture = ggml_new_tensor_2d(
+                    lctx.ctx_ple_capture, GGML_TYPE_F32, hc_dim, cap_cols);
+            ggml_set_name(lctx.ple_conv_capture, "ple_conv_capture");
+            lctx.buf_ple_capture = ggml_backend_alloc_ctx_tensors_from_buft(
+                    lctx.ctx_ple_capture, ggml_backend_cpu_buffer_type());
+            GGML_ASSERT(lctx.buf_ple_capture && "failed to allocate the PLE capture buffer");
+            ggml_backend_buffer_clear(lctx.buf_ple_capture, 0);
+        }
     }
 
     // the wide residual starts as hc identical copies of the embedding

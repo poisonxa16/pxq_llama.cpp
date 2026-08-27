@@ -6054,10 +6054,9 @@ static void llama_graph_compute(
     // recomputable later - they depend on the residual at those positions, which is gone once
     // the layer is done. Cheap: a few hundred KB per step.
     if (lctx.inp_ple_conv_hist) {
-        ggml_tensor * src = nullptr;
-        for (int i = gf->n_nodes - 1; i >= 0; --i) {
-            if (strcmp(gf->nodes[i]->name, "ple_conv_in") == 0) { src = gf->nodes[i]; break; }
-        }
+        // Read the PERSISTENT capture, not a mid-graph node. Hunting gf->nodes for
+        // "ple_conv_in" found a tensor whose buffer the scheduler had already reused.
+        ggml_tensor * src = lctx.ple_conv_capture;
         if (getenv("PXA_QWEN4EXP_PLE_DEBUG")) {
             fprintf(stderr, "PLE_DBG read: src=%s\n", src ? src->name : "<NOT FOUND IN GRAPH>");
         }
