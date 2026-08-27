@@ -82,6 +82,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_qwen35_tensors(const LLM_TN & tn);
 
+    bool create_qwen4exp_tensors(const LLM_TN & tn);
+
     bool create_phi2_tensors(const LLM_TN & tn);
 
     bool create_phi3_tensors(const LLM_TN & tn);
@@ -1897,6 +1899,171 @@ bool create_tensors_helper::create_qwen35moe_tensors(const LLM_TN & tn) {
                     { n_embd },
                     flags | llama_model_loader::TENSOR_NOT_REQUIRED);
         }
+    }
+
+    return use_mmap_buffer;
+}
+
+// =====================================================================================
+// Qwen3.8-Flash-Next (arch "qwen4exp").
+//
+// Layout, relative to its closest relative here, create_qwen35moe_tensors():
+//   * SAME  Gated DeltaNet on the recurrent layers (wqkv + wqkv_gate + ssm_conv1d/dt/a/
+//           beta/alpha/norm/out), and the SAME interleaved [q|gate] wq of width
+//           n_embd_head_k * n_head * 2 on the full-attention layers.
+//   * SAME  MoE: per-layer router + expert stack + a shared expert.
+//   * NEW   Low-rank hyper-connections replace attn_norm / attn_post_norm / output_norm.
+//           The residual stream is hc-expanded (hc_dim = hc * n_embd) and every layer
+//           carries two mixers (pre-token-mixer, pre-MoE); a third sits at the output.
+//   * NEW   A QSA "lightning indexer" on the full-attention layers only.
+//   * NEW   A PLE n-gram hash-embedding side path on the layers named by <arch>.ple.layers,
+//           gathering from one enormous GET_ROWS table (per_layer_token_embd).
+//
+// Split-mode contract (this fork only - mainline has no tensor-parallel concept, so the
+// upstream PR says nothing about any of it). Rules that made the choices below:
+//   1. Any tensor created in ctx_for_layer_split() lands in split_tensors when -sm graph/attn
+//      is active, i.e. in the CUDA split buffer, whose get_base() is the dummy 0x1000 and
+//      whose set_tensor() is a silent no-op for tensors with no ->extra. So a tensor placed
+//      there and then NOT handed to prepare_split_tensors() is never uploaded and reads as
+//      garbage - silently. Everything below is therefore either split, mirrored, or kept out
+//      of the split context on purpose.
+//   2. Everything reusing an existing llama_layer field (wq/wk/wv/wo, attn_q_norm/k_norm,
+//      wqkv/wqkv_gate/ssm_*, ffn_*_exps, ffn_*_shexp, ffn_gate_inp) is picked up by the
+//      generic field-driven loop at the bottom of create_tensors() and needs nothing new
+//      here beyond adding QWEN4EXP to the two [q|gate]-interleave conditionals.
+//   3. The genuinely new tensors are handled by split_qwen4exp_tensors() below.
+// =====================================================================================
+bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const int64_t hc     = hparams.dsv4_hc_mult;
+    const int64_t hc_dim = hc * n_embd;
+    const int64_t hc_lr  = hparams.hc_low_rank;
+
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+    // Output. There is deliberately NO output_norm for this arch: the final low-rank
+    // hyper-connection mixer (output_hc_norm/down/up) collapses the hc streams and
+    // normalises in one step, so model.output_norm stays null and every generic
+    // `if (model.output_norm)` / `split_tensors.find(model.output_norm)` site is inert.
+    {
+        model.hc_head_norm = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), {hc_dim});
+        model.hc_head_down = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), {hc_dim, hc_lr});
+        model.hc_head_up   = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), {hc_lr, hc_dim});
+
+        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab},
+                llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (model.output == NULL) {
+            model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
+                    llama_model_loader::TENSOR_DUPLICATED);
+        }
+    }
+
+    // The PLE n-gram table: [ple_head_dim, n_rows], where n_rows is the SUM of the padded
+    // per-head n-gram vocabularies. For Qwen3.8-Flash-Next that is 160 x 320001536 =
+    // 51,200,245,760 params, 95.4 GiB at bf16 - far larger than any GPU here, and meant to
+    // be pinned to host RAM with `-ot per_layer_token_embd=CPU`. Two consequences:
+    //   * the row count is a converter-side padded quantity, so read it back off the file
+    //     rather than recomputing it and risking an off-by-a-pad mismatch;
+    //   * it goes in ctx_input like GEMMA4's, never the split context. See the NOT-SPLIT
+    //     note in split_qwen4exp_tensors() for why splitting it is not merely unnecessary
+    //     but wrong.
+    if (hparams.ple_n_heads > 0) {
+        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight");
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        if (ple_w == nullptr) {
+            throw std::runtime_error("qwen4exp: hparams declare a PLE n-gram table but " + ple_name + " is missing from the model");
+        }
+        const int64_t ple_rows = ple_w->tensor->ne[1];
+        model.tok_embd_per_layer = create_tensor(ctx_input, ple_name, {hparams.ple_head_dim, ple_rows});
+    }
+
+    const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+    const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+
+    // Gated DeltaNet geometry. head_k_dim == head_v_dim == ssm_d_state, exactly as in
+    // create_qwen35moe_tensors; the hparams loader has already checked that ssm_d_inner
+    // agrees with that, which is what split_recurrent_tensors() re-derives head_v_dim from.
+    const int64_t head_k_dim = hparams.ssm_d_state;
+    const int64_t head_v_dim = hparams.ssm_d_state;
+    const int64_t n_k_heads  = hparams.ssm_n_group;
+    const int64_t n_v_heads  = hparams.ssm_dt_rank;
+    const int64_t key_dim    = head_k_dim * n_k_heads;
+    const int64_t value_dim  = head_v_dim * n_v_heads;
+    const int64_t conv_dim   = key_dim * 2 + value_dim;
+
+    const int64_t idx_dim    = hparams.indexer_head_size;
+    const int64_t idx_n_head = hparams.indexer_n_head;
+
+    for (int i = 0; i < n_layer; ++i) {
+        auto & layer = model.layers[i];
+
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        // Two low-rank hyper-connection mixers per layer. No attn_norm / attn_post_norm /
+        // ffn_norm exist for this arch - hc_attn_norm and hc_ffn_norm are what carries them,
+        // over the hc-expanded stream rather than over n_embd.
+        layer.hc_attn_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", i), {hc_dim});
+        layer.hc_attn_down   = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", i), {hc_dim, hc_lr});
+        layer.hc_attn_up     = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_UP,     "weight", i), {hc_lr, hc_dim});
+        layer.hc_attn_inject = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", i), {hc_dim, hc});
+        layer.hc_ffn_norm    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_NORM,    "weight", i), {hc_dim});
+        layer.hc_ffn_down    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", i), {hc_dim, hc_lr});
+        layer.hc_ffn_up      = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_UP,      "weight", i), {hc_lr, hc_dim});
+        layer.hc_ffn_inject  = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", i), {hc_dim, hc});
+
+        if (!hparams.is_recurrent(i)) {
+            // Full attention. wq holds [q|gate] interleaved per head, hence the *2 - the same
+            // packing qwen3next / qwen35 / qwen35moe use, and the reason QWEN4EXP has to join
+            // them in the two granularity conditionals in the split loop below.
+            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head * 2});
+            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa});
+            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa});
+            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd});
+
+            layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k});
+            layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k});
+
+            // QSA lightning indexer. Present only on full-attention layers.
+            layer.index_q_proj = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, idx_n_head * idx_dim});
+            layer.index_k_proj = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, idx_dim});
+            layer.index_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {idx_dim});
+            layer.index_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {idx_dim});
+        } else {
+            // Gated DeltaNet, byte-for-byte the qwen35moe tensor set. src/llama-delta-net.cpp
+            // already handles this exact layout (asymmetric k/v head counts with GVA repeat,
+            // fused qkvz split), so there is nothing new to port on this branch.
+            layer.wqkv       = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV,   "weight", i), {n_embd, key_dim * 2 + value_dim});
+            layer.wqkv_gate  = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE,  "weight", i), {n_embd, value_dim});
+            layer.ssm_conv1d = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {hparams.ssm_d_conv, conv_dim});
+            layer.ssm_dt     = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT,     "bias",   i), {hparams.ssm_dt_rank});
+            layer.ssm_a      = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_A_NOSCAN,         i), {hparams.ssm_dt_rank});
+            layer.ssm_beta   = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_BETA,   "weight", i), {n_embd, n_v_heads});
+            layer.ssm_alpha  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_ALPHA,  "weight", i), {n_embd, n_v_heads});
+            layer.ssm_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_NORM,   "weight", i), {head_v_dim});
+            layer.ssm_out    = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_OUT,    "weight", i), {value_dim, n_embd});
+        }
+
+        // PLE side path. Only the layers listed in <arch>.ple.layers carry these
+        // (layer 2 for Qwen3.8-Flash-Next); every other layer leaves them null.
+        if (hparams.is_ple(i)) {
+            layer.ple_key        = create_tensor(ctx_split, tn(LLM_TENSOR_PLE_KEY,        "weight", i), {n_embd, hc_dim});
+            layer.ple_value      = create_tensor(ctx_split, tn(LLM_TENSOR_PLE_VALUE,      "weight", i), {n_embd, n_embd});
+            layer.ple_norm_key   = create_tensor(ctx_split, tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", i), {hc_dim});
+            layer.ple_norm_query = create_tensor(ctx_split, tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", i), {hc_dim});
+            layer.ple_norm_conv  = create_tensor(ctx_split, tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", i), {hc_dim});
+            layer.ple_conv1d     = create_tensor(ctx_split, tn(LLM_TENSOR_PLE_CONV1D,     "weight", i), {hparams.ple_conv_kernel, hc_dim});
+        }
+
+        // MoE: every layer, no dense-FFN fallback in this arch.
+        layer.ffn_gate_inp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
+        use_mmap_buffer &= !create_std_ffn_exps(n_embd, tn, i, 0, n_ff_exp, ctx_split);
+
+        // Shared expert.
+        layer.ffn_gate_inp_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {n_embd});
+        layer.ffn_gate_shexp     = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", i), {n_embd, n_ff_shexp});
+        layer.ffn_up_shexp       = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", i), {n_embd, n_ff_shexp});
+        layer.ffn_down_shexp     = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), {n_ff_shexp, n_embd});
     }
 
     return use_mmap_buffer;
@@ -4594,6 +4761,83 @@ static void prepare_delta_split(int ttype, int repeat_type, int num_k_heads, int
     check_delta_split(t, l_split);
 }
 
+// qwen4exp: MIRROR-replicate the tensors that this arch adds and that no existing field-driven
+// branch of the split loop knows about. Mirror == prepare_split_tensors(-1, ...) == a FULL copy
+// on every participating device, the same treatment attn_norm / ffn_norm / the nextn fusion
+// tensors already get.
+//
+// WHY MIRROR AND NOT SHARD, per group:
+//
+//  * hc_{attn,ffn}_{norm,down,up,inject}  - the hyper-connection mixers read and rewrite the
+//    WHOLE hc-expanded residual stream (hc_dim = hc * n_embd) immediately before the token mixer
+//    and immediately before the MoE. They are the exact analogue of attn_norm / ffn_norm /
+//    nextn.eh_proj: input-fusion weights that must produce the FULL hidden on each device before
+//    the row-split attention slices its heads. Sharding the down/up bottleneck over its rank axis
+//    is possible in principle (column-split down, row-split up, all-reduce over the rank), but
+//    that needs a graph-side ggml_reduce that does not exist yet, so the door is left open rather
+//    than walked through. Cost of mirroring: ~26 MiB bf16 per layer per device.
+//
+//  * index_{q,k}_{proj,norm}  - the QSA lightning indexer decides WHICH tokens every head
+//    attends to. That selection has to be bit-identical on every device, or the devices attend to
+//    different token sets and the concatenated head outputs no longer describe one attention.
+//    Sharding index_q_proj over its indexer heads yields partial scores that would need an
+//    all-reduce BEFORE the top-k. Mirroring is correct by construction and costs ~3.3 MiB bf16
+//    per full-attention layer per device.
+//
+//  * ple_*  - the PLE side path exists on one layer, is tiny, and also writes the whole
+//    residual stream. Same argument as the HC mixers.
+//
+// DELIBERATELY NOT SPLIT, and not merely "not yet":
+//
+//  * model.tok_embd_per_layer (per_layer_token_embd, 160 x 320001536, 95.4 GiB bf16). It is a
+//    GET_ROWS gather table. prepare_split_tensors can only shard along an ne axis; sharding the
+//    row axis would put each token's n-gram row on exactly one device while every other device
+//    gathers from a hole, and this fork's split machinery has no all-gather to repair that. It is
+//    also destined for host RAM via `-ot per_layer_token_embd=CPU`, which reroutes it to the CPU
+//    buft inside get_context_for_tensor() before create_tensor() ever runs - so it never enters
+//    split_ctx and the split loop could not see it even if asked. Finally, setting ->extra on it
+//    would swap its base pointer for the 0x1000 dummy that ggml_backend_cuda_split_buffer_get_base
+//    returns, and split_buffer_set_tensor would then upload nothing at all, silently.
+//
+//  * model.tok_embd / model.output / model.hc_head_*  - the output group is handled (or
+//    deliberately left alone) by the existing generic code at the end of create_tensors(), exactly
+//    as for qwen3next and qwen35moe. hc_head_* lives in ctx_output, not a split context.
+//
+//  * attn_norm / attn_post_norm / ffn_norm / output_norm - this arch has none; the HC norms are
+//    what stands in for them, so those generic branches are simply inert here.
+static void split_qwen4exp_tensors(llama_layer & layer, const std::vector<int> & mirror,
+        std::vector<size_t> & mem_used, ggml_context * ctx_split) {
+    auto mirror_one = [&](ggml_tensor * t, llama_split_tensor & dst) {
+        // A tensor that is absent on this layer (indexer on a recurrent layer, PLE off the PLE
+        // layer) has nothing to replicate. A tensor that already carries ->extra was handled by
+        // an earlier branch and must not be re-registered.
+        if (t && !t->extra) {
+            prepare_split_tensors(-1, ctx_split, t, dst, mirror, mem_used);
+        }
+    };
+
+    mirror_one(layer.hc_attn_norm,   layer.split_hc_attn_norm);
+    mirror_one(layer.hc_attn_down,   layer.split_hc_attn_down);
+    mirror_one(layer.hc_attn_up,     layer.split_hc_attn_up);
+    mirror_one(layer.hc_attn_inject, layer.split_hc_attn_inject);
+    mirror_one(layer.hc_ffn_norm,    layer.split_hc_ffn_norm);
+    mirror_one(layer.hc_ffn_down,    layer.split_hc_ffn_down);
+    mirror_one(layer.hc_ffn_up,      layer.split_hc_ffn_up);
+    mirror_one(layer.hc_ffn_inject,  layer.split_hc_ffn_inject);
+
+    mirror_one(layer.index_q_proj,   layer.split_index_q_proj);
+    mirror_one(layer.index_k_proj,   layer.split_index_k_proj);
+    mirror_one(layer.index_q_norm,   layer.split_index_q_norm);
+    mirror_one(layer.index_k_norm,   layer.split_index_k_norm);
+
+    mirror_one(layer.ple_key,        layer.split_ple_key);
+    mirror_one(layer.ple_value,      layer.split_ple_value);
+    mirror_one(layer.ple_norm_key,   layer.split_ple_norm_key);
+    mirror_one(layer.ple_norm_query, layer.split_ple_norm_query);
+    mirror_one(layer.ple_norm_conv,  layer.split_ple_norm_conv);
+    mirror_one(layer.ple_conv1d,     layer.split_ple_conv1d);
+}
+
 static void split_recurrent_tensors(const llama_hparams & hparams, llama_layer & layer, const std::vector<float> & cur_splits, std::vector<size_t> & mem_used,
         ggml_context * ctx_split, [[maybe_unused]] int il) { //, int repeat_type) {
     int head_k_dim  = hparams.ssm_d_state;
@@ -4834,6 +5078,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_qwen35moe_tensors(tn); break;
         case LLM_ARCH_QWEN35:
             use_mmap_buffer = create_qwen35_tensors(tn); break;
+        case LLM_ARCH_QWEN4EXP:
+            use_mmap_buffer = create_qwen4exp_tensors(tn); break;
         case LLM_ARCH_PHI2:
             use_mmap_buffer = create_phi2_tensors(tn); break;
         case LLM_ARCH_PHI3:
@@ -5033,7 +5279,9 @@ bool create_tensors_helper::create_tensors() {
             else if (layer.wo && layer.wq && layer.wk && (layer.wv || model.arch == LLM_ARCH_GEMMA4)) {
                 auto granularity_kq = hparams.n_embd_head_k(il) * gqa_ratio;
                 int wq_ne1 = layer.wq->ne[1];
-                if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN35) {
+                if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN35 ||
+                    model.arch == LLM_ARCH_QWEN4EXP) {
+                    // wq is [q|gate] interleaved per head, so it is twice as wide as the head split implies
                     granularity_kq *= 2; wq_ne1 /= 2;
                 }
                 auto granularity_vo = hparams.n_embd_head_v(il) * gqa_ratio;
@@ -5103,7 +5351,8 @@ bool create_tensors_helper::create_tensors() {
                     LLAMA_LOG_DEBUG("\n");
                     prepare_split_tensors(1, ctx_split, layer.wqkv_gate, layer.split_wqkv_gate, wqkv_gate_split, mem_used);
                 }
-                if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN35) {
+                if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN35 ||
+                    model.arch == LLM_ARCH_QWEN4EXP) {
                     for (auto & s : split_kq) s /= 2*gqa_ratio;
                 } else {
                     for (auto & s : split_kq) s /= gqa_ratio;
@@ -5321,6 +5570,12 @@ bool create_tensors_helper::create_tensors() {
 
             if (layer.out_scale) {
                 prepare_split_tensors(-1, ctx_split, layer.out_scale, layer.split_out_scale, std::vector<int>(model.splits.size(), 1), mem_used);
+            }
+
+            // Must run AFTER every branch above: mirror_one() skips anything that already
+            // carries ->extra, so an earlier, more specific decision always wins.
+            if (model.arch == LLM_ARCH_QWEN4EXP) {
+                split_qwen4exp_tensors(layer, mirror, mem_used, ctx_split);
             }
         }
 

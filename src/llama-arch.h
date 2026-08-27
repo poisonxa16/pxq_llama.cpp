@@ -31,6 +31,7 @@ enum llm_arch {
     LLM_ARCH_QWEN3VLMOE,
     LLM_ARCH_QWEN35MOE,
     LLM_ARCH_QWEN35,
+    LLM_ARCH_QWEN4EXP,
     LLM_ARCH_MELLUM,
     LLM_ARCH_PHI2,
     LLM_ARCH_PHI3,
@@ -149,6 +150,9 @@ enum llm_kv {
     LLM_KV_HYPER_CONNECTION_COUNT,
     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
     LLM_KV_HYPER_CONNECTION_EPSILON,
+    // qwen4exp: the HC input mixer is low-rank (down: hc_dim -> r, up: r -> hc_dim).
+    // DeepSeek-V4 leaves this key absent and stays full-rank.
+    LLM_KV_HYPER_CONNECTION_LOW_RANK,
     LLM_KV_HASH_LAYER_COUNT,
 
     // DSpark block drafter. NOTE: these six names are LITERALS with no "%s" -
@@ -264,6 +268,17 @@ enum llm_kv {
 
     LLM_KV_ADAPTER_TYPE,
     LLM_KV_ADAPTER_LORA_ALPHA,
+
+    // qwen4exp PLE (per-layer n-gram hash embeddings)
+    LLM_KV_PLE_LAYERS,
+    LLM_KV_PLE_NGRAM_SIZE,
+    LLM_KV_PLE_HEADS_PER_NGRAM,
+    LLM_KV_PLE_CONV_KERNEL,
+    LLM_KV_PLE_LAYER_MULTIPLIERS,
+    LLM_KV_PLE_HEAD_OFFSETS,
+    LLM_KV_PLE_HEAD_VOCAB_SIZES,
+    LLM_KV_PLE_EOS_TOKEN_ID,
+    LLM_KV_PLE_IMAGE_TOKEN_ID,
 };
 
 struct LLM_KV {
@@ -429,6 +444,33 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_MARKOV_W1,
     LLM_TENSOR_DSPARK_MARKOV_W2,
     LLM_TENSOR_DSPARK_CONF_PROJ,
+
+    // ---- qwen4exp ----
+    // Low-rank hyper-connection mixers. Distinct from DeepSeek-V4's
+    // LLM_TENSOR_HC_{ATTN,FFN,HEAD}_{FN,BASE,SCALE} above, which are full-rank.
+    LLM_TENSOR_HC_HEAD_NORM,
+    LLM_TENSOR_HC_HEAD_DOWN,
+    LLM_TENSOR_HC_HEAD_UP,
+    LLM_TENSOR_HC_ATTN_NORM,
+    LLM_TENSOR_HC_ATTN_DOWN,
+    LLM_TENSOR_HC_ATTN_UP,
+    LLM_TENSOR_HC_ATTN_INJECT,
+    LLM_TENSOR_HC_FFN_NORM,
+    LLM_TENSOR_HC_FFN_DOWN,
+    LLM_TENSOR_HC_FFN_UP,
+    LLM_TENSOR_HC_FFN_INJECT,
+    // QSA lightning indexer, qwen4exp flavour (q_proj/k_proj + per-head norms).
+    // NOT the DeepSeek-V4 flavour (LLM_TENSOR_INDEXER_{PROJ,ATTN_K,ATTN_Q_B}) above.
+    LLM_TENSOR_INDEXER_Q_PROJ,
+    LLM_TENSOR_INDEXER_K_PROJ,
+    LLM_TENSOR_INDEXER_Q_NORM,
+    // PLE n-gram hash embedding side path (one layer only)
+    LLM_TENSOR_PLE_KEY,
+    LLM_TENSOR_PLE_VALUE,
+    LLM_TENSOR_PLE_NORM_KEY,
+    LLM_TENSOR_PLE_NORM_QUERY,
+    LLM_TENSOR_PLE_NORM_CONV,
+    LLM_TENSOR_PLE_CONV1D,
 
     LLM_TENSOR_UNKNOWN,
 };

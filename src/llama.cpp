@@ -3525,6 +3525,21 @@ static bool is_model_split_supported(const llama_model & model) {
     return it != k_supported.end();
 }
 
+// True when -ot / --override-tensor sends this tensor to a host (CPU) buffer. Matching is
+// std::regex_search on the tensor NAME, the same rule create_tensors_helper::get_context_for_tensor
+// applies when it actually picks the context.
+static bool tensor_overridden_to_host(const llama_model_loader & ml, const std::string & name) {
+    if (!ml.tensor_buft_overrides) {
+        return false;
+    }
+    for (const auto * o = ml.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+        if (std::regex_search(name, std::regex(o->pattern))) {
+            return ggml_backend_buft_is_host(o->buft);
+        }
+    }
+    return false;
+}
+
 struct expert_tensors {
     ggml_tensor * up = nullptr;
     ggml_tensor * gate = nullptr;
@@ -3591,6 +3606,29 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             if (name == "rope_freqs.weight") {
                 if (gemma4_rope_layer >= 0) {
                     result[gemma4_rope_layer] += size;
+                }
+                continue;
+            }
+        }
+        if (model.arch == LLM_ARCH_QWEN4EXP) {
+            // The final low-rank hyper-connection mixer stands in for output_norm on this
+            // arch, so it belongs to the output budget exactly as output_norm would.
+            if (name == "output_hc_norm.weight" || name == "output_hc_down.weight" ||
+                name == "output_hc_up.weight") {
+                output_misc_size += size;
+                continue;
+            }
+            // The PLE n-gram table is 160 x 320001536 = 95.4 GiB at bf16 for
+            // Qwen3.8-Flash-Next - two orders of magnitude bigger than anything else in the
+            // file. Falling through to the "strange name" path below drops it from the budget
+            // entirely and tells the placement heuristic it has ~95 GiB more room than it has.
+            // Charge it to the output budget like GEMMA4's per-layer table does, EXCEPT when
+            // the user has already sent it to host RAM with -ot (the intended way to run this
+            // model), where charging any device for it would be just as wrong in the other
+            // direction.
+            if (name == "per_layer_token_embd.weight") {
+                if (!tensor_overridden_to_host(ml, name)) {
+                    output_misc_size += size;
                 }
                 continue;
             }
@@ -9155,6 +9193,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN4EXP:
             return LLAMA_ROPE_TYPE_IMROPE;
 
         // all model arches should be listed explicitly here

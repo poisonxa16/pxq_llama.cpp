@@ -495,6 +495,61 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_QWEN4EXP,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,           "token_embd" },
+            { LLM_TENSOR_OUTPUT,               "output" },
+            // NOTE: qwen4exp has no output_norm - the final low-rank hyper-connection
+            // mixer (output_hc_norm/down/up) carries it.
+            { LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "per_layer_token_embd" },
+            { LLM_TENSOR_HC_HEAD_NORM,         "output_hc_norm" },
+            { LLM_TENSOR_HC_HEAD_DOWN,         "output_hc_down" },
+            { LLM_TENSOR_HC_HEAD_UP,           "output_hc_up" },
+            { LLM_TENSOR_HC_ATTN_NORM,         "blk.%d.hc_attn_norm" },
+            { LLM_TENSOR_HC_ATTN_DOWN,         "blk.%d.hc_attn_down" },
+            { LLM_TENSOR_HC_ATTN_UP,           "blk.%d.hc_attn_up" },
+            { LLM_TENSOR_HC_ATTN_INJECT,       "blk.%d.hc_attn_inject" },
+            { LLM_TENSOR_HC_FFN_NORM,          "blk.%d.hc_ffn_norm" },
+            { LLM_TENSOR_HC_FFN_DOWN,          "blk.%d.hc_ffn_down" },
+            { LLM_TENSOR_HC_FFN_UP,            "blk.%d.hc_ffn_up" },
+            { LLM_TENSOR_HC_FFN_INJECT,        "blk.%d.hc_ffn_inject" },
+            { LLM_TENSOR_ATTN_Q,               "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,               "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,               "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,             "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_Q_NORM,          "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,          "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_INDEXER_Q_PROJ,       "blk.%d.indexer.q_proj" },
+            { LLM_TENSOR_INDEXER_K_PROJ,       "blk.%d.indexer.k_proj" },
+            { LLM_TENSOR_INDEXER_Q_NORM,       "blk.%d.indexer.q_norm" },
+            { LLM_TENSOR_INDEXER_K_NORM,       "blk.%d.indexer.k_norm" },
+            { LLM_TENSOR_ATTN_QKV,             "blk.%d.attn_qkv" },
+            { LLM_TENSOR_ATTN_GATE,            "blk.%d.attn_gate" },
+            { LLM_TENSOR_SSM_CONV1D,           "blk.%d.ssm_conv1d" },
+            { LLM_TENSOR_SSM_DT,               "blk.%d.ssm_dt" },
+            { LLM_TENSOR_SSM_A_NOSCAN,         "blk.%d.ssm_a" },
+            { LLM_TENSOR_SSM_BETA,             "blk.%d.ssm_beta" },
+            { LLM_TENSOR_SSM_ALPHA,            "blk.%d.ssm_alpha" },
+            { LLM_TENSOR_SSM_NORM,             "blk.%d.ssm_norm" },
+            { LLM_TENSOR_SSM_OUT,              "blk.%d.ssm_out" },
+            { LLM_TENSOR_PLE_KEY,              "blk.%d.ple_key" },
+            { LLM_TENSOR_PLE_VALUE,            "blk.%d.ple_value" },
+            { LLM_TENSOR_PLE_NORM_KEY,         "blk.%d.ple_norm_key" },
+            { LLM_TENSOR_PLE_NORM_QUERY,       "blk.%d.ple_norm_query" },
+            { LLM_TENSOR_PLE_NORM_CONV,        "blk.%d.ple_norm_conv" },
+            { LLM_TENSOR_PLE_CONV1D,           "blk.%d.ple_conv1d" },
+            { LLM_TENSOR_FFN_GATE_INP,         "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,        "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,        "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,          "blk.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_GATE_UP_EXPS,     "blk.%d.ffn_gate_up_exps" },
+            { LLM_TENSOR_FFN_GATE_INP_SHEXP,   "blk.%d.ffn_gate_inp_shexp" },
+            { LLM_TENSOR_FFN_GATE_SHEXP,       "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_SHEXP,       "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP,         "blk.%d.ffn_up_shexp" },
+        },
+    },
+    {
         LLM_ARCH_QWEN35MOE,
         {
             { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
@@ -2116,6 +2171,7 @@ const char * llama_model_type_name(e_model type) {
         case MODEL_119B_A6B:      return "119B.A6B";
         case MODEL_118B_A8B:      return "118B.A8B";
         case MODEL_122B_A10B:     return "122B.A10B";
+        case MODEL_180B_A10B:     return "180B.A10B";
         case MODEL_230B_A10B:     return "230B.A10B";
         case MODEL_235B_A22B:     return "235B.A22B";
         case MODEL_295B_A21B:     return "295B.A21B";

@@ -117,6 +117,7 @@ enum e_model {
     MODEL_119B_A6B,
     MODEL_118B_A8B, // Laguna-S 2.1
     MODEL_122B_A10B,
+    MODEL_180B_A10B, // Qwen3.8-Flash-Next (qwen4exp)
     MODEL_230B_A10B, // Minimax M2
     MODEL_235B_A22B,
     MODEL_295B_A21B, // Hunyuan V3
@@ -373,6 +374,54 @@ struct llama_layer {
     //  `wkv` had no other user in this tree.)
     struct ggml_tensor * wo_a                = nullptr;
     struct ggml_tensor * wo_b                = nullptr;
+    // qwen4exp: low-rank hyper-connection mixers (two per layer: pre-token-mixer, pre-MoE).
+    // These are NOT the DeepSeek-V4 full-rank hc_*_fn/base/scale below; qwen4exp uses a
+    // norm + down/up bottleneck + a per-stream inject matrix instead.
+    struct ggml_tensor * hc_attn_norm        = nullptr;
+    struct ggml_tensor * hc_attn_down        = nullptr;
+    struct ggml_tensor * hc_attn_up          = nullptr;
+    struct ggml_tensor * hc_attn_inject      = nullptr;
+    struct ggml_tensor * hc_ffn_norm         = nullptr;
+    struct ggml_tensor * hc_ffn_down         = nullptr;
+    struct ggml_tensor * hc_ffn_up           = nullptr;
+    struct ggml_tensor * hc_ffn_inject       = nullptr;
+    // qwen4exp: QSA lightning indexer (full-attention layers only)
+    struct ggml_tensor * index_q_proj        = nullptr;
+    struct ggml_tensor * index_k_proj        = nullptr;
+    struct ggml_tensor * index_q_norm        = nullptr;
+    struct ggml_tensor * index_k_norm        = nullptr;
+    // qwen4exp: PLE n-gram side path (only on the layers named by <arch>.ple.layers)
+    struct ggml_tensor * ple_key             = nullptr;
+    struct ggml_tensor * ple_value           = nullptr;
+    struct ggml_tensor * ple_norm_key        = nullptr;
+    struct ggml_tensor * ple_norm_query      = nullptr;
+    struct ggml_tensor * ple_norm_conv       = nullptr;
+    struct ggml_tensor * ple_conv1d          = nullptr;
+
+    // qwen4exp per-device MIRROR replicas (split_dim = -1: a FULL copy per participating
+    // GPU). See the rationale block in split_qwen4exp_tensors() in llama-load-tensors.cpp:
+    // every one of these feeds or rewrites the WHOLE hc-expanded residual stream, or decides
+    // a token selection that must be bit-identical on every device, so none of them may be
+    // row-split without an all-reduce that this fork's split machinery does not provide.
+    llama_split_tensor split_hc_attn_norm;
+    llama_split_tensor split_hc_attn_down;
+    llama_split_tensor split_hc_attn_up;
+    llama_split_tensor split_hc_attn_inject;
+    llama_split_tensor split_hc_ffn_norm;
+    llama_split_tensor split_hc_ffn_down;
+    llama_split_tensor split_hc_ffn_up;
+    llama_split_tensor split_hc_ffn_inject;
+    llama_split_tensor split_index_q_proj;
+    llama_split_tensor split_index_k_proj;
+    llama_split_tensor split_index_q_norm;
+    llama_split_tensor split_index_k_norm;
+    llama_split_tensor split_ple_key;
+    llama_split_tensor split_ple_value;
+    llama_split_tensor split_ple_norm_key;
+    llama_split_tensor split_ple_norm_query;
+    llama_split_tensor split_ple_norm_conv;
+    llama_split_tensor split_ple_conv1d;
+
     struct ggml_tensor * hc_attn_fn          = nullptr;
     struct ggml_tensor * hc_attn_base        = nullptr;
     struct ggml_tensor * hc_attn_scale       = nullptr;
@@ -480,6 +529,11 @@ struct llama_model {
     struct ggml_tensor * output_norm_enc;
     struct ggml_tensor * output_mtp = nullptr;
 
+    // qwen4exp: final low-rank hyper-connection mixer; stands in for output_norm
+    struct ggml_tensor * hc_head_norm  = nullptr;
+    struct ggml_tensor * hc_head_down  = nullptr;
+    struct ggml_tensor * hc_head_up    = nullptr;
+
     // DeepSeek-V4 hyper-connection output head (upstream llama-model.h:585-587)
     struct ggml_tensor * hc_head_fn    = nullptr;
     struct ggml_tensor * hc_head_base  = nullptr;
@@ -572,7 +626,7 @@ struct llama_model {
         // the same token-scaled bound - the flat 65536 below aborts mid-build at ub2048.
         // Mirrors upstream llama_context::graph_max_nodes() (llama-context.cpp:2349).
         if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35 ||
-            arch == LLM_ARCH_DEEPSEEK4) {
+            arch == LLM_ARCH_QWEN4EXP  || arch == LLM_ARCH_DEEPSEEK4) {
             return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
         }
         //return std::max<size_t>(1024, 8*n_tensors);

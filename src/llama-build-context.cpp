@@ -2473,6 +2473,13 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_qwen35();
             } break;
+        case LLM_ARCH_QWEN4EXP:
+            {
+                // Tensor loading is done; the forward graph is the next phase. Fail here with a
+                // name rather than falling into the default "fatal error", so a run that gets
+                // this far is unambiguously reporting "loaded fine, no graph yet".
+                GGML_ABORT("qwen4exp: graph not implemented");
+            } break;
         case LLM_ARCH_QWEN3VL:
             {
                 result = llm.build_qwen3vl();

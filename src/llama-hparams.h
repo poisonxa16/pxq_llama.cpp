@@ -140,6 +140,9 @@ struct llama_hparams {
     uint32_t dsv4_o_lora_rank       = 0;
     uint32_t dsv4_hc_mult           = 0;
     uint32_t dsv4_hc_sinkhorn_iters = 0;
+    // qwen4exp: the HC input mixer is low-rank (down: hc_dim -> hc_low_rank, up: back).
+    // Zero means "full rank", which is what DeepSeek-V4 uses.
+    uint32_t hc_low_rank            = 0;
     uint32_t dsv4_hash_layer_count  = 0;
     float    dsv4_compress_rope_base = 0.0f;
     float    dsv4_hc_eps             = 0.0f;
@@ -149,8 +152,17 @@ struct llama_hparams {
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 
-    // gemma4 per-layer embedding
+    // gemma4 per-layer embedding; qwen4exp reuses it as the PLE head width
     uint32_t n_embd_per_layer = 0;
+
+    // qwen4exp PLE (per-layer n-gram hash embeddings). ple_n_heads == 0 means the GGUF
+    // carries no PLE key group at all and the whole side path is absent.
+    uint32_t ple_ngram_size      = 0;
+    uint32_t ple_heads_per_ngram = 0;
+    uint32_t ple_conv_kernel     = 0;
+    uint32_t ple_n_heads         = 0;
+    uint32_t ple_head_dim        = 0;
+    std::array<bool, LLAMA_MAX_LAYERS> ple_layer_arr = {};
 
     // gemma4 separate assistant MTP
     uint32_t mtp_backbone_n_embd = 0;
@@ -353,6 +365,11 @@ struct llama_hparams {
 
     bool is_recurrent(uint32_t il) const {
         return il < n_layer ? recurrent_layer_arr[il] : false;
+    }
+
+    // qwen4exp: true only on the layers named by <arch>.ple.layers
+    bool is_ple(uint32_t il) const {
+        return (ple_n_heads > 0 && il < n_layer) ? ple_layer_arr[il] : false;
     }
 
     static bool is_float_close(float a, float b, float abs_tol) {

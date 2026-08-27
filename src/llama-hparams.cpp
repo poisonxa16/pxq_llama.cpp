@@ -736,6 +736,102 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_QWEN4EXP:
+            {
+                // TENSOR-LOADER SCOPE: this case loads exactly the hparams that
+                // create_qwen4exp_tensors() needs to compute tensor SHAPES, plus the
+                // recurrent-layer map that decides which branch each layer takes. Anything
+                // the forward graph needs and the shapes do not (indexer_top_k, the PLE
+                // head-offset/vocab-size tables, ple eos/image token ids, HC epsilon,
+                // sinkhorn iterations, compress ratios) is deliberately NOT read here - the
+                // graph phase owns those and reading them now would just create a second
+                // place to keep in sync.
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+
+                ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
+
+                // Gated DeltaNet geometry, same key set as qwen35moe
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+                ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+                ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+                ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+
+                // split_recurrent_tensors() derives head_v_dim as ssm_d_inner/ssm_dt_rank,
+                // while the qwen4exp tensor shapes use ssm_d_state for BOTH head dims. If the
+                // converter ever writes an ssm_d_inner that disagrees, -sm graph would shard
+                // the delta-net weights on a different head width than they were created with
+                // and silently mis-slice them. Catch it here, at load, not there.
+                GGML_ASSERT(hparams.ssm_dt_rank > 0 && hparams.ssm_n_group > 0);
+                if (hparams.ssm_d_inner != hparams.ssm_d_state * hparams.ssm_dt_rank) {
+                    throw std::runtime_error(format(
+                        "qwen4exp: ssm_inner_size (%u) must equal ssm_state_size (%u) * ssm_time_step_rank (%u) = %u",
+                        hparams.ssm_d_inner, hparams.ssm_d_state, hparams.ssm_dt_rank,
+                        hparams.ssm_d_state * hparams.ssm_dt_rank));
+                }
+
+                // Low-rank hyper-connections: hc_dim = dsv4_hc_mult * n_embd
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+                if (hparams.dsv4_hc_mult == 0 || hparams.hc_low_rank == 0) {
+                    throw std::runtime_error("qwen4exp: needs a non-zero hyper_connection.count and hyper_connection.low_rank");
+                }
+
+                // QSA lightning indexer geometry (shapes only; top_k is a graph concern)
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+
+                // PLE n-gram hash embeddings. Absent key group => no PLE at all.
+                {
+                    hparams.ple_layer_arr.fill(false);
+                    hparams.ple_n_heads = 0;
+
+                    uint32_t n_ple = 0;
+                    ml.get_arr_n(LLM_KV_PLE_LAYERS, n_ple, false);
+                    if (n_ple > 0) {
+                        std::vector<uint32_t> ple_layers;
+                        ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
+                        for (uint32_t il : ple_layers) {
+                            if (il >= hparams.n_layer) {
+                                throw std::runtime_error(format("qwen4exp: ple.layers names layer %u but the model has %u layers", il, hparams.n_layer));
+                            }
+                            hparams.ple_layer_arr[il] = true;
+                        }
+
+                        ml.get_key(LLM_KV_PLE_NGRAM_SIZE,             hparams.ple_ngram_size);
+                        ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM,        hparams.ple_heads_per_ngram);
+                        ml.get_key(LLM_KV_PLE_CONV_KERNEL,            hparams.ple_conv_kernel);
+                        ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+
+                        if (hparams.ple_ngram_size < 2) {
+                            throw std::runtime_error("qwen4exp: ple.ngram_size must be >= 2");
+                        }
+                        hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+                        hparams.ple_head_dim = hparams.n_embd_per_layer;
+                        if (hparams.ple_n_heads == 0 || hparams.ple_head_dim == 0) {
+                            throw std::runtime_error("qwen4exp: PLE key group present but heads_per_ngram / embedding_length_per_layer_input is zero");
+                        }
+                    }
+                }
+
+                // Linear attention everywhere except every full_attention_interval-th layer.
+                // qwen4exp carries no MTP tensors in the GGUF, so there is no nextn tail to skip.
+                {
+                    uint32_t full_attn_interval = 4;
+                    ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    GGML_ASSERT(full_attn_interval > 0);
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                    }
+                }
+
+                switch (hparams.n_layer) {
+                    case 48: model.type = e_model::MODEL_180B_A10B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_QWEN35:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
