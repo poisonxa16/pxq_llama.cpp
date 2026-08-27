@@ -198,6 +198,8 @@ def main():
                     help="bytes per output shard (0 = single file)")
     ap.add_argument("--kv-only", type=Path, default=None,
                     help="build only the KV header and diff it against this reference GGUF")
+    ap.add_argument("--self-test-max-layer", type=int, default=None,
+                    help="with --self-test, only gate layers < N (every tensor kind\n                          appears within the first 8 layers)")
     ap.add_argument("--self-test", type=Path, default=None,
                     help="materialise every tensor thunk and compare against this reference GGUF")
     ap.add_argument("--dry-run", action="store_true",
@@ -243,9 +245,12 @@ def main():
           f"(config ple_layer_ids={t.get('ple_layer_ids')} -- not the module index)")
 
     P = f"model.language_model.layers.{ple_il}.ple."
-    mult   = store.i64(P + "ple_embedding.layer_multipliers")
-    offs   = store.i64(P + "ple_embedding.ngram_heads_offsets")
-    vocabs = store.i64(P + "ple_embedding.ngram_heads_vocab_sizes")
+    # These three are consumed as UINT64 KV entries rather than as tensors --
+    # record them as claimed so the completeness check does not flag them.
+    ple_const_names = [P + "ple_embedding.layer_multipliers",
+                       P + "ple_embedding.ngram_heads_offsets",
+                       P + "ple_embedding.ngram_heads_vocab_sizes"]
+    mult, offs, vocabs = (store.i64(n) for n in ple_const_names)
 
     shard_names = []
     i = 0
@@ -380,7 +385,7 @@ def main():
 
     # ------------------------------------------------------------- tensors
     stats = {"f32": 0, "bf16": 0, "skipped_visual": 0, "skipped_mtp": 0}
-    claimed = set()
+    claimed = set(ple_const_names)   # consumed as KV, not as tensors
 
     def add_f32(name, shape, produce):
         n = int(np.prod(shape)) * 4
@@ -486,7 +491,9 @@ def main():
                 need += [P + x for x in ("key_proj.weight", "value_proj.weight",
                                          "conv1d.weight", "norm_conv.weight",
                                          "norm_key.weight", "norm_query.weight")]
-            if not all(store.has(x) for x in need):
+            if (args.self_test_max_layer is not None
+                    and il >= args.self_test_max_layer) \
+                    or not all(store.has(x) for x in need):
                 skipped_layers.append(il)
                 continue
 

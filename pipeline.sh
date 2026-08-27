@@ -26,7 +26,12 @@ if [ ! -s "$BF16" ]; then
   step "convert HF -> BF16 GGUF"
   df -h <local-path> | tail -1
   # capped so a runaway cannot take the host down (188 GB RAM, zero swap)
-  /usr/local/bin/pxa-memcap.sh 48 python3 -u "$REPO/convert_qwen4exp.py" "$SRC" \
+  # pxa-memcap.sh <name> <limit> <command...>. 64G is far above the converter's
+  # working set (one tensor at a time) but stops a runaway allocation dead --
+  # that is what this cap is for. memory.max counts page cache, which is
+  # reclaimable, so a big streaming read/write reclaims rather than OOMs.
+  /usr/local/bin/pxa-memcap.sh qwen4exp-convert 64G \
+      python3 -u "$REPO/convert_qwen4exp.py" "$SRC" \
       --outfile "$BF16" 2>&1 | tee "$LOGD/convert.log"
 else
   step "BF16 already present, skipping convert"
