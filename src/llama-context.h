@@ -381,6 +381,25 @@ struct llama_context {
     struct ggml_tensor * inp_s_copy;      // I32 [kv_size]
     struct ggml_tensor * inp_s_mask;      // F32 [1, n_kv]
     struct ggml_tensor * inp_s_seq;       // I32 [n_kv, n_batch]
+    // qwen4exp PLE: I32 [ple_n_heads * n_batch]. One gather row per (token, head) into
+    // per_layer_token_embd. Filled host-side in llama_set_inputs because the hash needs
+    // int64 multiply and xor, neither of which ggml has.
+    struct ggml_tensor * inp_ple_rows;
+
+    // F32 [hc_dim, (conv_kernel-1)*ngram_size]: the PLE conv input of the positions just
+    // before this ubatch, carried across calls because it cannot be recomputed from the cache.
+    struct ggml_tensor * inp_ple_conv_hist;
+    std::map<llama_seq_id, std::vector<float>> ple_conv_hist;
+    std::vector<float> ple_conv_hist_prev;
+    llama_seq_id       ple_conv_hist_seq = 0;
+
+    // The n-gram window reaches back past the ubatch, so the last (n_gram - 1) tokens of
+    // each sequence are carried here. next_pos is the position this history is contiguous
+    // with; a jump (a rewind, a new sequence, a cache clear) drops it and the window falls
+    // back to EOS padding, exactly as a fresh sequence would.
+    struct ple_history { llama_pos next_pos = 0; std::vector<llama_token> toks; };
+    std::map<llama_seq_id, ple_history> ple_hist;
+
     struct ggml_tensor * inp_s_seq_qnext; // I32 [1, n_batch]
     struct ggml_tensor * inp_conv_seq_map;  // PXA_LLAMA_FIX_v4: I32 [n_batch, n_batch] conv seq-map for batched mixed-seq delta-net
     struct ggml_tensor * inp_qnext_state_mask; // PXA_LLAMA_FIX_v4: F32 [1, n_batch] per-seq recurrent-state reset mask (0=reset)

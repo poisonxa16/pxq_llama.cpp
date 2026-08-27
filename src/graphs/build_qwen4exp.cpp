@@ -86,6 +86,100 @@ ggml_tensor * llm_build_context::build_qwen4exp_hc_combine(
     return cur;
 }
 
+
+// PLE: per-layer n-gram hash embeddings, a side path that runs on the layers named by
+// <arch>.ple.layers (layer 1 alone in the shipped model) and adds into the wide residual.
+//
+// The gather table per_layer_token_embd is 95.4 GiB in the shipped model - larger than all
+// six cards put together - so it is meant to be pinned to host RAM with
+//   -ot per_layer_token_embd=CPU
+// The row indices come from inp_ple_rows, hashed host-side in llama_set_inputs.
+ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tensor * hidden, int il) {
+    const int64_t hc      = hparams.dsv4_hc_mult;
+    const int64_t hc_dim  = hc*n_embd;
+    const int64_t n_heads = hparams.ple_n_heads;
+    const int64_t kern    = hparams.ple_conv_kernel;
+    const int64_t dil     = hparams.ple_ngram_size;
+    const int64_t hist    = (kern - 1)*dil;
+
+    GGML_ASSERT(model.tok_embd_per_layer != nullptr);
+
+    // gather, then flatten the heads: get_rows lays the head dimension out slowest
+    ggml_tensor * emb = ggml_get_rows(ctx0, model.tok_embd_per_layer, lctx.inp_ple_rows);
+    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim*n_heads, n_tokens);
+    cb(emb, "ple_embd", il);
+
+    ggml_tensor * key   = llm_build_lora_mm(lctx, ctx0, model.layers[il].ple_key,   emb);
+    ggml_tensor * value = llm_build_lora_mm(lctx, ctx0, model.layers[il].ple_value, emb);
+
+    // both norms reduce over ONE hc stream and scale with a weight over the whole hc*n_embd
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
+        ggml_tensor * t = ggml_reshape_3d(ctx0, x, n_embd, hc, n_tokens);
+        t = ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps);
+        t = ggml_reshape_2d(ctx0, t, hc_dim, n_tokens);
+        t = ggml_mul(ctx0, t, w);
+        return ggml_reshape_3d(ctx0, t, n_embd, hc, n_tokens);
+    };
+
+    key = grouped_norm(key, model.layers[il].ple_norm_key);
+    ggml_tensor * query = grouped_norm(hidden, model.layers[il].ple_norm_query);
+
+    // per-stream dot product, then a SIGNED square root before the sigmoid
+    ggml_tensor * sc = ggml_sum_rows(ctx0, ggml_mul(ctx0, key, query));
+    sc = ggml_scale(ctx0, sc, 1.0f/sqrtf((float) n_embd));
+    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, sc), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, sc), mag));
+    cb(gate, "ple_gate", il);
+
+    ggml_tensor * v3 = ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens);
+    v3 = ggml_repeat_4d(ctx0, v3, n_embd, hc, n_tokens, 1);
+    ggml_tensor * gated = ggml_mul(ctx0, v3, gate);
+    cb(gated, "ple_gated_value", il);
+
+    ggml_tensor * normalized = grouped_norm(
+            ggml_reshape_2d(ctx0, gated, hc_dim, n_tokens), model.layers[il].ple_norm_conv);
+    normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
+
+    // The conv input of the PREVIOUS `hist` positions is not recomputable here: it depends on
+    // the residual at those positions, which is gone. So it is carried across calls explicitly -
+    // read as an input, written back host-side after the eval from this named output.
+    ggml_set_name(normalized, "ple_conv_in");
+    ggml_set_output(normalized);
+    ggml_build_forward_expand(gf, normalized);
+
+    // [hc_dim, hist + n_tokens] with the carried history in front
+    ggml_tensor * padded = ggml_concat(ctx0, lctx.inp_ple_conv_hist, normalized, 1);
+    cb(padded, "ple_conv_padded", il);
+
+    // Depthwise causal conv DILATED by the n-gram size, as a sum of shifted copies:
+    //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
+    // written this way because ggml_conv_1d_dw is documented as unreliable.
+    ggml_tensor * conv_out = nullptr;
+    for (int64_t k = 0; k < kern; ++k) {
+        const int64_t start = hist - (kern - 1 - k)*dil;
+        ggml_tensor * shifted = ggml_view_2d(ctx0, padded, hc_dim, n_tokens,
+                padded->nb[1], start*padded->nb[1]);
+
+        // column k of the [kern, hc_dim] kernel is one weight per channel
+        ggml_tensor * wk = ggml_cont(ctx0,
+                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
+                        model.layers[il].ple_conv1d->nb[1], k*model.layers[il].ple_conv1d->nb[0]));
+        wk = ggml_reshape_1d(ctx0, wk, hc_dim);
+        if (wk->type != GGML_TYPE_F32) {
+            wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
+        }
+
+        ggml_tensor * term = ggml_mul(ctx0, ggml_cont(ctx0, shifted), wk);
+        conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
+    }
+
+    conv_out = ggml_silu(ctx0, conv_out);
+    conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
+    cb(conv_out, "ple_conv_out", il);
+
+    return ggml_add(ctx0, hidden, ggml_add(ctx0, ggml_reshape_3d(ctx0, gated, n_embd, hc, n_tokens), conv_out));
+}
+
 ggml_cgraph * llm_build_context::build_qwen4exp() {
 
     ggml_cgraph * gf = new_graph_custom();
@@ -118,11 +212,18 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     const float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head))
                                                              : hparams.f_attention_scale;
 
-    if (hparams.ple_n_heads > 0) {
-        // The PLE n-gram side path needs a host-filled hash-index input and a slice of recurrent
-        // state for its dilated causal conv; neither exists in this fork yet. Refuse rather than
-        // return logits that quietly leave the side path out.
-        GGML_ABORT("qwen4exp: this GGUF carries a PLE key group, which the graph does not build yet");
+    const bool has_ple = hparams.ple_n_heads > 0;
+    if (has_ple) {
+        const int64_t hc_dim = hc*n_embd;
+        const int64_t hist   = (hparams.ple_conv_kernel - 1)*hparams.ple_ngram_size;
+
+        lctx.inp_ple_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hparams.ple_n_heads*n_tokens);
+        cb(lctx.inp_ple_rows, "inp_ple_rows", -1);
+        ggml_set_input(lctx.inp_ple_rows);
+
+        lctx.inp_ple_conv_hist = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, hist);
+        cb(lctx.inp_ple_conv_hist, "inp_ple_conv_hist", -1);
+        ggml_set_input(lctx.inp_ple_conv_hist);
     }
 
     // the wide residual starts as hc identical copies of the embedding
@@ -133,6 +234,10 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+
+        if (has_ple && hparams.is_ple(il)) {
+            res_hc = build_qwen4exp_ple(gf, res_hc, il);
+        }
 
         ggml_tensor * inject = nullptr;
         ggml_tensor * cur = build_qwen4exp_hc_mix(res_hc,

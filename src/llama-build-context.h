@@ -244,6 +244,9 @@ struct llm_build_context {
     ggml_tensor * build_qwen4exp_hc_combine(ggml_tensor * residual, ggml_tensor * block_out,
             ggml_tensor * inject, int il);
 
+    // PLE n-gram side path; runs only on the layers named by <arch>.ple.layers
+    ggml_tensor * build_qwen4exp_ple(ggml_cgraph * gf, ggml_tensor * hidden, int il);
+
     ggml_cgraph * build_qwen35();
 
     ggml_cgraph * build_phi2();

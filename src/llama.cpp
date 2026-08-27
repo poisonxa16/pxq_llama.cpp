@@ -5615,6 +5615,124 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     // PXA_LLAMA_MTP_FIX: fill the three qnext input tensors from ONE shared decomposition so the host fill
     // and the delta_net graph builder agree on n_seqs / seq_slot / reset (generalizes v4's n_seqs==n_tok
     // to MTP verify batches where each seq carries n_seq_tokens>1 tokens with the same seq_id).
+    // ---- qwen4exp PLE gather rows -------------------------------------------------
+    // row(head h, position p) = mixed_n % vocab[h] + offset[h], where
+    //     mixed_n = (t[p]*m[0]) ^ (t[p-1]*m[1]) ^ ... ^ (t[p-n+1]*m[n-1])
+    // for n = 2..n_gram, with heads_per_ngram consecutive heads sharing each n. An EOS in
+    // the window cuts it: everything at or before the EOS becomes EOS. A token's own EOS
+    // does not cut its context.
+    if (lctx.inp_ple_rows && lctx.inp_ple_rows->buffer) {
+        const int64_t n_tokens = batch.n_tokens;
+        const int64_t n_gram   = hparams.ple_ngram_size;
+        const int64_t n_heads  = hparams.ple_n_heads;
+        const int64_t per_gram = hparams.ple_heads_per_ngram;
+        const auto    eos      = (llama_token) hparams.ple_eos_token_id;
+
+        GGML_ASSERT(n_gram >= 2 && n_heads > 0 && per_gram > 0);
+        GGML_ASSERT((n_gram - 1) * per_gram == n_heads);
+
+        // An embeddings-only batch (an image) has no token ids, but every position still
+        // needs a row because this feeds ggml_get_rows. Stand in the configured image token.
+        const llama_token img_tok = hparams.ple_image_token_id != 0
+            ? (llama_token) hparams.ple_image_token_id : eos;
+        auto tok_of = [&](int64_t k) -> llama_token {
+            return batch.token ? batch.token[k] : img_tok;
+        };
+        auto seq_of = [&](int64_t k) -> llama_seq_id {
+            return (batch.seq_id && batch.seq_id[k] && batch.n_seq_id && batch.n_seq_id[k] > 0)
+                 ? batch.seq_id[k][0] : 0;
+        };
+        auto pos_of = [&](int64_t k) -> llama_pos {
+            return batch.pos ? batch.pos[k] : (llama_pos) k;
+        };
+
+        // Snapshot the history BEFORE any of this ubatch is appended, so a token cannot
+        // read another token of the same ubatch through the history path.
+        std::map<llama_seq_id, std::vector<llama_token>> snap;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq = seq_of(i);
+            if (snap.count(seq)) continue;
+            auto & hst = lctx.ple_hist[seq];
+            if (hst.next_pos != pos_of(i)) { hst.next_pos = pos_of(i); hst.toks.clear(); }
+            if ((int64_t) hst.toks.size() > n_gram - 1) {
+                hst.toks.erase(hst.toks.begin(), hst.toks.end() - (n_gram - 1));
+            }
+            std::vector<llama_token> padded(n_gram - 1, eos);
+            std::copy(hst.toks.begin(), hst.toks.end(), padded.end() - (int64_t) hst.toks.size());
+            snap[seq] = std::move(padded);
+        }
+
+        std::vector<int32_t> idx(n_heads * n_tokens);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq = seq_of(i);
+            const llama_pos    pos = pos_of(i);
+            const auto & hist = snap[seq];
+
+            auto prev = [&](int64_t s) -> llama_token {
+                const int64_t j = i - s;
+                if (j >= 0 && seq_of(j) == seq && pos_of(j) == pos - s) return tok_of(j);
+                const int64_t back = s - i;
+                const int64_t k    = (int64_t) hist.size() - back;
+                if (back > 0 && k >= 0 && k < (int64_t) hist.size() && pos - s >= 0) return hist[k];
+                return eos;
+            };
+
+            std::vector<int64_t> ctx(n_gram);
+            ctx[0] = tok_of(i);
+            bool cut = false;
+            for (int64_t s = 1; s < n_gram; ++s) {
+                ctx[s] = cut ? eos : prev(s);
+                if (ctx[s] == eos) cut = true;
+            }
+
+            for (int64_t n = 2; n <= n_gram; ++n) {
+                uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
+                for (int64_t j = 1; j < n; ++j) {
+                    mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
+                }
+                const int64_t base = (n - 2) * per_gram;
+                for (int64_t g = 0; g < per_gram; ++g) {
+                    const int64_t hi = base + g;
+                    GGML_ASSERT(hparams.ple_head_vocab_sizes[hi] > 0);
+                    idx[i * n_heads + hi] = (int32_t)
+                        (mixed % hparams.ple_head_vocab_sizes[hi] + hparams.ple_head_offsets[hi]);
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(lctx.inp_ple_rows, idx.data(), 0, idx.size() * sizeof(int32_t));
+
+        // The conv history below is carried per context, not per sequence slot, so a batch
+        // mixing sequences would feed one sequence's history to another. Refuse loudly.
+        {
+            std::set<llama_seq_id> seqs;
+            for (int64_t i = 0; i < n_tokens; ++i) seqs.insert(seq_of(i));
+            if (seqs.size() > 1) {
+                GGML_ABORT("qwen4exp PLE: this build carries the conv history per context, so a "
+                           "batch spanning %zu sequences cannot be served correctly", seqs.size());
+            }
+            if (lctx.inp_ple_conv_hist && lctx.inp_ple_conv_hist->buffer) {
+                const size_t need = ggml_nelements(lctx.inp_ple_conv_hist);
+                auto & hv = lctx.ple_conv_hist[seqs.empty() ? 0 : *seqs.begin()];
+                // a fresh sequence starts with a zero window, which is what an EOS-padded
+                // prefix convolves to
+                if (hv.size() != need) hv.assign(need, 0.0f);
+                ggml_backend_tensor_set(lctx.inp_ple_conv_hist, hv.data(), 0, need * sizeof(float));
+                lctx.ple_conv_hist_seq = seqs.empty() ? 0 : *seqs.begin();
+            }
+        }
+
+        // Append this ubatch to each sequence's history for the NEXT call.
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            auto & hst = lctx.ple_hist[seq_of(i)];
+            hst.toks.push_back(tok_of(i));
+            hst.next_pos = pos_of(i) + 1;
+            if ((int64_t) hst.toks.size() > n_gram - 1) {
+                hst.toks.erase(hst.toks.begin(), hst.toks.end() - (n_gram - 1));
+            }
+        }
+    }
+
     if (lctx.inp_s_seq_qnext || (lctx.inp_conv_seq_map && lctx.inp_conv_seq_map->buffer)
                              || (lctx.inp_qnext_state_mask && lctx.inp_qnext_state_mask->buffer)) {
         const int64_t n_tokens = batch.n_tokens;
@@ -5919,6 +6037,45 @@ static void llama_graph_compute(
 #endif
 
     ggml_backend_sched_graph_compute_async(lctx.sched, gf);
+
+    // qwen4exp PLE: keep the tail of this ubatch's conv input for the next call. The dilated
+    // causal conv reaches (conv_kernel-1)*ngram_size positions back, and those values are not
+    // recomputable later - they depend on the residual at those positions, which is gone once
+    // the layer is done. Cheap: a few hundred KB per step.
+    if (lctx.inp_ple_conv_hist) {
+        ggml_tensor * src = nullptr;
+        for (int i = gf->n_nodes - 1; i >= 0; --i) {
+            if (strcmp(gf->nodes[i]->name, "ple_conv_in") == 0) { src = gf->nodes[i]; break; }
+        }
+        if (src) {
+            ggml_backend_sched_synchronize(lctx.sched);
+
+            const int64_t hc_dim = src->ne[0];
+            const int64_t n_tok  = src->ne[1];
+            const int64_t hist   = lctx.inp_ple_conv_hist->ne[1];
+
+            auto & hv = lctx.ple_conv_hist[lctx.ple_conv_hist_seq];
+            hv.assign((size_t) hc_dim * hist, 0.0f);
+
+            // take the last min(hist, n_tok) columns; a shorter ubatch leaves the older
+            // columns of the window in place at the front
+            const int64_t take = std::min(hist, n_tok);
+            std::vector<float> tail((size_t) hc_dim * take);
+            ggml_backend_tensor_get(src, tail.data(),
+                    (size_t) (n_tok - take) * hc_dim * sizeof(float),
+                    tail.size() * sizeof(float));
+
+            if (take < hist) {
+                // keep the still-valid older part of the previous window, shifted left
+                auto & prev = lctx.ple_conv_hist_prev;
+                if ((int64_t) prev.size() == hc_dim * hist) {
+                    std::copy(prev.begin() + (size_t) take * hc_dim, prev.end(), hv.begin());
+                }
+            }
+            std::copy(tail.begin(), tail.end(), hv.end() - (int64_t) tail.size());
+            lctx.ple_conv_hist_prev = hv;
+        }
+    }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(lctx.sched));
 }
