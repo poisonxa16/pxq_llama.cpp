@@ -1723,10 +1723,33 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
     # table (LEVERS.md:99-103). One global -ub across a heterogeneous pool is wrong
     # by construction - the old file hardcoded 2048 for every card, including the
     # 11 GB 1080 Ti where ub2048/1024 compute buffers are measured to OOM.
+    # MEASURED 2026-08-28, Flash-Next six-card PXQ4, 2931-token prompt, 2 reps:
+    #     ub 512 (adaptive default)  prefill 337-366 tok/s   decode 30.6-30.9
+    #     ub 1024                    prefill 430-439 tok/s   decode 30.6-31.1
+    # +20% prefill for nothing: the decode ranges OVERLAP, so it is not a trade.
+    # ub 2048 gained a further +3% on the 4-P100 PXQU seat (411-414 -> 424-430)
+    # but OOMd the six-card PXQ4 seat, because -ts and -ub are COUPLED: llama.cpp
+    # folds a per-device compute allowance into the -ts walk, so raising -ub
+    # REPACKS THE LAYERS and a split tuned at one -ub can overflow a card at
+    # another. That coupling is why this is only emitted alongside the automatic
+    # split, whose compute-buffer figures are themselves measured AT ub1024.
+    # SCOPED TO qwen4exp ON PURPOSE: both arms were run on that arch. Another
+    # model has different activation shapes and would be a guess.
+    ub_auto = None
+    if not a.ub and prof.get("arch") == "qwen4exp":
+        ub_auto = 1024
     if a.ub:
         cmd += ["-b", str(a.ub), "-ub", str(a.ub)]
         print(f"  -ub {a.ub} FORCED by --ub. Adaptive-ub would have been left to choose; the "
               f"card-type table expects {ub_expect} here.")
+        print("  NOTE: -ub and -ts are coupled - llama.cpp folds a compute allowance into the "
+              "-ts walk, so this -ub repacks the layers. If you also passed --ts, re-derive it.")
+    elif ub_auto:
+        cmd += ["-b", str(ub_auto), "-ub", str(ub_auto)]
+        print(f"  -ub {ub_auto} [MEASURED]: on this arch ub1024 is +20% prefill over the "
+              f"adaptive 512 (337-366 -> 430-439 tok/s, six-card PXQ4, 2931-token prompt) "
+              f"with decode UNCHANGED (30.6-30.9 vs 30.6-31.1, overlapping). The automatic "
+              f"-ts below is derived from compute buffers measured at this same -ub.")
     else:
         print(f"  -b/-ub: NOT PASSED - adaptive-ub probes each device at startup. Card-type "
               f"table (LEVERS.md:99-103) expects {ub_expect} on this selection. Verify against "
