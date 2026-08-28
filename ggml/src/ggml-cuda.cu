@@ -7146,6 +7146,15 @@ static bool pxa_cuda_graph_v2_enabled() {
     // NOISE from a config where the cc<CC_AMPERE arch gate silently kept captures at 0 — always
     // verify captures>0 before believing a graph number. Decode is GPU-busy; replay bookkeeping
     // is pure tax on these cards. Stays env-only opt-in for instrumentation/diagnostics.
+    //
+    // RE-CONFIRMED (2026-08-28) on a very different graph: qwen4exp across six cards, 5817 nodes
+    // and ~140k sub-15us elementwise kernels per run — i.e. exactly the shape that looks like it
+    // should be launch-bound. It is not. Same 127-token measurement either side, captures
+    // verified firing (replays=882): 26.43 -> 25.68 t/s, −2.8%. The per-op profile explains why:
+    // MUL_MAT is 52.4% and MOE_FUSED_UP_GATE 16.7% of GPU time, so the tiny ops are interleaved
+    // with real work rather than sitting in launch gaps. Do not re-test this without a profile
+    // showing idle gaps first. Beware short runs: two arms of that sweep stopped at 53-57 tokens
+    // and their t/s is NOT comparable to a 127-token baseline.
     static const bool on = [] { const char * e = getenv("PXA_CUDA_GRAPH_V2"); return e && atoi(e) != 0; }();
     return on;
 }
