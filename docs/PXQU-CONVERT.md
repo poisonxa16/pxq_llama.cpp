@@ -52,15 +52,8 @@ A tier map is a text file of `#`-commented lines, one `regex=type` rule per expe
   an absolute or relative path is used as-is.
 
 Write one for your own tensor names and VRAM budget: total the per-tensor byte cost at each tier
-(bpw × elements), then spend the budget on the tensors your imatrix says matter most. As reference
-points, these are the budget/composition splits behind our published 122B-A5B (48 layers × 256
-experts) builds:
-
-| Budget | Composition (experts) | ~Resident |
-|---|---|---|
-| 24 GB | 126× pxq1 · 18× pxq2 | ~23.5 GiB |
-| 32 GB | 61× pxq1 · 57× pxq2 · 26× pxq3 | ~31.7 GiB |
-| 48 GB | 61× pxq2 · 57× pxq3 · 26× pxq6 | ~45.8 GiB |
+(bpw × elements), then spend the budget on the tensors your imatrix says matter most. Total the per-tensor byte cost at each tier (bpw x elements), then spend your budget on the
+tensors your imatrix says matter most.
 
 The tighter the budget, the more experts drop to `pxq1`, and the more the aggressive tiers benefit
 from a no-think serving posture.

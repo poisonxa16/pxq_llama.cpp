@@ -81,6 +81,11 @@ selection table: [`docker/vllm-pxq4/README.md`](docker/vllm-pxq4/README.md).
 For the llama.cpp engine images (`pxq-llama-cpp`), see
 [`docker/README.md`](docker/README.md).
 
+### Quantize your own model
+
+Both engines are fed from a GGUF. Full path for each, including Flash-Next:
+[`docs/QUANTIZING.md`](docs/QUANTIZING.md).
+
 ### Build from source
 
 
