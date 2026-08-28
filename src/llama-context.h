@@ -384,11 +384,18 @@ struct llama_context {
     // qwen4exp PLE: I32 [ple_n_heads * n_batch]. One gather row per (token, head) into
     // per_layer_token_embd. Filled host-side in llama_set_inputs because the hash needs
     // int64 multiply and xor, neither of which ggml has.
-    struct ggml_tensor * inp_ple_rows;
+    // = nullptr is load-bearing, not tidiness. This is assigned ONLY by
+    // build_qwen4exp(), but llama_set_inputs reads it for EVERY architecture. Left
+    // uninitialised it holds indeterminate heap bytes on any other model, and the
+    // `if (ptr && ptr->buffer)` guard then dereferences a wild pointer. Observed:
+    // a 0.6B dense model aborted on the PLE n_gram assert in 1 run of 3, and passed
+    // the other 2 -- the value tracked heap layout, so relinking the library changed
+    // the outcome. A segfault was equally available.
+    struct ggml_tensor * inp_ple_rows = nullptr;
 
     // F32 [hc_dim, (conv_kernel-1)*ngram_size]: the PLE conv input of the positions just
     // before this ubatch, carried across calls because it cannot be recomputed from the cache.
-    struct ggml_tensor * inp_ple_conv_hist;
+    struct ggml_tensor * inp_ple_conv_hist = nullptr;  // same contract as inp_ple_rows above
     // Destination for the conv-input capture. It lives in its OWN backend buffer, NOT in
     // the graph arena. Marking a mid-graph tensor ggml_set_output does not keep it
     // materialised: the scheduler still reuses that memory across splits (11 of them here,
