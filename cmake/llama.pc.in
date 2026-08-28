@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: llama
+Description: pxq_llama - llama.cpp fork with the PXQ quantization family, by PXA Network
+URL: https://pxanetwork.com
+Version: @LLAMA_INSTALL_VERSION@
+Libs: -L${libdir} -lllama
+Cflags: -I${includedir}

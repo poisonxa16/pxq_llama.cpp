@@ -1,0 +1,22 @@
+vendor/ is a verbatim, unmodified copy of these files from the pxq_llama engine
+tree, taken at engine commit acf8f245:
+
+    ggml/src/pxq-cpu.c                  the parity-locked CPU dequant
+    ggml/src/pxq-cpu.h                  its contract + layout ground truth (lines 1-18)
+    ggml/src/ggml-impl.h                GGML_COMPUTE_FP16_TO_FP32
+    ggml/include/ggml.h                 enum ggml_type (GGML_TYPE_PXQ4 = 252)
+    ggml/include/ggml-pxq6-tables.h     PXQ6_BOOK_INIT / PXQ6_SUB16_INIT (the frozen tables)
+    ggml/include/ggml-pxq2-tables.h     pulled in by pxq-cpu.c
+    ggml/include/ggml-pxq3-tables.h     pulled in by pxq-cpu.c
+    ggml/include/ggml-alloc.h           transitively included by ggml.h consumers
+    ggml/include/ggml-backend.h         transitively included by ggml.h consumers
+
+They are vendored, not referenced, so this harness builds standalone and so the
+copy is pinned: the parity gate must compare against a known revision of the
+engine's dequant, not against whatever happens to be checked out.
+
+Copying is not modifying: nothing here is ever written back to the engine tree.
+
+To refresh, copy the nine files above out of a pxq_llama checkout into vendor/,
+preserving their ggml/src and ggml/include paths, and re-run tests/. If the
+engine's dequant ever changes, gate G1 must be the thing that notices.

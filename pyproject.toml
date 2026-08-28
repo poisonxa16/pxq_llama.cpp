@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "pxq-llama-scripts"
+version = "0.0.0"
+description = "Python scripts that ship with pxq_llama (GGUF conversion and quantization helpers). Derived from llama.cpp - see NOTICE."
+authors = ["PXA Network"]
+readme = "README.md"
+homepage = "https://pxanetwork.com"
+repository = "https://github.com/poisonxa16/pxq_llama"
+keywords = ["pxq", "pxq_llama", "ggml", "gguf", "llama.cpp"]
+packages = [{ include = "*.py", from = "." }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[tool.poetry.dependencies]
+python = ">=3.9"
+numpy = "^1.25.0"
+sentencepiece = ">=0.1.98,<0.2.0"
+transformers = ">=4.35.2,<5.0.0"
+protobuf = ">=4.21.0,<5.0.0"
+gguf = { path = "./gguf-py" }
+torch = { version = "^2.2.0", source = "pytorch" }
+
+[tool.poetry.dev-dependencies]
+pytest = "^5.2"
+
+
+# Force wheel + cpu
+# For discussion and context see https://github.com/python-poetry/poetry#6409
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+llama-convert-hf-to-gguf = "convert_hf_to_gguf:main"
+llama-convert-llama-ggml-to-gguf = "convert_llama_ggml_to_gguf:main"
