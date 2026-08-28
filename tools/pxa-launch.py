@@ -121,7 +121,7 @@ sm_70 ONLY WAS A LIE, AND IT MADE THE MoE BRANCH UNREACHABLE
   The old file set MIN_VLLM_CAP=70 and routed any selection containing a
   sub-sm_70 card to llama.cpp. Every vLLM decode/prefill number in the decision
   table below was produced on 2x P100 sm_60 (SCOREBOARD.md:6; MOE-CROSSOVER.md:3,
-  image pxa-sm60-dev, libpxq4_sm60_v8.so, --attention-backend PASCAL_SDPA,
+  image pxa-sm60-dev, libpxq4_sm60_v10.so, --attention-backend PASCAL_SDPA,
   MOE-CROSSOVER.md:77-82). So the old table could never reproduce a single one of
   its own vLLM cells, and the np>=6 vLLM branch was dead on the only hardware
   where the crossover was measured. Eligibility is a property of the resolved
@@ -274,7 +274,7 @@ VLLM_IMAGES = {
     "pxa-sm60-dev": {
         "caps": {60}, "status": "MEASURED",
         "why": "produced every MoE-crossover vLLM number (MOE-CROSSOVER.md:77-82; "
-               "libpxq4_sm60_v8.so, --attention-backend PASCAL_SDPA)",
+               "libpxq4_sm60_v10.so, --attention-backend PASCAL_SDPA)",
         # NOT A SELF-CONTAINED IMAGE. `pip list` inside it shows pip and nothing else:
         # it is a bare CUDA runtime, and torch, vllm and the PXQ4 plugin all live on the
         # HOST and are bind-mounted at run time. Every number attributed to this tag was
@@ -296,7 +296,11 @@ VLLM_IMAGES = {
                          "<local-path>"],
             "python": "/c/pxq4-sm60/venv/bin/python",
             "env": {"PYTHONPATH": "/c/moe-branch/site",
-                    "PXQ4_LIB": "/c/moe-branch/libpxq4_sm60_v8.so"},
+                    # v10, NOT v8 (stale: both shipping launchers moved to v10) and
+                    # NOT v11. v11 exists and is FASTER on prefill with PXQ4_GEMM2D=1
+                    # (300.1 tok/s, +37%) but FAILS raw-prompt correctness. A prefill
+                    # win that changes what the model says is not a win.
+                    "PXQ4_LIB": "/c/moe-branch/libpxq4_sm60_v10.so"},
             "why": "traced 2026-08-26 through the last boot on this tag "
                    "(xover-vllm-boot1) and confirmed by importing inside it: torch is "
                    "/c/pxq4-sm60/venv/lib/python3.12/site-packages/torch (2.7.1+cu126) "
@@ -1935,12 +1939,12 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
         env.setdefault(_k, _v)
     if cc == 70:
         # The sm_70 recipes carry this; the sm_60 arm does NOT - it carries
-        # SITE=<site> LIB=libpxq4_sm60_v8.so PACKED=1 instead (MOE-CROSSOVER.md:78).
+        # SITE=<site> LIB=libpxq4_sm60_v10.so PACKED=1 instead (MOE-CROSSOVER.md:78).
         # The old file emitted the Volta backend name unconditionally, i.e. into a
         # Pascal image - a config the corpus never ran.
         env["VLLM_SM70_QUANT_BACKEND"] = "turbomind"
     else:
-        print("  sm_60 arm: the MEASURED recipe carries SITE=<site> LIB=libpxq4_sm60_v8.so "
+        print("  sm_60 arm: the MEASURED recipe carries SITE=<site> LIB=libpxq4_sm60_v10.so "
               "PACKED=1 (MOE-CROSSOVER.md:78). Those are IMAGE-INTERNAL paths - this launcher "
               "will not fabricate them. Declare them in your container invocation or the run is "
               "off the measured envelope (I-11).")
