@@ -1,7 +1,15 @@
 # PXQ llama.cpp — v2026.08.28-rc3
 
-Release candidate. Supersedes **v2026.08.25-rc2**; **55 commits** across the engine,
-the serving distribution and the vLLM thin images.
+Release candidate. Supersedes **v2026.08.25-rc2**; **47 commits** — 19 on the
+distribution side and 28 carrying the Flash-Next architecture work, which until now
+lived on a separate branch. Branch `rc/unified`.
+
+**This is the first release cut from a single tree.** The engine and the Flash-Next
+work had unrelated git histories, so the architecture support, both correctness fixes
+and the performance levers were not in any release build. They are now: the unified
+tree builds clean and was gated on the real model before this tag was cut — 49/49
+layers offloaded, KV exactly 3840.00 MiB, PXQ2/PXQ3/PXQ6 fused kernels engaged, nine
+capitals correct, and decode at 26.86 tok/s, identical to the pre-merge measurement.
 
 ---
 
