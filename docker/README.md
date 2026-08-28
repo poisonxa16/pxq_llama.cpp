@@ -15,19 +15,34 @@ CPU or CUDA sections under [Prebuilt](#Prebuilt)/[Build](#Build) and [Run](#Run)
 - [Extra Features](#Extra)
 - [Credits](#Credits)
 
-## Prebuilt Docker images
+## Prebuilt binaries and images
 
-Pull one of the available images from `ghcr.io`. [View all tags](https://github.com/poisonxa16/pxq_llama/pkgs/container/pxq-llama-cpp)
+**Engine binaries** — `llama-cli`, `llama-server`, `llama-quantize` for Linux x86-64,
+CUDA 12, built for Pascal (sm_60) and Volta (sm_70), with the bundled libraries they
+need. Attached to the release:
+
+<https://github.com/poisonxa16/pxq_llama.cpp/releases/latest>
 
 ```bash
-docker pull ghcr.io/poisonxa16/pxq-llama-cpp:cpu-swap
-docker pull ghcr.io/poisonxa16/pxq-llama-cpp:cpu-server
-docker pull ghcr.io/poisonxa16/pxq-llama-cpp:cpu-full
-
-docker pull ghcr.io/poisonxa16/pxq-llama-cpp:cu12-swap
-docker pull ghcr.io/poisonxa16/pxq-llama-cpp:cu12-server
-docker pull ghcr.io/poisonxa16/pxq-llama-cpp:cu12-full
+tar xzf pxq_llama-*-linux-x64-cuda12.tar.gz
+cd pxq_llama-*-linux-x64-cuda12
+./llama-cli --version
 ```
+
+Requires an NVIDIA driver and the CUDA 12 runtime (`libcudart.so.12`, `libcublas.so.12`,
+`libcublasLt.so.12`). Everything else is bundled.
+
+**vLLM images with the PXQ4 backend** — for serving PXQ4 models through vLLM:
+
+```bash
+docker pull ghcr.io/poisonxa16/pxa-vllm:sm60   # Pascal: P100, GTX 10xx
+docker pull ghcr.io/poisonxa16/pxa-vllm:sm70   # Volta:  V100, Titan V
+```
+
+See [`vllm-pxq4/README.md`](vllm-pxq4/README.md).
+
+There is no prebuilt image of the llama.cpp engine itself yet. Build one with the
+Containerfiles in this directory, as below.
 
 ## Build
 
