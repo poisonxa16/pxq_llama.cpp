@@ -263,7 +263,7 @@ NO_CPU_CODEC = {"PXQ1", "PXQ6"}
 # SPEC CORRECTION C5: the arch names are one of TWO triggers; the structural one
 # (linear_attn.* tensors) is the other, so an unnamed arch with the same tensors
 # is caught too.
-GRAPH_SPLIT_GUARDED_ARCHES = {"qwen35moe", "qwen3next", "qwen35"}
+GRAPH_SPLIT_GUARDED_ARCHES = {"qwen35moe", "qwen3next", "qwen35", "qwen4exp"}
 
 # ---------------------------------------------------------------------------
 # vLLM IMAGES - eligibility is an IMAGE property (see docstring)
@@ -649,6 +649,36 @@ def model_profile(path, kind):
         # PXA-Coder-35B-v2-f16.gguf) - the head was dropped in the recovery pipeline
         # and the flag survived. Arming MTP on those arms a drafter that does not exist.
         p["mtp_tensors"] = sum(1 for n, _, _ in tn if "nextn" in n or ".mtp" in n)
+        # PER-LAYER EMBEDDING (PLE). qwen4exp and gemma3n carry a per_layer_token_embd
+        # table that is a pure GET_ROWS gather - one lookup per token per head, no
+        # GEMM - and it is ENORMOUS: on Flash-Next it is 160 x 320001536 = 51.2e9
+        # elements, ~51 GiB of a 97 GiB file. It belongs in host RAM.
+        # MEASURED 2026-08-28: leaving it on the GPU made a 5-card seat try to
+        # cudaMalloc 16089.57 MiB for it on one card and die during load.
+        for _n, _t, _ne in tn:
+            if _n.startswith("per_layer_token_embd"):
+                p["ple_tensor"] = _n
+                try:
+                    # gguf_header stores ne as the TOTAL ELEMENT COUNT (an int),
+                    # not a dims list - iterating it raises and silently loses the
+                    # size, which is how this subtraction failed the first time.
+                    e = int(_ne)
+                    p["ple_elems"] = e
+                    # GGML block geometry is FIXED and documented (ggml.h), so this is
+                    # arithmetic, not an estimate. Only the types a PLE table is ever
+                    # stored in are listed; anything else leaves ple_bytes None and the
+                    # caller then declines to subtract rather than guessing.
+                    _BPE = {0: 4.0, 1: 2.0, 30: 2.0,      # f32, f16, bf16
+                            8: 34.0 / 32.0,               # q8_0
+                            14: 210.0 / 256.0,            # q6_K
+                            12: 144.0 / 256.0,            # q4_K
+                            20: 18.0 / 32.0}              # iq4_nl
+                    if _t in _BPE:
+                        p["ple_bytes"] = int(e * _BPE[_t])
+                        p["ple_type"] = _t
+                except Exception:
+                    p["ple_elems"] = None
+                break
         p["mtp_kv"] = kv.get(f"{arch}.nextn_predict_layers")
         p["mtp_src"] = "tensor walk for nextn/mtp names"
         # M6 / SPEC CORRECTION C5 and C6: structural DeltaNet detection.
@@ -759,10 +789,46 @@ def kv_bytes_per_token(kv, arch):
         if not (n_layer and n_kv and d_k and d_v):
             return None, ("UNMEASURABLE from this header (missing block_count / head_count_kv / "
                           "key_length) - no fit estimate is printed")
-        b = n_layer * n_kv * (d_k * 2 + d_v * 2)     # f16 K and V
-        return b, (f"[INFERRED] arithmetic: {n_layer} layers x {n_kv} kv-heads x "
-                   f"({d_k}+{d_v}) dims x 2 B (f16) = {b/1024:.1f} KiB/token. "
-                   f"UNVALIDATED against a real allocation (Q9) - warn only, never blocks")
+        # HYBRID ATTENTION: NOT EVERY LAYER HOLDS A KV CACHE.
+        # MEASURED 2026-08-28 on qwen4exp (Qwen3.8-Flash-Next). The flat
+        # n_layer form above overestimates this arch by EXACTLY 4x, because
+        # full_attention_interval=4 means only 12 of its 48 layers keep a KV
+        # cache; the other 36 are gated-delta-net linear-attention layers whose
+        # recurrent state is FIXED per sequence and does not grow with context.
+        # Left uncorrected the launcher prices 160k ctx at 15.0 GiB instead of
+        # 3.75 GiB and refuses seats that fit comfortably.
+        kv_layers = n_layer
+        interval = kv.get(f"{arch}.full_attention_interval")
+        ratios = kv.get(f"{arch}.attention.compress_ratios")
+        how = f"{n_layer} layers"
+        if isinstance(ratios, (list, tuple)) and len(ratios) == n_layer:
+            # Most direct evidence: one entry per layer, nonzero => full attention.
+            n_full = sum(1 for r in ratios if r)
+            if 0 < n_full < n_layer:
+                kv_layers = n_full
+                how = f"{n_full} of {n_layer} layers (compress_ratios)"
+        elif isinstance(interval, int) and interval > 1 and n_layer % interval == 0:
+            kv_layers = n_layer // interval
+            how = f"{kv_layers} of {n_layer} layers (full_attention_interval={interval})"
+        b = kv_layers * n_kv * (d_k * 2 + d_v * 2)     # f16 K and V
+        # THE MEASUREMENT IS PER-ARCH. It was taken on qwen4exp and it does NOT
+        # transfer: another arch may count its full-attention layers differently,
+        # or keep a per-token component in the linear layers this formula ignores.
+        # Claiming MEASURED on an arch nobody booted is the exact failure this
+        # file's three-tag rule exists to prevent.
+        if arch == "qwen4exp":
+            tag = ("MEASURED 2026-08-28: predicts 24576 B/token and the engine allocated "
+                   "EXACTLY 3516.00 / 3840.00 / 6144.00 MiB at c=150016 / 163840 / 262144. "
+                   "Three exact hits - Q9 is CLOSED for this arch only.")
+        elif kv_layers != n_layer:
+            tag = ("[INFERRED] hybrid-attention correction applied from the qwen4exp "
+                   "measurement, but NOT validated on this arch. Q9 stays OPEN here - "
+                   "warn only, never blocks.")
+        else:
+            tag = ("[INFERRED] UNVALIDATED against a real allocation (Q9) - warn only, "
+                   "never blocks")
+        return b, (f"arithmetic: {how} x {n_kv} kv-heads x ({d_k}+{d_v}) dims x 2 B (f16) "
+                   f"= {b/1024:.1f} KiB/token. {tag}")
     except Exception:
         return None, "UNMEASURABLE (header arithmetic failed) - no fit estimate is printed"
 
@@ -1380,16 +1446,36 @@ def vram_check(plan, sel, mbytes, ctx, prof, ngl_all):
         return notes
     total = sum(g[3] for g in sel) * 1024 * 1024
     free = sum((g[3] - g[4]) for g in sel) * 1024 * 1024
-    if mbytes and ngl_all and mbytes > total:
-        plan.refuse("R-17B", mb=mbytes / BYTES_PER_GIB, tb=total / BYTES_PER_GIB, n=len(sel))
+    # R-17B COMPARES GPU-RESIDENT BYTES, NOT FILE BYTES.
+    # A per-layer-embedding table is pinned to host RAM by -ot and NEVER reaches
+    # VRAM, so counting it here refuses seats that fit. MEASURED 2026-08-28:
+    # Flash-Next PXQU is a 96.77 GiB file of which 51.15 GiB is per_layer_token_embd;
+    # the GPU-resident remainder is 46.70 GiB and runs on five cards (75 GiB) with
+    # room for a 3.75 GiB KV cache at 160k. Uncorrected, R-17B refused it outright.
+    gpu_bytes = mbytes
+    ple_note = None
+    if mbytes and prof.get("ple_bytes"):
+        gpu_bytes = mbytes - prof["ple_bytes"]
+        ple_note = (f"PLE: {prof['ple_tensor']} is {prof['ple_bytes']/BYTES_PER_GIB:.2f} GiB and "
+                    f"is pinned to host RAM by -ot, so the VRAM figures below use the "
+                    f"GPU-resident remainder {gpu_bytes/BYTES_PER_GIB:.2f} GiB, not the "
+                    f"{mbytes/BYTES_PER_GIB:.2f} GiB file.")
+    elif mbytes and prof.get("ple_tensor"):
+        ple_note = ("PLE present but its ggml type is not in the block-geometry table, so its "
+                    "bytes were NOT subtracted. The VRAM figures below OVERSTATE what reaches "
+                    "the cards - treat any refusal here as suspect and re-check by hand.")
+    if ple_note:
+        notes.append(ple_note)
+    if gpu_bytes and ngl_all and gpu_bytes > total:
+        plan.refuse("R-17B", mb=gpu_bytes / BYTES_PER_GIB, tb=total / BYTES_PER_GIB, n=len(sel))
         return notes
     if not mbytes:
         return notes
     kvb = prof.get("kv_bytes_tok")
     if kvb:
         kv = kvb * ctx
-        need = mbytes + kv
-        notes.append(f"VRAM estimate [INFERRED, never blocks]: weights {mbytes/BYTES_PER_GIB:.2f} "
+        need = gpu_bytes + kv
+        notes.append(f"VRAM estimate [INFERRED, never blocks]: weights {gpu_bytes/BYTES_PER_GIB:.2f} "
                      f"GiB + KV {kv/BYTES_PER_GIB:.2f} GiB (= ctx {ctx} x "
                      f"{kvb/1024:.1f} KiB/tok) = {need/BYTES_PER_GIB:.2f} GiB vs "
                      f"{free/BYTES_PER_GIB:.2f} GiB free / {total/BYTES_PER_GIB:.2f} GiB total "
@@ -1400,6 +1486,15 @@ def vram_check(plan, sel, mbytes, ctx, prof, ngl_all):
             notes.append("TIGHT FIT by that estimate. It is arithmetic, not a measurement (Q9 is "
                          "'measure KV bytes/token per arch family'), so it WARNS and does not "
                          "block. Reduce -c or add cards if the boot OOMs.")
+        # MEASURED 2026-08-28: A CONFIG THAT LOADS IS NOT A CONFIG THAT RUNS.
+        # A 5-card Flash-Next seat at c=262144 loaded cleanly, printed every buffer,
+        # and then died on the FIRST TOKEN with "CUDA error: out of memory" in
+        # llama_decode - the split had left card 0 with 51 MiB. Decode allocates
+        # transient buffers beyond the compute buffer llama.cpp reports at init.
+        # The same seat at c=163840 kept 807-1803 MiB free per card and ran.
+        notes.append("HEADROOM RULE [MEASURED]: leave ~1200 MiB free per card AFTER load. "
+                     "Decode allocates transient buffers that the init-time buffer report does "
+                     "not include, so a seat can load and still OOM on its first token.")
     else:
         notes.append("VRAM estimate: " + prof.get("kv_bytes_src", "UNMEASURABLE") +
                      f" (weights alone {mbytes/BYTES_PER_GIB:.2f} GiB vs "
@@ -1512,6 +1607,80 @@ def parse_spec(spec):
     return method.strip(), params
 
 
+
+# ---------------------------------------------------------------------------
+# AUTOMATIC -ts FROM REAL FREE VRAM
+# ---------------------------------------------------------------------------
+# MEASURED 2026-08-28 on Flash-Next PXQU over cards 0,1,3,5,6.
+#
+# WHY THIS EXISTS: an even split is the default and it is WRONG on any pool where
+# the cards are not equally free. Card 0 here carries a production seat (7865 of
+# 16384 MiB free) and card 3 is an 11 GiB 1080 Ti also carrying production. An
+# even five-way split puts ~9.2 GiB of weights on a card with 7.8 GiB free.
+#
+# -ts PARTITIONS BYTES, NOT LAYERS (llama.cpp:4071-4100) and llama.cpp folds a
+# per-device compute allowance into the same walk - which is why CHANGING -ub
+# REPACKS THE LAYERS and a -ts tuned at one ub can OOM at another (measured: PXQ4
+# six-card at ub2048 pushed a 16140 MiB V100 over with the ub512-tuned split).
+#
+# THE HEADROOM TERM IS THE WHOLE POINT. A config that LOADS is not a config that
+# RUNS: at c=262144 this model loaded, printed every buffer, then died on the
+# first token with "CUDA error: out of memory" in llama_decode because the split
+# left card 0 with 51 MiB. Decode allocates transient buffers that the init-time
+# buffer report does not include.
+#
+# Compute-buffer figures are MEASURED at ub1024 and interpolated linearly in ctx:
+#   ordinary card   282 MiB @ c8192   567 @ c150016   786 @ c262144
+#   head card       980 MiB, FLAT - it did not grow with context across that range
+TS_HEADROOM_MIB = 1200      # MEASURED: 807-1803 free per card ran; 51 free OOMd
+TS_CUDA_CTX_MIB = 250       # per-device CUDA context, approximate
+TS_HEAD_COMPUTE_MIB = 980   # MEASURED, flat in ctx
+
+
+def _compute_buf_mib(ctx):
+    """MEASURED at ub1024, linear interpolation in ctx between the two anchors."""
+    lo_c, lo_v, hi_c, hi_v = 8192, 282.0, 262144, 786.0
+    if ctx <= lo_c:
+        return lo_v
+    if ctx >= hi_c:
+        return hi_v
+    return lo_v + (hi_v - lo_v) * (ctx - lo_c) / (hi_c - lo_c)
+
+
+def auto_tensor_split(sel, ctx):
+    """Capacity-proportional -ts over the SELECTED cards, using free VRAM.
+
+    Returns (ts_string, notes). The LAST device in the selection is treated as the
+    head (llama.cpp places the output head on the last device in PCI order), so it
+    is charged the larger head compute buffer.
+    Returns (None, notes) if any card has no room at all - better to refuse loudly
+    than to emit a split that cannot work."""
+    notes, caps = [], []
+    comp = _compute_buf_mib(ctx)
+    for i, g in enumerate(sel):
+        total_mib, used_mib = g[3], g[4]
+        free_mib = total_mib - used_mib
+        is_head = (i == len(sel) - 1)
+        overhead = (TS_HEAD_COMPUTE_MIB if is_head else comp) + TS_CUDA_CTX_MIB + TS_HEADROOM_MIB
+        caps.append(max(0.0, free_mib - overhead))
+    if min(caps) <= 0:
+        bad = [g[0] for g, c in zip(sel, caps) if c <= 0]
+        notes.append(f"AUTO -ts DECLINED: card(s) {bad} have no capacity left after "
+                     f"{TS_HEADROOM_MIB} MiB headroom + compute buffers at ctx={ctx}. "
+                     f"Free a card, drop -c, or pass --ts by hand.")
+        return None, notes
+    tot = sum(caps)
+    shares = [int(round(1000 * c / tot)) for c in caps]
+    ts = ",".join(str(x) for x in shares)
+    detail = "  ".join(f"{g[0]}:{c:.0f}MiB" for g, c in zip(sel, caps))
+    notes.append(f"AUTO -ts {ts} [MEASURED method]: capacity-proportional over FREE VRAM after "
+                 f"reserving {TS_HEADROOM_MIB} MiB decode headroom + {comp:.0f} MiB compute "
+                 f"({TS_HEAD_COMPUTE_MIB} on the head card) + {TS_CUDA_CTX_MIB} MiB context "
+                 f"per device. Capacities: {detail}. -ts partitions BYTES, not layers, and "
+                 f"llama.cpp repacks when -ub changes - re-derive if you force a different -ub.")
+    return ts, notes
+
+
 def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
     E, note = resolve_engine_dir()
     if E is None:
@@ -1558,8 +1727,28 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
         print(f"  -b/-ub: NOT PASSED - adaptive-ub probes each device at startup. Card-type "
               f"table (LEVERS.md:99-103) expects {ub_expect} on this selection. Verify against "
               f"the server's own 'PXA posture: mode=... fa=... ub=...' line.")
+    # PLE -> CPU. Not an optimisation: without it the gather table is offloaded with
+    # everything else and the load dies with a cudaMalloc of the whole tensor on one
+    # card (MEASURED 2026-08-28, 16089.57 MiB on device 2 of a 5-card Flash-Next seat).
+    # The pattern is ANCHORED on the full name on purpose - a loose 'ple' regex also
+    # matches blk.N.ple_key, ple_conv1d and the F32 ple_norm_* tensors, which are tiny
+    # and MUST stay on the GPU.
+    if prof.get("ple_tensor") and not any(x == "-ot" for x in cmd):
+        cmd += ["-ot", r"per_layer_token_embd\.weight=CPU"]
+        _e = prof.get("ple_elems")
+        print("  -ot per_layer_token_embd -> CPU: this model carries a PLE gather table"
+              + (f" of {_e/1e9:.1f}e9 elements" if _e else "") +
+              ". It is GET_ROWS only (no GEMM), so host RAM costs a PCIe gather and frees "
+              "a large fraction of the file from VRAM. Without this the load OOMs.")
     if a.ts:
         cmd += ["-ts", a.ts]
+        print(f"  -ts {a.ts} FORCED by --ts; the automatic capacity split was not used.")
+    elif sel and len(sel) > 1:
+        _ts, _tsnotes = auto_tensor_split(sel, ctx)
+        for _n in _tsnotes:
+            print("  " + _n)
+        if _ts:
+            cmd += ["-ts", _ts]
     if a.spec:
         cmd += ["--spec-type", a.spec]
     if a.draft_model:
