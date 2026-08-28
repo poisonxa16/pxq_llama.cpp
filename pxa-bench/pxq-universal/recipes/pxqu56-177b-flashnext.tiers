@@ -1,6 +1,6 @@
 # PXQU tier map 'pxqu56-177b-flashnext': qwen4exp routed experts, 48 layers x 3 tensors.
-# expert budget 39.50 GiB -> 39.43 GiB used, avg 2.804 bpw, hist {'pxq2': 66, 'pxq3': 78}
-# 4x P100 with card 0 sharing the production seat; ub2048, 150k KV at q8_0; ~2.5 GiB headroom held back for the compute buffer
+# expert budget 41.85 GiB -> 41.78 GiB used, avg 2.971 bpw, hist {'pxq2': 42, 'pxq3': 102}
+# 4x P100 with card 0 sharing the production seat; ub2048, 150k KV; compute buffer from a MEASURED six-card load (127 MiB/card at ub512, 490 MiB on the output card) scaled to ub2048
 # Solved by a Lagrangian knapsack on a PROXY sensitivity (depth x kind), not a
 # measured sens.json -- no sensitivity sweep exists for this arch yet. Regenerate
 # from a real imatrix before treating the assignment as final.
@@ -19,22 +19,22 @@
 ^blk\.3\.ffn_down_exps\.weight$=pxq2
 ^blk\.4\.ffn_gate_exps\.weight$=pxq2
 ^blk\.4\.ffn_up_exps\.weight$=pxq2
-^blk\.4\.ffn_down_exps\.weight$=pxq2
+^blk\.4\.ffn_down_exps\.weight$=pxq3
 ^blk\.5\.ffn_gate_exps\.weight$=pxq2
 ^blk\.5\.ffn_up_exps\.weight$=pxq2
-^blk\.5\.ffn_down_exps\.weight$=pxq2
+^blk\.5\.ffn_down_exps\.weight$=pxq3
 ^blk\.6\.ffn_gate_exps\.weight$=pxq2
 ^blk\.6\.ffn_up_exps\.weight$=pxq2
-^blk\.6\.ffn_down_exps\.weight$=pxq2
+^blk\.6\.ffn_down_exps\.weight$=pxq3
 ^blk\.7\.ffn_gate_exps\.weight$=pxq2
 ^blk\.7\.ffn_up_exps\.weight$=pxq2
-^blk\.7\.ffn_down_exps\.weight$=pxq2
+^blk\.7\.ffn_down_exps\.weight$=pxq3
 ^blk\.8\.ffn_gate_exps\.weight$=pxq2
 ^blk\.8\.ffn_up_exps\.weight$=pxq2
-^blk\.8\.ffn_down_exps\.weight$=pxq2
+^blk\.8\.ffn_down_exps\.weight$=pxq3
 ^blk\.9\.ffn_gate_exps\.weight$=pxq2
 ^blk\.9\.ffn_up_exps\.weight$=pxq2
-^blk\.9\.ffn_down_exps\.weight$=pxq2
+^blk\.9\.ffn_down_exps\.weight$=pxq3
 ^blk\.10\.ffn_gate_exps\.weight$=pxq2
 ^blk\.10\.ffn_up_exps\.weight$=pxq2
 ^blk\.10\.ffn_down_exps\.weight$=pxq3
@@ -62,32 +62,32 @@
 ^blk\.18\.ffn_gate_exps\.weight$=pxq2
 ^blk\.18\.ffn_up_exps\.weight$=pxq2
 ^blk\.18\.ffn_down_exps\.weight$=pxq3
-^blk\.19\.ffn_gate_exps\.weight$=pxq2
-^blk\.19\.ffn_up_exps\.weight$=pxq2
+^blk\.19\.ffn_gate_exps\.weight$=pxq3
+^blk\.19\.ffn_up_exps\.weight$=pxq3
 ^blk\.19\.ffn_down_exps\.weight$=pxq3
-^blk\.20\.ffn_gate_exps\.weight$=pxq2
-^blk\.20\.ffn_up_exps\.weight$=pxq2
+^blk\.20\.ffn_gate_exps\.weight$=pxq3
+^blk\.20\.ffn_up_exps\.weight$=pxq3
 ^blk\.20\.ffn_down_exps\.weight$=pxq3
-^blk\.21\.ffn_gate_exps\.weight$=pxq2
-^blk\.21\.ffn_up_exps\.weight$=pxq2
+^blk\.21\.ffn_gate_exps\.weight$=pxq3
+^blk\.21\.ffn_up_exps\.weight$=pxq3
 ^blk\.21\.ffn_down_exps\.weight$=pxq3
-^blk\.22\.ffn_gate_exps\.weight$=pxq2
-^blk\.22\.ffn_up_exps\.weight$=pxq2
+^blk\.22\.ffn_gate_exps\.weight$=pxq3
+^blk\.22\.ffn_up_exps\.weight$=pxq3
 ^blk\.22\.ffn_down_exps\.weight$=pxq3
-^blk\.23\.ffn_gate_exps\.weight$=pxq2
-^blk\.23\.ffn_up_exps\.weight$=pxq2
+^blk\.23\.ffn_gate_exps\.weight$=pxq3
+^blk\.23\.ffn_up_exps\.weight$=pxq3
 ^blk\.23\.ffn_down_exps\.weight$=pxq3
-^blk\.24\.ffn_gate_exps\.weight$=pxq2
-^blk\.24\.ffn_up_exps\.weight$=pxq2
+^blk\.24\.ffn_gate_exps\.weight$=pxq3
+^blk\.24\.ffn_up_exps\.weight$=pxq3
 ^blk\.24\.ffn_down_exps\.weight$=pxq3
-^blk\.25\.ffn_gate_exps\.weight$=pxq2
-^blk\.25\.ffn_up_exps\.weight$=pxq2
+^blk\.25\.ffn_gate_exps\.weight$=pxq3
+^blk\.25\.ffn_up_exps\.weight$=pxq3
 ^blk\.25\.ffn_down_exps\.weight$=pxq3
-^blk\.26\.ffn_gate_exps\.weight$=pxq2
-^blk\.26\.ffn_up_exps\.weight$=pxq2
+^blk\.26\.ffn_gate_exps\.weight$=pxq3
+^blk\.26\.ffn_up_exps\.weight$=pxq3
 ^blk\.26\.ffn_down_exps\.weight$=pxq3
-^blk\.27\.ffn_gate_exps\.weight$=pxq2
-^blk\.27\.ffn_up_exps\.weight$=pxq2
+^blk\.27\.ffn_gate_exps\.weight$=pxq3
+^blk\.27\.ffn_up_exps\.weight$=pxq3
 ^blk\.27\.ffn_down_exps\.weight$=pxq3
 ^blk\.28\.ffn_gate_exps\.weight$=pxq3
 ^blk\.28\.ffn_up_exps\.weight$=pxq3

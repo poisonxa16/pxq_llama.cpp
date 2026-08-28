@@ -30,20 +30,27 @@ Four P100s are cards 0, 1, 5, 6. **Card 0 carries the production granite seat (~
 which is not evictable, so the honest budget is 64.0 - 8.4 = **55.6 GiB**.
 
     55.6  physical
-   - 1.2  CUDA context + cuBLAS handle, 4 cards
-   - 5.8  compute buffer at n_ubatch=2048, 4 cards   <-- ESTIMATE, see caveat
+   - 1.20 CUDA context + cuBLAS handle, 4 cards
+   - 3.46 compute buffer at n_ubatch=2048, 4 cards   (measured-derived, below)
    - 3.86 KV at 150k f16
    - 2.73 backbone + embed + head at PXQ4
-   = 42.0 GiB nominal expert budget; the map is solved to 39.5 to hold real headroom.
+   - 2.50 headroom held back deliberately
+   = 41.85 GiB expert budget.
+
+The compute-buffer figure is derived from a real six-card load, not guessed:
+`llama_init_from_model` reported **127 MiB/card, and 490 MiB on the card holding the
+output head**, at c=4096 / ub=512. The 490 MiB is exactly 512 x 248320 x 4 B, i.e. it
+scales linearly with n_ubatch, so at ub=2048 it becomes ~1.98 GiB while the other cards
+go to ~504 MiB: 3 x 504 MiB + 1.98 GiB = 3.46 GiB over four cards.
 
 ## The map
 
 `pxa-bench/pxq-universal/recipes/pxqu56-177b-flashnext.tiers`
 
-    experts      39.43 GiB   avg 2.804 bpw   66 tensors PXQ2 / 78 tensors PXQ3
-    GPU weights  42.17 GiB
+    experts      41.78 GiB   avg 2.971 bpw   42 tensors PXQ2 / 102 tensors PXQ3
+    GPU weights  44.51 GiB
     host RAM     26.82 GiB   (per_layer_token_embd, IQ4_NL, gathered over PCIe)
-    file         68.99 GiB
+    file         71.33 GiB
 
 | target | need | have | headroom |
 |---|---|---|---|
@@ -62,7 +69,7 @@ The public UD-IQ1_S we currently run puts `ffn_down_exps` at IQ4_NL and both
 `ffn_gate_exps` and `ffn_up_exps` at **IQ1_S — 1.5625 bpw** — averaging 2.54 bpw over the
 experts, 40.4 GiB of GPU weights, 68 GiB on disk.
 
-This map is 68.99 GiB on disk, essentially the same footprint, with **nothing below PXQ2**.
+This map is 71.33 GiB on disk, ~3 GiB more, with **nothing below PXQ2**.
 Measured wrel (rng-42 lab protocol, from `ggml/include/ggml.h`): PXQ2 0.3020, PXQ3 0.1435.
 Trading a 1.56-bpw tier for a 2.25/3.25-bpw tier at equal file size is the whole point.
 
@@ -80,11 +87,12 @@ Generator: `pxa-bench/pxq-universal/gen_pxqu_flashnext.py`.
    architecture yet, so the weighting here is `depth x kind` (down-projection favoured 1.3x
    because it writes back into the residual; deeper layers favoured linearly). A real imatrix
    sweep will move assignments and should be run before this is called final.
-2. **The 1.45 GiB/card compute-buffer figure at ub2048 is an estimate, not a measurement.**
-   It is the single softest number in the budget. Measure it from an actual load
-   (`llama_init_from_model` prints `compute buffer size`) and re-solve if it is materially
-   larger. The 2.57 GiB headroom at the 150k/f16 target absorbs a ~0.6 GiB/card error;
-   beyond that, drop to q8_0 KV for another 1.8 GiB.
+2. **The compute buffer is measured at ub=512 and scaled, not measured at ub=2048.**
+   The 127 MiB/card and 490 MiB output-card figures are real, read off a six-card load.
+   The step to ub=2048 assumes linear scaling in n_ubatch, which is right for the output
+   head (it is literally `n_ubatch x n_vocab x 4`) and approximately right for the rest.
+   Confirm with one ub2048 load before building. The 2.57 GiB headroom at the 150k/f16
+   target absorbs roughly a 0.6 GiB/card error; beyond that, q8_0 KV buys another 1.8 GiB.
 
 ## Build
 
