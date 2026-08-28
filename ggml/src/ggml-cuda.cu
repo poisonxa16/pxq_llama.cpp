@@ -3329,6 +3329,162 @@ static bool ggml_cuda_small_gemv_f16(ggml_backend_cuda_context & ctx, const ggml
     return true;
 }
 
+// Small-K / large-R F16 decode GEMV: the TRANSPOSE of the k_pxa_gemv_f16 shape family above,
+// and the reason it cannot just reuse it. The hyper-connection up-projection is [K=320,
+// R=10240]: R > 512 fails the small-R gate, so it lands on ggml_cuda_op_mul_mat_cublas, which
+// for this shape is a THREE-kernel chain (convert x f32->f16, GemmEx COMPUTE_16F, convert dst
+// f16->f32). nsys prices that chain at 3.81 ms/token over 97 calls -- 45.7us/call on a P100
+// for a 6.55 MB weight read, ~60x off the memory roofline. The IDENTICAL work in the down
+// direction, on k_pxa_gemv_f16, costs 19.2us/call. That 2.4x gap is pure dispatch loss.
+//
+// The R cap in the small-R gate is deliberately NOT raised. Its documented job is to never
+// intercept a real dense projection, and raising it would admit exactly that. The safety
+// argument here runs from the other side: K <= 512. Every real projection in this arch
+// consumes a hidden state or an hc-wide stream, so its K is n_embd (2560) or hc_dim (10240)
+// and cannot enter whatever its R. The two gates are therefore disjoint by construction.
+//
+// GEOMETRY, and why it is NOT a transposed port of k_pxa_gemv_f16. That kernel gives one
+// 128-thread block to each row, which suits K=10240 (40 half2 iterations per thread). Applied
+// to K=320 the same shape gives each thread 1.25 iterations and launches 10240 blocks to do
+// it, with most of the block idling in a reduction tree. Here a WARP owns a row: the whole
+// reduction is one shfl butterfly, no smem tree and no __syncthreads on the row path. K=320
+// halves = 640 B = exactly 5 x 128 B, and nb01 = 640 keeps every row start 128 B aligned, so
+// a warp's half2 loads are 5 perfectly aligned fully-coalesced transactions with zero
+// over-fetch. This shape could not suit a warp better if it had been designed for it.
+//
+// RPW (rows per warp) is the one knob a memory-bound kernel has: it multiplies the loads in
+// flight per warp, and lets one pass over x feed several rows, without disturbing that
+// coalescing pattern at all. 16-byte loads were considered and rejected -- 640 B per row is
+// not a multiple of 32 lanes x 16 B, so a uint4 form idles 20% of the lanes for no extra
+// bandwidth, while half2 is already exactly balanced.
+//
+// x is staged in shared memory. It is only 1.28 KB, but EVERY warp reads all of it, and the
+// 6.55 MB of weight streaming through the unified L1 would evict it continuously. That costs
+// one __syncthreads per block, none per row.
+//
+// Numerics: fp32 accumulate, weights widened before the FMA, x never rounded to f16 -- the
+// same policy as k_pxa_gemv_f16, and strictly TIGHTER than the cuBLAS chain it replaces,
+// which rounds both x and the result through f16. So it is not bit-identical by construction:
+// behavior-gauntlet gated, not sha-gated. Checked standalone against an fp64 CPU reference
+// at the live shape: max ABSOLUTE error 6.05e-07 against a max |y| of 6.71, i.e. 9e-08
+// relative -- plain fp32 round-off. (Do not read the max RELATIVE error per row: with 10240
+// random rows one of them lands near zero and reports 5e-03 off a true value of 4.2e-05.)
+// PXA_F16_GEMV_WIDE=0 rolls back to the cuBLAS chain.
+#define PXA_WIDE_WARPS 8    // warps per block -> blockDim 256
+#define PXA_WIDE_KMAX  512  // K bound; also the shared stage, in floats
+
+template <int RPW>
+static __global__ void __launch_bounds__(PXA_WIDE_WARPS*WARP_SIZE) k_pxa_gemv_f16_wide(
+        const half * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int ne00, const size_t nb01) {
+    // __align__(16) is load-bearing: the row loop reads this stage as float2, and a bare
+    // __shared__ float[] is only guaranteed 4-byte aligned. nvcc happens to over-align it
+    // today, so dropping this would work until it silently did not.
+    __shared__ __align__(16) float sx[PXA_WIDE_KMAX];
+    for (int i = threadIdx.x; i < ne00; i += PXA_WIDE_WARPS*WARP_SIZE) {
+        sx[i] = x[i];
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & (WARP_SIZE-1);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int row0 = (blockIdx.x*PXA_WIDE_WARPS + warp)*RPW;
+
+    // No row bounds check: the gate admits only ne01 % (PXA_WIDE_WARPS*RPW) == 0, so every
+    // warp owns RPW real rows. That keeps the full 0xffffffff shuffle mask unconditionally
+    // legal -- an early return here would leave the butterfly with absent lanes. The price is
+    // declining a ragged R, which the RPW search below simply falls out of.
+    const half2  * __restrict__ w2  = (const half2  *)((const char *) w + (size_t) row0 * nb01);
+    const float2 * __restrict__ sx2 = (const float2 *) sx;
+    const int k2max  = ne00/2;
+    const int rstep2 = (int)(nb01/sizeof(half2));
+
+    float sum[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        sum[r] = 0.0f;
+    }
+
+    for (int k = lane; k < k2max; k += WARP_SIZE) {
+        const float2 fx = sx2[k];   // one smem read feeds all RPW rows
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const half2 hw = w2[k + r*rstep2];
+            sum[r] += __low2float(hw)*fx.x + __high2float(hw)*fx.y;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            sum[r] += __shfl_down_sync(0xffffffff, sum[r], off);
+        }
+        if (lane == 0) y[row0 + r] = sum[r];
+    }
+}
+
+// Returns true if it fully handled the mul_mat (caller should return immediately).
+static bool ggml_cuda_wide_gemv_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const bool on = [] {
+        const char * e = getenv("PXA_F16_GEMV_WIDE");
+        return !(e && atoi(e) == 0);
+    }();
+    if (!on) return false;
+    // This preamble is a deliberate copy of ggml_cuda_small_gemv_f16's rather than a shared
+    // helper: the two gates own opposite shape families and must be free to drift apart, and
+    // this one must never silently widen because that one was edited.
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) return false;
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1)) return false;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (src0->ne[0] < 64 || src0->ne[0] > PXA_WIDE_KMAX) return false;  // small-K: THE wall
+    if (src0->ne[1] <= 512) return false;                      // large-R: what small-R declines
+    if (src0->ne[0] % 2 != 0) return false;                    // half2 loads
+    if (src0->nb[0] != sizeof(half) || src1->nb[0] != sizeof(float)) return false;
+    if (src0->nb[1] % sizeof(half2) != 0) return false;        // half2 row stride
+    if (!ggml_is_contiguous(src1)) return false;
+    if (!ggml_is_contiguous(dst) || dst->nb[0] != sizeof(float)) return false;  // kernel writes packed y
+
+    // RPW preference order, measured standalone at the live shape (K=320, R=10240, 6.55 MB)
+    // on an idle card of each type, 200 iterations after a 20-iteration warmup:
+    //            P100                    V100
+    //   RPW=1    19.29us  340 GB/s       9.70us  676 GB/s
+    //   RPW=2    16.33us  401 GB/s       8.01us  818 GB/s   <- best on BOTH
+    //   RPW=4    16.49us  398 GB/s       9.76us  671 GB/s
+    // RPW=2 wins because it doubles the loads in flight per warp while still leaving 640
+    // blocks, i.e. enough to fill both cards; RPW=4 halves the grid to 320 and starts losing
+    // more to a partial wave than it gains in memory-level parallelism, which bites the
+    // 80-SM V100 harder than the 56-SM P100. The cuBLAS chain it replaces is 45.7us/call on
+    // a P100 and 13.5us/call on a V100 for the identical work.
+    // PXA_F16_GEMV_WIDE_RPW pins it for A/B; honoured only if it also tiles R exactly,
+    // because the kernel has no ragged path.
+    static const int rpw_env = [] {
+        const char * e = getenv("PXA_F16_GEMV_WIDE_RPW");
+        return e ? atoi(e) : 0;
+    }();
+    const int64_t R = src0->ne[1];
+    const auto tiles = [R](int rpw) { return rpw > 0 && R % (int64_t)(PXA_WIDE_WARPS*rpw) == 0; };
+    int rpw = 0;
+    if      (tiles(rpw_env)) rpw = rpw_env;
+    else if (tiles(2))       rpw = 2;
+    else if (tiles(4))       rpw = 4;
+    else if (tiles(1))       rpw = 1;
+    else return false;
+
+    const unsigned grid  = (unsigned)(R / (PXA_WIDE_WARPS*rpw));
+    const half  * w = (const half  *) src0->data;
+    const float * x = (const float *) src1->data;
+    float       * y = (float *) dst->data;
+    switch (rpw) {
+        case 4: k_pxa_gemv_f16_wide<4><<<grid, PXA_WIDE_WARPS*WARP_SIZE, 0, ctx.stream()>>>(w, x, y, (int) src0->ne[0], src0->nb[1]); break;
+        case 2: k_pxa_gemv_f16_wide<2><<<grid, PXA_WIDE_WARPS*WARP_SIZE, 0, ctx.stream()>>>(w, x, y, (int) src0->ne[0], src0->nb[1]); break;
+        default: k_pxa_gemv_f16_wide<1><<<grid, PXA_WIDE_WARPS*WARP_SIZE, 0, ctx.stream()>>>(w, x, y, (int) src0->ne[0], src0->nb[1]); break;
+    }
+    return true;
+}
+
 // Returns true if it fully handled the mul_mat (caller should return immediately).
 // Engagement counters. The RATIO is the assertion, not the banner: a one-shot bool cannot
 // distinguish "fired once" from "fires every token". On a clean np1 non-speculative run
@@ -3439,6 +3595,13 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     // Small-R F16 decode GEMV (rev-2 per-head attn_gate class) — see k_pxa_gemv_f16.
     if (ggml_cuda_small_gemv_f16(ctx, src0, src1, dst)) {
+        return node_n;
+    }
+
+    // Small-K / large-R F16 decode GEMV (hyper-connection up-projection class) -- the
+    // transpose of the family above, which the R <= 512 cap there declines. See
+    // k_pxa_gemv_f16_wide; the two predicates are disjoint, that cap is untouched.
+    if (ggml_cuda_wide_gemv_f16(ctx, src0, src1, dst)) {
         return node_n;
     }
 
