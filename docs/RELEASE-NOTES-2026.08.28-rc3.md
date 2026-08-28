@@ -42,6 +42,28 @@ Nothing here changes numerics on an existing PXQ4 seat.
 
 ---
 
+## Both engines, one tree
+
+This release carries the llama.cpp engine **and** the vLLM serving path, which
+until now lived in a separate repository:
+
+| piece | what it is |
+|---|---|
+| `tools/vllm-pxq4/` | the PXQ4 quantization backend / vLLM plugin |
+| `scripts/pxa-serve-sm70.sh` | V100 seat, measured: 51.46 tok/s single, 135.78 aggregate @8 |
+| `scripts/pxa-serve-sm60.sh` | P100 seat, measured: 24.0-26.4 single, 70-72 aggregate @8 |
+| `scripts/pxa-serve-flashnext.sh` | Flash-Next PXQU seat, 4x P100 + 1080 Ti, 160k context |
+| `pxa/pxq4/` | 6 kernel libraries, 75 kernel sources, README + MANIFEST with md5s |
+
+Before `pxa/pxq4` was vendored, none of it was in version control anywhere — the
+kernel sources existed only in a scratch directory on a single machine.
+
+Both seats were restarted from this tree's own copies and verified by generating,
+including tool calling, which needs `--enable-auto-tool-choice` and
+`--tool-call-parser qwen3_coder`; without those every `tools=` request returns 400.
+
+---
+
 ## New architecture: qwen4exp (Qwen3.8-Flash-Next)
 
 48 layers, 512 experts with 10 used, hybrid attention, and two structures that do
