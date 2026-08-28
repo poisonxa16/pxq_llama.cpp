@@ -3565,7 +3565,15 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
     const int ne00 = (int) src0->ne[0];
     const int ne01 = (int) src0->ne[1];
     if (pxa_router_fuse_mode_resolve() == 3) {
-        if (ne00 % 4 != 0 || (src0->nb[1] % 16) != 0) return false;   // float4 loads
+        // float4 loads. ne00 % 4 sizes the loop and nb[1] % 16 makes the ROW STRIDE safe,
+        // but neither says anything about where the tensor actually STARTS, and the kernel
+        // casts both src0->data and src1->data to float4*. A pool suballocation is not
+        // required to be 16-byte aligned; when it is not, the first load is a misaligned-
+        // address fault, i.e. an abort rather than a wrong number. Check the base pointers.
+        if (ne00 % 4 != 0 || (src0->nb[1] % 16) != 0) return false;
+        if ((((uintptr_t) src0->data) % 16) != 0 || (((uintptr_t) src1->data) % 16) != 0) {
+            return false;
+        }
         pxa_rf_fired_banner(3, ne00, ne01);
         k_pxa_router_gemv_f32_v2<<<ne01, 128, 0, ctx.stream()>>>(
             (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
