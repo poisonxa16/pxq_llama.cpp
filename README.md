@@ -59,6 +59,31 @@ somebody booted it eleven times and gated each boot on correctness first.
 
 ## Quick start
 
+### Serve a PXQ4 model — prebuilt, nothing to compile
+
+Pascal and Volta images with the PXQ4 backend already inside. Pick the tag for your
+cards; the container works out which kernel to load from the GPUs it can see.
+
+```bash
+docker pull ghcr.io/poisonxa16/pxa-vllm:sm60   # Pascal: P100, GTX 10xx
+docker pull ghcr.io/poisonxa16/pxa-vllm:sm70   # Volta:  V100, Titan V
+
+docker run --rm --runtime=nvidia --gpus '"device=0,1"' \
+  -v /path/to/models:/models -p 8000:8000 \
+  ghcr.io/poisonxa16/pxa-vllm:sm60 \
+    --model /models/your-pxq4-model --quantization pxq4 \
+    --tensor-parallel-size 2 --host 0.0.0.0 --port 8000
+```
+
+An OpenAI-compatible server on `:8000`. Details, environment variables and the kernel
+selection table: [`docker/vllm-pxq4/README.md`](docker/vllm-pxq4/README.md).
+
+For the llama.cpp engine images (`pxq-llama-cpp`), see
+[`docker/README.md`](docker/README.md).
+
+### Build from source
+
+
 **Build** (step by step from scratch in [`docs/QUICKSTART.md`](docs/QUICKSTART.md); every
 trap and its exact error in [`BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md)):
 
