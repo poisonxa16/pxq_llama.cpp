@@ -78,7 +78,7 @@ docker run --rm --runtime=nvidia --gpus '"device=0,1"' \
 An OpenAI-compatible server on `:8000`. Details, environment variables and the kernel
 selection table: [`docker/vllm-pxq4/README.md`](docker/vllm-pxq4/README.md).
 
-For the llama.cpp engine images (`pxq-llama-cpp`), see
+For prebuilt engine binaries and Docker build recipes, see
 [`docker/README.md`](docker/README.md).
 
 ### Quantize your own model
