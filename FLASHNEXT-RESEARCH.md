@@ -34,12 +34,24 @@ Identical engine, flags, context and token count; no profiler; interleaved arms;
 each arm's loaded quant types read out of its own log.
 `-c 2048 -n 128 -ts 7,16,16,16,16,16`, six cards.
 
-| arm | tok/s | tokens | confirmed types |
+| arm | samples | median | verdict |
 |---|---|---|---|
-| ours (PXQ4) | **28.80** | 127 | `pxq4: 384` **[M]** |
-| public IQ1_S | (see codec-h2h/summary.txt) | 127 | no pxq **[M]** |
+| ours (PXQ4) | 28.80, 29.26 — **both 127 tokens** | **29.03 tok/s** | valid **[M]** |
+| public IQ1_S | 25.52 (57 tok), 25.18 (56 tok) | 25.35 | **VOID** — token counts differ **[M]** |
 
-Logs: `<local-path>`.
+**Our codec measures 29.03 tok/s (34.45 ms/token).** Logs: `<local-path>`.
+
+The public arm voided itself twice by hitting EOS at ~56-57 tokens against our
+127. **Always pass `--ignore-eos`** for any cross-model comparison; without it
+the two arms generate different token counts and the comparison is worthless.
+Note a short arm is *flattered*, not penalised, because warmup amortises over
+fewer tokens — so the public quant is no better than 25.35 and ours is clearly
+ahead.
+
+**Incidental but useful: a bracketed control spread of 1.6%.** The two `ours`
+samples were separated by a pub run, making them a CTL-a / ... / CTL-b pair.
+1.6% is under the 2% threshold, so wall clock may be usable on this six-card
+cell for effects above ~3% — pending a proper back-to-back pair. **[M]**
 
 **A number that caused a false alarm and must not be requoted as a codec result:
 15.50 tok/s.** That is our PXQ4 *with `PXA_PROFILE=1`*, which syncs before and
