@@ -54,11 +54,11 @@ for _ in $(seq 1 30); do
 done
 docker run -d --name "$NAME" --runtime=nvidia --restart unless-stopped \
   -e NVIDIA_VISIBLE_DEVICES="$CARDS" -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
-  -e LD_LIBRARY_PATH=/src/build-cuda/src:/src/build-cuda/ggml/src \
+  -e LD_LIBRARY_PATH=/src/build-rc/src:/src/build-rc/ggml/src \
   -v <local-path>:<local-path>:ro -v <local-path>:/src -w /src \
   -p 127.0.0.1:${PORT}:${PORT} \
   pxa-sm60-dev:latest \
-  /src/build-cuda/bin/llama-server \
+  /src/build-rc/bin/llama-server \
     -m "$MODEL" -ngl 99 -ts "$TS" \
     -ot 'per_layer_token_embd\.weight=CPU' \
     -c "$NCTX" -ub "$UB" -t 16 \
