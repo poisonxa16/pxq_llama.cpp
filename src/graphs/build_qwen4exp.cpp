@@ -263,8 +263,23 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
             lctx.ple_conv_capture = ggml_new_tensor_2d(
                     lctx.ctx_ple_capture, GGML_TYPE_F32, hc_dim, cap_cols);
             ggml_set_name(lctx.ple_conv_capture, "ple_conv_capture");
+            // Allocate the capture on the SAME backend that holds the PLE weights,
+            // NOT on the CPU. A CPU buffer makes the ggml_cpy below a device->host
+            // copy INSIDE the graph, which forces an extra scheduler split and a
+            // synchronisation on every decode step. The post-compute read already
+            // uses ggml_backend_tensor_get, which is backend-agnostic, so nothing
+            // downstream needs to change. Falls back to CPU if the PLE weights are
+            // somehow unplaced, which keeps the old behaviour rather than failing.
+            ggml_backend_buffer_type_t cap_buft = ggml_backend_cpu_buffer_type();
+            for (int lp = 0; lp < n_layer; ++lp) {
+                ggml_tensor * probe = model.layers[lp].ple_norm_conv;
+                if (probe && probe->buffer) {
+                    cap_buft = ggml_backend_buffer_get_type(probe->buffer);
+                    break;
+                }
+            }
             lctx.buf_ple_capture = ggml_backend_alloc_ctx_tensors_from_buft(
-                    lctx.ctx_ple_capture, ggml_backend_cpu_buffer_type());
+                    lctx.ctx_ple_capture, cap_buft);
             GGML_ASSERT(lctx.buf_ple_capture && "failed to allocate the PLE capture buffer");
             ggml_backend_buffer_clear(lctx.buf_ple_capture, 0);
         }
