@@ -120,6 +120,15 @@ void llm_build_context::init() {
     lctx.inp_s_seq_qnext = nullptr;
     lctx.inp_conv_seq_map  = nullptr; // PXA_LLAMA_FIX_v4
     lctx.inp_qnext_state_mask = nullptr; // PXA_LLAMA_FIX_v4
+    // qwen4exp PLE inputs were MISSING from this reset. A graph that does not rebuild them
+    // (the MTP draft graph, k_shift, defrag) then inherited the previous target graph's
+    // pointers: the input filler wrote hash rows and the conv-history block into arena
+    // memory the scheduler had already re-purposed, and the post-compute readback re-applied
+    // a STALE capture tail into the per-sequence conv window — shifting it once more per
+    // draft step. Cost: one full sched_synchronize + D2H/H2D per draft step; correctness:
+    // the carried PLE conv window was corrupted on every speculative round.
+    lctx.inp_ple_rows      = nullptr;
+    lctx.inp_ple_conv_hist = nullptr;
     lctx.inp_pos_bucket    = nullptr;
     lctx.inp_embd_enc      = nullptr;
     lctx.inp_KQ_mask_cross = nullptr;
