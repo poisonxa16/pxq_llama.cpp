@@ -3269,6 +3269,73 @@ static __global__ void __launch_bounds__(128) k_pxa_router_gemv_f32_v2(
     }
 }
 
+// PXA_F32_GEMV_NY (2026-08-30): the hc_inject class — a TINY f32 GEMV ([K=hc_dim, R=hc] with
+// R=4 on qwen4exp) that cuBLAS prices at ~147us/call for a 160KB read (~300x off roofline;
+// PXA_PROFILE named it 11.4% of ALL GPU time under MTP verify, 2.5% at plain decode, because
+// the router-fuse path declines ny>1 and defaults off on sm_60). One 128-thread block per
+// (row, token): float4 loads, the SAME canonical warp/smem fold as k_pxa_router_gemv_f32_v2.
+// Reduction order differs from cuBLAS -> behavior-gauntlet gated like PXA_F16_GEMV, not
+// sha-gated. Default OFF (PXA_F32_GEMV_NY=1 arms; banner on first fire).
+static __global__ void __launch_bounds__(128) k_pxa_gemv_f32_ny(
+        const float * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int ne00, const size_t nb01, const size_t xs_tok, const size_t ys_tok) {
+    const int row = blockIdx.x;
+    const int tok = blockIdx.y;
+    const float4 * w4 = (const float4 *)((const char *) w + (size_t) row * nb01);
+    const float4 * x4 = (const float4 *)((const char *) x + (size_t) tok * xs_tok);
+    const int k4 = ne00/4;
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < k4; k += 128) {
+        const float4 a = w4[k];
+        const float4 b = x4[k];
+        sum += (a.x*b.x + a.y*b.y) + (a.z*b.z + a.w*b.w);
+    }
+    __shared__ float warpsum[4];
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, off);
+    }
+    if ((threadIdx.x & (WARP_SIZE-1)) == 0) warpsum[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ((float *)((char *) y + (size_t) tok * ys_tok))[row] = (warpsum[0] + warpsum[1]) + (warpsum[2] + warpsum[3]);
+    }
+}
+
+static bool ggml_cuda_small_gemv_f32_ny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const int on = [] {
+        const char * e = getenv("PXA_F32_GEMV_NY");
+        const int v = e ? atoi(e) : 0;
+        if (v) fprintf(stderr, "PXA_F32_GEMV_NY: armed (tiny f32 GEMV, hc_inject class; "
+                               "an A/B without the in-run ENGAGED banner is void)\n");
+        return v;
+    }();
+    if (!on) return false;
+    if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) return false;
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1)) return false;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+    if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    // the tiny-R family: a handful of output rows over a wide K. R<=64 can never be a real
+    // projection (those are n_embd/hc_dim/vocab sized); K>=2048 keeps it off degenerate nodes.
+    if (src0->ne[1] < 2 || src0->ne[1] > 64) return false;
+    if (src0->ne[0] < 2048) return false;
+    if (src1->ne[1] < 1 || src1->ne[1] > 8) return false;
+    if (src0->ne[0] % 4 != 0 || (src0->nb[1] % 16) != 0 || (src1->nb[1] % 16) != 0) return false;
+    if ((((uintptr_t) src0->data) % 16) != 0 || (((uintptr_t) src1->data) % 16) != 0) return false;
+    static std::atomic<bool> fired{false};
+    if (!fired.exchange(true)) {
+        fprintf(stderr, "PXA_F32_GEMV_NY: ENGAGED (%dx%d, ny=%d)\n",
+                (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1]);
+    }
+    dim3 grid((unsigned) src0->ne[1], (unsigned) src1->ne[1]);
+    k_pxa_gemv_f32_ny<<<grid, 128, 0, ctx.stream()>>>(
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+        (int) src0->ne[0], src0->nb[1], src1->nb[1], dst->nb[1]);
+    return true;
+}
+
 // PXA_F16_GEMV (2026-07-26): small-R F16 GEMV for ne11==1 decode nodes. Motivation: the rev-2
 // backbone table promotes the per-head attn_gate (ne[1] = n_head, 48..64 on the Laguna family)
 // to F16, and an F16 x F32 ne11==1 GEMV misses every fast dispatch path (dmmv/mmvq need a
@@ -3598,6 +3665,11 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const ggml_cgraph * cgraph, int node_n) {
 
     if (ggml_cuda_router_gemv_f32(ctx, src0, src1, dst)) {
+        return node_n;
+    }
+
+    // Tiny-R f32 GEMV, ny-capable (the hc_inject class) — see k_pxa_gemv_f32_ny.
+    if (ggml_cuda_small_gemv_f32_ny(ctx, src0, src1, dst)) {
         return node_n;
     }
 
