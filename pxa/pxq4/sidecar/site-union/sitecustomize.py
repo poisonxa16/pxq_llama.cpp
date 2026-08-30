@@ -764,3 +764,204 @@ if _pxa_os5.getenv("VLLM_SM70_DRAFT_GREEDY_FAST", "") not in ("", "0"):
         print("VLLM_SM70_DRAFT_GREEDY_FAST armed", file=_pxa_sys5.stderr, flush=True)
     except Exception:
         pass
+
+# ---------------------------------------------------------------------------
+# VLLM_SM70_DRAFT_FF_FAST: env-gated single-request fast path for the
+# Flash-V100 small-query decode metadata expansion.
+# Measured (V100 lab, np4 MTP, steady state, WORKER_PROFILE yardstick): the
+# drafter's first-pass build_for_drafting costs ~1.1 ms and 0.95 ms of it is
+# _update_smallq_decode_metadata — a repeat_interleave/where/clamp chain of
+# ~13 tiny kernel launches that, for the steady spec-decode shape
+# (num_reqs=1, q=max_query_len, no padding), collapses algebraically:
+#   decode_block_table[i] = clamped block-table row      (one expand-copy)
+#   decode_seq_lens[i]    = max(seq_len, q) + (i+1-q)    (one clamp + one add)
+#   smallq_query_start_loc = query_start_loc[:2]         (one copy)
+# The same helper runs on the TARGET verify build every step (and inside the
+# VLLM_SM70_META_CACHE FA hit path), so this cuts both sides of the round.
+# The steady first_forward itself measures ~1.8 ms (the 13-22 ms figure was
+# cumulative-average warmup skew), and a FULL drafter cudagraph is documented
+# in-tree as collapsing acceptance (initialize_cudagraph_keys), so the eager
+# path stays; this shaves its per-call CPU instead.
+# Falls back to the stock helper for any shape it does not cover (force /
+# padding / multi-request); on any error arms itself off permanently.
+# Default OFF; enable with VLLM_SM70_DRAFT_FF_FAST=1.
+# ---------------------------------------------------------------------------
+import os as _pxa_os6
+
+if _pxa_os6.getenv("VLLM_SM70_DRAFT_FF_FAST", "") not in ("", "0"):
+    try:
+        import sys as _pxa_sys6
+
+        import torch as _pxa_torch6
+        from vllm.v1.attention.backends import flash_attn_v100 as _pxa_fam
+        from vllm.v1.attention.backends.flash_attn_v100 import (
+            FlashAttnV100MetadataBuilder as _PXA_FAB6,
+        )
+
+        _pxa_ff_state = {"disabled": False, "hits": 0}
+        _pxa_ff_orig = _PXA_FAB6._update_smallq_decode_metadata
+
+        def _pxa_ff_smallq(
+            self,
+            attn_metadata,
+            common_attn_metadata,
+            *,
+            force=False,
+            workspace_seq_capacity_cap=None,
+            partition_size_hint=None,
+        ):
+            st = _pxa_ff_state
+            if st["disabled"] or force:
+                return _pxa_ff_orig(
+                    self,
+                    attn_metadata,
+                    common_attn_metadata,
+                    force=force,
+                    workspace_seq_capacity_cap=workspace_seq_capacity_cap,
+                    partition_size_hint=partition_size_hint,
+                )
+            try:
+                m = common_attn_metadata
+                flash_metadata = _pxa_fam._as_flash_v100_metadata(attn_metadata)
+                self._clear_smallq_decode_metadata(attn_metadata)
+
+                max_query_len = int(getattr(attn_metadata, "max_query_len", 1))
+                smallq_max_query_len = self._configured_smallq_max_query_len()
+                if (
+                    smallq_max_query_len <= 0
+                    or max_query_len <= 1
+                    or max_query_len > smallq_max_query_len
+                ):
+                    return
+                smallq_max_model_len = self._configured_smallq_max_model_len()
+                max_model_len = int(self.vllm_config.model_config.max_model_len)
+                if smallq_max_model_len > 0 and max_model_len > smallq_max_model_len:
+                    return
+
+                query_start_loc_cpu = m.query_start_loc_cpu
+                seq_lens_cpu = getattr(m, "_seq_lens_cpu", None)
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = getattr(m, "seq_lens_cpu_upper_bound", None)
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = m.seq_lens_cpu
+
+                num_query_tokens = int(attn_metadata.num_actual_tokens)
+                num_reqs = int(m.num_reqs)
+                real_num_query_tokens = int(query_start_loc_cpu[-1].item())
+                if (
+                    num_reqs != 1
+                    or num_query_tokens != real_num_query_tokens
+                    or num_query_tokens != max_query_len
+                    or num_query_tokens <= 0
+                ):
+                    # Shapes the fast path does not cover: stock helper.
+                    return _pxa_ff_orig(
+                        self,
+                        attn_metadata,
+                        common_attn_metadata,
+                        force=force,
+                        workspace_seq_capacity_cap=workspace_seq_capacity_cap,
+                        partition_size_hint=partition_size_hint,
+                    )
+
+                query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+                has_prefix_context = bool(
+                    _pxa_torch6.any(query_lens_cpu != seq_lens_cpu).item()
+                )
+                if not has_prefix_context and self._smallq_buffer_shape is None:
+                    return
+
+                block_table = attn_metadata.block_table[:num_reqs]
+                if not self._ensure_smallq_decode_buffers(
+                    num_query_tokens, num_reqs, block_table
+                ):
+                    # Capacity problem: let the stock helper raise its own
+                    # descriptive error.
+                    return _pxa_ff_orig(
+                        self,
+                        attn_metadata,
+                        common_attn_metadata,
+                        force=force,
+                        workspace_seq_capacity_cap=workspace_seq_capacity_cap,
+                        partition_size_hint=partition_size_hint,
+                    )
+
+                n = num_query_tokens
+                offs_cache = getattr(self, "_pxa_ff_offs", None)
+                if offs_cache is None:
+                    offs_cache = {}
+                    self._pxa_ff_offs = offs_cache
+                seq_dtype = attn_metadata.seq_lens.dtype
+                offs = offs_cache.get((n, seq_dtype))
+                if offs is None:
+                    offs = (
+                        _pxa_torch6.arange(
+                            1, n + 1, dtype=seq_dtype, device=self.device
+                        )
+                        - n
+                    )
+                    offs_cache[(n, seq_dtype)] = offs
+
+                # decode_block_table[i] = clamp_min(block_table_row, 0)
+                self._smallq_decode_block_table[:n].copy_(
+                    block_table.clamp_min(0).expand(n, -1), non_blocking=True
+                )
+                # decode_seq_lens[i] = max(seq_len, n) - n + (i + 1)
+                eff = _pxa_torch6.clamp(attn_metadata.seq_lens[:1], min=n)
+                _pxa_torch6.add(eff, offs, out=self._smallq_decode_seq_lens[:n])
+                self._smallq_query_start_loc[:2].copy_(
+                    attn_metadata.query_start_loc[:2], non_blocking=True
+                )
+
+                flash_metadata.smallq_decode_block_table = (
+                    self._smallq_decode_block_table[:n]
+                )
+                flash_metadata.smallq_decode_seq_lens = self._smallq_decode_seq_lens[
+                    :n
+                ]
+                flash_metadata.smallq_query_start_loc = self._smallq_query_start_loc[
+                    :2
+                ]
+                raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
+                max_seq_len_hint = int(seq_lens_cpu.max().item())
+                if max_seq_len_hint > 0 and raw_seq_capacity > 0:
+                    flash_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
+                    if workspace_seq_capacity_cap is not None:
+                        raw_seq_capacity = min(
+                            raw_seq_capacity,
+                            max(max_seq_len_hint, int(workspace_seq_capacity_cap)),
+                        )
+                    flash_metadata.smallq_decode_workspace_seq_capacity_hint = (
+                        raw_seq_capacity
+                    )
+                    flash_metadata.smallq_decode_partition_size_hint = (
+                        partition_size_hint
+                    )
+                st["hits"] += 1
+                if st["hits"] == 1:
+                    print(
+                        "VLLM_SM70_DRAFT_FF_FAST active (first hit)",
+                        file=_pxa_sys6.stderr,
+                        flush=True,
+                    )
+                return
+            except Exception as exc:
+                st["disabled"] = True
+                print(
+                    f"VLLM_SM70_DRAFT_FF_FAST disabled after error: {exc!r}",
+                    file=_pxa_sys6.stderr,
+                    flush=True,
+                )
+                return _pxa_ff_orig(
+                    self,
+                    attn_metadata,
+                    common_attn_metadata,
+                    force=force,
+                    workspace_seq_capacity_cap=workspace_seq_capacity_cap,
+                    partition_size_hint=partition_size_hint,
+                )
+
+        _PXA_FAB6._update_smallq_decode_metadata = _pxa_ff_smallq
+        print("VLLM_SM70_DRAFT_FF_FAST armed", file=_pxa_sys6.stderr, flush=True)
+    except Exception:
+        pass
