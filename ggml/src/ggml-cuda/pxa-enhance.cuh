@@ -402,6 +402,23 @@ static inline bool pxa_fa_mask_skip_tile() {
     return v;
 }
 
+// PXA_FA_TILE_F32ACC (2026-08-30, register C2.16): surgical fp32-accumulator variant of the
+// Pascal tile-f16 FA kernel. Promotes ONLY the per-thread running state — kqmax, kqsum and the
+// VKQ output accumulators — to fp32 registers; the shared-memory staging (KV_tmp, Q_h2, the KQ
+// score tile) stays half2, so the smem budget and the D=256 route are unchanged. Targets the
+// long-sequence accumulation error (VKQ/kqsum sum thousands of half-rounded terms at 32k ctx)
+// implicated in the sm_60 fidelity floor (register C2.17/C2.18) while keeping the half2 dot
+// products. Register cost: VKQ 8->16 regs/j at D=256/ncols=16 under __launch_bounds__(.,1) —
+// occupancy and a speed A/B are owed before any default flip. NOT bit-identical to the f16
+// path by design (it is the higher-precision arm). Default OFF; env-only.
+static inline bool pxa_fa_tile_f32acc() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_FA_TILE_F32ACC");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 // PXA_FA_PREFILL_SPLIT: per-ubatch FA regime dispatch — an OPT-IN prefill carrier. A graph
 // whose attention batch (n_tokens) >= this threshold builds the non-FA batched-cuBLAS
 // attention chain even under -fa on (prefill rides the fa-off math = the P100/1080Ti/V100
