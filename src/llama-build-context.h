@@ -609,6 +609,18 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * inp_pos
     );
 
+    // qwen4exp (Qwen3.8-Flash-Next) NextN/MTP: one grafted full-attention hyper-connection
+    // layer, dense attention (no QSA indexer), MoE FFN, its OWN nextn.hc_* head mixer.
+    // Unlike qwen35*, prev_embeddings is the WIDE hc row: [dsv4_hc_mult * n_embd, n_tokens].
+    // Implementation in src/graphs/build_qwen4exp.cpp.
+    struct ggml_tensor * build_qwen4exp_mtp(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        int64_t n_embd_head,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos
+    );
+
     // PXA qwen3next-MTP: near-copy of build_qwen35moe_mtp, but the tail attention uses NEOX rope
     // (qwen3next is NEOX, not the IMROPE qwen35moe uses) -> is_multi=false in build_std_attention.
     struct ggml_tensor * build_qwen3next_mtp(

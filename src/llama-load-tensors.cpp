@@ -2000,48 +2000,61 @@ bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
 
         ggml_context * ctx_split = ctx_for_layer_split(i);
 
+        // NextN/MTP tail (blk.<n_layer-1> of a grafted nextn_predict_layers>0 GGUF): one
+        // full-attention layer WITHOUT indexer/PLE tensors, plus the blk.*.nextn.* fusion +
+        // head mixer loaded at the bottom of this loop. Skipped entirely when MTP is off,
+        // exactly as create_qwen35_tensors does it.
+        const bool is_mtp_layer = hparams.nextn_predict_layers > 0 &&
+                                  (uint32_t) i >= (uint32_t) n_layer - hparams.nextn_predict_layers;
+        int flags = 0;
+        if (!model.mtp && is_mtp_layer) {
+            flags |= llama_model_loader::TENSOR_SKIP;
+        }
+
         // Two low-rank hyper-connection mixers per layer. No attn_norm / attn_post_norm /
         // ffn_norm exist for this arch - hc_attn_norm and hc_ffn_norm are what carries them,
         // over the hc-expanded stream rather than over n_embd.
-        layer.hc_attn_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", i), {hc_dim});
-        layer.hc_attn_down   = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", i), {hc_dim, hc_lr});
-        layer.hc_attn_up     = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_UP,     "weight", i), {hc_lr, hc_dim});
-        layer.hc_attn_inject = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", i), {hc_dim, hc});
-        layer.hc_ffn_norm    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_NORM,    "weight", i), {hc_dim});
-        layer.hc_ffn_down    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", i), {hc_dim, hc_lr});
-        layer.hc_ffn_up      = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_UP,      "weight", i), {hc_lr, hc_dim});
-        layer.hc_ffn_inject  = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", i), {hc_dim, hc});
+        layer.hc_attn_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", i), {hc_dim}, flags);
+        layer.hc_attn_down   = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", i), {hc_dim, hc_lr}, flags);
+        layer.hc_attn_up     = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_UP,     "weight", i), {hc_lr, hc_dim}, flags);
+        layer.hc_attn_inject = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", i), {hc_dim, hc}, flags);
+        layer.hc_ffn_norm    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_NORM,    "weight", i), {hc_dim}, flags);
+        layer.hc_ffn_down    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", i), {hc_dim, hc_lr}, flags);
+        layer.hc_ffn_up      = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_UP,      "weight", i), {hc_lr, hc_dim}, flags);
+        layer.hc_ffn_inject  = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", i), {hc_dim, hc}, flags);
 
         if (!hparams.is_recurrent(i)) {
             // Full attention. wq holds [q|gate] interleaved per head, hence the *2 - the same
             // packing qwen3next / qwen35 / qwen35moe use, and the reason QWEN4EXP has to join
             // them in the two granularity conditionals in the split loop below.
-            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head * 2});
-            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa});
-            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa});
-            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd});
+            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head * 2}, flags);
+            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa}, flags);
+            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa}, flags);
+            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, flags);
 
-            layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k});
-            layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k});
+            layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, flags);
+            layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, flags);
 
-            // QSA lightning indexer. Present only on full-attention layers.
-            layer.index_q_proj = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, idx_n_head * idx_dim});
-            layer.index_k_proj = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, idx_dim});
-            layer.index_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {idx_dim});
-            layer.index_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {idx_dim});
+            // QSA lightning indexer. Present only on full-attention MAIN layers; the grafted
+            // MTP tail runs its attention DENSE and carries no indexer tensors at all.
+            const int idx_flags = is_mtp_layer ? (flags | llama_model_loader::TENSOR_NOT_REQUIRED) : flags;
+            layer.index_q_proj = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, idx_n_head * idx_dim}, idx_flags);
+            layer.index_k_proj = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, idx_dim}, idx_flags);
+            layer.index_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {idx_dim}, idx_flags);
+            layer.index_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {idx_dim}, idx_flags);
         } else {
             // Gated DeltaNet, byte-for-byte the qwen35moe tensor set. src/llama-delta-net.cpp
             // already handles this exact layout (asymmetric k/v head counts with GVA repeat,
             // fused qkvz split), so there is nothing new to port on this branch.
-            layer.wqkv       = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV,   "weight", i), {n_embd, key_dim * 2 + value_dim});
-            layer.wqkv_gate  = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE,  "weight", i), {n_embd, value_dim});
-            layer.ssm_conv1d = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {hparams.ssm_d_conv, conv_dim});
-            layer.ssm_dt     = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT,     "bias",   i), {hparams.ssm_dt_rank});
-            layer.ssm_a      = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_A_NOSCAN,         i), {hparams.ssm_dt_rank});
-            layer.ssm_beta   = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_BETA,   "weight", i), {n_embd, n_v_heads});
-            layer.ssm_alpha  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_ALPHA,  "weight", i), {n_embd, n_v_heads});
-            layer.ssm_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_NORM,   "weight", i), {head_v_dim});
-            layer.ssm_out    = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_OUT,    "weight", i), {value_dim, n_embd});
+            layer.wqkv       = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV,   "weight", i), {n_embd, key_dim * 2 + value_dim}, flags);
+            layer.wqkv_gate  = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE,  "weight", i), {n_embd, value_dim}, flags);
+            layer.ssm_conv1d = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {hparams.ssm_d_conv, conv_dim}, flags);
+            layer.ssm_dt     = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT,     "bias",   i), {hparams.ssm_dt_rank}, flags);
+            layer.ssm_a      = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_A_NOSCAN,         i), {hparams.ssm_dt_rank}, flags);
+            layer.ssm_beta   = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_BETA,   "weight", i), {n_embd, n_v_heads}, flags);
+            layer.ssm_alpha  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_ALPHA,  "weight", i), {n_embd, n_v_heads}, flags);
+            layer.ssm_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_NORM,   "weight", i), {head_v_dim}, flags);
+            layer.ssm_out    = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_OUT,    "weight", i), {value_dim, n_embd}, flags);
         }
 
         // PLE side path. Only the layers listed in <arch>.ple.layers carry these
@@ -2056,14 +2069,30 @@ bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
         }
 
         // MoE: every layer, no dense-FFN fallback in this arch.
-        layer.ffn_gate_inp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
-        use_mmap_buffer &= !create_std_ffn_exps(n_embd, tn, i, 0, n_ff_exp, ctx_split);
+        layer.ffn_gate_inp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
+        use_mmap_buffer &= !create_std_ffn_exps(n_embd, tn, i, flags, n_ff_exp, ctx_split);
 
         // Shared expert.
-        layer.ffn_gate_inp_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {n_embd});
-        layer.ffn_gate_shexp     = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", i), {n_embd, n_ff_shexp});
-        layer.ffn_up_shexp       = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", i), {n_embd, n_ff_shexp});
-        layer.ffn_down_shexp     = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), {n_ff_shexp, n_embd});
+        layer.ffn_gate_inp_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {n_embd}, flags);
+        layer.ffn_gate_shexp     = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", i), {n_embd, n_ff_shexp}, flags);
+        layer.ffn_up_shexp       = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", i), {n_embd, n_ff_shexp}, flags);
+        layer.ffn_down_shexp     = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), {n_ff_shexp, n_embd}, flags);
+
+        // --- NextN/MTP fusion + the draft's own head mixer, on the tail layer only ---
+        // Like qwen35/qwen35moe these live in the plain per-layer ctx (they must REPLICATE
+        // under a split mode, not row-split; -sm layer reads them cross-device like any norm).
+        //   eh_proj = concat([fc_embedding, fc_hidden], dim=1) -> one [2*n_embd -> n_embd] mm
+        //   hnorm   = grouped RMS gamma over the WHOLE hc row (hc_dim wide, +1 baked in)
+        //   hc_*    = the MTP block's own low-rank collapse before the shared lm_head
+        if (is_mtp_layer) {
+            auto nextn_ctx = ctx_for_layer(i);
+            layer.nextn.eh_proj = create_tensor(nextn_ctx, tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {2*n_embd, n_embd}, flags);
+            layer.nextn.enorm   = create_tensor(nextn_ctx, tn(LLM_TENSOR_NEXTN_ENORM,   "weight", i), {n_embd}, flags);
+            layer.nextn.hnorm   = create_tensor(nextn_ctx, tn(LLM_TENSOR_NEXTN_HNORM,   "weight", i), {hc_dim}, flags);
+            layer.nextn.hc_norm = create_tensor(nextn_ctx, tn(LLM_TENSOR_NEXTN_HC_NORM, "weight", i), {hc_dim}, flags);
+            layer.nextn.hc_down = create_tensor(nextn_ctx, tn(LLM_TENSOR_NEXTN_HC_DOWN, "weight", i), {hc_dim, hc_lr}, flags);
+            layer.nextn.hc_up   = create_tensor(nextn_ctx, tn(LLM_TENSOR_NEXTN_HC_UP,   "weight", i), {hc_lr, hc_dim}, flags);
+        }
     }
 
     return use_mmap_buffer;

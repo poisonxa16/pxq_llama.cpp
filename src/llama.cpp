@@ -1136,6 +1136,7 @@ static bool llama_kv_cache_init(
                              model.arch == LLM_ARCH_QWEN35 ||
                              model.arch == LLM_ARCH_QWEN35MOE ||
                              model.arch == LLM_ARCH_QWEN3NEXT ||
+                             model.arch == LLM_ARCH_QWEN4EXP ||
                              model.arch == LLM_ARCH_BAILINGMOE2) && hparams.nextn_predict_layers > 0;
         const int64_t n_mtp_first = hparams.n_layer - hparams.nextn_predict_layers;
         (void) n_mtp_first; (void) is_mtp;
@@ -1256,6 +1257,7 @@ static bool llama_kv_cache_init(
         const bool is_mtp_tail_layer = (model.arch == LLM_ARCH_QWEN35 ||
                                         model.arch == LLM_ARCH_QWEN35MOE ||
                                         model.arch == LLM_ARCH_QWEN3NEXT ||
+                                        model.arch == LLM_ARCH_QWEN4EXP ||
                                         model.arch == LLM_ARCH_BAILINGMOE2 ||
                                         model.arch == LLM_ARCH_GLM_DSA) &&
                 hparams.nextn_predict_layers > 0 && i >= (int)n_mtp_first_layer;
@@ -6733,10 +6735,26 @@ static int llama_decode_internal(
             const bool use_raw_mtp_embd = has_mtp && (lctx.model.arch == LLM_ARCH_QWEN35    ||
                                                       lctx.model.arch == LLM_ARCH_QWEN35MOE ||
                                                       lctx.model.arch == LLM_ARCH_QWEN3NEXT ||
+                                                      lctx.model.arch == LLM_ARCH_QWEN4EXP  ||
                                                       lctx.model.arch == LLM_ARCH_GEMMA4    ||
                                                       lctx.model.arch == LLM_ARCH_GEMMA4_MTP);
             if (cparams.embeddings || has_mtp) {
-                for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                // qwen4exp: the MTP feature row is the WIDE hyper-connection residual
+                // (hc*n_embd, which llama_mtp_state_n_embd reports) and only the dedicated
+                // "result_mtp_embd" node carries it. "result_norm" on this arch is the
+                // COLLAPSED n_embd mixer output and sits later in the graph, so the generic
+                // backward scan below would pick it and the wide row copy would read past
+                // its storage. Prefer the wide node outright; arch-gated so the extraction
+                // order of every other arch is untouched.
+                if (use_raw_mtp_embd && lctx.model.arch == LLM_ARCH_QWEN4EXP) {
+                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                        if (strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
+                            embd = gf->nodes[i];
+                            break;
+                        }
+                    }
+                }
+                for (int i = gf->n_nodes - 1; i >= 0 && embd == nullptr; --i) {
                     if (use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
                         // MTP recurrent state can be wider/different than the logits head hidden state.
                         embd = gf->nodes[i];
@@ -8376,6 +8394,7 @@ struct llama_context * llama_init_from_model(
         model->arch != LLM_ARCH_QWEN35MOE && model->arch != LLM_ARCH_GEMMA4 &&
         model->arch != LLM_ARCH_GEMMA4_MTP && model->arch != LLM_ARCH_GLM_DSA &&
         model->arch != LLM_ARCH_BAILINGMOE2 && model->arch != LLM_ARCH_QWEN3NEXT &&
+        model->arch != LLM_ARCH_QWEN4EXP &&
         cparams.mtp != 0) {
         cparams.mtp = 0;
     }

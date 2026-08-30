@@ -779,6 +779,16 @@ void llm_load_hparams(
                     throw std::runtime_error("qwen4exp: needs a non-zero hyper_connection.count and hyper_connection.low_rank");
                 }
 
+                // NextN/MTP graft: a nextn_predict_layers>0 GGUF carries one extra
+                // full-attention tail layer (blk.<n_layer-1>) with a blk.*.nextn.* fusion +
+                // head mixer. Same n_layer_kv_from_start handling as qwen35/qwen35moe.
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                if (model.mtp) {
+                    hparams.n_layer_kv_from_start = hparams.n_layer;
+                } else {
+                    hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                }
+
                 // QSA lightning indexer geometry (shapes only; top_k is a graph concern)
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
@@ -840,18 +850,23 @@ void llm_load_hparams(
                 }
 
                 // Linear attention everywhere except every full_attention_interval-th layer.
-                // qwen4exp carries no MTP tensors in the GGUF, so there is no nextn tail to skip.
+                // The NextN/MTP tail (the last nextn_predict_layers layers of a grafted GGUF)
+                // is ALWAYS plain full attention, never delta-net — the interval formula would
+                // otherwise call layer 48 of a 49-block graft recurrent ((48+1)%4 != 0).
                 {
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
                     GGML_ASSERT(full_attn_interval > 0);
+                    const uint32_t n_main_layers = hparams.n_layer - hparams.nextn_predict_layers;
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                        hparams.recurrent_layer_arr[i] = i < n_main_layers && ((i + 1) % full_attn_interval != 0);
                     }
                 }
 
                 switch (hparams.n_layer) {
-                    case 48: model.type = e_model::MODEL_180B_A10B; break;
+                    case 48: // plain model
+                    case 49: // with the grafted MTP tail (48 main + 1 nextn)
+                        model.type = e_model::MODEL_180B_A10B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;

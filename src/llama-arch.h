@@ -471,6 +471,13 @@ enum llm_tensor {
     LLM_TENSOR_PLE_NORM_QUERY,
     LLM_TENSOR_PLE_NORM_CONV,
     LLM_TENSOR_PLE_CONV1D,
+    // qwen4exp NextN/MTP: the grafted tail's OWN head mixer (the model-level
+    // LLM_TENSOR_HC_HEAD_* above is the MAIN model's collapse; the MTP block carries a
+    // separate low-rank mixer under blk.%d.nextn.hc_*). eh_proj/enorm/hnorm reuse the
+    // existing LLM_TENSOR_NEXTN_* enums.
+    LLM_TENSOR_NEXTN_HC_NORM,
+    LLM_TENSOR_NEXTN_HC_DOWN,
+    LLM_TENSOR_NEXTN_HC_UP,
 
     LLM_TENSOR_UNKNOWN,
 };

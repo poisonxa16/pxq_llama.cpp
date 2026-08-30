@@ -15,6 +15,14 @@ uint32_t llama_mtp_state_n_embd(const struct llama_context * ctx) {
         return hparams.mtp_backbone_n_embd;
     }
 
+    // qwen4exp: the MTP block is conditioned on the target's WIDE hyper-connection residual
+    // (res_hc before the head mixer), so the whole feature pipe — target extraction, the
+    // per-seq hidden store, inp_mtp_states, the chained-draft read-back — moves
+    // dsv4_hc_mult * n_embd floats per token.
+    if (ctx->cparams.mtp && ctx->model.arch == LLM_ARCH_QWEN4EXP && hparams.dsv4_hc_mult > 0) {
+        return hparams.dsv4_hc_mult * hparams.n_embd;
+    }
+
     return hparams.n_embd;
 }
 

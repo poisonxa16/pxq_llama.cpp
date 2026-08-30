@@ -138,6 +138,12 @@ struct llama_layer_nextn {
     struct ggml_tensor * hnorm            = nullptr;
     struct ggml_tensor * shared_head_head = nullptr;
     struct ggml_tensor * shared_head_norm = nullptr;
+    // qwen4exp: the MTP block's OWN low-rank hyper-connection head mixer, which collapses
+    // the hc-wide draft residual before the shared lm_head (the model-level hc_head_* is
+    // the MAIN model's collapse and is not shared with the draft).
+    struct ggml_tensor * hc_norm          = nullptr;
+    struct ggml_tensor * hc_down          = nullptr;
+    struct ggml_tensor * hc_up            = nullptr;
 };
 
 // TODO: separate into "llama_layer_enc" and "llama_layer_dec"

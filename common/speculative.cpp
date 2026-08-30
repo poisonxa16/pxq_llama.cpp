@@ -2171,7 +2171,7 @@ static bool mtp_model_uses_recurrent_conditioning(const common_speculative_state
     }
 
     std::string arch{llama_model_arch_string(model)};
-    return arch == "qwen35" || arch == "qwen35moe";
+    return arch == "qwen35" || arch == "qwen35moe" || arch == "qwen4exp";
 }
 
 static void mtp_clear_target_hidden(common_speculative_state_mtp & state, llama_seq_id seq_id) {
