@@ -1361,6 +1361,106 @@ static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
     out[grow] = u;
 }
 
+// PXA_PXQ_MMV_TOK (2026-08-30): TOK-batched twin of k_pxq6_mmv_ksplit_gen — the dense-2D /
+// MoE-down mmv arm of the PXA_PXQ_TOKBATCH recipe (gateup twin below at pxq6_gu_tok_pass).
+// The per-token kernel carries the token on blockIdx.z, so an ny-token verify batch or an
+// ny-request concurrent decode re-streams every weight panel from DRAM once PER TOKEN. This
+// twin folds TOK consecutive tokens into one block: grid.z = ceil(ny/TOK), the TOK x
+// chunk-slices are staged token-major in dynamic smem (TOK*Kc floats), and the token loop
+// sits INSIDE the (kb, row) weight walk so tokens 2..TOK hit L1/registers instead of DRAM.
+// BIT-EXACT by construction: per token t the (fixed-chunk, lane) fp32 chain is the per-token
+// kernel's chain verbatim (same canon_v1 chunks, same kb order, same pxq6_dot32 sourcing;
+// the acc[t] chains are independent, so the t-inner loop cannot change any fold), and it
+// writes the SAME raw-partial ws slots; the canonical reducer (k_pxq_mmv_reduce_s) is reused
+// unchanged. temp-0 sha vs the per-token arm is a valid gate. Register discipline follows the
+// gateup twin: __launch_bounds__(256, PXA_PXQ_TOK_MINBLK); single-matrix walk keeps TOK
+// accumulators + TOK panel pointers + TOK anchors live (roomier than the gateup U+G pair, so
+// TOK=4 is offered here where the gateup arm caps at 3 — gate fired instantiations with
+// cuobjdump -res-usage all the same). FUSERED is not offered on this arm (reducer always
+// runs). A dead token slot (iy >= ny) rides e = -1: no staging, no dots, no ws writes.
+// Default OFF (PXA_PXQ_MMV_TOK unset/0).
+#ifndef PXA_PXQ_TOK_MINBLK
+#define PXA_PXQ_TOK_MINBLK 4
+#endif
+template <class POL, int MODE, bool VECX, int TOK>
+static __global__ void __launch_bounds__(256, PXA_PXQ_TOK_MINBLK)
+k_pxq6_mmv_ksplit_gen_tok(const uint8_t * __restrict__ W,
+                      const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+                      float * __restrict__ ws,
+                      const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                      const int R, const int K, const int n_as, const int n_ids, const int S,
+                      const int ny) {
+    const int pk = blockIdx.x;
+    const int p     = pk / S;
+    const int chunk = pk % S;
+    const int j   = blockIdx.y;
+    const int iy0 = (int)blockIdx.z * TOK;
+
+    const int kslabs = K / PXQ6_QK;
+    const int nfix = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);   // S divides nfix (driver-guaranteed)
+    const int cpb  = nfix/S;                                        // fixed chunks per block
+    const int c0 = chunk*cpb, c1 = c0 + cpb;
+    const int kb0 = (kslabs*c0)/nfix, kb1 = (kslabs*c1)/nfix;
+    const int Kc  = (kb1 - kb0)*PXQ6_QK;
+
+    extern __shared__ float pxq6_smem[];
+    float * xs  = pxq6_smem;                      // TOK * Kc floats, token-major
+
+    int e_t[TOK];
+    #pragma unroll
+    for (int t = 0; t < TOK; ++t) {
+        const int iy = iy0 + t;
+        e_t[t] = iy < ny ? *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0) : -1;
+        if (e_t[t] >= n_as) e_t[t] = -1;
+        if (e_t[t] >= 0) {
+            const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride) + kb0*PXQ6_QK;
+            for (int idx = threadIdx.x; idx < Kc; idx += blockDim.x) xs[(size_t)t*Kc + idx] = x[idx];
+        }
+    }
+
+    __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
+    __shared__ float sub[16];
+    __shared__ float2 plut[pxq6_mode<MODE>::pairl ? 256 : (pxq6_mode<MODE>::pairl3 ? 64 : 1)];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    if (pxq6_mode<MODE>::pairl) pxq6_stage_pairlut<POL>(plut, threadIdx.x, 256);
+    if constexpr (pxq6_mode<MODE>::pairl3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 256);
+    __syncthreads();
+    pxq6_prmt_book pb{};
+    if constexpr (pxq6_mode<MODE>::prmt) pxq6_prmt_build(tab, pb);
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM;
+    const uint8_t * pan_t[TOK];
+    float anch_t[TOK];
+    #pragma unroll
+    for (int t = 0; t < TOK; ++t) {
+        pan_t[t]  = e_t[t] >= 0 ? pxq6_panel<POL>(W, e_t[t], panels, p, kslabs) : W;
+        anch_t[t] = (e_t[t] >= 0 && POL::HDR) ? POL::anchor(pan_t[t], row) : 0.f;
+    }
+
+    for (int c = c0; c < c1; ++c) {
+        const int b0 = (kslabs*c)/nfix, b1 = (kslabs*(c+1))/nfix;
+        float acc[TOK];
+        #pragma unroll
+        for (int t = 0; t < TOK; ++t) acc[t] = 0.f;
+        for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
+            #pragma unroll
+            for (int t = 0; t < TOK; ++t) {
+                if (e_t[t] < 0) continue;
+                acc[t] += pxq6_dot32<POL, MODE, VECX>(pan_t[t] + POL::HDR + (size_t)kb*POL::SLAB, row,
+                            anch_t[t], xs + (size_t)t*Kc + (size_t)(kb - kb0)*PXQ6_QK, tab, sub, plut, pb);
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < TOK; ++t) {
+            if (e_t[t] < 0) continue;
+            float * wsj = ws + ((size_t)(iy0 + t)*n_ids + j)*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*R;
+            wsj[(size_t)(c*PXQ4_MMV_KSEG + kseg)*R + p*PXQ6_BM + row] = acc[t];
+        }
+    }
+}
+
 // K1b generic S-split: 256-thr blocks, block pk handles its S-chunk with the full 64x4 kseg
 // structure INSIDE the chunk. Stages only its K-chunk slice of x (dyn smem K/S).
 // PXQ_CANON_v1 (2026-07-28): writes RAW per-(fixed-chunk, lane) partials (2 x NFIX*KSEG slots
@@ -3533,6 +3633,68 @@ static inline pxq6_gateup_ksg_tok_fn pxq6_pick_gateup_ksplit_gen_tok(int fu, int
     if (tok == 2) return pxq6_pick_gu_ksg_tok_t<2>(fu, fg);
     if (tok == 3) return pxq6_pick_gu_ksg_tok_t<3>(fu, fg);
     return nullptr;
+}
+
+// TOK-batched mmv gen-split picker (PXA_PXQ_MMV_TOK) — the single-matrix twin of the gateup
+// tok picker above, same shipped-sourcing restriction (TAB x VECX=1 only; every other
+// mode/vecx returns nullptr and the driver logs a DECLINE and falls back to the per-token
+// kernel, which produces the same bytes). TOK=4 is offered on this arm: one matrix walk
+// leaves more register headroom than the gateup U+G pair (gate with cuobjdump -res-usage).
+typedef void (*pxq6_mmv_ksg_tok_fn)(const uint8_t *, const char *, size_t, size_t, float *,
+        const char *, size_t, size_t, int, int, int, int, int, int);
+template <int TOK>
+static inline pxq6_mmv_ksg_tok_fn pxq6_pick_mmv_ksg_tok_t(int fmt) {
+    switch (fmt) {
+        case PXA_PXQ_FMT_P6:  return k_pxq6_mmv_ksplit_gen_tok<pxq6_pol_p6,   PXQ6_MODE_TAB, true, TOK>;
+        case PXA_PXQ_FMT_P2:  return k_pxq6_mmv_ksplit_gen_tok<pxq6_pol_p2,   PXQ6_MODE_TAB, true, TOK>;
+        case PXA_PXQ_FMT_P3:  return k_pxq6_mmv_ksplit_gen_tok<pxq6_pol_p3,   PXQ6_MODE_TAB, true, TOK>;
+        case PXA_PXQ_FMT_P6R: return k_pxq6_mmv_ksplit_gen_tok<pxq6_pol_p6r,  PXQ6_MODE_TAB, true, TOK>;
+        case PXA_PXQ_FMT_P1:  return k_pxq6_mmv_ksplit_gen_tok<pxq6_pol_p1,   PXQ6_MODE_TAB, true, TOK>;
+        default:              return k_pxq6_mmv_ksplit_gen_tok<pxq6_pol_p6hq, PXQ6_MODE_TAB, true, TOK>;
+    }
+}
+static inline pxq6_mmv_ksg_tok_fn pxq6_pick_mmv_ksplit_gen_tok(int fmt, int m, bool vx, int tok) {
+    if (!vx || m != PXQ6_MODE_TAB) return nullptr;   // shipped decode sourcing only
+    if (tok == 2) return pxq6_pick_mmv_ksg_tok_t<2>(fmt);
+    if (tok == 3) return pxq6_pick_mmv_ksg_tok_t<3>(fmt);
+    if (tok == 4) return pxq6_pick_mmv_ksg_tok_t<4>(fmt);
+    return nullptr;
+}
+
+// PXA_PXQ_MMV_TOK env (0 = OFF default; 2/3/4 = TOK). 1 is meaningless (that IS the
+// per-token kernel); >4 is register-unsafe. Requires the K8-2D S-split machinery
+// (PXA_PXQ4_2D_SPLIT, default on): with the split lever off this lever never engages and
+// the ENGAGED banner will not print -- such an A/B is VOID, not null.
+static inline int pxa_pxq_mmv_tok() {
+    static const int v = [](){
+        const char * e = getenv("PXA_PXQ_MMV_TOK");
+        int t = e ? atoi(e) : 0;
+        if (t != 0 && (t < 2 || t > 4)) {
+            fprintf(stderr, "PXA_PXQ_MMV_TOK=%d invalid (want 0/2/3/4) -- OFF\n", t);
+            t = 0;
+        }
+        if (t) fprintf(stderr, "PXA_PXQ_MMV_TOK: TOK=%d armed (dense-2D mmv token-batching, bit-exact; "
+                               "an A/B without the in-run ENGAGED banner is void)\n", t);
+        return t;
+    }();
+    return v;
+}
+
+// first-fire / first-decline banner per device (phantom-lever discipline).
+static inline void pxa_pxq_mmv_tok_log(int device, bool fired, int tok, unsigned gx, unsigned gy,
+                                       unsigned gz, int ny, int S, size_t smem, int fmt,
+                                       int m, int vx) {
+    static std::atomic<uint32_t> seen{0};
+    if (device < 0 || device >= 16) return;
+    const uint32_t bit = 1u << (2*device + (fired ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    if (fired) {
+        fprintf(stderr, "PXA_PXQ_MMV_TOK dev%d: ENGAGED tok=%d grid=%ux%ux%u ny=%d S=%d smem=%zuB fmt=%d mode=%d vecx=%d\n",
+                device, tok, gx, gy, gz, ny, S, smem, fmt, m, vx);
+    } else {
+        fprintf(stderr, "PXA_PXQ_MMV_TOK dev%d: DECLINED -> per-token mmv (tok=%d ny=%d S=%d smem=%zuB fmt=%d mode=%d vecx=%d: no instantiation for this fmt/mode/vecx or smem > 46K)\n",
+                device, tok, ny, S, smem, fmt, m, vx);
+    }
 }
 PXQ6_PICK_FMT(pxq6_gemm_fn,       pxq6_pick_gemm,              k_pxq6_gemm_grouped)
 PXQ6_PICK_FMT(pxq6_scat_fn,       pxq6_pick_down_scat,         k_pxq6_gemm_down_scat)

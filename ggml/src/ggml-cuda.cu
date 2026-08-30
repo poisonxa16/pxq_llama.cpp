@@ -4447,6 +4447,57 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     // NFIX (so S always divides the canonical chunking => bit-exact vs unsplit).
     if (pxa_pxq4_2d_split()) {
         const int target = pxa_pxq4_2d_split_target(ctx.device);
+
+        // PXA_PXQ_MMV_TOK (2026-08-30): TOK-batched dense decode. On an ny>1 verify batch or
+        // concurrent decode, fold TOK consecutive tokens into one block (grid.z = ceil(ny/TOK))
+        // so the panel weight walk is shared across the group's tokens (kernel header in
+        // pxq6.cuh). ws sizing and the canonical reducer are IDENTICAL to the per-token S-split
+        // arm -- output is bit-identical; only the launch shape and the weight-read temporal
+        // locality change. S is re-derived for this arm: the smem cap sees TOK slices, and the
+        // occupancy target sees ny/TOK grid-z slices, so S both starts higher (fit) and climbs
+        // higher (fill) than the per-token S. Declines (lever off, ny==1, no instantiation,
+        // smem cap unmeetable) fall through to the per-token launches unchanged.
+        const int tok_req = pxa_pxq_mmv_tok();
+        if (tok_req >= 2 && ny >= 2) {
+            const int tok = ny < (int64_t)tok_req ? (int)ny : tok_req;
+            auto * kt = pxq6_pick_mmv_ksplit_gen_tok(fmt, pair, vecx, tok);
+            auto smem_tok = [&](int Sx) {
+                return (size_t)tok*(size_t)((kslabs + Sx - 1)/Sx)*PXQ6_QK*sizeof(float);
+            };
+            int St = S_min;
+            while (St < nfix && smem_tok(St) > smem_cap) St *= 2;
+            const int nyz = ((int)ny + tok - 1)/tok;
+            while (St < nfix && (int64_t)panels*nyz*St < target) St *= 2;
+            if (kt && tok >= 2 && St <= nfix && smem_tok(St) <= smem_cap) {
+                const size_t need = (size_t)ny*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*(size_t)R;
+                float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
+                if (ws) {
+                    const size_t smem_t = smem_tok(St);
+                    dim3 gridt((unsigned)(panels*St), 1u, (unsigned)nyz);
+                    pxa_pxq_mmv_tok_log(ctx.device, true, tok, gridt.x, gridt.y, gridt.z,
+                                        (int)ny, St, smem_t, fmt, pair, (int)vecx);
+                    kt<<<gridt, 256, smem_t, stream>>>(
+                        (const uint8_t *)src0->data,
+                        (const char *)src1->data, src1->nb[1], /* x_slot_stride */ 0,
+                        ws,
+                        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                        (int)R, (int)K, /* n_as */ 1, /* n_ids */ 1, St, (int)ny);
+                    CUDA_CHECK(cudaGetLastError());
+                    const int rblk = pxa_pxq_reduce_blk();
+                    dim3 gridr((unsigned)((R + rblk - 1)/rblk), 1u, (unsigned)ny);
+                    k_pxq_mmv_reduce_s<<<gridr, rblk, 0, stream>>>(ws,
+                        (char *)dst->data, dst->nb[1], /* dst_slot_stride */ 0,
+                        (const char *)idz, /* ids_nb0 */ 0, /* ids_nb1 */ 0,
+                        (int)R, /* n_as */ 1, /* n_ids */ 1, kslabs);
+                    CUDA_CHECK(cudaGetLastError());
+                    return 0;
+                }
+            } else if (tok >= 2) {
+                pxa_pxq_mmv_tok_log(ctx.device, false, tok, 0, 0, 0,
+                                    (int)ny, St, smem_tok(St), fmt, pair, (int)vecx);
+            }
+        }
+
         int S = S_min;               // >= 1; above 1 only when the x stage demands it
         while (S < nfix && (int64_t)panels*ny*S < target) S *= 2;
         if (S > 1) {
