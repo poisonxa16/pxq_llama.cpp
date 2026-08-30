@@ -52,6 +52,31 @@ A control run *without* the capture callback on the same config is fine, and the
   approximately quant-independent) or on a multi-GPU `-sm layer` split — just keep `-ngl 99`.
 - **Status:** upstream fix pending; tracked here so nobody burns a day rediscovering it.
 
+## qwen4exp PXQ run fails at ~38% PXQ-family bytes (bf16 `per_layer_token_embd`)
+
+**Symptom.** A PXQ target on a Flash-Next / qwen4exp GGUF ends with:
+
+```
+PXQ composition assertion: target PXQ4 ... produced 38.5% PXQ-family bytes (floor 50%)
+llama_model_quantize_internal: removed mislabelled output ...
+```
+
+and the composition table shows a large `bf16` entry (~97656 MiB).
+
+**Cause.** `per_layer_token_embd` is a row-gather table. The quantizer refuses to
+panel-encode it — a panel codec would make its single-row reads return nonsense —
+and copies it through at the **input's** width. A `bf16` PLE is ~95 GiB that no
+target can quantize away, so the 50% floor is unreachable from the first byte.
+
+**Fix the input, not the run.** Re-convert with `convert_qwen4exp.py --ple-type q8_0`
+(the default), or start from a GGUF whose PLE is already `Q8_0`. Current builds
+detect this before doing any work and fail in seconds naming the tensor; older
+builds ran to completion first and then deleted their own output.
+
+`--pxq-composition-override` is **not** the remedy here — it would keep a file that
+is ~60% `bf16` while its name claims PXQ4. Full details, verification snippet and
+worked examples: [QWEN4EXP-PXQ4.md](QWEN4EXP-PXQ4.md).
+
 ## PXQ models require full GPU residency (no CPU / partial offload)
 
 The CPU backend's fused MoE op (`MOE_FUSED_UP_GATE`) has **no PXQ support**: a PXQ-quantized

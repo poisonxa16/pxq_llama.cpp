@@ -33,8 +33,15 @@ python3 convert_hf_to_gguf.py /path/to/hf-model --outfile model-f16.gguf --outty
 `convert_hf_to_gguf.py`:
 
 ```bash
-python3 convert_qwen4exp.py /path/to/hf-model --outfile model-f16.gguf
+python3 convert_qwen4exp.py /path/to/hf-model --outfile model-f16.gguf --ple-type q8_0
 ```
+
+`--ple-type q8_0` is the default and must stay that way for anything destined for
+PXQ. That architecture's `per_layer_token_embd` is a 51.2B-parameter row-gather
+table which the quantizer copies through **unchanged** — so if it arrives at
+`bf16`, ~95 GiB of `bf16` lands in the output and the run cannot meet the PXQ
+composition floor. See **[QWEN4EXP-PXQ4.md](QWEN4EXP-PXQ4.md)** for the full
+picture, verification snippet, and worked examples.
 
 ## 2. GGUF to PXQ4
 
@@ -45,6 +52,18 @@ results than going straight from f16, and it makes re-quantizing to other tiers 
 ./llama-quantize model-f16.gguf model-q8.gguf   Q8_0  $(nproc)
 ./llama-quantize model-q8.gguf  model-pxq4.gguf PXQ4  $(nproc)
 ```
+
+Quantizing **from an existing Q8_0 GGUF** needs `--allow-requantize`; without it the
+run stops at the first tensor that has to be converted out of `q8_0`:
+
+```bash
+./llama-quantize --allow-requantize model-q8.gguf model-pxq4.gguf PXQ4 $(nproc)
+```
+
+For a split GGUF, pass the **first** shard — the rest are found automatically. An
+imatrix is optional for PXQ4; if yours reports
+`load_imatrix: failed reading name for entry N` it is unreadable by this build, and
+dropping the flag still produces a valid artifact.
 
 That file runs on the llama.cpp engine as-is. Stop here if that is all you need.
 

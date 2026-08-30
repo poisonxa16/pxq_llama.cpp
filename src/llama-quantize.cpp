@@ -618,6 +618,16 @@ static bool pxa_is_row_gather_tensor(const ggml_tensor * tensor) {
     return tensor->ne[1] >= 1000000;
 }
 
+// A row-gather table that arrives at FULL PRECISION is the one input shape that can
+// never reach a PXQ-family output. The guard above refuses to panel-encode it, so it is
+// copied through at whatever width the input carried. On qwen4exp that single tensor is
+// 51.2B parameters -- ~95 GiB at bf16 -- which alone drags PXQ-family share under the
+// 50% composition floor. Detecting it up front is the difference between a five-second
+// error and a multi-hour run that deletes its own output.
+static bool pxa_is_full_precision_store(ggml_type t) {
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+}
+
 static bool pxa_is_panel_codec(ggml_type t) {
     switch (t) {
         case GGML_TYPE_PXQ1:
@@ -1867,6 +1877,43 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
     }
 
+    // ------------------------------------------------------------------------------------------
+    // PXQ PRECONDITION (row-gather stored at full precision). Motivation: a PXQ4 run on a
+    // qwen4exp GGUF whose per_layer_token_embd was bf16 spent hours quantizing ~337 GiB, then
+    // failed the end-of-run composition assertion at 38.5% and deleted every file it wrote. The
+    // run was doomed before it started: the row-gather guard copies that tensor through
+    // UNCHANGED (a panel codec would make its single-row reads return nonsense), so ~95 GiB of
+    // bf16 was always going to be in the output and the 50% floor was never reachable.
+    //
+    // The percentage-only message was read in the field as "this tensor is too large to
+    // quantize". It is not -- it is not quantizable HERE at all, and the fix belongs to the
+    // INPUT. Say that, before doing any work.
+    // ------------------------------------------------------------------------------------------
+    if (pxq_tier != PXA_TIER_NONE) {
+        for (int i = 0; i < ml.n_tensors; ++i) {
+            const struct ggml_tensor * meta = ml.get_tensor_meta(i);
+            if (!pxa_is_row_gather_tensor(meta) || !pxa_is_full_precision_store(meta->type)) {
+                continue;
+            }
+            throw std::runtime_error(format(
+                "PXQ precondition failed: row-gather tensor %s is stored as %s (%.1f GiB) in the INPUT file.\n"
+                "  This quantizer copies row-gather tables through UNCHANGED by design -- encoding one with a\n"
+                "  panel codec produces a file that loads cleanly and then gathers nonsense. So those bytes\n"
+                "  survive into the output as-is, and a %s target cannot reach the 50%% PXQ-family composition\n"
+                "  floor no matter what this run does.\n"
+                "  FIX THE INPUT, not this run: re-convert storing the gather table with a block-32 codec\n"
+                "  (convert_qwen4exp.py --ple-type q8_0 -- this is already the default), or quantize from a\n"
+                "  GGUF that already holds it at Q8_0.\n"
+                "  --pxq-composition-override is NOT the remedy: it would ship a file that is mostly %s while\n"
+                "  its name claims %s.",
+                ggml_get_name(meta), ggml_type_name(meta->type),
+                ggml_nbytes(meta)/1024.0/1024.0/1024.0,
+                llama_model_ftype_name(params->ftype).c_str(),
+                ggml_type_name(meta->type),
+                llama_model_ftype_name(params->ftype).c_str()));
+        }
+    }
+
 
     gguf_set_val_u32(ctx_out, "general.file_type", ftype); // TODO: use LLM_KV
     if (pxq_tier != PXA_TIER_NONE) {
@@ -2735,15 +2782,35 @@ QuantizationDone:;
                 const bool override_on = getenv("PXA_PXQ_COMPOSITION_OVERRIDE")
                                       && atoi(getenv("PXA_PXQ_COMPOSITION_OVERRIDE")) != 0;
                 const pxa_pxq_bb_cfg & bb = pxa_pxq_backbone_cfg();
-                char msg[512];
+                // Name the type actually responsible. A bare percentage was misread in the
+                // field as "that tensor is too large to quantize"; pointing at the dominant
+                // non-PXQ contributor makes the cause, and therefore the fix, legible.
+                int    worst_type  = -1;
+                size_t worst_bytes = 0;
+                for (const auto & r : comp_stats) {
+                    if (!pxq_family.count(r.first) && r.second.second > worst_bytes) {
+                        worst_bytes = r.second.second;
+                        worst_type  = r.first;
+                    }
+                }
+                char dominant[224] = "";
+                if (worst_type >= 0) {
+                    snprintf(dominant, sizeof(dominant),
+                            " Largest non-PXQ contributor: %s, %.1f GiB (%.1f%% of output).",
+                            ggml_type_name((ggml_type) worst_type),
+                            worst_bytes/1024.0/1024.0/1024.0,
+                            total_size_new ? 100.0*worst_bytes/total_size_new : 0.0);
+                }
+                char msg[1024];
                 snprintf(msg, sizeof(msg),
                         "PXQ composition assertion: target %s produced %.1f%% PXQ-family bytes"
                         "%s%s (floor 50%%; backbone=%s). The output would misrepresent its"
-                        " contents.",
+                        " contents.%s",
                         llama_model_ftype_name(params->ftype).c_str(), 100.0*fam_share,
                         tier_absent ? " and ZERO bytes of the named tier " : "",
                         tier_absent ? ggml_type_name((ggml_type) spec_type) : "",
-                        bb.mode == PXA_BB_LEGACY ? "legacy" : (bb.lite ? "lite" : (bb.hq ? "hq" : "v2")));
+                        bb.mode == PXA_BB_LEGACY ? "legacy" : (bb.lite ? "lite" : (bb.hq ? "hq" : "v2")),
+                        dominant);
                 if (override_on) {
                     LLAMA_LOG_WARN("%s: %s OVERRIDDEN by --pxq-composition-override — file kept.\n",
                             __func__, msg);

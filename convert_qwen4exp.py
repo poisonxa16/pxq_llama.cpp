@@ -253,7 +253,7 @@ def main():
     ap.add_argument("--tokenizer-dir", type=Path, default=None,
                     help="where tokenizer.json lives (default: model_dir)")
     ap.add_argument("--ple-type", choices=["q8_0", "bf16"], default="q8_0",
-                    help="codec for per_layer_token_embd (default q8_0: block-32,\n                          legal at ne0=160, ~54 GiB instead of 95 GiB bf16)")
+                    help="codec for per_layer_token_embd (default q8_0: block-32,\n                          legal at ne0=160, ~54 GiB instead of 95 GiB bf16).\n                          bf16 makes the output UNQUANTIZABLE to any PXQ target --\n                          llama-quantize copies row-gather tables through unchanged,\n                          so ~95 GiB of bf16 survives and the 50%% PXQ-family\n                          composition floor can never be met.")
     ap.add_argument("--name", default="Qwen3.8 Flash Next")
     ap.add_argument("--size-label", default="56B")
     args = ap.parse_args()
@@ -508,6 +508,17 @@ def main():
             store, _pn, ple_nbytes)
     print(f"per_layer_token_embd codec: {args.ple_type} "
           f"({ple_nbytes / 2**30:.1f} GiB)")
+    if args.ple_type != "q8_0":
+        # Say it here, where the choice is made. llama-quantize refuses to panel-encode a
+        # row-gather table (a panel codec makes single-row reads return nonsense) and copies
+        # it through at the input's width -- so a bf16 table of this size puts a PXQ target
+        # permanently under its 50% composition floor. Warning at conversion time costs a
+        # line; finding out costs a full quantize run that then deletes its own output.
+        print(f"  WARNING: this GGUF cannot be quantized to a PXQ target. "
+              f"{ple_nbytes / 2**30:.1f} GiB of bf16 is copied through unchanged by "
+              f"llama-quantize, which puts PXQ-family bytes under the 50% floor. "
+              f"Use --ple-type q8_0 (the default) if this file is destined for PXQ.",
+              flush=True)
     stats["bf16"] += 1
 
     n_kv_in = t["linear_num_key_heads"] * t["linear_key_head_dim"]
