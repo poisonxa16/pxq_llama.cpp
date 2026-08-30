@@ -431,9 +431,10 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
 //   * prev_embeddings is the WIDE hc row [hc*n_embd, n_tokens] (the target's res_hc before
 //     its head mixer), not the collapsed n_embd hidden — llama_mtp_state_n_embd() reports
 //     the wide width so the whole driver moves hc*n_embd floats per token.
-//   * hnorm is a GROUPED RMS: the reduction runs over ONE stream (n_embd), the gamma spans
-//     the whole hc row (hc*n_embd, +1 baked in by the graft) — build_qwen4exp_hc_mix's
-//     first step and build_qwen4exp_ple's grouped_norm do exactly this.
+//   * hnorm is a WHOLE-ROW RMS: the reduction runs over the full hc row (hc*n_embd), and
+//     only then is the row split into streams — upstream reference semantics ("unlike
+//     deepseek4, which norms each stream"). PXA_FN_MTP_HNORM_GROUPED=1 flips to a
+//     per-stream (grouped) reduction for A/B; acceptance rate is the oracle.
 //   * the head collapse uses layer.nextn.hc_{norm,down,up}, NOT model.hc_head_* (that one
 //     is the MAIN model's output mixer; the graft gives the draft its own).
 //   * inp_out_ids is NOT threaded into the attention: the wide residual must stay whole
@@ -467,10 +468,23 @@ struct ggml_tensor * llm_build_context::build_qwen4exp_mtp(
             n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    // hnorm: grouped RMS over the wide row — reduce over ONE stream, gamma over hc_dim
-    ggml_tensor * h_norm = ggml_rms_norm(ctx0,
-            ggml_reshape_3d(ctx0, prev_embeddings, n_embd, hc, n_tokens), hparams.f_norm_rms_eps);
-    h_norm = ggml_mul(ctx0, ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens), mtp_layer.nextn.hnorm);
+    // hnorm: default = WHOLE-ROW RMS (reduce over the full hc_dim row, then split into
+    // streams — upstream reference; "unlike deepseek4, which norms each stream").
+    // PXA_FN_MTP_HNORM_GROUPED=1 = per-stream reduction, for the acceptance A/B.
+    static const bool hnorm_grouped = [] {
+        const char * e = getenv("PXA_FN_MTP_HNORM_GROUPED");
+        return e && atoi(e) != 0;
+    }();
+    ggml_tensor * h_norm;
+    if (hnorm_grouped) {
+        h_norm = ggml_rms_norm(ctx0,
+                ggml_reshape_3d(ctx0, prev_embeddings, n_embd, hc, n_tokens), hparams.f_norm_rms_eps);
+        h_norm = ggml_mul(ctx0, ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens), mtp_layer.nextn.hnorm);
+    } else {
+        h_norm = ggml_rms_norm(ctx0,
+                ggml_reshape_2d(ctx0, prev_embeddings, hc_dim, n_tokens), hparams.f_norm_rms_eps);
+        h_norm = ggml_mul(ctx0, h_norm, mtp_layer.nextn.hnorm);
+    }
     h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
     cb(h_norm, "mtp_hnorm", il);
 
