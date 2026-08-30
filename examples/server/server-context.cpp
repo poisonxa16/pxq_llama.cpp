@@ -110,6 +110,66 @@ static void discard_speculative_checkpoint(server_slot & slot, llama_context * /
     slot.spec_ckpt.clear();
 }
 
+// PXA_SPEC_TRACE: aggregate CPU-wall decomposition of the speculative round. The GPU-op profiler
+// showed MTP mode adds only ~5% GPU time while costing ~27% decode, so the tax is host-side; this
+// names it. A "round" is one update_slots tick where at least one slot verified a draft. Phases:
+//   draft  = common_speculative_draft (K MTP forwards + sampling + hidden copies)
+//   ckpt   = pre-verify recurrent checkpoint save (llama_synchronize + bulk state read)
+//   verify = the target llama_decode calls of the tick
+//   accept = speculative_decoding_accept in full (sample+accept, restore/commit decodes)
+//   commit = the restore/commit sub-block inside accept (subset of accept)
+//   other  = tick wall minus the above (batch build, slot walks, token emit)
+// update_slots runs on one thread, so plain statics suffice. Env PXA_SPEC_TRACE=1 turns it on,
+// PXA_SPEC_TRACE_EVERY (default 64) sets the dump period. Off = zero cost (one getenv-cached bool).
+struct pxa_spec_trace_state {
+    bool    on;
+    int     every;
+    int     rounds       = 0;
+    bool    tick_spec    = false;
+    int64_t tick_t0      = 0;
+    int64_t tk[5]        = {0,0,0,0,0}; // draft, ckpt, verify, accept, commit (this tick)
+    int64_t ac[6]        = {0,0,0,0,0,0}; // accumulated: draft, ckpt, verify, accept, commit, tick
+    pxa_spec_trace_state() {
+        on    = getenv("PXA_SPEC_TRACE") && atoi(getenv("PXA_SPEC_TRACE")) != 0;
+        every = getenv("PXA_SPEC_TRACE_EVERY") ? std::max(1, atoi(getenv("PXA_SPEC_TRACE_EVERY"))) : 64;
+    }
+};
+static pxa_spec_trace_state pxa_sptr;
+
+enum { PXA_SPTR_DRAFT = 0, PXA_SPTR_CKPT, PXA_SPTR_VERIFY, PXA_SPTR_ACCEPT, PXA_SPTR_COMMIT };
+
+static inline void pxa_sptr_tick_begin() {
+    if (!pxa_sptr.on) return;
+    pxa_sptr.tick_t0   = ggml_time_us();
+    pxa_sptr.tick_spec = false;
+    for (auto & v : pxa_sptr.tk) v = 0;
+}
+
+static inline void pxa_sptr_add(int phase, int64_t t0) {
+    if (!pxa_sptr.on) return;
+    pxa_sptr.tk[phase] += ggml_time_us() - t0;
+}
+
+static inline void pxa_sptr_tick_end() {
+    if (!pxa_sptr.on || !pxa_sptr.tick_spec || pxa_sptr.tick_t0 == 0) return;
+    for (int i = 0; i < 5; ++i) pxa_sptr.ac[i] += pxa_sptr.tk[i];
+    pxa_sptr.ac[5] += ggml_time_us() - pxa_sptr.tick_t0;
+    if (++pxa_sptr.rounds % pxa_sptr.every == 0) {
+        const double n = (double) pxa_sptr.every;
+        const double tick   = pxa_sptr.ac[5] / n / 1e3;
+        const double draft  = pxa_sptr.ac[PXA_SPTR_DRAFT]  / n / 1e3;
+        const double ckpt   = pxa_sptr.ac[PXA_SPTR_CKPT]   / n / 1e3;
+        const double verify = pxa_sptr.ac[PXA_SPTR_VERIFY] / n / 1e3;
+        const double accept = pxa_sptr.ac[PXA_SPTR_ACCEPT] / n / 1e3;
+        const double commit = pxa_sptr.ac[PXA_SPTR_COMMIT] / n / 1e3;
+        fprintf(stderr,
+            "PXA_SPEC_TRACE rounds=%d avg_ms tick=%.2f draft=%.2f ckpt=%.2f verify=%.2f accept=%.2f (commit=%.2f) other=%.2f\n",
+            pxa_sptr.rounds, tick, draft, ckpt, verify, accept, commit,
+            tick - draft - ckpt - verify - accept);
+        for (auto & v : pxa_sptr.ac) v = 0;
+    }
+}
+
 static bool save_speculative_checkpoint(server_slot & slot, llama_model * model, llama_context * ctx, int ckpt_mode) {
     slot.spec_ckpt.clear();
     const int32_t n_pre_spec_tokens = slot.cache_tokens.n_tokens() - (int32_t)(slot.drafted.size() + 1);
@@ -3975,6 +4035,7 @@ void server_context::add_sampled_tokens() {
                 }
             }
 
+            const int64_t pxa_sptr_t0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
             llama_tokens draft = common_speculative_draft(
                 slot.spec,
                 params_spec,
@@ -3982,6 +4043,7 @@ void server_context::add_sampled_tokens() {
                 slot.sampled,
                 draft_base_pos,
                 slot.id);
+            if (pxa_sptr.on) pxa_sptr_add(PXA_SPTR_DRAFT, pxa_sptr_t0); // PXA_SPEC_TRACE
 
             // PXA_MTP_ADAPTIVE: restore the request's speculative params after the capped draft call
             if (pxa_draft_cap > 0) {
@@ -4065,6 +4127,7 @@ void server_context::add_sampled_tokens() {
             && !draft.empty();
 
         if (emit_spec) {
+            pxa_sptr.tick_spec = true; // PXA_SPEC_TRACE: this tick verifies a draft
             // add the sampled token to the batch
             slot.i_batch_dft.push_back(batch.n_tokens);
             common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
@@ -5042,6 +5105,7 @@ void server_context::speculative_decoding_accept() {
         slot.n_past = slot.cache_tokens.n_tokens();
 
         // for recurrent/hybrid models: if any drafts were rejected, restore recurrent state
+        const int64_t pxa_sptr_cm0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
         if (any_rejected && slot.spec_ckpt.valid) {
             restore_speculative_checkpoint(slot, ctx, model, spec_type_used, sampled_before, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base);
         } else {
@@ -5084,6 +5148,7 @@ void server_context::speculative_decoding_accept() {
             llama_kv_cache_seq_rm(ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
             discard_speculative_checkpoint(slot, ctx);
         }
+        if (pxa_sptr.on) pxa_sptr_add(PXA_SPTR_COMMIT, pxa_sptr_cm0); // PXA_SPEC_TRACE
 
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
@@ -5440,6 +5505,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         last_decode_start_us.store(ggml_time_us(), std::memory_order_relaxed);
         const int ret = llama_decode(ctx, batch_view);
         last_decode_done_us.store(ggml_time_us(), std::memory_order_relaxed);
+        // PXA_SPEC_TRACE: the target verify/generation decode wall of this tick
+        if (pxa_sptr.on) {
+            pxa_sptr.tk[PXA_SPTR_VERIFY] +=
+                last_decode_done_us.load(std::memory_order_relaxed) -
+                last_decode_start_us.load(std::memory_order_relaxed);
+        }
         // PXA_SYNC_BISECT: was the 620ms queued during llama_decode?
         if (getenv("PXA_SYNC_BISECT")) {
             const int64_t t0 = ggml_time_us();
@@ -5722,7 +5793,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // speculative decoding - main model sample and accept
         {
             const int64_t pxa_ac0 = getenv("PXA_DECODE_WALL_DBG") ? ggml_time_us() : 0;
+            const int64_t pxa_sptr_ac0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
             speculative_decoding_accept();
+            if (pxa_sptr.on) pxa_sptr_add(PXA_SPTR_ACCEPT, pxa_sptr_ac0); // PXA_SPEC_TRACE
             if (pxa_ac0) fprintf(stderr, "PXA_ACCEPT_BLK: %lldus\n", (long long) (ggml_time_us() - pxa_ac0));
         }
     }
@@ -5756,6 +5829,7 @@ void server_context::update_slots() {
         }
     };
     pxa_us_mark("entry");
+    pxa_sptr_tick_begin(); // PXA_SPEC_TRACE
 
     if (system_need_update) {
         system_prompt_update();
@@ -5859,6 +5933,7 @@ void server_context::update_slots() {
 
     if (llama_model_has_recurrent(model)) {
         const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
+        const int64_t pxa_sptr_ck0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
 
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
@@ -5872,12 +5947,14 @@ void server_context::update_slots() {
                 SLT_WRN(slot, "%s", "failed to save spec checkpoint\n");
             }
         }
+        if (pxa_sptr.on) pxa_sptr_add(PXA_SPTR_CKPT, pxa_sptr_ck0); // PXA_SPEC_TRACE
     }
 
     // process the created batch of tokens
     pxa_us_mark("pre_pbt");
     process_batch_tokens(n_batch); // Decode with batch
     pxa_us_mark("us_exit");
+    pxa_sptr_tick_end(); // PXA_SPEC_TRACE
 
     LOG_VERBOSE("run slots completed", {});
 }
