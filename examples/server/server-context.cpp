@@ -5134,8 +5134,11 @@ void server_context::speculative_decoding_accept() {
                     if (_have_hidden) {
                         _commit_hidden = _ch->second;
                     }
+                    // PXA_MTP_PREFETCH: route through the async wrapper so the serial ~9ms/round
+                    // companion commit decode overlaps token emit + the next tick. The wrapper is
+                    // the env gate: unset -> the identical synchronous call, byte-for-byte.
                     bool _committed = !_commit_hidden.empty() &&
-                        common_speculative_commit_accepted_hidden_rows(
+                        common_speculative_commit_accepted_hidden_rows_async(
                             slot.spec, spec_type_used, slot.id, mtp_n_past_base,
                             sampled_before, ids, _commit_hidden);
                     if (!_committed) {
