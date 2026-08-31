@@ -1598,6 +1598,12 @@ int main(int argc, char ** argv) {
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
             { "n_ctx",                       ctx_server.n_ctx },
+            // PXA_KV_UNIFIED_v1: n_ctx above is the TOTAL ring. Until now a client had to infer the
+            // real per-request ceiling by dividing it by total_slots, which is wrong the moment the
+            // ring is unified. Publish the effective ceiling and the mode so it cannot be guessed at.
+            { "n_ctx_slot",                  ctx_server.n_ctx_slot },
+            { "kv_unified",                  ctx_server.params_base.kv_unified },
+            { "kv_cache_used_cells",         llama_get_kv_cache_used_cells(ctx_server.ctx) },
             { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
 
         };
@@ -2728,12 +2734,30 @@ int main(int argc, char ** argv) {
         &server_context::update_slots, &ctx_server));
     // PXA_DEFER_PUMP_v1: lets the queue loop revive parked tasks the moment a slot frees
     ctx_server.queue_tasks.on_slot_available([&ctx_server]() {
+        bool any_available = false;
         for (const auto & slot : ctx_server.slots) {
             if (slot.available()) {
-                return true;
+                any_available = true;
+                break;
             }
         }
-        return false;
+        if (!any_available) {
+            return false;
+        }
+        // PXA_KV_UNIFIED_v1: under the shared ring a free slot is no longer sufficient -- tasks are
+        // also parked for lack of KV cells. Re-dispatching into a ring that is still full only makes
+        // them bounce straight back to the deferred queue, so require some headroom as well. (The
+        // pump already waits up to 500 ms per cycle, so a bounce is a poll and not a spin; this check
+        // keeps the churn and the log noise down.) Attention KV cells only -- the per-sequence
+        // recurrent GDN state is not in this ring and is not part of this decision.
+        if (ctx_server.params_base.kv_unified) {
+            const int32_t used    = llama_get_kv_cache_used_cells(ctx_server.ctx);
+            const int32_t pending = ctx_server.kv_unified_cells_busy(nullptr);
+            if (ctx_server.n_ctx - used - pending <= ctx_server.kv_unified_reserve) {
+                return false;
+            }
+        }
+        return true;
         });
     ctx_server.queue_results.on_multitask_update(std::bind(
         &server_queue::update_multitask,

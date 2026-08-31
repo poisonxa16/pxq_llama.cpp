@@ -289,6 +289,13 @@ struct gpt_params {
     int32_t n_chunks              =      -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =       1; // number of parallel sequences to decode
     int32_t n_sequences           =       1; // number of sequences to decode
+    // PXA_KV_UNIFIED_v1: let every server slot address the FULL attention-KV ring instead of the
+    // static n_ctx/n_parallel split. This base's cell ring is already physically shared and
+    // seq-tagged (src/llama.cpp:8459, cells at :1605-1611), so nothing in the memory layer changes;
+    // only the server's per-slot context ceiling does. NOTE: this concerns ATTENTION KV CELLS ONLY.
+    // The per-sequence recurrent (GDN/delta-net) state is a separate, non-unifiable allocation whose
+    // cost still scales with n_parallel -- see server_context::kv_unified_* for the accounting.
+    bool    kv_unified            =   false; // share one KV ring across all slots (default: off)
     float   p_split               =    0.1f; // speculative decoding split probability
     int32_t n_gpu_layers          =      -1; // number of layers to store in VRAM (-1 - use default)
     int32_t main_gpu              =       0; // the GPU that is used for scratch and small tensors

@@ -296,6 +296,43 @@ struct server_context {
 
     int32_t n_ctx; // total context for all clients / slots
 
+    // ---- PXA_KV_UNIFIED_v1 -------------------------------------------------------------------
+    // Effective per-slot attention-context ceiling, computed once in init().
+    //   lever OFF (default) : n_ctx / n_parallel   -- byte-identical to the historical behaviour
+    //   lever ON            : n_ctx                -- every slot may address the whole shared ring
+    // The ring itself is unchanged either way: this base already allocates ONE seq-tagged cell ring
+    // of exactly cparams.n_ctx cells (src/llama.cpp:8459) and never multiplies it by n_seq_max, so
+    // -np N costs zero extra attention-KV bytes. Only the server's arithmetic is being unified.
+    //
+    // SCOPE, stated explicitly because it is easy to get wrong on this model family: every number
+    // tracked here is ATTENTION KV CELLS (one cell == one token position in the shared ring). The
+    // per-sequence recurrent GDN/delta-net state (n_embd_v_s rows, ~112.2 MiB per sequence on
+    // qwen4exp) lives in kv_self.s_l, is indexed by absolute seq_id, is NOT part of this ring, does
+    // NOT unify, and its cost still scales with -np. It is deliberately absent from every budget
+    // below. Nor do we ever let two slots share a cell: src/llama-delta-net.cpp:43 asserts
+    // batch.n_seq_id[i] == 1, so cross-slot cell sharing stays forbidden.
+    int32_t n_ctx_slot = 0;
+
+    // Attention KV cells the shared ring must still be able to give a slot beyond its prompt before
+    // that slot can make forward progress. Keeps admission from handing out a ring with room for the
+    // prompt but not for a single generated token.
+    int32_t kv_unified_reserve = 0;
+
+    // Cells currently pinned in the shared ring by slots OTHER than `except` that we may not touch:
+    // any slot that is mid-request. Idle slots are counted separately because their cells are only a
+    // prompt cache and are reclaimable without disturbing a live sequence.
+    int32_t kv_unified_cells_busy(const server_slot * except) const;
+    int32_t kv_unified_cells_idle_reclaimable(const server_slot * except) const;
+
+    // Drop the prompt-cache KV of idle slots (oldest-used first) until `need` cells are free or
+    // nothing reclaimable is left. Returns cells reclaimed. NEVER touches a processing slot.
+    int32_t kv_unified_reclaim_idle(int32_t need, const server_slot * except);
+
+    // Admission gate. Decides whether a prompt of n_prompt_tokens may enter the shared ring now.
+    enum kv_admission { KV_ADMIT_OK, KV_ADMIT_DEFER, KV_ADMIT_REJECT };
+    kv_admission kv_unified_admit(int32_t n_prompt_tokens, const server_slot * except, int32_t & n_free_out);
+    // ------------------------------------------------------------------------------------------
+
     // system prompt
     bool system_need_update = false;
 

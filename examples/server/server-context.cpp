@@ -13,6 +13,7 @@
 #include "mtmd-helper.h"
 #include "pxa-expert-log.hpp"
 
+#include <algorithm> // PXA_KV_UNIFIED_v1: std::sort over reclaim victims
 #include <fstream>
 #include <iostream>
 #include <regex>
@@ -462,7 +463,14 @@ bool server_context::load_model(const gpt_params& params_) {
         if (params_dft.n_ctx == 0) {
             params_dft.n_ctx = params_base.speculative.n_ctx;
         }
-        params_dft.n_ctx = params_dft.n_ctx == 0 ? params_base.n_ctx / params_base.n_parallel : params_dft.n_ctx;
+        // PXA_KV_UNIFIED_v1: the draft context must be able to follow the target slot. Under the
+        // lever a slot may grow to the full ring, so a draft sized at n_ctx/n_parallel would overrun
+        // during long generations. Mirror the target's effective per-slot ceiling. Untouched when
+        // the lever is off. (Only reached with a separate -md draft model; the MTP path builds its
+        // companion from params_base further down.)
+        params_dft.n_ctx = params_dft.n_ctx == 0
+                         ? (params_base.kv_unified ? params_base.n_ctx : params_base.n_ctx / params_base.n_parallel)
+                         : params_dft.n_ctx;
         params_dft.n_parallel = 1;
         params_dft.n_batch = params_dft.n_ctx;
 
@@ -493,9 +501,39 @@ bool server_context::load_model(const gpt_params& params_) {
 }
 
 void server_context::init() {
-    const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
+    // PXA_KV_UNIFIED_v1: the ONE line of server arithmetic that statically partitions an already
+    // shared, seq-tagged attention-KV ring. With the lever off this is bit-for-bit the historical
+    // expression; with it on, every slot may address the full ring and admission control (see
+    // kv_unified_admit) takes over the job the division used to do implicitly.
+    n_ctx_slot = params_base.kv_unified
+               ? n_ctx
+               : n_ctx / params_base.n_parallel;
 
-    LOG_INFO("initializing slots", { {"n_slots", params_base.n_parallel} });
+    // Forward-progress reserve, in ATTENTION KV CELLS. A prompt is only admitted if the ring can
+    // also give the slot room to actually generate; otherwise we would admit a request that stalls
+    // on its first decoded token. Cheap relative to the ring, and bounded so tiny contexts still work.
+    kv_unified_reserve = params_base.kv_unified
+                       ? std::max(1, std::min(256, n_ctx / (16 * std::max(1, params_base.n_parallel))))
+                       : 0;
+
+    LOG_INFO("initializing slots", {
+        {"n_slots",    params_base.n_parallel},
+        {"kv_unified", params_base.kv_unified},
+        {"n_ctx",      n_ctx},
+        {"n_ctx_slot", n_ctx_slot},
+        });
+
+    if (params_base.kv_unified) {
+        // Loud and unmistakable: this mode changes the capacity contract of every slot.
+        LOG_WARNING("kv-unified ENABLED: slots share one attention-KV ring", {
+            {"n_ctx",              n_ctx},
+            {"n_ctx_slot",         n_ctx_slot},
+            {"n_slots",            params_base.n_parallel},
+            {"n_ctx_slot_if_split", n_ctx / params_base.n_parallel},
+            {"kv_unified_reserve", kv_unified_reserve},
+            });
+        LOG_WARNING("kv-unified: per-slot recurrent (GDN) state is NOT unified and still scales with -np", {});
+    }
 
     // PXA_SHARED_MTP_v1: the single shared MTP companion spec, created on the first MTP slot and
     // aliased (non-owning) into every other slot. nullptr until the first MTP slot builds it.
@@ -3174,6 +3212,36 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
 
+        // PXA_KV_UNIFIED_v1: shared-ring admission. A free slot is no longer proof of capacity once
+        // the n_ctx/n_parallel split is gone, so gate on the ring itself before committing the task.
+        // No-op (returns KV_ADMIT_OK immediately) when the lever is off.
+        if (params_base.kv_unified && !task.embedding) {
+            int32_t n_free = 0;
+            const int32_t n_prompt = task.n_tokens();
+            const kv_admission adm = kv_unified_admit(n_prompt, slot, n_free);
+            if (adm == KV_ADMIT_DEFER) {
+                // Park on the existing deferred queue; PXA_DEFER_PUMP_v1 re-dispatches on slot
+                // release or its 500 ms heartbeat. The request waits, it does not fail, and no
+                // live sequence is disturbed.
+                LOG_WARNING("kv-unified: shared KV ring full - task deferred", {
+                    {"id_task",         task.id},
+                    {"id_slot",         slot->id},
+                    {"n_prompt_tokens", n_prompt},
+                    {"n_cells_free",    n_free},
+                    {"n_ctx",           n_ctx},
+                    {"n_cells_used",    llama_get_kv_cache_used_cells(ctx)},
+                    {"n_cells_busy",    kv_unified_cells_busy(slot)},
+                    {"n_cells_idle",    kv_unified_cells_idle_reclaimable(slot)},
+                    });
+                queue_tasks.defer(std::move(task));
+                break;
+            }
+            // KV_ADMIT_REJECT is intentionally NOT handled here: the prompt is larger than the whole
+            // ring, which is exactly the condition the pre-existing over-length guard in
+            // update_slots() reports (slot.n_prompt_tokens >= slot.n_ctx, with slot.n_ctx == n_ctx
+            // under the lever). Letting it fall through keeps one error path, not two.
+        }
+
         if (task.data.contains("system_prompt")) {
             std::string sys_prompt = json_value(task.data, "system_prompt", std::string());
             system_prompt_set(sys_prompt);
@@ -3829,10 +3897,230 @@ bool server_context::slots_idle(){
         return all_idle;
 }
 
+// ================= PXA_KV_UNIFIED_v1: shared-ring admission control ==========================
+//
+// WHY THIS EXISTS. With the lever OFF the server hands each slot a private n_ctx/n_parallel window,
+// so a slot can never consume cells another slot needs -- the split IS the admission policy. With
+// the lever ON every slot may address the whole ring, and that policy disappears. Without a
+// replacement, two long sequences would race for the same cells and llama_kv_cache_find_slot()
+// (src/llama.cpp:1509) would eventually return false mid-request: llama_decode fails, the slot dies
+// with a 500, and (worse) nothing stops one sequence from starving another. That is strictly worse
+// than the fixed split, which is why the flag cannot just delete the division.
+//
+// WHAT WE ACCOUNT. ATTENTION KV CELLS ONLY. One cell == one token position in the single seq-tagged
+// ring of exactly cparams.n_ctx cells (src/llama.cpp:8459, tagging at :1605-1611). The per-sequence
+// recurrent GDN/delta-net state (kv_self.s_l, ~112.2 MiB per sequence on qwen4exp) is NOT in this
+// ring, is indexed by absolute seq_id, does NOT unify, and its cost still scales with -np. It is
+// intentionally absent from every sum below; unifying the attention ring neither helps nor hurts it.
+// We also never share a cell between slots: src/llama-delta-net.cpp:43 asserts one seq_id per token.
+//
+// THE POLICY. Ground truth for occupancy is llama_get_kv_cache_used_cells(), an O(1) read of
+// kv_self.used. A request is admitted only if the ring can hold its prompt plus a small forward
+// -progress reserve. If it cannot, we prefer, in order:
+//   1. reclaim -- drop the prompt CACHE of idle slots (oldest-used first). An idle slot's cells are
+//      a disposable optimisation, not a live sequence; dropping them costs a future re-prefill and
+//      disturbs nobody. This is the same teardown the SLOT_ERASE task already performs.
+//   2. defer  -- park the task on the EXISTING deferred queue (PXA_DEFER_PUMP_v1), which re-dispatches
+//      when a slot releases or on its 500 ms heartbeat. The request waits; it does not fail.
+//   3. reject -- only when the prompt could not fit even on a completely empty ring. This falls
+//      through to the pre-existing context_length_exceeded / "exceeds the available context size"
+//      path rather than inventing a second error.
+// At no point do we evict cells belonging to a slot that is mid-request.
+
+int32_t server_context::kv_unified_cells_busy(const server_slot * except) const {
+    // Cells that in-flight slots have already been ADMITTED for but have not yet materialised in the
+    // ring. This is the part llama_get_kv_cache_used_cells() cannot see, and leaving it out is a real
+    // bug rather than a conservatism: several requests arriving in the same tick each look at a ring
+    // that is still empty, each is admitted, and then they collectively overrun it during prefill --
+    // observed as three of four concurrent 2993-token prompts dying on "Input prompt is too big
+    // compared to KV size" at n_ctx 8192. Charging the outstanding promise fixes that admission race.
+    //
+    // Only the REMAINDER is charged: whatever a slot has already decoded is counted by used_cells, so
+    // adding its full prompt here as well would double-count it.
+    //
+    // A slot that has been launched but has not yet had an update_slots() tick still has
+    // n_prompt_tokens == 0 (it is set in batch_pending_prompt), while prompt_tokens is already
+    // populated by launch_slot_with_task. Take the larger of the two so a slot is charged from the
+    // moment it is committed, not from the moment it is first ticked.
+    int32_t n = 0;
+    for (const auto & s : slots) {
+        if (&s == except || !s.is_processing()) {
+            continue;
+        }
+        const int32_t want = std::max(s.n_prompt_tokens, (int32_t) s.prompt_tokens.size()) + kv_unified_reserve;
+        n += std::max(0, want - s.n_past);
+    }
+    return n;
+}
+
+int32_t server_context::kv_unified_cells_idle_reclaimable(const server_slot * except) const {
+    int32_t n = 0;
+    for (const auto & s : slots) {
+        if (&s == except || !s.available()) {
+            continue;
+        }
+        n += (int32_t) s.cache_tokens.size();
+    }
+    return n;
+}
+
+int32_t server_context::kv_unified_reclaim_idle(int32_t need, const server_slot * except) {
+    if (need <= 0) {
+        return 0;
+    }
+
+    // Oldest-used idle slot first: that is the cache least likely to be hit again, and it matches
+    // the victim order get_available_slot() already uses when it picks a slot to overwrite.
+    std::vector<server_slot *> victims;
+    for (auto & s : slots) {
+        if (&s == except || !s.available() || s.cache_tokens.size() == 0) {
+            continue;
+        }
+        victims.push_back(&s);
+    }
+    std::sort(victims.begin(), victims.end(), [](const server_slot * a, const server_slot * b) {
+        return a->t_last_used < b->t_last_used;
+    });
+
+    int32_t reclaimed = 0;
+    for (server_slot * s : victims) {
+        if (reclaimed >= need) {
+            break;
+        }
+        const int32_t n_cells = (int32_t) s->cache_tokens.size();
+
+        // PXA_WAVE4_FIX_v1 idiom: drain before any full-sequence teardown, on BOTH contexts.
+        auto * ctx_companion = s->spec ? common_speculative_get_companion_ctx(s->spec) : nullptr;
+        llama_synchronize(ctx);
+        if (ctx_companion != nullptr) {
+            llama_synchronize(ctx_companion);
+        }
+        llama_kv_cache_seq_rm(ctx, s->id, -1, -1);
+        if (ctx_companion != nullptr) {
+            llama_kv_cache_seq_rm(ctx_companion, s->id, -1, -1);
+        }
+        s->cache_tokens.keep_first(0);
+        s->server_cached_prompt.checkpoints.clear();
+        s->server_cached_prompt.data.clear();
+        s->n_past = 0;
+        s->n_past_prompt = 0;
+        s->n_prompt_tokens_cache = 0;
+
+        reclaimed += n_cells;
+
+        LOG_INFO("kv-unified: reclaimed idle slot prompt cache", {
+            {"id_slot",   s->id},
+            {"n_cells",   n_cells},
+            {"reclaimed", reclaimed},
+            {"need",      need},
+            });
+    }
+
+    return reclaimed;
+}
+
+server_context::kv_admission server_context::kv_unified_admit(int32_t n_prompt_tokens,
+                                                              const server_slot * except,
+                                                              int32_t & n_free_out) {
+    n_free_out = n_ctx;
+
+    if (!params_base.kv_unified) {
+        // Lever OFF: the static n_ctx/n_parallel split is the admission policy, exactly as before.
+        return KV_ADMIT_OK;
+    }
+
+    const int32_t need = n_prompt_tokens + kv_unified_reserve;
+
+    // Could this ever fit, on a completely empty ring? If not, do not park it forever -- let it fall
+    // through to the pre-existing over-length error path.
+    if (need > n_ctx) {
+        n_free_out = n_ctx;
+        return KV_ADMIT_REJECT;
+    }
+
+    // Ground truth occupancy of the shared ring (O(1): returns kv_self.used) PLUS the cells already
+    // promised to slots that are in flight but have not decoded them yet. Both terms are required:
+    // used_cells alone loses the admission race described in kv_unified_cells_busy().
+    const int32_t used    = llama_get_kv_cache_used_cells(ctx);
+    const int32_t pending = kv_unified_cells_busy(except);
+
+    // Cells the requesting slot itself already holds are not an obstacle to its own request: they are
+    // either reused as a cache_prompt prefix or trimmed by the reuse path before its prompt lands.
+    const int32_t own = except != nullptr ? (int32_t) except->cache_tokens.size() : 0;
+
+    int32_t n_free = n_ctx - used - pending + own;
+    if (need <= n_free) {
+        n_free_out = n_free;
+        return KV_ADMIT_OK;
+    }
+
+    // Not enough right now. Try reclaiming disposable idle-slot caches before making anyone wait.
+    const int32_t reclaimed = kv_unified_reclaim_idle(need - n_free, except);
+    if (reclaimed > 0) {
+        n_free = n_ctx - llama_get_kv_cache_used_cells(ctx) - kv_unified_cells_busy(except) + own;
+        if (need <= n_free) {
+            n_free_out = n_free;
+            return KV_ADMIT_OK;
+        }
+    }
+
+    // Still short: the missing cells are pinned by slots that are mid-request. Wait for them rather
+    // than evicting a live sequence.
+    n_free_out = n_free;
+    return KV_ADMIT_DEFER;
+}
+// ============================================================================================
+
 void server_context::context_shift() {
+    // PXA_KV_UNIFIED_v1: runtime half of admission control.
+    //
+    // Admission bounds what ENTERS the ring; it cannot bound generation, because n_predict is
+    // routinely unbounded. With the lever off, slot.n_ctx == n_ctx/n_parallel and the per-slot test
+    // below is itself the backstop -- a slot simply cannot outgrow its private window. With the
+    // lever on, slot.n_ctx == n_ctx, so that test only fires when ONE slot has eaten the entire
+    // ring, and several co-resident slots could collectively exhaust it first. We therefore add a
+    // SHARED-ring trigger and route it into this same, already-correct handler: context shift when
+    // enabled (which discards the slot's OWN oldest tokens -- never another sequence's), or the
+    // pre-existing clean context_length_exceeded error when --no-context-shift is set.
+    //
+    // Only the deepest slot is asked to yield. It frees the most cells, it is the slot actually
+    // responsible for the pressure, and making one slot shift is far less disruptive than making
+    // every slot shift at once. Cells belonging to any other live sequence are never touched.
+    // Accounting is ATTENTION KV CELLS ONLY; the per-sequence GDN state is not in this ring.
+    const server_slot * pxa_kvu_deepest = nullptr;
+    if (params_base.kv_unified) {
+        const int32_t margin = std::max(kv_unified_reserve, 4 * std::max(1, params_base.n_parallel));
+        if (llama_get_kv_cache_used_cells(ctx) >= n_ctx - margin) {
+            // Idle-slot prompt caches are disposable and may be holding the cells that live slots
+            // need. Reclaim those FIRST -- no running request is affected by dropping them.
+            kv_unified_reclaim_idle(2 * margin, nullptr);
+        }
+        if (llama_get_kv_cache_used_cells(ctx) >= n_ctx - margin) {
+            int32_t best = -1;
+            for (const auto & s : slots) {
+                if (s.ga_n == 1 && s.state == SLOT_STATE_PROCESSING && s.n_past > best) {
+                    best = s.n_past;
+                    pxa_kvu_deepest = &s;
+                }
+            }
+            if (pxa_kvu_deepest != nullptr) {
+                LOG_WARNING("kv-unified: shared KV ring near capacity - yielding deepest slot", {
+                    {"id_slot",      pxa_kvu_deepest->id},
+                    {"n_past",       pxa_kvu_deepest->n_past},
+                    {"n_cells_used", llama_get_kv_cache_used_cells(ctx)},
+                    {"n_ctx",        n_ctx},
+                    {"margin",       margin},
+                    {"ctx_shift",    params_base.ctx_shift},
+                    });
+            }
+        }
+    }
+
     for (server_slot& slot : slots) {
         if (slot.ga_n == 1) {
-            if (slot.is_processing() && (int)system_tokens.size() + slot.n_past >= slot.n_ctx - 1) {
+            const bool pxa_kvu_ring_pressure = (pxa_kvu_deepest == &slot);
+            if (slot.is_processing() && (pxa_kvu_ring_pressure ||
+                                         (int)system_tokens.size() + slot.n_past >= slot.n_ctx - 1)) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -5587,6 +5875,21 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                         slot.release();
                     }
                     else {
+                        // PXA_KV_UNIFIED_v1: this branch historically unwinds EVERY slot in `slots`,
+                        // including ones that were never part of the failing batch -- it force-flips
+                        // truly idle slots to PROCESSING and then releases them, posting an error to
+                        // a stale id_task. Under the fixed n_ctx/n_parallel split that blast radius
+                        // was mostly theoretical, because a slot could not overrun its private window
+                        // in the first place. Under the shared ring it is exactly the "one slot's
+                        // exhaustion corrupts another slot's request" failure this feature must not
+                        // have, so scope the unwind to slots that were actually in flight -- the same
+                        // discipline PXA_SCOPED_CANCEL_v1 already applies to the cancel branch above.
+                        // Gated on the lever: with it off, behaviour is bit-for-bit as before.
+                        if (params_base.kv_unified &&
+                            !slot.is_processing() &&
+                            !(slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT)) {
+                            continue; // untouched bystander — leave its state and its cache alone
+                        }
                         slot.state = SLOT_STATE_PROCESSING;
                         slot.command = SLOT_COMMAND_NONE;
                         slot.release();

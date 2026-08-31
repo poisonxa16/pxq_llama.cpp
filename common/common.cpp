@@ -740,6 +740,8 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_THREADS",          params.n_threads);
     get_env("LLAMA_ARG_CTX_SIZE",         params.n_ctx);
     get_env("LLAMA_ARG_N_PARALLEL",       params.n_parallel);
+    get_env("LLAMA_ARG_KV_UNIFIED",       params.kv_unified);
+    get_env("PXA_KV_UNIFIED",             params.kv_unified); // PXA_KV_UNIFIED_v1: house lever alias (takes precedence)
     get_env("LLAMA_ARG_BATCH",            params.n_batch);
     get_env("LLAMA_ARG_UBATCH",           params.n_ubatch);
     get_env("LLAMA_ARG_N_GPU_LAYERS",     params.n_gpu_layers);
@@ -1529,6 +1531,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-np" || arg == "--parallel") {
         CHECK_ARG
         params.n_parallel = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "-kvu" || arg == "--kv-unified") {
+        params.kv_unified = true;
+        return true;
+    }
+    if (arg == "-no-kvu" || arg == "--no-kv-unified") {
+        params.kv_unified = false;
         return true;
     }
     if (arg == "-ns" || arg == "--sequences") {
@@ -3184,6 +3194,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-mea,  --max-extra-alloc",      "Max extra VRAM allocation per GPU (default: %d)", params.max_extra_alloc_MiB});
     options.push_back({ "*",           "-np,   --parallel N",           "number of parallel sequences to decode (default: %d)", params.n_parallel });
     options.push_back({ "*",           "-ns,   --sequences N",          "number of sequences to decode (default: %d)", params.n_sequences });
+    options.push_back({ "*",           "-kvu,  --kv-unified",           "server: let every slot address the full attention-KV ring instead of n_ctx/n_parallel;\n"
+                                                                        "requires the shared-ring admission guard (default: %s)\n"
+                                                                        "(env: LLAMA_ARG_KV_UNIFIED / PXA_KV_UNIFIED)", params.kv_unified ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-no-kvu, --no-kv-unified",      "server: keep the static n_ctx/n_parallel per-slot split (default)" });
     options.push_back({ "*",           "-cb,   --cont-batching",        "enable continuous batching (a.k.a dynamic batching) (default: %s)", params.cont_batching ? "enabled" : "disabled" });
     options.push_back({ "*",           "-nocb, --no-cont-batching",     "disable continuous batching" });
 
