@@ -1029,3 +1029,197 @@ if _pxa_os7.getenv("VLLM_SM70_ROUND_GRAPH", "") not in ("", "0"):
         print("VLLM_SM70_ROUND_GRAPH armed", file=_pxa_sys7.stderr, flush=True)
     except Exception:
         pass
+
+# ---------------------------------------------------------------------------
+# VLLM_SM70_DRAFT_INT8_HEAD: env-gated int8 draft lm_head GEMV.
+# The proposer's 4 greedy sample calls per round are bandwidth-bound on the
+# fp16 lm_head GEMV (measured 1.52 ms/call for the [1 x 5120] x [124160 local
+# vocab] shard = ~1.27 GB HBM read per rank). Greedy verification makes the
+# FINAL output independent of draft choices (byte-identical probe holds by
+# construction), so the DRAFT-side head may be quantized: this lever builds a
+# one-time per-rank int8 copy of the lm_head shard (per-row absmax scales,
+# chunked quantization to bound transients, ~636 MB extra VRAM) and answers
+# greedy draft sampling with a triton int8-weight/fp16-activation GEMV
+# (measured 0.735 ms standalone, argmax agreement 99.0% on random draws) plus
+# the vocab-parallel (value, index) all-gather reduction. Only acceptance
+# rate is at risk; the A/B accept gate decides keep/dead. Falls back to the
+# stock path for any batch/config it does not cover; on any error (including
+# the int8 copy failing to allocate) it arms itself off permanently.
+# Default OFF; enable with VLLM_SM70_DRAFT_INT8_HEAD=1.
+# ---------------------------------------------------------------------------
+import os as _pxa_os8
+
+if _pxa_os8.getenv("VLLM_SM70_DRAFT_INT8_HEAD", "") not in ("", "0"):
+    try:
+        import sys as _pxa_sys8
+
+        import torch as _pxa_torch8
+        import triton as _pxa_triton8
+        import triton.language as _pxa_tl8
+        from vllm.distributed import (
+            get_tensor_model_parallel_world_size as _pxa_tp_size8,
+        )
+        from vllm.distributed import (
+            tensor_model_parallel_all_gather as _pxa_all_gather8,
+        )
+        from vllm.v1.spec_decode.llm_base_proposer import (
+            SpecDecodeBaseProposer as _PXA_SDP8,
+        )
+
+        @_pxa_triton8.jit
+        def _pxa_i8_gemv_kernel(
+            W8p, Xp, Sp, Op,
+            K: _pxa_tl8.constexpr,
+            BLOCK_N: _pxa_tl8.constexpr,
+            BLOCK_K: _pxa_tl8.constexpr,
+        ):
+            pid = _pxa_tl8.program_id(0)
+            rn = pid * BLOCK_N + _pxa_tl8.arange(0, BLOCK_N)
+            acc = _pxa_tl8.zeros((BLOCK_N,), dtype=_pxa_tl8.float32)
+            for k0 in range(0, K, BLOCK_K):
+                rk = k0 + _pxa_tl8.arange(0, BLOCK_K)
+                xv = _pxa_tl8.load(Xp + rk).to(_pxa_tl8.float32)
+                w = _pxa_tl8.load(W8p + rn[:, None] * K + rk[None, :])
+                acc += _pxa_tl8.sum(w.to(_pxa_tl8.float32) * xv[None, :], axis=1)
+            sc = _pxa_tl8.load(Sp + rn)
+            _pxa_tl8.store(Op + rn, acc * sc)
+
+        _pxa_i8_state = {"disabled": False, "hits": 0}
+        _pxa_i8_orig = _PXA_SDP8._sample_draft_tokens
+
+        def _pxa_i8_prepare(self):
+            lm_head = getattr(self.model, "lm_head", None)
+            w = getattr(lm_head, "weight", None)
+            if (
+                w is None
+                or w.dtype != _pxa_torch8.float16
+                or not w.is_cuda
+                or w.ndim != 2
+                or not w.is_contiguous()
+                or w.shape[0] % 32 != 0
+                or w.shape[1] % 512 != 0
+            ):
+                return None
+            n, k = int(w.shape[0]), int(w.shape[1])
+            scales = (w.abs().amax(dim=1).float() / 127.0).clamp_min(1e-8)
+            w8 = _pxa_torch8.empty(n, k, dtype=_pxa_torch8.int8, device=w.device)
+            ch = 4096
+            for i in range(0, n, ch):
+                w8[i : i + ch] = (
+                    (w[i : i + ch].float() / scales[i : i + ch, None])
+                    .round()
+                    .clamp_(-127, 127)
+                    .to(_pxa_torch8.int8)
+                )
+            shard = lm_head.shard_indices
+            num_pad = int(shard.num_org_vocab_padding)
+            ctx = {
+                "w8": w8,
+                "scales": scales,
+                "out": _pxa_torch8.empty(
+                    n, dtype=_pxa_torch8.float32, device=w.device
+                ),
+                "n": n,
+                "k": k,
+                "num_pad": num_pad,
+                "vocab_start": int(shard.org_vocab_start_index),
+            }
+            self._pxa_i8_ctx = ctx
+            return ctx
+
+        def _pxa_i8_sample(
+            self, hidden_states, sampling_metadata, logits=None, spec_step_idx=0
+        ):
+            st = _pxa_i8_state
+            if (
+                st["disabled"]
+                or logits is not None
+                or self._static_draft_vocab is not None
+                or not sampling_metadata.all_greedy
+                or sampling_metadata.max_num_logprobs is not None
+                or getattr(sampling_metadata, "logprob_token_ids", None)
+                or getattr(sampling_metadata, "bad_words_token_ids", None)
+                or getattr(sampling_metadata, "allowed_token_ids_mask", None)
+                is not None
+                or not getattr(sampling_metadata, "no_penalties", False)
+                or hidden_states.ndim != 2
+                or hidden_states.shape[0] != 1
+                or getattr(self.model, "draft_id_to_target_id", None) is not None
+            ):
+                return _pxa_i8_orig(
+                    self, hidden_states, sampling_metadata, logits, spec_step_idx
+                )
+            try:
+                ctx = getattr(self, "_pxa_i8_ctx", None)
+                if ctx is None:
+                    ctx = _pxa_i8_prepare(self)
+                    if ctx is None:
+                        st["disabled"] = True
+                        print(
+                            "VLLM_SM70_DRAFT_INT8_HEAD disabled: "
+                            "lm_head shard not eligible",
+                            file=_pxa_sys8.stderr,
+                            flush=True,
+                        )
+                        return _pxa_i8_orig(
+                            self,
+                            hidden_states,
+                            sampling_metadata,
+                            logits,
+                            spec_step_idx,
+                        )
+                x = hidden_states[0]
+                if x.dtype != _pxa_torch8.float16:
+                    x = x.to(_pxa_torch8.float16)
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                out = ctx["out"]
+                _pxa_i8_gemv_kernel[(ctx["n"] // 32,)](
+                    ctx["w8"], x, ctx["scales"], out,
+                    ctx["k"], BLOCK_N=32, BLOCK_K=512, num_warps=4,
+                )
+                if ctx["num_pad"] > 0:
+                    out[-ctx["num_pad"] :] = float("-inf")
+                local_max, local_idx = out.max(dim=0)
+                global_idx = local_idx + ctx["vocab_start"]
+                if _pxa_tp_size8() == 1:
+                    token_ids = global_idx.view(1)
+                else:
+                    pair = _pxa_torch8.stack(
+                        [local_max.view(1), global_idx.view(1).float()], dim=-1
+                    )
+                    gathered = _pxa_all_gather8(pair, dim=-1).view(
+                        1, _pxa_tp_size8(), 2
+                    )
+                    rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+                    token_ids = (
+                        gathered[:, :, 1]
+                        .gather(dim=-1, index=rank_idx)
+                        .squeeze(-1)
+                        .to(_pxa_torch8.int64)
+                    )
+                st["hits"] += 1
+                if st["hits"] == 1:
+                    print(
+                        "VLLM_SM70_DRAFT_INT8_HEAD active (first hit)",
+                        file=_pxa_sys8.stderr,
+                        flush=True,
+                    )
+                return token_ids, None
+            except Exception as exc:
+                st["disabled"] = True
+                print(
+                    f"VLLM_SM70_DRAFT_INT8_HEAD disabled after error: {exc!r}",
+                    file=_pxa_sys8.stderr,
+                    flush=True,
+                )
+                return _pxa_i8_orig(
+                    self, hidden_states, sampling_metadata, logits, spec_step_idx
+                )
+
+        _PXA_SDP8._sample_draft_tokens = _pxa_i8_sample
+        print(
+            "VLLM_SM70_DRAFT_INT8_HEAD armed", file=_pxa_sys8.stderr, flush=True
+        )
+    except Exception:
+        pass
