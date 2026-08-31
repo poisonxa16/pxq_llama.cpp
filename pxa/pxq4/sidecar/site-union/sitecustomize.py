@@ -965,3 +965,67 @@ if _pxa_os6.getenv("VLLM_SM70_DRAFT_FF_FAST", "") not in ("", "0"):
         print("VLLM_SM70_DRAFT_FF_FAST armed", file=_pxa_sys6.stderr, flush=True)
     except Exception:
         pass
+
+# ---------------------------------------------------------------------------
+# VLLM_SM70_ROUND_GRAPH: env-gated drafter FULL-graph upgrade (round-graph
+# endgame, bounded experiment).
+# Round accounting on the official config (ENGLOOP + async worker trace +
+# proposer marginals): the engine-loop gap between spec rounds is already
+# ~0.03 ms (async worker), the target verify runs as a FULL graph, and the
+# drafter's 4 forwards run as PIECEWISE graphs — the remaining fusible glue
+# is ~8-10 ms/round of enqueue python BETWEEN graph replays. A true
+# whole-round capture is blocked at this level: torch cannot replay existing
+# FULL/PIECEWISE graphs inside a new stream capture, and recapturing the
+# drafter loop eagerly is exactly the "model-level FULL drafter graph" that
+# SpecDecodeBaseProposer.initialize_cudagraph_keys documents as collapsing
+# acceptance. This lever re-tests that documented claim on the current build
+# (the _stabilize_draft_graph_metadata persistent-buffer machinery for FULL
+# q=1 drafter replay exists today): it upgrades the drafter dispatcher from
+# pinned PIECEWISE to FULL_AND_PIECEWISE so the q=1 loop forwards replay as
+# FULL graphs (the q=5 first pass stays PIECEWISE). Gates: byte-identical
+# probe + unchanged accept length decide keep/dead.
+# Default OFF; enable with VLLM_SM70_ROUND_GRAPH=1.
+# ---------------------------------------------------------------------------
+import os as _pxa_os7
+
+if _pxa_os7.getenv("VLLM_SM70_ROUND_GRAPH", "") not in ("", "0"):
+    try:
+        import sys as _pxa_sys7
+
+        from vllm.config import CUDAGraphMode as _PXA_CGM7
+        from vllm.v1.spec_decode.llm_base_proposer import (
+            SpecDecodeBaseProposer as _PXA_SDP7,
+        )
+
+        _pxa_rg_orig_init = _PXA_SDP7.initialize_cudagraph_keys
+
+        def _pxa_rg_init(self, cudagraph_mode):
+            try:
+                if (
+                    not self.speculative_config.enforce_eager
+                    and cudagraph_mode.mixed_mode()
+                    in (_PXA_CGM7.PIECEWISE, _PXA_CGM7.FULL)
+                ):
+                    self.cudagraph_dispatcher.initialize_cudagraph_keys(
+                        _PXA_CGM7.FULL_AND_PIECEWISE
+                    )
+                    self._specialize_mtp_cudagraph_keys()
+                    print(
+                        "VLLM_SM70_ROUND_GRAPH active (drafter "
+                        "FULL_AND_PIECEWISE keys)",
+                        file=_pxa_sys7.stderr,
+                        flush=True,
+                    )
+                    return
+            except Exception as exc:
+                print(
+                    f"VLLM_SM70_ROUND_GRAPH disabled after error: {exc!r}",
+                    file=_pxa_sys7.stderr,
+                    flush=True,
+                )
+            return _pxa_rg_orig_init(self, cudagraph_mode)
+
+        _PXA_SDP7.initialize_cudagraph_keys = _pxa_rg_init
+        print("VLLM_SM70_ROUND_GRAPH armed", file=_pxa_sys7.stderr, flush=True)
+    except Exception:
+        pass
