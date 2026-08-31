@@ -3,7 +3,7 @@
 #
 # MEASURED shipping configuration. Every arm was correctness-gated AND
 # byte-gated (20/20 greedy outputs identical to an NCCL reference boot) before
-# its number was recorded. Measured on the box cards 1,6, 2026-08-27:
+# its number was recorded. Measured on cards 1,6, 2026-08-27:
 #
 #   gate config (old site, v7 lib, CAR off, custom_ops none)  13.31 single
 #   this config                                               24.0-26.4 single
@@ -37,13 +37,18 @@
 #      image and die on `undefined symbol: ...incref_pyobject...` mid-load.
 #  PASCAL_SDPA            Pascal has no tensor cores; FLASH_ATTN_V100 is sm_70.
 set -uo pipefail
-if [ "$(hostname)" != "the box" ]; then echo "WRONG HOST: $(hostname)"; exit 1; fi
+# Set PXQ_HOST_GUARD to pin this seat to one host.
+if [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ]; then
+  echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1
+fi
 
 NAME=${NAME:-pxa-pxq4-p100}
 PORT=${PORT:-8199}
 CARDS=${CARDS:-1,6}     # free P100s. NEVER 0 (production seat) or 3 (1080 Ti).
 PKG=${PKG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/pxa/pxq4}
-MODEL=${MODEL:-<local-path>}
+MODEL=${MODEL:?set MODEL to the model dir or repo id}
+# host dir bind-mounted into the container so the model path resolves inside it
+MODEL_MOUNT=${MODEL_MOUNT:-$( [ -e "$MODEL" ] && cd "$(dirname "$MODEL")" && pwd || echo "$PWD" )}
 IMAGE=${IMAGE:-pxa-vllm:sm60}
 SITE=${SITE:-$PKG/sidecar/site-sm60}
 LIB=${LIB:-$PKG/kernels/libpxq4_sm60_v10.so}
@@ -69,7 +74,7 @@ docker run -d --name "$NAME" --runtime=nvidia --restart unless-stopped \
   -e PYTHONPATH="$SITE" -e PXQ4_LIB="$LIB" \
   -e HOME=/tmp -e TMPDIR=/tmp -e PYTHONUNBUFFERED=1 \
   -p 127.0.0.1:${PORT}:${PORT} \
-  -v "$PKG":"$PKG" -v <local-path>:<local-path> -v <local-path>:<local-path> \
+  -v "$PKG":"$PKG" -v "$MODEL_MOUNT":"$MODEL_MOUNT" ${EXTRA_MOUNT:+-v "$EXTRA_MOUNT":"$EXTRA_MOUNT"} \
   --shm-size=16g --ipc=host \
   "$IMAGE" python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --quantization pxq4 \

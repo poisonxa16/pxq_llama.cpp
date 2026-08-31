@@ -68,7 +68,7 @@ RUNTIME (in-container, out-of-tree pip package `pxq4-vllm`)
                                    vendored slice of ggml/src/ggml-cuda/pxq6.cuh)
 ```
 
-Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<local-path>` is modified.
+Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<engine-tree>` is modified.
 
 ---
 
@@ -94,7 +94,7 @@ Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<local-path>` is modified.
 | `pxq4_vllm/linear.py` | 300 | `PXQ4LinearMethod(LinearMethodBase)` — §3.2. Includes the pure-torch dequant used by S1 and as the permanent CPU/meta fallback. |
 | `pxq4_vllm/mxfp4.py` | 90 | Phase 2 only: `PXQ4MXFP4LinearMethod`, delegating to the fork's already-built `torch.ops._C.mxfp4_sm70_prepare` / `mxfp4_gemm_sm70_out` (FACT, `csrc/torch_bindings.cpp:198-200`; `sm70_turbomind.py:229-253`). |
 | `pxq4_vllm/ops.py` | 100 | `torch.ops.pxq4.*` wrappers + `@register_fake` meta kernels for **every** op. §4.4. |
-| `pxq4_vllm/csrc/pxq4_pxa.cuh` | 560 | **Vendored verbatim** from `<local-path>` (~500 lines) + ~60 lines of edits. Slice list in §4.2. |
+| `pxq4_vllm/csrc/pxq4_pxa.cuh` | 560 | **Vendored verbatim** from `<engine-tree>` (~500 lines) + ~60 lines of edits. Slice list in §4.2. |
 | `pxq4_vllm/csrc/pxq4_sm70.cu` | 320 | Torch shim: `TORCH_LIBRARY(pxq4, m)`, dtype/shape/device `TORCH_CHECK`s, stream plumbing, launch config. §4.3. |
 | `setup.py` | 70 | `CUDAExtension` with `-gencode arch=compute_70,code=sm_70`. §4.5. |
 | `pyproject.toml` | 30 | `[project.entry-points."vllm.general_plugins"] pxq4 = "pxq4_vllm:register"`. |
@@ -114,7 +114,7 @@ Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<local-path>` is modified.
 `site-packages/vllm` is a *copied* install, not an editable link to `/opt/1Cat-vLLM`, so edits
 there are inert at runtime anyway (FACT, 05 §A2).
 
-**In `<local-path>` (our llama.cpp tree): NONE.** Read-only by rule. The vendored kernel
+**In `<engine-tree>` (our llama.cpp tree): NONE.** Read-only by rule. The vendored kernel
 slice is a copy, with the provenance canary comment (`pxq6.cuh:1-3`) preserved and a
 `// VENDORED FROM mgv-wt@acf8f245 ggml/src/ggml-cuda/pxq6.cuh:<range>` banner per block so a
 future re-sync is mechanical.
@@ -352,7 +352,7 @@ in v1 and must raise a clear error, not silently misbehave.
 
 ### 4.2 The vendored slice (`pxq4_pxa.cuh`, ~500 copied + ~60 edited LOC)
 
-Copy verbatim from `<local-path>` (**not** `pxq4.cuh` — that
+Copy verbatim from `<engine-tree>` (**not** `pxq4.cuh` — that
 file documents the retired id-250 MXFP4-repack format and contains no id-252 compute kernel at
 all; FACT, `pxq4.cuh:1-17`, `:59-60`, `:117-119`):
 

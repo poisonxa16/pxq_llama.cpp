@@ -19,10 +19,12 @@
 # The -ot pattern is ANCHORED. A loose 'ple' regex would also match blk.1's ple_key,
 # ple_conv1d and three F32 ple_norm_* tensors, which must stay on the GPU.
 set -u
-[ "$(hostname)" != "the box" ] && { echo "WRONG HOST: $(hostname)"; exit 1; }
+# Set PXQ_HOST_GUARD to pin this script to one host.
+[ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ] && \
+  { echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1; }
 
-ENGINE=${ENGINE:-<local-path>}
-MODEL=${MODEL:-<local-path>}
+ENGINE=${ENGINE:-$(git rev-parse --show-toplevel 2>/dev/null || echo .)/build-cuda/bin/llama-cli}
+MODEL=${MODEL:?set MODEL to the .gguf to run}
 NCTX=${NCTX:-4096}
 NPRED=${NPRED:-64}
 PROMPT=${PROMPT:-"Explain in two sentences what makes a mixture-of-experts model efficient."}
@@ -36,7 +38,8 @@ for d in ${CUDA_VISIBLE_DEVICES:-0,1,2,4,5,6}; do
 done
 
 # the engine binaries carry no RPATH
-export LD_LIBRARY_PATH=<local-path>:<local-path>${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ENGINE_BUILD=$(cd "$(dirname "$ENGINE")/.." && pwd)
+export LD_LIBRARY_PATH="$ENGINE_BUILD/src:$ENGINE_BUILD/ggml/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,4,5,6}

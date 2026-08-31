@@ -2,7 +2,7 @@
 
 Target: `KewaiiGamer/1Cat-vLLM` @ `2ceb15066`, Qwen3.8-27B (gguf arch `qwen35`), 4x V100-32GB (DGX, TP=4)
 and 2x V100-16GB (Unraid, TP=2). Artifact: `/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
-Every line citation below is to a file that was read (either `<local-path>` @ `acf8f245`, or
+Every line citation below is to a file that was read (either `<engine-tree>` @ `acf8f245`, or
 `/opt/1Cat-vLLM` inside the running container). **No GPU was run in this workflow. Every throughput
 number in this document is a PROJECTION and is labelled as such.**
 

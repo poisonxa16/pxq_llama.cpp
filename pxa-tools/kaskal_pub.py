@@ -17,15 +17,15 @@ max_tokens), so completion_tokens is compared against the cap explicitly.
 """
 import json, os, sys, time, subprocess, urllib.request, collections, re
 
-BUILD = "<local-path>"
+BUILD = os.environ.get("PXQ_BUILD", "./build")
 IMG = "nvidia/cuda:12.8.1-devel-ubuntu24.04"
 PORT = 8490
 NAME = "kaskalpub"
 GPUS = "0,1,2,4,6"
 MAXTOK = 2048
 
-PUB = "<local-path>"
-FIX = "<local-path>"
+PUB = os.environ.get("PXQ_MODEL_PUB", "")
+FIX = os.environ.get("PXQ_MODEL_FIX", "")
 
 CELLS = [
     ("pub_MXFP4attn_merged", PUB, {}),
@@ -80,7 +80,7 @@ def g8(txt):
 
 
 PROMPT = None
-for f in ["<local-path>"]:
+for f in [os.environ.get("PXQ_PROMPTS", "./codec_ab_prompts.json")]:
     for p in json.load(open(f)):
         if "kaskal" in p["qid"]:
             PROMPT = p["prompt"]

@@ -70,7 +70,7 @@
 #   PXA_PXQ_BACKBONE=v2,universal PXA_PXQ_COMPOSITION_OVERRIDE=1 \
 #   ./build/bin/llama-quantize --allow-requantize \
 #     --imatrix /path/to/flashnext.imatrix \
-#     --pxq-universal <local-path> \
+#     --pxq-universal <engine-tree> \
 #     <local-path> \
 #     <local-path> PXQ_UNIVERSAL 32
 #   PXA_PXQ_COMPOSITION_OVERRIDE=1 IS MANDATORY: PXQ-family share is 47.96%, below the 50%

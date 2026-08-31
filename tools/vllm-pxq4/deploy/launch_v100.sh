@@ -12,7 +12,7 @@ docker run -d --name "$NAME" \
   -e VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=0 \
   -e PXQ4_MMV_SLICE_MAX=8 \
   ${EXTRA_ENV:-} \
-  -v <local-path>:/models -v <local-path>:/plugin \
+  -v "${PXQ4_MODELS:-$PWD/models}":/models -v "${PXQ4_PLUGIN:-$PWD/plugin}":/plugin \
   -p 127.0.0.1:${PORT}:${PORT} --ipc=host \
   --entrypoint python kewaii/vllm:latest \
   -m vllm.entrypoints.openai.api_server \

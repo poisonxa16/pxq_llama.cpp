@@ -10,8 +10,10 @@ import re, sys
 BLOCK32 = {"mxfp4","q8_0","q4_k","q5_k","q6_k","q4_0","q5_0","q6_0","iq4_nl",
            "iq1_s","iq2_xxs","pxq1","pxq2","pxq3","pxq4","pxq4hq","pxq6"}
 PASSTHRU = {"f32","f16","bf16"}
-MAP = "<local-path>"
-TENSORS = "<local-path>"
+MAP = os.environ.get("PXQU_MAP",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "recipes", "pxqu-flashnext-4xp100-150k-ub1024.tiers"))
+TENSORS = os.environ.get("PXQU_TENSORS", "./qwen4exp-IQ1_S-tensors.txt")
 
 rules = []
 for l in open(MAP):

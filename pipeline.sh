@@ -1,30 +1,33 @@
 #!/bin/bash
 # qwen4exp: original weights -> BF16 GGUF -> PXQ4 -> six Teslas, n-gram table on CPU.
 #
-# Source is on <local-path>; output goes to <local-path> -- a DIFFERENT SPINDLE
+# $PXQ_SRC and $PXQ_OUT must be on DIFFERENT SPINDLES
 # (verified via stat -c %d: 2309 vs 2311). Reading and writing hundreds of GiB
 # on one spindle cost 9x throughput earlier in this build.
 set -euo pipefail
 
-if [ "$(hostname)" != "the box" ]; then echo "WRONG HOST: $(hostname)"; exit 1; fi
+# Set PXQ_HOST_GUARD to the hostname these artifacts live on to re-arm this check.
+if [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ]; then
+  echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1
+fi
 
-SRC=<local-path>
-REPO=<local-path>
-OUT=<local-path>
+SRC="${PXQ_SRC:-./qwen4exp-weights}"          # HF source weights
+REPO="${PXQ_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+OUT="${PXQ_OUT:-./qwen4exp}"                  # BF16 output (separate spindle)
 BF16=$OUT/Qwen3.8-Flash-Next-BF16.gguf
 PXQ4=$OUT/Qwen3.8-Flash-Next-PXQ4.gguf
-REF=<local-path>
+REF="${PXQ_REF:-$SRC/../qwen4exp-testfile/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf}"
 LOGD=$OUT/logs
 mkdir -p "$OUT" "$LOGD"
 
-[ "$(stat -c %d <local-path>)" != "$(stat -c %d <local-path>)" ] || { echo "disk5 and disk7 are the SAME device"; exit 1; }
+[ "$(stat -c %d "$SRC")" != "$(stat -c %d "$OUT")" ] || { echo "SRC and OUT are on the SAME device"; exit 1; }
 
 step() { echo; echo "=== [$(date -u +%H:%M:%S)] $* ==="; }
 
 # ---------------------------------------------------------------- 1. convert
 if [ ! -s "$BF16" ]; then
   step "convert HF -> BF16 GGUF"
-  df -h <local-path> | tail -1
+  df -h "$OUT" | tail -1
   # capped so a runaway cannot take the host down (188 GB RAM, zero swap)
   # pxa-memcap.sh <name> <limit> <command...>. 64G is far above the converter's
   # working set (one tensor at a time) but stops a runaway allocation dead --
@@ -65,11 +68,11 @@ fi
 ls -l "$PXQ4"
 
 step "confirm per_layer_token_embd did NOT get a panel codec"
-python3 - <<'PY'
-import sys, glob
-sys.path.insert(0, "<local-path>")
+python3 - "$REPO/gguf-py" "$PXQ4" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
 from gguf import GGUFReader
-r = GGUFReader(glob.glob("<local-path>")[0])
+r = GGUFReader(sys.argv[2])
 for t in r.tensors:
     if "per_layer_token_embd" in t.name:
         print("  %s -> %s  (must NOT be PXQ*/MXFP4)" % (t.name, t.tensor_type.name))

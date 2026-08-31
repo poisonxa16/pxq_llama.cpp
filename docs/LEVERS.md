@@ -900,7 +900,7 @@ count via /tokenize+/detokenize; temp 0, top_k 1, seed 1234, `cache_prompt:false
 | **Alina 3 cards -> 2 cards** (NEW) | cards 4,1 vs 4,1,6; fill 8192 | **BIGGEST WIN.** `-ts 45,55 -c 131072`: **prefill 289.4 -> 378.4 (+30.7%)**, **decode 19.74 -> 22.33 (+13.1%)**, and it **frees a whole P100 (card 6)**. Ladder in dev0's share: 36,64 +16.9/+8.2; 40,60 +22.4/+10.0; **45,55 +30.7/+13.1**. 40,60 repeat within 0.2%/0.4%. **COST: max context 262144 -> 131072** (65536/slot at np2; observed peak use ~25k). 50,50 untested, predicted OOM (dev0 also holds the 3670.81 MiB projector) | **byte-identical output vs the 3-card baseline** (sha `cb0b4a6d…`), 3 reps x 128 tok. Measured, not assumed — moving layers across an sm_70/sm_60 boundary can change kernels |
 | **`--spec-type mtp:n_max=1`** on Ana | Ana card 5, fill 8352 | **NET LOSS: −6.5% decode.** MTP-on baselines 40.85/41.36/41.23 (mean 41.15) vs MTP-off **43.83**. With `GQA_PACK=4` too: **44.59 = +8.4%** over the live config. MTP-off spreads are the tightest in the campaign (0.3-0.4%). ⚠ one fill, single stream, synthetic **repetitive** prompt — which biases acceptance *in MTP's favour*, and it still lost. Needs a real-traffic confirm before flipping | bit-exact by construction (verify-gated); confirmed byte-identical (sha `a69dce26…`). Engagement proven both ways (`MTP context ready` / `speculation left off`) |
 | **`PXA_FA_GQA_PACK=4`** on Ana | Ana card 5, fill 8352 | **DOES NOT REPRODUCE. NOT SHIPPED.** Measured **+1.7%** (MTP off, spreads 0.3/0.4%) and +2.7% (MTP on, vs a baseline band of 1.3%) — against the record's **~+6.9%**. `NH=8` is **+0.3% = NOISE** (the record's "+6.9% at NH=8" does not reproduce either). Ana satisfies every documented gate (D=256, K/V f16, gqa_ratio 4, sm_60) and sm_60 decode *does* route to `vec_f32` (`fattn.cu:137-166` via `pxq_use_sm60_vec_f32`), so it *could* fire | **VOID — engagement not proven.** The `PXA_FA_GQA_PACK: NH=4` banner comes from a `static` resolver lambda and proves only that the env var was **parsed**, not that the kernel dispatched; the kernel gate also needs `cols_per_block == 1`. The lever is documented NOT bit-exact yet output is byte-identical in every arm. **Needs a firing counter in `fattn-vec-f32.cuh` + rebuild before it can ship either way** |
-| **`PXA_P100_FP16_GEMM`** | Ana card 5 (single sm_60), 40 chunks x 512 tok | ⚠ **FAILS THE STANDING QUALITY GATE: `Same top token` = 94.088 ± 0.234 %** (reject threshold is <98%). Median KLD 0.004266, max KLD 1.755914. **Auto-armed on ALL THREE live seats today** (every seat has a P100). Nothing was disarmed — reported for the owner's decision, since its benefit (+51% gpt-oss prefill on the record) is a real speed/fidelity trade | prefill/batched-path -> `llama-perplexity --kl-divergence`, reference = **lever OFF, same model** (not a Q8_0 parent). Engagement proven: `PXA_AUTO: P100_FP16_GEMM=off` vs `=on` in the two arms. Corpus `<local-path>` (**not** della). Perplexity NOT used |
+| **`PXA_P100_FP16_GEMM`** | Ana card 5 (single sm_60), 40 chunks x 512 tok | ⚠ **FAILS THE STANDING QUALITY GATE: `Same top token` = 94.088 ± 0.234 %** (reject threshold is <98%). Median KLD 0.004266, max KLD 1.755914. **Auto-armed on ALL THREE live seats today** (every seat has a P100). Nothing was disarmed — reported for the owner's decision, since its benefit (+51% gpt-oss prefill on the record) is a real speed/fidelity trade | prefill/batched-path -> `llama-perplexity --kl-divergence`, reference = **lever OFF, same model** (not a Q8_0 parent). Engagement proven: `PXA_AUTO: P100_FP16_GEMM=off` vs `=on` in the two arms. Corpus `<engine-tree>` (**not** della). Perplexity NOT used |
 
 ## `-ts` SWEEP on the 2-card Alina layout — the optimum is further than 40,60
 Cards 4,1 (V100+P100), `-sm layer -c 131072 -np 2`, fill 8192, 3 reps, vs the 3-card baseline
@@ -928,7 +928,7 @@ ruling the instrument is `llama-perplexity --kl-divergence`, reading `Same top t
 **REFERENCE:** the same model with the lever OFF (`PXA_P100_FP16_GEMM=0`), per the ruling — not a
 Q8_0 parent.
 **CELL:** Ana's card 5, a **single P100 (sm_60)**, `Ornith-9B-Heretic-PXQ4`, build-srv,
-`-ngl 99 -c 512 --chunks 40` over `<local-path>` (a neutral corpus, **not**
+`-ngl 99 -c 512 --chunks 40` over `<engine-tree>` (a neutral corpus, **not**
 the della corpus). **Sample: 40 chunks x 512 tokens = 20,480 tokens.**
 **ENGAGEMENT PROVEN:** the two arms log
 `PXA_AUTO: P100_FP16_GEMM=off …` and `PXA_AUTO: P100_FP16_GEMM=on …` respectively.
@@ -1139,7 +1139,7 @@ Measured, identical prompt text on both seats, n_predict 128, temp 0, top_k 1:
 
 Fixed harness committed as `pxa-hive/seat-measure.py`; the before/after is
 re-checkable via `pxa-hive/seat-corpus-verify.py`. Corpus:
-`<local-path>` (the box's own perplexity reference).
+`<engine-tree>` (the box's own perplexity reference).
 **The endpoint switch costs no metric** — llama-server returns the same
 `timings` object (`prompt_per_second`/`predicted_per_second`) on the chat
 endpoint.
@@ -1283,7 +1283,7 @@ occupancy-measured. Not attempted: it is a real kernel change in a tree two live
 
 ### ⚠ QUALITY — and a warning about the `Same top token` threshold itself
 Batched KL, single-P100 cell, 40 chunks x 512 tok, reference = carve-out OFF (the shipped binary),
-corpus `<local-path>`, perplexity ignored:
+corpus `<engine-tree>`, perplexity ignored:
 **Same top token 94.127 ± 0.233 %**, median KLD 0.004603, median Δp **0.000%**, mean Δp −0.073%.
 
 **This is statistically indistinguishable from the `PXA_P100_FP16_GEMM` figure (94.088 ± 0.234%,

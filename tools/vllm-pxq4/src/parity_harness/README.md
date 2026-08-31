@@ -6,7 +6,7 @@ machine with numpy alone**, or clearly marked as needing a GPU.
 **Status as of writing: 31 gates PASS, 0 fail, ~20 s, no GPU.** Real tensors pulled from
 `/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`; agent A's converter reference, agent C's
 numpy twin, AND agent C's real CUDA kernel (host-simulated) all bit-exact against the
-production `ggml/src/pxq-cpu.c`. No container was touched. `<local-path>` was
+production `ggml/src/pxq-cpu.c`. No container was touched. `<engine-tree>` was
 read, never written. No GPU was run, and no number in this harness is a throughput claim.
 
 ```

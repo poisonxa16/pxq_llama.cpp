@@ -2,7 +2,7 @@
 
 Status: definitive. Supersedes `08-design-minimal-risk.md`, `08-design-max-performance.md`,
 `08-design-least-code.md`. Implementation agents build from this file.
-No GPU was run. No container was restarted. Nothing under `<local-path>` was modified.
+No GPU was run. No container was restarted. Nothing under `<engine-tree>` was modified.
 
 ---
 
@@ -658,7 +658,7 @@ Namespace is `pxq4`, **not** `_C` — we must not collide with the fork's own `t
 Both ops preallocate nothing, allocate nothing, and are capture-safe.
 
 ### 7.2 Vendoring: what to copy, and the only three lines to change
-Copy **verbatim** from `<local-path>` (read-only source; do not edit that tree):
+Copy **verbatim** from `<engine-tree>` (read-only source; do not edit that tree):
 
 | from | symbols |
 |---|---|
@@ -784,7 +784,7 @@ with no input from B or C. Agent C can reach G6 against A's `reference.dequant` 
 
 Estimated LOC: converter 850 · runtime python 420 · CUDA 900 (of which ~500 vendored verbatim)
 · tests 350 · encoder shim (P2) 180. **≈2,700 total, ≈2,200 hand-written.
-Files modified in `/opt/1Cat-vLLM` or `<local-path>`: 0.**
+Files modified in `/opt/1Cat-vLLM` or `<engine-tree>`: 0.**
 
 ---
 

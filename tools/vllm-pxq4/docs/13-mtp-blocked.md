@@ -162,15 +162,15 @@ and is not recommended without checking the loader accepts it.
 
 ```
 # non-MTP baseline
-<local-path> pxa-vllm-2v100 8420
+<engine-tree> pxa-vllm-2v100 8420
 
 # MTP4
 EXTRA_ENV="-e VLLM_SM70_GEMMA_LONG_PREFILL_FUSED=0" MNS=1 \
-  <local-path> pxa-vllm-2v100-mtp 8421 \
+  <engine-tree> pxa-vllm-2v100-mtp 8421 \
   --speculative-config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 4,
     "rejection_sample_method": "standard", "draft_sample_method": "probabilistic"}'
 
-python3 <local-path> --port 8421 --model m \
+python3 <engine-tree> --port 8421 --model m \
     --tokens 512 --n 8 --tag X --out /path/X.json
 ```
 

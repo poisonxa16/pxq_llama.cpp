@@ -2,7 +2,7 @@
 # PXA Network — PXQ4 sm_70 (Tesla V100) serving launcher.
 #
 # This is the MEASURED shipping configuration, not a guess. Every value below
-# was A/B'd on the box cards 2,4 on 2026-08-27 and each arm was correctness-gated
+# was A/B'd on cards 2,4 on 2026-08-27 and each arm was correctness-gated
 # before its number was recorded. Results (single-stream decode / agg@4 / agg@8):
 #
 #   reproduce final-v10                    48.74 / 106.46 / 134.36
@@ -30,12 +30,17 @@
 #  ladder [..16]- the "16-token graph poisons the stack" finding is MoE-specific.
 #                 Verified clean on this dense model; correctness held on all arms.
 set -uo pipefail
-if [ "$(hostname)" != "the box" ]; then echo "WRONG HOST: $(hostname)"; exit 1; fi
+# Set PXQ_HOST_GUARD to pin this seat to one host.
+if [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ]; then
+  echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1
+fi
 
 NAME=${NAME:-pxa-pxq4-v100}
 PORT=${PORT:-8001}
 CARDS=${CARDS:-2,4}                 # V100 pair. NEVER card 3 (protected 1080 Ti).
-MODEL=${MODEL:-<local-path>}
+MODEL=${MODEL:?set MODEL to the model dir or repo id}
+# host dir bind-mounted into the container so the model path resolves inside it
+MODEL_MOUNT=${MODEL_MOUNT:-$( [ -e "$MODEL" ] && cd "$(dirname "$MODEL")" && pwd || echo "$PWD" )}
 IMAGE=${IMAGE:-pxa-vllm:sm70}
 PKG=${PKG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/pxa/pxq4}
 SITE=${SITE:-$PKG/sidecar/site-union}
@@ -63,7 +68,7 @@ docker run -d --name "$NAME" --runtime=nvidia --restart unless-stopped \
   -e PXQ4_MMV_SPLIT_MAX_BLOCKS=300 \
   -e PYTHONUNBUFFERED=1 -e HOME=/tmp -e TMPDIR=/tmp \
   -p 127.0.0.1:${PORT}:${PORT} \
-  -v "$PKG":"$PKG" -v <local-path>:<local-path> -v <local-path>:<local-path> \
+  -v "$PKG":"$PKG" -v "$MODEL_MOUNT":"$MODEL_MOUNT" ${EXTRA_MOUNT:+-v "$EXTRA_MOUNT":"$EXTRA_MOUNT"} \
   --shm-size=16g --ipc=host \
   "$IMAGE" /bin/bash -c "exec python -m vllm.entrypoints.openai.api_server \
     --model $MODEL --served-model-name qwen3.8-27b --quantization pxq4 \

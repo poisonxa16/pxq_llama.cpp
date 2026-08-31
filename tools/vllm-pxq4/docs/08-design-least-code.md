@@ -187,7 +187,7 @@ MTP spec-decode model — is inherited untouched.
 
 ### 3.4 Existing files to patch
 
-**None in `/opt/1Cat-vLLM`. None in `<local-path>`.** Both trees are read-only in this design.
+**None in `/opt/1Cat-vLLM`. None in `<engine-tree>`.** Both trees are read-only in this design.
 The only "patch" is deployment-side: the serving container must `pip install pxq4-vllm` (or mount it on
 `PYTHONPATH`) and pass `--quantization pxq4` is *not even needed* — `override_quantization_method`
 self-selects from `config.json`.
@@ -688,7 +688,7 @@ makes prefill competitive. Scope it separately after S6 gives a real measurement
 Policy A alone (drop `pxq4_encode.py`, `mxfp4_repack.py`, `mxfp4.py`) is ~1,600 total / ~1,150
 hand-written — and ships a 15% regression. The extra ~690 LOC *is* the project.
 
-Patches to `/opt/1Cat-vLLM`: **0 files.** Patches to `<local-path>`: **0 files.**
+Patches to `/opt/1Cat-vLLM`: **0 files.** Patches to `<engine-tree>`: **0 files.**
 
 ---
 

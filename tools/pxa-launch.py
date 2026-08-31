@@ -33,14 +33,14 @@ HOW TO READ EVERY CLAIM IN THIS FILE
     [INFERRED]   a branch taken from an ADJACENT measurement. Never a new number.
     UNMEASURED   nothing was measured. The launcher says the word and stops or asks.
 
-  Source corpus (all committed 2026-08-24, tree <local-path>):
+  Source corpus (all committed 2026-08-24, in the engine tree):
     pxa-stack/docs/baselines-20260824/{SCOREBOARD,MOE-CROSSOVER,PXQ-TYPE-MATRIX,
                                        PERPLEXITY-RESULTS,RELEASE-GATE}.md
     pxa-stack/docs/run-20260824/{ENGINE-VERDICT,PORT-ASSESSMENT,BUILD-RECIPE,
                                    DGX-FDO-FAILURE}.md
     docs/LEVERS.md ; src/llama-quantize.cpp ; src/llama-model-loader.cpp ;
     ggml/include/ggml.h
-  Spec this file is measured against: <local-path>
+  Spec this file is measured against: baselines/LAUNCHER-SPEC.md
   (md5 86115482841eaa371e6050bc58734ca8). Where this file DIFFERS from that spec,
   the comment says so and why - see "SPEC CORRECTIONS", below.
 
@@ -129,7 +129,11 @@ sm_70 ONLY WAS A LIE, AND IT MADE THE MoE BRANCH UNREACHABLE
 """
 import argparse, collections, json, os, re, shutil, struct, subprocess, sys
 
-SPEC_MD5 = "86115482841eaa371e6050bc58734ca8"       # <local-path>
+# Host directory bind-mounted at /c inside the serving containers.
+# Override with PXA_HOST_ROOT; defaults to the current working directory.
+_HOST_ROOT = os.environ.get("PXA_HOST_ROOT", os.getcwd())
+
+SPEC_MD5 = "86115482841eaa371e6050bc58734ca8"       # baselines/LAUNCHER-SPEC.md
 BYTES_PER_GIB = 1024 ** 3
 
 # ---------------------------------------------------------------------------
@@ -232,7 +236,7 @@ NON_PXQ_GGML_TYPE = {0: "f32", 1: "f16", 8: "q8_0", 14: "q6_K", 30: "bf16", 39: 
 # ggml type ids the CURRENT tree does not define at all. Any tensor carrying one
 # cannot be dispatched: `grep -n "24[4-9]" ggml/include/ggml.h` yields only PXQ1's
 # 248, and PXQ1C/PXQ2C appear nowhere in the tree. VERIFIED on the box: a real
-# file, <local-path>,
+# file, <models>/qwen3-coder-next-pxqu/Fusion-Coder-80-PXQU.gguf,
 # carries 106 tensors of type 247 and 38 of type 246 plus pxa.pxq1c.* / pxa.pxq2c.*
 # KVs - retired clustered variants this engine no longer implements. The old
 # launcher emitted a full, confident command for it. R-23 refuses it.
@@ -282,18 +286,21 @@ VLLM_IMAGES = {
         # without it the launcher declares the image eligible on a box where the venv has
         # moved, and emits `vllm serve`, which is not even on PATH in this container.
         "host_env": {
-            "mounts": {"<local-path>": "/c"},
+            "mounts": {_HOST_ROOT: "/c"},
             # Presence is checked with lexists, not exists. venv/bin/python is a symlink
             # to /usr/bin/python3, which exists INSIDE the container and nowhere on this
             # host - so exists() calls a perfectly good venv missing and refuses a seat
             # that would have served. lexists asks the question we can actually answer
             # from here: is the entry there.
-            "requires": ["<local-path>",
-                         "<local-path>",
-                         "<local-path>",
-                         "<local-path>",
-                         "<local-path>",
-                         "<local-path>"],
+            # Rooted at $PXA_HOST_ROOT (the host dir mounted at /c above), so the
+            # six probes stay six DISTINCT paths under a relocatable base.
+            "requires": [os.path.join(_HOST_ROOT, p) for p in (
+                         "pxq4-sm60/venv/pyvenv.cfg",
+                         "pxq4-sm60/venv/bin/python",
+                         "pxq4-sm60/venv/lib/python3.12/site-packages/torch",
+                         "pxq4-sm60/1cat/vllm/__init__.py",
+                         "moe-site/site",
+                         "moe-site/libpxq4_sm60_v10.so")],
             "python": "/c/pxq4-sm60/venv/bin/python",
             "env": {"PYTHONPATH": "/c/moe-branch/site",
                     # v10, NOT v8 (stale: both shipping launchers moved to v10) and
@@ -312,7 +319,7 @@ VLLM_IMAGES = {
             # branch and the seat serves a different engine with no redeploy and no
             # version change to notice. Every sm_60 number in the corpus was taken this
             # way, which is why they cannot be reproduced from an image alone.
-            "editable_source": "<local-path>",
+            "editable_source": os.environ.get("PXQ4_SM60_SRC", ""),
         }},
     # THE FAT IMAGE IS WITHDRAWN. One image spanning sm_60+sm_70 was tried and does
     # not work: 8 boot attempts on a Tesla V100, 8 failures (RELEASE-GATE.md 3.7). The
@@ -1510,13 +1517,11 @@ def vram_check(plan, sel, mbytes, ctx, prof, ngl_all):
 # ENGINE RESOLUTION (llama.cpp build dirs)
 # ---------------------------------------------------------------------------
 ENGINE_DIR_CANDIDATES = [
-    "<local-path>",   # the tree this launcher ships in
+    os.environ.get("PXA_ENGINE_DIR", ""),         # set PXA_ENGINE_DIR to your build dir
     "/mnt/models/pxa-sky-build/build70",          # DGX, sm_70
     "/mnt/models/pxq_llama/build70",              # DGX, sm_70
-    "<local-path>",          # Unraid, sm_60;70 - serves PXQ4 in production
-    "<local-path>",             # Unraid, second live seat
-    "<local-path>",
-    "<local-path>",
+    "./build-unified",                            # in-tree build
+    "./build",                                    # in-tree build
 ]
 
 
@@ -1854,7 +1859,7 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
     hpy = hostenv.get("python")
     if hpy:
         # The model path has to be translated through the same mount the interpreter
-        # came through. This launcher runs INSIDE the container, where <local-path> does
+        # came through. This launcher runs INSIDE the container, where the host root does
         # not exist - only /c does. Emitting the host path produces a command that is
         # correct on paper and cannot find its weights, which surfaces as a load failure
         # minutes in rather than as a sentence here.
@@ -2029,7 +2034,7 @@ def print_post_boot_contract(engine, cv):
 # ---------------------------------------------------------------------------
 def selftest(gpus):
     print("=== selftest: decision table against this machine ===")
-    print(f"    spec: <local-path> md5 {SPEC_MD5}")
+    print(f"    spec: baselines/LAUNCHER-SPEC.md md5 {SPEC_MD5}")
     if gpus:
         for g in gpus:
             print(f"    card {g[0]}: {g[1]:<28} sm_{g[2]}  {g[3]} MiB total, {g[4]} MiB used, "

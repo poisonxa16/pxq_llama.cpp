@@ -28,7 +28,7 @@ no expert KV of any kind**. Per-class tensor census below. There is no fused-MoE
 2. The PXQ4 artifact is **five** types, not the four the brief listed, and it contains **no f16
    tensor at all**. Measured histogram (ggml type id → count):
    `{0 (F32): 360, 8 (Q8_0): 132, 14 (Q6_K): 1, 39 (MXFP4): 48, 252 (PXQ4): 325}`.
-   `GGML_TYPE_MXFP4 = 39` confirmed at `<local-path>:424`.
+   `GGML_TYPE_MXFP4 = 39` confirmed at `<engine-tree>:424`.
    **`ssm_out.weight` (all 48 GDN layers) is MXFP4, not PXQ4** — the backbone map
    (`pxa.pxq.backbone_map` KV, read from the file) lists
    `attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=tier+1` and `ssm_out` is not in

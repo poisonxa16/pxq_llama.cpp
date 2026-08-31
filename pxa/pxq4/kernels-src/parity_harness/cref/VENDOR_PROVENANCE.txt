@@ -1,6 +1,6 @@
 vendor/ is a verbatim, unmodified copy taken from the READ-ONLY production tree
 
-    <box>:<local-path>   branch swa-kv   HEAD acf8f245
+    pxq_llama.cpp   branch swa-kv   HEAD acf8f245
 
 of exactly these files:
 
@@ -14,13 +14,14 @@ of exactly these files:
     ggml/include/ggml-alloc.h           transitively included by ggml.h consumers
     ggml/include/ggml-backend.h         transitively included by ggml.h consumers
 
-Copying is not modifying: nothing was written back to mgv-wt.  Refresh with
+Copying is not modifying: nothing was written back to the engine tree.  Refresh from
+an engine checkout at that sha with
 
-    ssh <box> 'cd <local-path> && tar cz ggml/src/pxq-cpu.c ggml/src/pxq-cpu.h \
+    tar cz ggml/src/pxq-cpu.c ggml/src/pxq-cpu.h \
         ggml/src/ggml-impl.h ggml/include/ggml.h ggml/include/ggml-pxq6-tables.h \
         ggml/include/ggml-pxq2-tables.h ggml/include/ggml-pxq3-tables.h \
-        ggml/include/ggml-alloc.h ggml/include/ggml-backend.h | base64 -w0' \
-      | base64 -d | tar xz -C vendor/
+        ggml/include/ggml-alloc.h ggml/include/ggml-backend.h \
+      | tar xz -C vendor/
 
 and re-run tests/ afterwards: if the engine's dequant ever changes, gate G1 must be the
 thing that notices.

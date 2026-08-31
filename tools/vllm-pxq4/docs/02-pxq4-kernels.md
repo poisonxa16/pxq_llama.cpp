@@ -1,6 +1,6 @@
 # PXQ4 CUDA kernel inventory + vLLM reusability verdict
 
-Source tree: `<local-path>` (branch swa-kv, HEAD acf8f245), read-only over ssh.
+Source tree: `<engine-tree>` (branch swa-kv, HEAD acf8f245), read-only over ssh.
 All line citations are from that tree. Nothing was built, run, or measured for this document.
 
 ---
@@ -337,7 +337,7 @@ GPUs we are not allowed to run on in this workflow. **Do not rewrite.**
 
 ## 5. CPU reference for bit-exact validation — YES
 
-**`<local-path>`**, 360 lines, plain C.
+**`<engine-tree>`**, 360 lines, plain C.
 
 - `pxa_deq_row_pxq6(base, row, k, dst, hq=false)` — pxq-cpu.c:135-158. The PXQ4 (id 252) row dequant:
   panel stride pxq-cpu.c:140, fp16 anchor pxq-cpu.c:141, `eff = anchor * sub[nibble]` pxq-cpu.c:150-151,

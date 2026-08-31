@@ -8,23 +8,25 @@
 # Card 3 (the production 1080 Ti) is excluded at the CONTAINER boundary via
 # NVIDIA_VISIBLE_DEVICES -- it is not merely unselected, it is not present.
 #
-# Spindles: BF16 source on disk7, PXQ4 output on disk6, reference on disk5 --
-# three different devices, verified by device id.
+# Spindles: $PXQ_BF16D, $PXQ_PXQ4D and $PXQ_REFD must be three different
+# devices; the device ids are verified below.
 set -euo pipefail
-if [ "$(hostname)" != "the box" ]; then echo "WRONG HOST: $(hostname)"; exit 1; fi
+# Set PXQ_HOST_GUARD to the hostname these artifacts live on to re-arm this check.
+if [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ]; then
+  echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1
+fi
 
-REPO=<local-path>
-BF16D=<local-path>
-PXQ4D=<local-path>
-REFD=<local-path>
+REPO="${PXQ_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+BF16D="${PXQ_BF16D:-./qwen4exp}"              # BF16 source dir
+PXQ4D="${PXQ_PXQ4D:-./qwen4exp-pxq4}"         # PXQ4 output, DIFFERENT spindle
+REFD="${PXQ_REFD:-./qwen4exp-testfile}"       # reference shards, third spindle
 LOGD=$BF16D/logs
 IMG=pxa-sm60-dev:latest
 CARDS=0,1,2,4,5,6
 BF16NAME=${BF16NAME:-Qwen3.8-Flash-Next-BF16-pleq8.gguf}
 mkdir -p "$PXQ4D" "$LOGD"
 
-for a in disk5 disk6 disk7; do :; done
-[ "$(stat -c %d <local-path>)" != "$(stat -c %d <local-path>)" ] || { echo "disk6/disk7 same device"; exit 1; }
+[ "$(stat -c %d "$PXQ4D")" != "$(stat -c %d "$BF16D")" ] || { echo "PXQ4D/BF16D same device"; exit 1; }
 case ",$CARDS," in *,3,*) echo "REFUSING: card 3 is the production 1080 Ti"; exit 1;; esac
 
 step() { echo; echo "=== [$(date -u +%H:%M:%S)] $* ==="; }
@@ -53,9 +55,9 @@ fi
 ls -l "$PXQ4D/Qwen3.8-Flash-Next-PXQ4.gguf"
 
 step "confirm the row-gather table did NOT get a panel codec"
-python3 - "$PXQ4D/Qwen3.8-Flash-Next-PXQ4.gguf" <<'PY'
+python3 - "$REPO/gguf-py" "$PXQ4D/Qwen3.8-Flash-Next-PXQ4.gguf" <<'PY'
 import sys
-sys.path.insert(0, "<local-path>")
+sys.path.insert(0, sys.argv.pop(1))
 from gguf import GGUFReader
 r = GGUFReader(sys.argv[1]); bad = 0
 for t in r.tensors:

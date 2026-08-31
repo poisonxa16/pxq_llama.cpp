@@ -1,6 +1,6 @@
 # PXQ4 (GGML_TYPE_PXQ4 = 252) — complete byte-level format specification
 
-Source of truth: `<local-path>` @ branch `swa-kv`, HEAD `acf8f245` (READ ONLY).
+Source of truth: `<engine-tree>` @ branch `swa-kv`, HEAD `acf8f245` (READ ONLY).
 Every claim below is tagged FACT (read in source, with file:line), INFERENCE, or ASSUMPTION.
 
 **FILE-NAME TRAP (confirmed FACT).** The id-252 implementation lives in

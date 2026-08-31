@@ -6,19 +6,22 @@
 # are ~258 GiB against ~87 GiB of usable VRAM. The BF16 file gets a STRUCTURAL
 # check instead; behaviour is gated on the PXQ4 artifact, which actually fits.
 set -euo pipefail
-if [ "$(hostname)" != "the box" ]; then echo "WRONG HOST: $(hostname)"; exit 1; fi
+# Set PXQ_HOST_GUARD to the hostname these artifacts live on to re-arm this check.
+if [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ]; then
+  echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1
+fi
 
-REPO=<local-path>
-OUT=<local-path>
+REPO="${PXQ_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+OUT="${PXQ_OUT:-./qwen4exp}"                  # BF16 source dir
 BF16=$OUT/Qwen3.8-Flash-Next-BF16.gguf
 # PXQ4 lands on a DIFFERENT SPINDLE from the BF16 source: quantize reads ~354 GB
 # and writes ~100 GB, and doing both on one spindle roughly halves throughput.
-QOUT=<local-path>
+QOUT="${PXQ_QOUT:-./qwen4exp-pxq4}"           # PXQ4 output, DIFFERENT spindle from $OUT
 PXQ4=$QOUT/Qwen3.8-Flash-Next-PXQ4.gguf
 mkdir -p "$QOUT"
-[ "$(stat -c %d <local-path>)" != "$(stat -c %d <local-path>)" ] || { echo "disk6 and disk7 are the SAME device"; exit 1; }
+[ "$(stat -c %d "$OUT")" != "$(stat -c %d "$QOUT")" ] || { echo "OUT and QOUT are on the SAME device"; exit 1; }
 # shard 00001 is metadata-only (0 tensors); 00002 carries the weights
-REF=<local-path>
+REF="${PXQ_REF:-./qwen4exp-testfile/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf}"
 LOGD=$OUT/logs
 mkdir -p "$LOGD"
 
@@ -28,9 +31,9 @@ export LD_LIBRARY_PATH="$REPO/build-cuda/src:$REPO/build-cuda/ggml/src${LD_LIBRA
 step() { echo; echo "=== [$(date -u +%H:%M:%S)] $* ==="; }
 
 step "BF16 structural check"
-python3 - "$BF16" "$REF" <<'PY'
+python3 - "$REPO/gguf-py" "$BF16" "$REF" <<'PY'
 import sys
-sys.path.insert(0, "<local-path>")
+sys.path.insert(0, sys.argv.pop(1))
 from gguf import GGUFReader
 mine, ref = GGUFReader(sys.argv[1]), GGUFReader(sys.argv[2])
 mt = {t.name: t for t in mine.tensors}
@@ -62,9 +65,9 @@ fi
 ls -l "$PXQ4"
 
 step "confirm the row-gather table did NOT get a panel codec"
-python3 - "$PXQ4" <<'PY'
+python3 - "$REPO/gguf-py" "$PXQ4" <<'PY'
 import sys
-sys.path.insert(0, "<local-path>")
+sys.path.insert(0, sys.argv.pop(1))
 from gguf import GGUFReader
 r = GGUFReader(sys.argv[1])
 bad = 0

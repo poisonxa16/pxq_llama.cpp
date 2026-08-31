@@ -26,12 +26,16 @@
 # every decode token faults PLE pages off whatever disk holds the file. From the
 # parity array that is ~17 MB/s and wedges the process in uninterruptible D state.
 set -uo pipefail
-if [ "$(hostname)" != "the box" ]; then echo "WRONG HOST: $(hostname)"; exit 1; fi
+# Set PXQ_HOST_GUARD to pin this seat to one host.
+if [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ]; then
+  echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1
+fi
 
 NAME=${NAME:-pxa-flashnext}
 PORT=${PORT:-8261}   # the hive expects Alex (id glimmer) here; see pxa-hive/brains.mjs
 CARDS=${CARDS:-0,1,3,5,6}
-MODEL=${MODEL:-<local-path>}
+MODEL=${MODEL:?set MODEL to the .gguf to serve}
+ENGINE_TREE=${ENGINE_TREE:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
 TS=${TS:-110,268,94,268,261}
 UB=${UB:-1024}
 NCTX=${NCTX:-163840}          # 160k. 262144 LOADS but OOMs at decode: card 0 was left 51 MiB. Decode needs transient buffers beyond the reported compute buffer, so every card needs ~1200 MiB spare.
@@ -55,7 +59,7 @@ done
 docker run -d --name "$NAME" --runtime=nvidia --restart unless-stopped \
   -e NVIDIA_VISIBLE_DEVICES="$CARDS" -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e LD_LIBRARY_PATH=/src/build-rc/src:/src/build-rc/ggml/src \
-  -v <local-path>:<local-path>:ro -v <local-path>:/src -w /src \
+  -v "$(dirname "$MODEL")":"$(dirname "$MODEL")":ro -v "$ENGINE_TREE":/src -w /src \
   -p 127.0.0.1:${PORT}:${PORT} \
   pxa-sm60-dev:latest \
   /src/build-rc/bin/llama-server \

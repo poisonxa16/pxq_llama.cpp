@@ -10,10 +10,13 @@
 #   nvidia-smi read : card 0 carries ~8.4 GiB of production granite. -ts must respect it.
 #   card 3 refusal  : production VLM + embeddings. Opt-in only, with a ceiling.
 set -u
-[ "$(hostname)" != "the box" ] && { echo "WRONG HOST: $(hostname)"; exit 1; }
+# Set PXQ_HOST_GUARD to pin this script to one host.
+[ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ] && \
+  { echo "WRONG HOST: $(hostname) (expected $PXQ_HOST_GUARD)"; exit 1; }
 
-MODEL=${MODEL:-<local-path>}
-ENGINE=${ENGINE:-<local-path>}
+REPO=${REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}
+MODEL=${MODEL:?set MODEL to the .gguf to test}
+ENGINE=${ENGINE:-$(git rev-parse --show-toplevel 2>/dev/null || echo .)/build-cuda/bin/llama-cli}
 CARDS=${CARDS:-0,1,5,6}
 TS=${TS:-13,29,29,29}
 UB=${UB:-1024}
@@ -21,7 +24,7 @@ NCTX=${NCTX:-150016}
 NPRED=${NPRED:-127}
 MODE=${MODE:-speed}
 TAG=${TAG:-$(date +%H%M%S)}
-LOG=<local-path>${MODE}-ub${UB}-${TAG}.log
+LOG=${LOGDIR:-.}/pxqu-test-${MODE}-ub${UB}-${TAG}.log
 
 [ -x "$ENGINE" ] || { echo "engine missing: $ENGINE"; exit 1; }
 [ -f "$MODEL" ]  || { echo "model missing: $MODEL"; exit 1; }
@@ -50,9 +53,9 @@ docker run --rm --runtime=nvidia \
   -e NVIDIA_VISIBLE_DEVICES="$CARDS" \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e LD_LIBRARY_PATH=/src/build-cuda/src:/src/build-cuda/ggml/src \
-  -v <local-path>:/src \
-  -v <local-path>:<local-path>:ro \
-  -v <local-path>:<local-path>:ro \
+  -v "$REPO":/src \
+  -v "$(dirname "$MODEL")":"$(dirname "$MODEL")":ro \
+  -v "$(cd "${LOGDIR:-.}" && pwd)":"$(cd "${LOGDIR:-.}" && pwd)" \
   -w /src --name "pxqu-test-$MODE-$TAG" \
   pxa-sm60-dev:latest \
   /src/build-cuda/bin/llama-cli \
