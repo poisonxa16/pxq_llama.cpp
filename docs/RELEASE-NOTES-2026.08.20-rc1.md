@@ -157,8 +157,9 @@ wrong.
 
 ## Serving stack under version control
 
-`pxa-stack/` now vendors the hive, seat keeper, Ana affinity/cache proxy, launch scripts, tools,
-tests and templates. Previously loose files on one box — untracked, and therefore unmergeable.
+The serving stack — hive, seat keeper, affinity/cache proxy, launch scripts, tools, tests and
+templates — is now tracked. Previously loose files on one box: untracked, and therefore
+unmergeable. The stack is operational infrastructure and is not part of this public release.
 
 ---
 
@@ -176,7 +177,7 @@ cmake -B build -DGGML_IQK_MUL_MAT=OFF
 cmake --build build -j
 ```
 
-Both configurations are gated in CI-equivalent form (`tools/noik.sh`, `tools/avxdefault.sh`).
+Both configurations are gated in CI-equivalent form by the no-ik and AVX-default build gates.
 
 ## Not in this RC
 

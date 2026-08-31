@@ -473,7 +473,7 @@ not a failure, and the composition prints before the abort:
 > generated incoherent output while every artifact without it was fine — isolated across
 > six controls, with a missing imatrix as the only uncontrolled variable. Not enough to
 > call the codec defective, and enough that PXQ1 should not be shipped to anyone until
-> that is resolved. See pxa-stack/docs/baselines-20260824/PXQ-TYPE-MATRIX.md.
+> that is resolved. The per-type baseline matrix is kept with the serving stack.
 
 | `PXQ4` `=pxq6` | pxq6 56.9% | byte-identical to the PXQ6 default: rollback holds |
 | `PXQ4` `=hq` | pxq4hq 53.1% | identical to the PXQ3 default |
