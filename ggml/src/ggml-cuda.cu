@@ -6601,6 +6601,7 @@ static bool pxa_g2_sole_consumer(const ggml_cgraph * cgraph, int i, const ggml_t
 
 
 #include "ggml-cuda/pxa-deltanet-fuse.cuh"
+#include "ggml-cuda/pxa-ew-fuse.cuh"
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst, const ggml_cgraph * cgraph, int & i) {
 
@@ -6618,6 +6619,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     auto next = i < cgraph->n_nodes - 1 ? cgraph->nodes[i+1] : nullptr;
 
     auto fusion = ctx.fusion;
+
+    // PXA_EW_FUSE: collapse a straight-line elementwise run starting here into one kernel
+    // (bit-identical; see pxa-ew-fuse.cuh). Declines (env off, chain < min, any guard) fall
+    // through to the per-op switch unchanged.
+    if (fusion && pxa_ew_fuse_enabled()) {
+        const int pxa_ew_n = pxa_try_ew_chain(ctx, cgraph, i);
+        if (pxa_ew_n > 0) {
+            i += pxa_ew_n - 1;
+            return true;
+        }
+    }
 
     //printf("%4d %s(%s) on device %d. time = %ld\n", i, ggml_op_name(dst->op), dst->name, ctx.device, ggml_time_us());
     switch (dst->op) {
