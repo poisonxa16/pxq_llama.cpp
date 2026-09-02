@@ -163,7 +163,7 @@ Full raw reps, the arm-by-arm ladder, and what each lever's number depends on:
 `RELEASE-NOTES-2026-09-02.md`.
 
 > **Lab footnote:** this is the campaign's shipped set, not the whole lab. `PXA_FA_KEYS_PER_SPLIT`
-> and `PXA_GEMV_RPB` were measured in the same session and are **negative** at this fill depth —
+> and `PXA_GEMV_RPB` were measured in the same run and are **negative** at this fill depth —
 > left off deliberately, not omitted by oversight. See `docs/lab/LEVERS.md` and
 > `RELEASE-NOTES-2026-09-02.md`'s rejected-levers list before re-trying either.
 

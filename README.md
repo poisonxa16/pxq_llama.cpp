@@ -18,7 +18,7 @@ Models: **https://github.com/poisonxa16/pxq_llama** ← you are here · Weights:
 - **p100-patches** — makes llama.cpp master less bad on Pascal.
 - **pxq_llama** — the codec + kernel pack for cards with HBM2 and no DP4A: **Pascal (P100)**, and Volta.
 
-The pitch in one sentence: **run real models fully in VRAM on a $150 Tesla P100** — kernels
+The pitch in one sentence: **run real models fully in VRAM on a used Tesla P100** — kernels
 written for a chip with no DP4A and no tensor cores, not ported from one that has them. Volta
 (V100), the 1080 Ti, and multi-card 122B-class MoE spreads all run on the same engine and are
 covered below — they're scaling proof, not the pitch.
@@ -100,7 +100,7 @@ fidelity).
 
 ## The reproducible proof: a 35B MoE on one 16 GB P100
 
-One $150 card, one downloadable GGUF (PXQU-16, 14.0 GB), fully GPU-resident:
+One used P100, one downloadable GGUF (PXQU-16, 14.0 GB), fully GPU-resident:
 **~62 t/s decode, 827–843 t/s prefill** — reproduce with `bench/speed-bench.sh`, numbers and
 protocol in [`bench/README.md`](bench/README.md). This is the on-ramp, not the ceiling — the
 same engine and codec scale to multi-card MoE below.
