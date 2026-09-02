@@ -106,7 +106,8 @@ Not yet in a tagged release — the ship list and full measurements are in
 - **Pipeline scheduler fixes.** The graph allocator now reserves against the real decode graph
   instead of re-planning on every prompt chunk, and the per-batch MoE row-mapping step no longer
   forces a host sync inside the layer loop — together these were the reason a second CUDA stream
-  bought almost nothing; fixed, byte-identical, **+21% prefill @20,801** at reduced context.
+  bought almost nothing; fixed, byte-identical, **+27.8% prefill @20,801** at `-c 98304` (does not
+  fit at the rig's production `-c 150016`).
 - **Device-side MoE row map.** The expert-routing table used to round-trip through the host once
   per batched MoE layer; it now builds on-device, self-checked bit-identical against the old path.
 - **GQA-packed attention**, revisited. An earlier version of this same lever (see "D=256

@@ -113,8 +113,8 @@ same engine and codec scale to multi-card MoE below.
 | 35B MoE, 4-bit flagship | 2× P100 or V100 | PXQ4 (18.7 GB, doesn't fit one 16 GB card) | 55.7 t/s decode |
 | 35B MoE, budget card | 1× GTX 1080 Ti 11 GB | PXQ2 (+opt-in int8 prefill) | ~71 t/s decode, 709 t/s prefill |
 | 35B MoE, 12 GB card | 1× 12 GB card | PXQU-12 | 58.4 t/s (P100) / 97.6 t/s (V100) decode |
-| 4× P100 rig, hybrid MoE (next engine build) | 4× Tesla P100 16 GB | PXQ_UNIVERSAL 4-bit | ~485 t/s prefill @3k, ~19 t/s decode @86k fill |
-| 2× V100 rig, 27B dense (vLLM sm_70 line) | 2× Tesla V100 16 GB | PXQ4 | 1,006 t/s prefill @3k, 298 t/s aggregate @16 streams |
+| 4× P100 rig, hybrid MoE (next engine build) | 4× Tesla P100 16 GB | PXQ_UNIVERSAL 4-bit | ~487 t/s prefill @3k, ~19 t/s decode @86k fill |
+| 2× V100 rig, 27B dense (vLLM sm_70 line) | 2× Tesla V100 16 GB | PXQ4 | 1,009 t/s prefill @3k, 299 t/s aggregate @16 streams |
 
 Exact commands and expected numbers for each: [`docs/COOKBOOK.md`](docs/COOKBOOK.md).
 
@@ -132,10 +132,10 @@ discarded), `-c 150016 -b 2048 -ub 2048 -wgt 8 -ts 5079,12612,12612,11897 -sm la
 
 | metric | before | after | change |
 |---|---|---|---|
-| decode, low fill | 26.1 t/s | 27.8 t/s | +7% |
-| decode, 86,401-tok fill | 12.5 t/s | 19.4 t/s | **+55%** |
-| prefill @3,121 | 476.8 t/s | 484.9 t/s | +2% |
-| prefill @20,801 | 397.6 t/s | 406.8 t/s | +2% |
+| decode, low fill | 27.0 t/s | 27.7 t/s | +2% |
+| decode, 86,401-tok fill | 13.0 t/s | 19.3 t/s | **+49%** |
+| prefill @3,121 | 474.9 t/s | 487.1 t/s | +3% |
+| prefill @20,801 | 392.6 t/s | 410.6 t/s | +5% |
 
 The deep-fill decode line is the single biggest number in the campaign: `PXA_FA_GQA_PACK=4` reads
 each attention key/value once per query group instead of once per head, which only pays off once
@@ -147,14 +147,14 @@ boots (protocol and the NCCL finding: [`docs/PXA-SM70-SERVING.md`](docs/PXA-SM70
 
 | metric | before | after | change |
 |---|---|---|---|
-| prefill @3k | 919 t/s | 1,006 t/s | +9% |
-| prefill @20k | 880 t/s | 983 t/s | +12% |
-| decode, single stream | 48.5 t/s | 50.3 t/s | +4% |
-| decode, aggregate @8 streams | 129 t/s | 187 t/s | +45% |
-| decode, aggregate @16 streams | 129 t/s | 298 t/s | **+131%** |
+| prefill @3k | 919 t/s | 1,009 t/s | +10% |
+| prefill @20k | 880 t/s | 984 t/s | +12% |
+| decode, single stream | 48.5 t/s | 50.4 t/s | +4% |
+| decode, aggregate @8 streams | 129 t/s | 190 t/s | +48% |
+| decode, aggregate @16 streams | 129 t/s | 299 t/s | **+132%** |
 
 The aggregate line is mostly one kernel — a Volta tensor-core path for the PXQ4 decode GEMV at
-batch sizes of 5 and up (`PXQ4_MMV_MMA=1`, kernel v12). The prefill line is mostly not a kernel at
+batch sizes of 5 and up (`PXQ4_MMV_MMA=1`, kernel v12b). The prefill line is mostly not a kernel at
 all — see the NCCL finding below.
 
 ### Engine: what the next build adds
@@ -164,9 +164,9 @@ Not yet in a tagged release. The full ship list, every rejected lever, and the k
 
 - **Pipelined prefill.** Two scheduler bugs — a full graph re-plan on every prompt chunk instead
   of once per request, and a host-side sync inside every batched MoE layer — were hiding the
-  overlap a second CUDA stream should have bought. Fixed, byte-identical: **+21% prefill @20,801**
-  at `-c 32768`. It doesn't fit at the rig's real `-c 150016` yet — the second stream's KV and
-  mask buffers need roughly 1.5–2 GB more VRAM per card than is free there today.
+  overlap a second CUDA stream should have bought. Fixed, byte-identical: **+27.8% prefill
+  @20,801** (+8.5% @3,121) at `-c 98304`. It doesn't fit at the rig's real `-c 150016`: compute
+  buffer allocation fails on card 1 there, and the no-PP fallback doesn't recover either.
 - **GQA-packed attention**, above: +40% decode at 86k-token fill, flat at low fill,
   output-identical.
 - **Host-overhead cuts** — bounded top-k sampling off raw logits, a struct-of-arrays KV-sequence

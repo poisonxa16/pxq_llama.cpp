@@ -1,7 +1,7 @@
 # PXA Network — PXQ4 sm_70 (Tesla V100) serving
 
 Measured on the box, cards 2+4 (2x Tesla V100-PCIE-16GB, PHB, no P2P). Original recipe dated
-2026-08-27, refreshed 2026-09-02 for kernel v12 and the NCCL/batched-tokens findings below.
+2026-08-27, refreshed 2026-09-02 for kernel v12b and the NCCL/batched-tokens findings below.
 Every arm below was correctness-gated ("The capital of France is" -> Paris) BEFORE its speed
 number was recorded. A fast wrong answer is not a result.
 
@@ -9,7 +9,7 @@ number was recorded. A fast wrong answer is not a result.
 
     scripts/pxa-serve-sm70.sh          # default profile: agg
 
-    PXQ4_LIB=libpxq4_sm70_v12.so
+    PXQ4_LIB=libpxq4_sm70_v12b.so
     PXQ4_MMV_MMA=1
     PXQ4_MMV_SPLIT_MAX_BLOCKS=300
     NCCL_P2P_LEVEL=SYS
@@ -20,13 +20,13 @@ number was recorded. A fast wrong answer is not a result.
 
 | metric | production (mnbt 4096, GMU 0.92) | this config | change |
 |---|---|---|---|
-| prefill @3k | 919 t/s | **1,005.7 t/s** | +9.4% |
-| prefill @20k | 880 t/s | **983.1 t/s** | +11.7% |
-| decode, single stream | 48.5 t/s | **50.31 t/s** | +3.7% |
-| decode, aggregate @8 | 129 t/s | **186.8 t/s** | +45% |
-| decode, aggregate @16 | 129 t/s | **298.0 t/s** | +131% |
+| prefill @3k | 919 t/s | **1,008.6 t/s** | +9.8% |
+| prefill @20k | 880 t/s | **983.7 t/s** | +11.8% |
+| decode, single stream | 48.5 t/s | **50.35 t/s** | +3.8% |
+| decode, aggregate @8 | 129 t/s | **190.3 t/s** | +48% |
+| decode, aggregate @16 | 129 t/s | **299.0 t/s** | +132% |
 
-n=7, coherence-gated 3/3. Aggregate is carried almost entirely by v12 below; prefill is carried
+n=7, coherence-gated 3/3. Aggregate is carried almost entirely by v12b below; prefill is carried
 almost entirely by the NCCL fix below.
 
 ## v12: a Volta tensor-core path for the PXQ4 decode GEMV

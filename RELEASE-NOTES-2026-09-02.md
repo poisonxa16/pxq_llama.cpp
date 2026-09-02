@@ -36,18 +36,18 @@ its buffers on every prompt chunk instead of once per request (a stale reserve/r
 mismatch caused by state-reset nodes only emitted at position 0), and the batched MoE
 row-mapping step forced a host sync inside the per-layer loop on every batched call. Fixed:
 re-plans per 20k-token prefill went from 12 to 2, and the MoE row map moved fully on-device (next
-item). With the fix, prefill at `-c 32768 -b 8192 -ub 2048 -wgt 8`:
+item). With the fix, on top of the full ship set, prefill at `-c 98304` (`PXA_PIPELINE_PP=1
+GGML_SCHED_MAX_COPIES=2`):
 
 | arm | prefill @3,121 | prefill @20,801 |
 |---|---|---|
-| single-stream (fixed scheduler) | 497.9 | 417.6 |
-| pipelined, two streams | 506.6 | **496.0 (+21.0% vs single-stream)** |
+| single-stream (ship set, PP off) | 487.06 | 410.61 |
+| pipelined, two streams | 515.36 | **501.79 (+22.2% vs single-stream)** |
 
-Byte-identical across 15 comparisons including sequence switches. **Known limit:** the second
-stream's KV and mask buffers cost roughly 1.5–2 GB more VRAM per card, which the P100 rig's real
-`-c 150016` configuration does not currently have free — it fits at reduced context today, and
-needs a persistent per-device mask buffer (rather than one sized per copy) before it fits at the
-rig's production context length. Also fixed on this branch, unconditionally, regardless of
+Byte-identical across 15 comparisons including sequence switches. **Known limit:** it does not fit
+at the P100 rig's production `-c 150016` — compute buffer allocation fails on card 1 there, and
+the no-PP fallback does not recover either. It ships as opt-in at reduced context (`-c 98304`)
+today, not the default. Also fixed on this branch, unconditionally, regardless of
 whether pipelining ships: a per-slot attention state window on the hybrid architecture that was
 never reset between requests, so a second request could inherit the first request's window.
 
@@ -63,7 +63,7 @@ off. Re-measured at 86,401 tokens, where the re-read volume the lever removes is
 | `PXA_FA_GQA_PACK=4` | 26.22 | **17.54 (+40%)** |
 
 Output-identical. Stacked with the host-overhead cuts below, the full shipped set measures
-**+55% decode at 86,401 tokens, +7% at low fill**, over a bracketing control pair, output
+**+49% decode at 86,401 tokens, +2.3% at low fill**, over a bracketing control pair, output
 identical in every arm.
 
 ### Host-overhead cuts
@@ -75,8 +75,8 @@ for multi-row MoE dispatch (a correctness guard, zero measured cost, kept on). T
 GQA-packed attention: measured host time per token at deep fill, **6.0 ms → 1.6 ms**; GPU submit
 time per token, 73.6 ms → 48.7 ms. The full stack (these four plus GQA-pack plus five smaller
 bit-identical prefill micro-fixes — narrowed get_rows, a fast-div copy kernel, a flattened concat
-path, a register-cached norm, and lazy scheduler resets) measured **+1–2% prefill, +7% low-fill
-decode, +40–46% deep-fill decode**, output-identical at temp 0 in every arm.
+path, a register-cached norm, and lazy scheduler resets) measured **+2.6–4.6% prefill, +2.3%
+low-fill decode, +49% deep-fill decode**, output-identical at temp 0 in every arm.
 
 ### Device-side MoE row map
 
@@ -139,9 +139,9 @@ quantize the token embedding tensor to a PXQ type.
   −2.8%. Dead, not revisited.
 - **Fused TP2 all-reduce + RMSNorm fusion (V100)** — engagement confirmed in the boot log, but
   measured prefill −1.5…−1.9%, under the noise floor at best. Not shipped.
-- **QPN v13 kernel** — a from-scratch PXQ4 GEMV rewrite, measured slower than the v12 tensor-core
+- **QPN v13 kernel** — a from-scratch PXQ4 GEMV rewrite, measured slower than the v12b tensor-core
   path at batch 16 on this rig's actual tensor shapes, and found on inspection to inherit the
-  same split-K partials-arena capture-order hazard v12's tensor-core path has (see
+  same split-K partials-arena capture-order hazard v12 had before the v12b fix (see
   `docs/PXA-SM70-SERVING.md`). Not shipped.
 - **PXQ4 output head (4-bit lm_head)** — fails the 70-prompt same-top-token gate at 97.1%
   (bar is ≥98%); see `docs/PXA-SM70-SERVING.md`. Kept the fp16 head.
@@ -152,9 +152,9 @@ quantize the token embedding tensor to a PXQ type.
 
 ## Known limits
 
-- **Pipelined prefill needs more VRAM than the P100 rig's production context has free** — roughly
-  1.5–2 GB more per card at `-c 150016`. It's real and byte-identical at reduced context; it
-  isn't shipped at full context yet.
+- **Pipelined prefill does not fit at the P100 rig's production context** — compute buffer
+  allocation fails on card 1 at `-c 150016`, and the no-PP fallback doesn't recover either. It's
+  real and byte-identical at reduced context (`-c 98304`); it isn't shipped at full context yet.
 - **Volta dense decode still loses to MXFP4** — a structural DP4A-scale-fixup cost, not a tuning
   gap; see the codec-only table in `README.md` and `bench/fair-battle.md`.
 - **A 4-bit output head fails the quality gate** — 97.1% same-top-token agreement against a

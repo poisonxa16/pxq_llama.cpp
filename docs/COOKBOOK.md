@@ -155,9 +155,9 @@ Expected, `-c 150016`, temp 0, n=7 median (1 warmup discarded), `/completion`:
 
 | context fill | prefill | decode |
 |---|---|---|
-| ~3,000 tok | ~485 t/s | ~28 t/s |
-| ~20,000 tok | ~407 t/s | — |
-| ~86,000 tok | ~230 t/s | ~18.4–19.4 t/s |
+| ~3,000 tok | ~487 t/s | ~28 t/s |
+| ~20,000 tok | ~411 t/s | — |
+| ~86,000 tok | ~230 t/s | ~19.3 t/s |
 
 Full raw reps, the arm-by-arm ladder, and what each lever's number depends on:
 `RELEASE-NOTES-2026-09-02.md`.
@@ -174,7 +174,7 @@ above — see `docs/PXA-SM70-SERVING.md` for the full build and why the two exis
 tensor-parallel across both cards.
 
 ```bash
-export PXQ4_LIB=libpxq4_sm70_v12.so
+export PXQ4_LIB=libpxq4_sm70_v12b.so
 export PXQ4_MMV_MMA=1
 export PXQ4_MMV_SPLIT_MAX_BLOCKS=300
 export NCCL_P2P_LEVEL=SYS
@@ -188,7 +188,7 @@ vllm serve your-27b-dense-hybrid-pxq4 \
   --compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,16]}'
 ```
 
-`PXQ4_MMV_MMA=1` arms the v12 tensor-core decode path (batch ≥5); `NCCL_P2P_LEVEL=SYS` +
+`PXQ4_MMV_MMA=1` arms the v12b tensor-core decode path (batch ≥5); `NCCL_P2P_LEVEL=SYS` +
 `NCCL_BUFFSIZE=1048576` fix the two V100s defaulting to a non-P2P NCCL path on a PCIe x4/PHB
 topology, which was costing prefill far more than any kernel (`docs/PXA-SM70-SERVING.md`).
 `--gpu-memory-utilization 0.88`, not the usual 0.92, because the inductor autotune pass OOMs at
@@ -199,11 +199,11 @@ Expected, temp 0, n=7 median, `/completion`:
 
 | metric | value |
 |---|---|
-| prefill @3k | ~1,006 t/s |
-| prefill @20k | ~983 t/s |
-| decode, single stream | ~50.3 t/s |
-| decode, aggregate @8 streams | ~187 t/s |
-| decode, aggregate @16 streams | ~298 t/s |
+| prefill @3k | ~1,009 t/s |
+| prefill @20k | ~984 t/s |
+| decode, single stream | ~50.4 t/s |
+| decode, aggregate @8 streams | ~190 t/s |
+| decode, aggregate @16 streams | ~299 t/s |
 
 Full raw reps and the arm-by-arm NCCL/GMU ladder: `RELEASE-NOTES-2026-09-02.md`.
 
