@@ -618,6 +618,21 @@ static bool pxa_is_row_gather_tensor(const ggml_tensor * tensor) {
     return tensor->ne[1] >= 1000000;
 }
 
+// the six PXQ slab tiers (excludes MXFP4, which is a panel codec here but not a PXQ type)
+static bool pxa_is_pxq_slab_type(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_PXQ1:
+        case GGML_TYPE_PXQ2:
+        case GGML_TYPE_PXQ3:
+        case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ:
+        case GGML_TYPE_PXQ6:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool pxa_is_panel_codec(ggml_type t) {
     switch (t) {
         case GGML_TYPE_PXQ1:
@@ -2485,12 +2500,43 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             } else {
                 float * f32_data;
 
-                if (tensor->type == GGML_TYPE_PXQ4 || tensor->type == GGML_TYPE_PXQ4HQ ||
-                    tensor->type == GGML_TYPE_PXQ6 || tensor->type == GGML_TYPE_PXQ1 ||
-                    tensor->type == GGML_TYPE_PXQ2 || tensor->type == GGML_TYPE_PXQ3) {
-                    throw std::runtime_error("cannot requantize from a PXQ slab type (PXQ1/PXQ2/PXQ3/PXQ4/PXQ4-HQ/PXQ6: CUDA-only slab layout, no CPU codec) — requantize from the original F32/BF16/Q8_0 source");
+                const bool src_is_pxq = pxa_is_pxq_slab_type(tensor->type);
+
+                // Requantizing from an already-lossy source compounds two independent
+                // quantization errors and hands the second codec a distribution that is no
+                // longer the model's. Q8_0 is near-lossless so the damage is small; a PXQ tier
+                // is 1.26-5.27 bpw and the damage is not. Both are legitimate when the original
+                // checkpoint is gone -- they are not legitimate by accident, so they need an
+                // explicit statement of intent on the command line.
+                if (!params->allow_double_lossy &&
+                    (src_is_pxq || tensor->type == GGML_TYPE_Q8_0)) {
+                    throw std::runtime_error(format(
+                        "refusing to requantize from %s: that is a second lossy pass over an "
+                        "already-quantized tensor. Quantize from the original F32/BF16 if you "
+                        "still have it; if you do not, pass --i-know-this-is-double-lossy.",
+                        ggml_type_name(tensor->type)));
                 }
-                if (tensor->type == GGML_TYPE_F32) {
+
+                if (src_is_pxq) {
+                    // PXQ is a 64-row PANEL format: a row's bytes are scattered across its
+                    // panel, so llama_tensor_dequantize_internal() -- which walks row pointers
+                    // through .to_float -- cannot read it, and .to_float must stay NULL for
+                    // exactly that reason. The panel-aware decoder in ggml/src/pxq-cpu.c takes
+                    // the TENSOR BASE plus a global row index instead, which is the only
+                    // addressing that is meaningful here. Experts need no loop: a PXQ tensor is
+                    // E*(ne1/64) contiguous panels, so nrows = ne1*ne2*ne3 decodes it whole.
+                    if (!pxa_pxq_is_cpu_supported(tensor->type)) {
+                        throw std::runtime_error(format(
+                            "cannot requantize from %s: no CPU panel dequant for this tier "
+                            "(ggml/src/pxq-cpu.c)", ggml_type_name(tensor->type)));
+                    }
+                    if (f32_conv_buf.size() < nelements) {
+                        f32_conv_buf.resize(nelements);
+                    }
+                    pxa_pxq_dequant_2d(tensor->type, tensor->data, (float *) f32_conv_buf.data(),
+                                       tensor->ne[1]*tensor->ne[2]*tensor->ne[3], tensor->ne[0]);
+                    f32_data = (float *) f32_conv_buf.data();
+                } else if (tensor->type == GGML_TYPE_F32) {
                     f32_data = (float *) tensor->data;
                 } else if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));

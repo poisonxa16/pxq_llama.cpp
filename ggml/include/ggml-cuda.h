@@ -49,6 +49,26 @@ GGML_API GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t *
 // raw compute capability (100*major + 10*minor, e.g. 610 for sm_61); -1 if device is out of range.
 GGML_API GGML_CALL int  ggml_backend_cuda_get_device_cc(int device);
 
+// name of the arch dispatch path the PXA tier logic selects for this device (e.g. "sm_61 dp4a");
+// reporting only, decides nothing. "" if device is out of range.
+GGML_API GGML_CALL const char * ggml_backend_cuda_get_device_pxa_path(int device);
+
+// Offline PXQ slab dequant (llama-pxq-export). Decodes a contiguous run of 64-row PXQ panels
+// from HOST memory to HOST memory with the SAME device kernels the runtime uses
+// (ggml_get_to_fp16_cuda / ggml_get_to_fp32_cuda), so an export is bit-identical to what a
+// dequant->cuBLAS fallback would have fed the GEMM.
+//   src        base of the panel run: tensor data + (row0/64)*panel_stride
+//   src_bytes  byte length of that run
+//   nrows      rows in the run, multiple of 64 (experts are just more panels: a 3-D PXQ
+//              tensor is E * (ne1/64) contiguous panels, so nrows = ne1*ne2*ne3 decodes whole)
+//   n_per_row  ne[0], multiple of 32
+//   dst_type   GGML_TYPE_F16 or GGML_TYPE_F32; dst holds nrows*n_per_row elements
+// Returns false (without touching dst) for a type with no CUDA dequant, a bad device, a
+// non-slab-aligned shape, or a device allocation failure.
+GGML_API GGML_CALL bool pxa_pxq_dequant_host(int device, enum ggml_type src_type, enum ggml_type dst_type,
+                                             const void * src, size_t src_bytes,
+                                             int64_t nrows, int64_t n_per_row, void * dst);
+
 // true if every ordered GPU pair can peer-access (P2P) each other, or if there is <=1 device.
 // read-only probe (cudaDeviceCanAccessPeer only, NO EnablePeerAccess) — safe to call at model-load time. cached.
 GGML_API GGML_CALL bool ggml_backend_cuda_all_pairs_can_peer(void);

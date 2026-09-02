@@ -104,7 +104,7 @@ def join_blob(slabs: np.ndarray, anchor: np.ndarray) -> bytes:
 
 # ---------------------------------------------------------------------------------------------
 # frozen tables — transcribed from ggml/include/ggml-pxq6-tables.h:33-44 as C99 hex float
-# literals, exactly as they appear in the header, so the transcription is difrun by eye and
+# literals, exactly as they appear in the header, so the transcription is diffable by eye and
 # cannot drift through decimal rounding. float.fromhex parses the same grammar C uses.
 # ---------------------------------------------------------------------------------------------
 _BOOK_HEX = [

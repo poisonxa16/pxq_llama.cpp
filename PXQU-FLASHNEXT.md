@@ -21,14 +21,13 @@ indexer-K(128) = 1152 elements per token:
 | token_embd + output head | 1.27B | 1.0% |
 | `per_layer_token_embd` -> host RAM | 51.20B | (not on GPU) |
 
-A straight PXQ4 of this model is **114.7 GiB** (`<local-path>`).
+A straight PXQ4 of this model is **114.7 GiB** (`/path/to/models/qwen4exp/Qwen3.8-Flash-Next-PXQ4.gguf`).
 It will never see a P100. The experts have to come down, and only the experts.
 
 ## Budget
 
-Four P100s are cards 0, 1, 5, 6. **Card 0 keeps a smaller split because it is shared with
-another production service (~8.4 GiB)**, which is not evictable, so the honest budget is
-64.0 - 8.4 = **55.6 GiB**.
+Four P100s are cards 0, 1, 5, 6. **Card 0 carries another production model (~8.4 GiB)**,
+which is not evictable, so the honest budget is 64.0 - 8.4 = **55.6 GiB**.
 
     55.6  physical
    - 1.20 CUDA context + cuBLAS handle, 4 cards
@@ -62,8 +61,7 @@ go to ~504 MiB: 3 x 504 MiB + 1.98 GiB = 3.46 GiB over four cards.
 | all four free, 150k KV f16 | 53.03 | 64.0 | 10.97 GiB |
 
 A second map, `pxqu64-177b-flashnext.tiers` (50.37 GiB experts, 3.582 bpw, PXQ3/PXQ4),
-exists for the case where card 0 is ever freed. Do not deploy it while the other service
-still holds its share of card 0.
+exists for the case where card 0 is ever freed. Do not deploy it while that other model is resident.
 
 ## Why this beats the reference artifact
 
@@ -100,8 +98,8 @@ Generator: `pxa-bench/pxq-universal/gen_pxqu_flashnext.py`.
 
     llama-quantize \
       --pxq-universal pxa-bench/pxq-universal/recipes/pxqu56-177b-flashnext.tiers \
-      <local-path> \
-      <local-path> \
+      /path/to/models/qwen4exp/Qwen3.8-Flash-Next-BF16-pleq8.gguf \
+      /path/to/models/qwen4exp/Qwen3.8-Flash-Next-PXQU56.gguf \
       PXQ_UNIVERSAL
 
 Serve with `per_layer_token_embd` pinned to the host, as the six-card launcher already does:

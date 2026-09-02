@@ -70,9 +70,9 @@
 #   PXA_PXQ_BACKBONE=v2,universal PXA_PXQ_COMPOSITION_OVERRIDE=1 \
 #   ./build/bin/llama-quantize --allow-requantize \
 #     --imatrix /path/to/flashnext.imatrix \
-#     --pxq-universal <engine-tree> \
-#     <local-path> \
-#     <local-path> PXQ_UNIVERSAL 32
+#     --pxq-universal /path/to/work-tree/pxa-bench/pxq-universal/recipes/pxqu-flashnext-4xp100-150k.tiers \
+#     /path/to/models/qwen4exp/Qwen3.8-Flash-Next-BF16-pleq8.gguf \
+#     /path/to/models/qwen4exp/Qwen3.8-Flash-Next-PXQU-150k.gguf PXQ_UNIVERSAL 32
 #   PXA_PXQ_COMPOSITION_OVERRIDE=1 IS MANDATORY: PXQ-family share is 47.96%, below the 50%
 #   assertion, because 51.15 GiB of the file is gather tables that may never be a panel
 #   codec. Without it the run deletes its own output after hours of work.

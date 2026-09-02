@@ -5,9 +5,9 @@ the final byte-writing is exercised by ``--dry-run``, which plans the entire con
 the GGUF header alone and runs every structural self-check.
 
     python -m gguf_to_vllm.convert \
-      --gguf   /mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
-      --ref-hf /mnt/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ \
-      --out    /mnt/models/pxa-models/Qwen3.8-27B-PXQ4-vllm \
+      --gguf   /path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
+      --ref-hf /path/to/hf/<reference-hf-model> \
+      --out    /path/to/models/pxa-models/Qwen3.8-27B-PXQ4-vllm \
       --policy p1 [--encoder .../pxq4_encode.so] [--shard-size-gb 4] [--dry-run]
 
 WHAT COMES OUT
@@ -235,7 +235,7 @@ def build_plan(gg: G.GGUFFile | G.GGUFHeaderOnly, policy: str, ref_hf: str | Non
                 raise SystemExit(
                     f"policy {policy} does not serve {module!r} as PXQ4, so the {n_exp} experts "
                     f"of {name} would be emitted DENSE as fp16. For this model that is the "
-                    f"3.4x-over-VRAM failure documented in 122B-VLLM-FINDINGS.md §4 -- "
+                    f"3.4x-over-VRAM failure documented in FABLE-122B-VLLM-FINDINGS.md §4 -- "
                     f"refusing rather than writing a checkpoint that cannot be loaded. Use a "
                     f"policy whose module list contains {NM.module_suffix(module)!r}.")
             if ti.type_id != G.GGML_PXQ4:

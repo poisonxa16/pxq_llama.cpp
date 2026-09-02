@@ -13,6 +13,9 @@
 #include <numeric>
 #include <unordered_map>
 #include <fstream>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 
 static void llama_log_softmax(float * array, size_t size) {
     float max_l = *std::max_element(array, array + size);
@@ -36,6 +39,36 @@ void llama_set_rng_seed_impl(struct llama_sampling * smpl, uint32_t seed) {
     smpl->rng.seed(seed);
 }
 
+// PXA_TOPK_PARTIAL=1 selects the top k with nth_element + sort instead of partial_sort.
+// Default OFF. PXA_TOPK_PARTIAL_STATS=1 additionally counts how often the cut logit is tied
+// with an excluded one, which is the only case where the two can disagree.
+static bool pxa_topk_partial_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_TOPK_PARTIAL");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+static bool pxa_topk_partial_stats() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_TOPK_PARTIAL_STATS");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+static void pxa_topk_partial_note(bool boundary_tie) {
+    static uint64_t n_calls = 0;
+    static uint64_t n_ties  = 0;
+    n_calls++;
+    n_ties += boundary_tie ? 1 : 0;
+    if ((n_calls & 0xff) == 0) {
+        fprintf(stderr, "PXA_TOPK_PARTIAL: calls=%llu boundary_ties=%llu\n",
+                (unsigned long long) n_calls, (unsigned long long) n_ties);
+    }
+}
+
 static void llama_sort(llama_token_data_array * candidates, int32_t k) {
     if (candidates->sorted || candidates->size < 2) {
         return;
@@ -49,6 +82,29 @@ static void llama_sort(llama_token_data_array * candidates, int32_t k) {
     if (k <= 1024) { //128) {
         if (k == int(candidates->size)) {
             std::sort(candidates->data, candidates->data + candidates->size, comp);
+        } else if (pxa_topk_partial_enabled()) {
+            // PXA_TOPK_PARTIAL: std::partial_sort maintains a k-element heap across the whole
+            // array, so selecting the top 20 of a 250k-entry vocabulary still costs
+            // O(n log k) heap operations with a branch in the inner loop. std::nth_element is
+            // O(n) with a much cheaper inner loop; sorting the k survivors afterwards is free
+            // at these k. This is the host analogue of not radix-sorting a whole vocabulary to
+            // read the first k off the top, and it runs after llama_synchronize(), i.e. with
+            // the GPU idle and the token blocked on it.
+            //
+            // Same comparator, same resulting k-element prefix in the same order -- EXCEPT
+            // when the logit at the cut is tied with the one just below it, where the two
+            // algorithms may keep different members of the tied group. Counted below so the
+            // exposure can be measured rather than assumed.
+            std::nth_element(candidates->data, candidates->data + k - 1, candidates->data + candidates->size, comp);
+            if (pxa_topk_partial_stats()) {
+                const float cut = candidates->data[k - 1].logit;
+                bool tie = false;
+                for (int i = k; i < (int) candidates->size; ++i) {
+                    if (candidates->data[i].logit == cut) { tie = true; break; }
+                }
+                pxa_topk_partial_note(tie);
+            }
+            std::sort(candidates->data, candidates->data + k, comp);
         } else {
             std::partial_sort(candidates->data, candidates->data + k, candidates->data + candidates->size, comp);
         }

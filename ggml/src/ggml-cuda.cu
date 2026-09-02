@@ -2919,7 +2919,8 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                                || dst->op == GGML_OP_PERMUTE || dst->op == GGML_OP_NONE) {
             ++node_n; continue;
         }
-        if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type)) break;
+        if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type) ||
+                !ggml_cuda_should_use_mmq(dst->src[0]->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) break;
         // the GEMV arm below dispatches straight into mmvq; a quantized type without an mmvq
         // kernel (PXQ6/PXQ2/... tiers) would GGML_ABORT there. Stop the chain instead.
         if (is_gemv && !ggml_cuda_mmvq_type_supported(dst->src[0]->type)) break;
@@ -3373,6 +3374,115 @@ static __global__ void __launch_bounds__(128) k_pxa_gemv_f16(
     }
 }
 
+// =================================================================================================
+// PXA_GEMV_RPB / PXA_GEMV_NWARPS (2026-09-01) — rows-per-block and K-sized warp count for the
+// small-R F16 decode GEMV above. Technique translated from the shinbunbun sm_60 set
+// (`mmvq-rows-per-block-sm60`, `mmvq-moe-rows-sm60`, `mmvq-nwarps-small-k-sm60`), which target
+// stock MMVQ — a path this fork never executes on a PXQU model. The two mechanisms do map:
+//
+//  (a) ROWS PER BLOCK. k_pxa_gemv_f16 gives one 128-thread block to ONE output row, so the
+//      activation row x is re-read from L2 once per output row. At the live hc_down shape
+//      (K=10240, R=320) that is 320 x 40 KB = 12.8 MB of L2 reads against 6.55 MB of weight
+//      DRAM traffic: the activation, not the weight, is the majority of the load issue.  Giving
+//      one block RPB rows makes ONE x load feed RPB weight rows, exactly the reuse shinbunbun
+//      measured as +15%/+23% at rows_per_block 2/4 on GP100.
+//
+//      BIT-IDENTICAL. Thread t still accumulates k = t, t+nthr, ... for every row it owns, and
+//      the warp butterfly plus the fixed (w0+w1)+(w2+w3) fold are unchanged, so each row's fp32
+//      summation order is byte-for-byte what RPB=1 produces. Only the block->row map changes.
+//
+//  (b) WARP COUNT vs K. The block is 4 warps wide whatever K is. A thread only enters the loop
+//      if its lane index is below ne00/2, so a row with K < 256 leaves warps completely idle for
+//      the life of the kernel — shinbunbun's `calc_nwarps` observation, and it applies verbatim
+//      here because our block width is likewise a constant. NOT bit-identical: fewer warps means
+//      a different partition of K across threads and therefore a different partial-sum tree.
+//
+// Both default to the stock geometry (RPB=1, 4 warps), which dispatches to the ORIGINAL kernel
+// above, untouched. PXA_GEMV_RPB=-1 arms the per-shape table; a positive value pins it (honoured
+// only if it tiles R exactly — like the wide kernel, there is no ragged path). PXA_GEMV_NWARPS=-1
+// auto-sizes to K; a positive value pins it.
+// =================================================================================================
+template <int NW, int RPB>
+static __global__ void __launch_bounds__(NW*WARP_SIZE) k_pxa_gemv_f16_rpb(
+        const half * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int ne00, const size_t nb01) {
+    const int row0 = blockIdx.x*RPB;
+    const half2  * __restrict__ w2 = (const half2  *)((const char *) w + (size_t) row0 * nb01);
+    const float2 * __restrict__ x2 = (const float2 *)x;
+    const int k2max  = ne00/2;
+    const int rstep2 = (int)(nb01/sizeof(half2));
+
+    float sum[RPB];
+#pragma unroll
+    for (int r = 0; r < RPB; ++r) sum[r] = 0.0f;
+
+    for (int k = threadIdx.x; k < k2max; k += NW*WARP_SIZE) {
+        const float2 fx = x2[k];            // one activation load feeds all RPB rows
+#pragma unroll
+        for (int r = 0; r < RPB; ++r) {
+            const half2 hw = w2[k + r*rstep2];
+            sum[r] += __low2float(hw)*fx.x + __high2float(hw)*fx.y;
+        }
+    }
+
+    __shared__ float warpsum[NW*RPB];
+#pragma unroll
+    for (int r = 0; r < RPB; ++r) {
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            sum[r] += __shfl_down_sync(0xffffffff, sum[r], off);
+        }
+        if ((threadIdx.x & (WARP_SIZE-1)) == 0) warpsum[r*NW + (threadIdx.x >> 5)] = sum[r];
+    }
+    __syncthreads();
+    if (threadIdx.x < RPB) {
+        const float * ws = warpsum + threadIdx.x*NW;
+        // Same fold shape as k_pxa_gemv_f16, so NW == 4 reproduces its result exactly.
+        float acc;
+        if      (NW == 4) acc = (ws[0] + ws[1]) + (ws[2] + ws[3]);
+        else if (NW == 2) acc =  ws[0] + ws[1];
+        else              acc =  ws[0];
+        y[row0 + threadIdx.x] = acc;
+    }
+}
+
+// -1 arms the per-shape table, 0/unset is stock, >0 pins.
+static inline int pxa_gemv_rpb_env() {
+    static const int v = [] {
+        const char * e = getenv("PXA_GEMV_RPB");
+        const int n = e ? atoi(e) : 0;
+        if (n) fprintf(stderr, "PXA_GEMV_RPB: armed (%s) — small-R F16 decode GEMV rows per block; "
+                               "bit-identical to the stock geometry; PXA_GEMV_RPB=0 reverts\n",
+                       n < 0 ? "per-shape table" : "pinned");
+        return n;
+    }();
+    return v;
+}
+
+static inline int pxa_gemv_nwarps_env() {
+    static const int v = [] {
+        const char * e = getenv("PXA_GEMV_NWARPS");
+        const int n = e ? atoi(e) : 0;
+        if (n) fprintf(stderr, "PXA_GEMV_NWARPS: armed (%s) — small-R F16 decode GEMV block width; "
+                               "K is partitioned differently, so this is NOT bit-identical; "
+                               "PXA_GEMV_NWARPS=0 reverts\n", n < 0 ? "sized to K" : "pinned");
+        return n;
+    }();
+    return v;
+}
+
+// Per-shape rows-per-block table. Deliberately conservative: the reuse only pays when the
+// activation row is large enough to dominate the block's load issue, which on this arch means a
+// K in the thousands; below that the block is already short-lived and a bigger RPB just cuts the
+// grid. Entries are hypotheses to be priced by microbench, not measured defaults — which is why
+// nothing here is reachable without PXA_GEMV_RPB=-1.
+static inline int pxa_gemv_rpb_table(int64_t K, int64_t R) {
+    if (K >= 4096 && R % 4 == 0) return 4;   // hc_*_down class: K=10240, R=320
+    if (K >= 4096 && R % 2 == 0) return 2;
+    if (K >= 1024 && R % 2 == 0) return 2;   // attn_gate class: K=n_embd, R=n_head
+    return 1;
+}
+
 // Returns true if it fully handled the mul_mat (caller should return immediately).
 static bool ggml_cuda_small_gemv_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     static const bool on = [] {
@@ -3390,9 +3500,58 @@ static bool ggml_cuda_small_gemv_f16(ggml_backend_cuda_context & ctx, const ggml
     if (src0->nb[0] != sizeof(half) || src1->nb[0] != sizeof(float)) return false;
     if (src0->nb[1] % 4 != 0) return false;                    // half2 row alignment
     if (!ggml_is_contiguous(src1)) return false;
-    k_pxa_gemv_f16<<<(unsigned)src0->ne[1], 128, 0, ctx.stream()>>>(
+    if (!ggml_is_contiguous(dst) || dst->nb[0] != sizeof(float)) return false;  // kernel writes packed y
+
+    // PXA_GEMV_RPB / PXA_GEMV_NWARPS geometry selection (see the block above). Anything that does
+    // not tile R exactly, or that has no instantiation, silently falls back to the stock launch.
+    const int64_t K = src0->ne[0], R = src0->ne[1];
+    const int rpb_env = pxa_gemv_rpb_env();
+    int rpb = 1;
+    if (rpb_env < 0)      rpb = pxa_gemv_rpb_table(K, R);
+    else if (rpb_env > 0) rpb = rpb_env;
+    if (rpb != 1 && rpb != 2 && rpb != 4) rpb = 1;
+    if (R % rpb != 0) rpb = 1;
+
+    const int nw_env = pxa_gemv_nwarps_env();
+    int nw = 4;
+    if (nw_env < 0) {
+        // Just enough warps to cover K in one pass over the half2 row, clamped to {1,2,4}.
+        const int64_t k2 = K/2;
+        nw = k2 <= WARP_SIZE ? 1 : (k2 <= 2*WARP_SIZE ? 2 : 4);
+    } else if (nw_env == 1 || nw_env == 2 || nw_env == 4) {
+        nw = nw_env;
+    }
+
+    if (rpb == 1 && nw == 4) {
+        k_pxa_gemv_f16<<<(unsigned)R, 128, 0, ctx.stream()>>>(
+            (const half *) src0->data, (const float *) src1->data, (float *) dst->data,
+            (int) K, src0->nb[1]);
+        return true;
+    }
+
+    static std::atomic<bool> geom_fired{false};
+    if (!geom_fired.exchange(true)) {
+        fprintf(stderr, "PXA_GEMV geometry: ENGAGED (K=%d R=%d, nwarps=%d rows_per_block=%d, grid=%d)\n",
+                (int) K, (int) R, nw, rpb, (int)(R/rpb));
+    }
+
+    const unsigned grid = (unsigned)(R/rpb);
+    const half  * w = (const half  *) src0->data;
+    const float * x = (const float *) src1->data;
+    float       * y = (float *) dst->data;
+#define PXA_GEMV_RPB_CASE(NWV, RPBV) \
+    if (nw == NWV && rpb == RPBV) { \
+        k_pxa_gemv_f16_rpb<NWV, RPBV><<<grid, NWV*WARP_SIZE, 0, ctx.stream()>>>(w, x, y, (int) K, src0->nb[1]); \
+        return true; \
+    }
+    PXA_GEMV_RPB_CASE(4, 2) PXA_GEMV_RPB_CASE(4, 4)
+    PXA_GEMV_RPB_CASE(2, 1) PXA_GEMV_RPB_CASE(2, 2) PXA_GEMV_RPB_CASE(2, 4)
+    PXA_GEMV_RPB_CASE(1, 1) PXA_GEMV_RPB_CASE(1, 2) PXA_GEMV_RPB_CASE(1, 4)
+#undef PXA_GEMV_RPB_CASE
+
+    k_pxa_gemv_f16<<<(unsigned)R, 128, 0, ctx.stream()>>>(
         (const half *) src0->data, (const float *) src1->data, (float *) dst->data,
-        (int) src0->ne[0], src0->nb[1]);
+        (int) K, src0->nb[1]);
     return true;
 }
 
@@ -3885,6 +4044,7 @@ static __global__ void k_copy_dst_from_contiguous(char * __restrict__ dst_origin
 
     const int32_t i1 = row_mapping[i].i1;
     const int32_t i2 = row_mapping[i].i2;
+    if (i1 < 0) return;   // device-built map: slot past the routed total, nothing to scatter
 
     const float * dst_row_contiguous = (const float *)(dst_contiguous + i*nb1);
     float * dst_row_original = (float *)(dst_original + i1*nb1 + i2*nb2);
@@ -3912,11 +4072,33 @@ static __global__ void k_quick_add(uint32_t n_per_row, const float * src1, const
     }
 }
 
+// PXA_MOE_DEVICE_MAP: 0 (default) = the host row mapping below; 1 = the device kernels in
+// ggml-cuda/pxq-moemap.cuh; 2 = those kernels plus a host cross-check of the buffers they build.
+static inline int pxa_moe_device_map_mode() {
+    static const int v = [] {
+        const char * e = getenv("PXA_MOE_DEVICE_MAP");
+        return e ? atoi(e) : 0;
+    }();
+    return v;
+}
+static inline bool pxa_moe_device_map() { return pxa_moe_device_map_mode() != 0; }
+
 static inline bool prepare_row_mappigs(ggml_backend_cuda_context& ctx, int64_t n_as, int64_t n_ids,
         const ggml_tensor * ids, std::vector<int>& moe_counts, std::vector<int>& cum_moe_counts,
         ggml_cuda_pool_alloc<mmid_row_mapping>& dev_row_mapping) {
 
     GGML_ASSERT(moe_counts.empty() && cum_moe_counts.empty());
+
+    // With PXA_MOE_DEVICE_MAP on, every remaining visit here is a D2H + cudaStreamSynchronize
+    // still sitting inside graph compute. Name the first few so the un-migrated call sites are
+    // identifiable from a server log instead of from a profiler.
+    if (pxa_moe_device_map()) {
+        static std::atomic<int> left{16};
+        if (left.fetch_sub(1) > 0) {
+            fprintf(stderr, "PXA_MOE_HOST_MAP dev%d: ids=%s n_as=%d n_ids=%d rows=%d (host readback + sync)\n",
+                    ctx.device, ids->name, (int)n_as, (int)n_ids, (int)(ids->ne[1]*n_ids));
+        }
+    }
 
     auto stream = ctx.stream();
 
@@ -4166,6 +4348,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 #include "ggml-cuda/grouped_moe_verify.cuh"
 #include "ggml-cuda/pxq4.cuh"
+#include "ggml-cuda/pxq-moemap.cuh"
 #include "ggml-cuda/pxq6.cuh"
 #include "ggml-cuda/pxq6i8.cuh"
 
@@ -4744,6 +4927,99 @@ static void pxa_pxq_gemm_2d_log(int device, bool fired, int R, int K, int ny, in
 }
 
 // returns 0 if it handled the node, -1 to decline (caller falls through to the stock paths)
+// =================================================================================================
+// PXA_X_CACHE (2026-09-01) — hoist the shared activation conversion across the GEMMs of one block.
+//
+// Translated from shinbunbun `mmvq-q8-1-activation-cache`, which caches the q8_1 quantization of
+// the activation row across the many stock-MMVQ calls that share it in one layer. AUDIT of our
+// decode path first, because most of what that patch fixes does not exist here:
+//
+//   * The PXQ decode mmv family (k_pxq6_mmv*, k_pxq6_mmv_ksplit_gen, the fused gateup) reads f32
+//     activations DIRECTLY and stages them in shared memory per block. There is no quantization
+//     or dtype conversion of x anywhere on that path, so there is nothing to hoist.
+//   * pxa_pxq4_moe_fast_tg converts nothing and launches ONE grid over (R/BM) x n_ids x Ny, so the
+//     routed expert GEMVs of a layer already share a single pass over x by construction.
+//   * The stock q8_1 fast-TG MoE branch already quantizes dst once for all n_ids*Ny rows
+//     (ggml-cuda.cu ~:5894) — upstream had already done this hoist for the path shinbunbun patched.
+//   * The hc_* f16 GEMVs (ggml_cuda_small_gemv_f16 / ggml_cuda_wide_gemv_f16) consume f32 x with
+//     no conversion at all; only the cuBLAS chain they REPLACE converted per call.
+//
+// The one place the mechanism does map is PREFILL: pxa_pxq_gemm_2d converts src1 f32 -> f16 into a
+// fresh pool buffer on EVERY call, and the q, k and v projections of an attention block are three
+// consecutive MUL_MAT nodes over the identical `cur` tensor. At ub 2048 with K = n_embd that is
+// 2048*2560*4 B read + 10 MB written, three times, for one distinct result — two thirds redundant.
+//
+// SAFETY. The cache is keyed on the src1 tensor OBJECT, its data pointer, and ny/K, and — the
+// load-bearing part — it is only honoured when the previous conversion happened on the
+// IMMEDIATELY PRECEDING executed graph node (the op_seq check below). That rules out any
+// intervening node having written through an alias of src1's buffer, which a pointer-only key
+// could not: ggml pool addresses are recycled within a graph and in-place ops mutate through views.
+//
+// Bit-identical when it fires: the reused buffer is the output of the same converter over the same
+// bytes, so the kernel sees exactly the activations it would have converted itself. Default OFF.
+// =================================================================================================
+static std::atomic<uint64_t> pxa_op_seq{0};   // bumped once per executed graph node
+
+static inline bool pxa_x_cache_on() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_X_CACHE");
+        const bool on = e && atoi(e) != 0;
+        if (on) fprintf(stderr, "PXA_X_CACHE: armed — the f32->f16 activation stage of the PXQ 2D "
+                                "prefill GEMM is reused across consecutive nodes that share src1 "
+                                "(bit-identical); PXA_X_CACHE=0 reverts\n");
+        return on;
+    }();
+    return v;
+}
+
+struct pxa_x_cache_t {
+    half * ptr = nullptr;
+    size_t sz  = 0;                       // bytes
+    const ggml_tensor * key_t = nullptr;
+    const void * key_d = nullptr;
+    int64_t key_ny = 0, key_K = 0;
+    uint64_t key_seq = 0;                 // pxa_op_seq at the time of the conversion
+};
+
+static inline half * pxa_x_cache_get(int device, cudaStream_t stream,
+                                     const ggml_tensor * src1, int64_t ny, int64_t K, bool & hit) {
+    static pxa_x_cache_t cc_[64];
+    hit = false;
+    if (device < 0 || device >= 64) return nullptr;
+    pxa_x_cache_t & c = cc_[device];
+    const uint64_t seq = pxa_op_seq.load(std::memory_order_relaxed);
+
+    if (c.ptr && c.key_t == src1 && c.key_d == src1->data &&
+        c.key_ny == ny && c.key_K == K && c.key_seq + 1 == seq) {
+        c.key_seq = seq;                  // chain q -> k -> v
+        hit = true;
+        return c.ptr;
+    }
+
+    const size_t need = (size_t)ny*K*sizeof(half);
+    if (c.sz < need) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &st);
+        if (st != cudaStreamCaptureStatusNone) return nullptr;   // cannot grow mid-capture
+        if (c.ptr) cudaFree(c.ptr);
+        c.ptr = nullptr; c.sz = 0;
+        if (cudaMalloc(&c.ptr, need) != cudaSuccess) { c.ptr = nullptr; (void)cudaGetLastError(); return nullptr; }
+        c.sz = need;
+    }
+    c.key_t = src1; c.key_d = src1->data; c.key_ny = ny; c.key_K = K; c.key_seq = seq;
+    return c.ptr;
+}
+
+static inline void pxa_x_cache_log(int device, bool hit, int64_t ny, int64_t K) {
+    static std::atomic<long> hits{0}, misses{0};
+    const long h = hit ? hits.fetch_add(1) + 1 : hits.load();
+    const long m = hit ? misses.load() : misses.fetch_add(1) + 1;
+    if (((h + m) % 512) == 0 || (h + m) < 4) {
+        fprintf(stderr, "PXA_X_CACHE: dev=%d ny=%d K=%d reuse=%ld convert=%ld\n",
+                device, (int) ny, (int) K, h, m);
+    }
+}
+
 static int pxa_pxq_gemm_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                            const ggml_tensor * src1, ggml_tensor * dst) {
     const int mode = pxa_pxq_gemm_2d_mode();
@@ -4807,15 +5083,31 @@ static int pxa_pxq_gemm_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     // src1 contiguous f32 [ny][K] -> the row-major half [ny][K] the kernel indexes as At + srow*K.
     // Same converter, same argument order, as the cuBLAS fallback's src1 stage, so the kernel sees
     // byte-identical activations to the path it replaces.
-    ggml_cuda_pool_alloc<half> A_f16(ctx.pool(), (size_t)ny*K);
+    ggml_cuda_pool_alloc<half> A_f16;
     const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
     GGML_ASSERT(to_fp16 != nullptr);
-    to_fp16(src1->data, A_f16.get(), ny, K, stream);
+
+    // PXA_X_CACHE: reuse the stage when the previous graph node converted the identical src1.
+    half * A = nullptr;
+    if (pxa_x_cache_on()) {
+        bool hit = false;
+        half * cached = pxa_x_cache_get(ctx.device, stream, src1, ny, K, hit);
+        if (cached) {
+            if (!hit) to_fp16(src1->data, cached, ny, K, stream);
+            pxa_x_cache_log(ctx.device, hit, ny, K);
+            A = cached;
+        }
+    }
+    if (!A) {
+        A_f16.alloc(ctx.pool(), (size_t)ny*K);
+        to_fp16(src1->data, A_f16.get(), ny, K, stream);
+        A = A_f16.get();
+    }
 
     pxa_pxq_gemm_2d_log(ctx.device, true, (int)R, (int)K, (int)ny, cc);
 
     dim3 grid((unsigned)(R/PXQ4_BM), (unsigned)ntiles);
-    kern<<<grid, 64, 0, stream>>>((const uint8_t *)src0->data, A_f16.get(), (float *)dst->data,
+    kern<<<grid, 64, 0, stream>>>((const uint8_t *)src0->data, A, (float *)dst->data,
                                   /* bias */ nullptr, /* bias_nb1 */ 0,
                                   dev_tiles.get(), (int)R, (int)K);
     CUDA_CHECK(cudaGetLastError());
@@ -5248,28 +5540,56 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
         next->src[0]->ne[1] % PXQ4_BM == 0 && ggml_is_contiguous(next) &&
         pxa_pxq4_bufs_on_device(ctx, {next->src[0], next});
 
+    // Row mapping + tile list. PXA_MOE_DEVICE_MAP=1 builds both on the device (no ids readback,
+    // no cudaStreamSynchronize inside graph compute); the grids are then sized for the worst
+    // case and the padding tiles / mapping slots are skipped by the consuming kernels.
     ggml_cuda_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool());
-    std::vector<int> moe_counts, cum_moe_counts;
-    bool is_ser = prepare_row_mappigs(ctx, n_as, n_ids, ids, moe_counts, cum_moe_counts, dev_row_mapping);
-    if (is_ser) {
-        ggml_tensor * t = fuse_down ? next : dst;
-        CUDA_CHECK(cudaMemsetAsync(t->data, 0, ggml_nbytes(t), stream));
-    }
-    const int64_t total = cum_moe_counts[n_as];
-    if (total == 0) return fuse_down ? i + 1 : i;
+    ggml_cuda_pool_alloc<pxq4_tile_info>   dev_tiles(ctx.pool());
+    pxq_moemap_bufs moemap(ctx.pool());
+    const int  n_rows_max = (int)(ids->ne[1]*n_ids);
+    const int  n_tiles_wc = pxq_moemap_tiles_max(n_rows_max, (int)n_as);
+    const bool devmap     = pxa_moe_device_map() && n_rows_max > 0 &&
+                            n_as <= PXQ_MOEMAP_MAXAS && n_tiles_wc <= 65535;
+    int64_t total;
+    size_t  n_tiles;
 
-    // host tile map: (expert, flat row0, nrows<=64) per 64-token tile, expert-grouped order
-    std::vector<pxq4_tile_info> tiles;
-    tiles.reserve((size_t)(total/PXQ4_BN + n_as + 1));
-    for (int e = 0; e < (int)n_as; ++e) {
-        for (int t0 = 0; t0 < moe_counts[e]; t0 += PXQ4_BN) {
-            tiles.push_back({e, cum_moe_counts[e] + t0, std::min((int)PXQ4_BN, moe_counts[e] - t0), 0});
+    if (devmap) {
+        total   = n_rows_max;                 // == the routed row count unless an id is out of range
+        n_tiles = (size_t)n_tiles_wc;
+        dev_row_mapping.alloc((size_t)total);
+        dev_tiles.alloc(n_tiles);
+        if (!pxq_moemap_build(ctx, ids, n_as, n_ids, n_rows_max, n_tiles_wc, moemap,
+                              (pxq4_rowmap *)dev_row_mapping.get(), dev_tiles.get())) return -1;
+        if (pxa_moe_device_map_mode() >= 2) {
+            pxq_moemap_verify(ctx, ids, n_as, n_ids, n_rows_max, n_tiles_wc,
+                              (const pxq4_rowmap *)dev_row_mapping.get(), dev_tiles.get());
         }
+        // stands in for the host path's is_ser memset (see pxq-moemap.cuh)
+        pxq_moemap_zero_unrouted(ctx, ids, fuse_down ? next : dst, n_as, n_ids, n_rows_max);
+    } else {
+        std::vector<int> moe_counts, cum_moe_counts;
+        bool is_ser = prepare_row_mappigs(ctx, n_as, n_ids, ids, moe_counts, cum_moe_counts, dev_row_mapping);
+        if (is_ser) {
+            ggml_tensor * t = fuse_down ? next : dst;
+            CUDA_CHECK(cudaMemsetAsync(t->data, 0, ggml_nbytes(t), stream));
+        }
+        total = cum_moe_counts[n_as];
+        if (total == 0) return fuse_down ? i + 1 : i;
+
+        // host tile map: (expert, flat row0, nrows<=64) per 64-token tile, expert-grouped order
+        std::vector<pxq4_tile_info> tiles;
+        tiles.reserve((size_t)(total/PXQ4_BN + n_as + 1));
+        for (int e = 0; e < (int)n_as; ++e) {
+            for (int t0 = 0; t0 < moe_counts[e]; t0 += PXQ4_BN) {
+                tiles.push_back({e, cum_moe_counts[e] + t0, std::min((int)PXQ4_BN, moe_counts[e] - t0), 0});
+            }
+        }
+        if (tiles.empty() || tiles.size() > 65535) return -1;   // grid.y limit; fallback handles it
+        n_tiles = tiles.size();
+        dev_tiles.alloc(n_tiles);
+        CUDA_CHECK(cudaMemcpyAsync(dev_tiles.get(), tiles.data(), n_tiles*sizeof(pxq4_tile_info),
+                                   cudaMemcpyHostToDevice, stream));
     }
-    if (tiles.empty() || tiles.size() > 65535) return -1;   // grid.y limit; fallback handles it
-    ggml_cuda_pool_alloc<pxq4_tile_info> dev_tiles(ctx.pool(), tiles.size());
-    CUDA_CHECK(cudaMemcpyAsync(dev_tiles.get(), tiles.data(), tiles.size()*sizeof(pxq4_tile_info),
-                               cudaMemcpyHostToDevice, stream));
 
     // gather activations once (f32 -> f16, same convert the cublas fp16 path does)
     ggml_cuda_pool_alloc<half> A_f16(ctx.pool(), total*K);
@@ -5281,7 +5601,7 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // Kernel-family selection (PXQ6 spec K3/K4/K5/K6): with NO PXA_PXQ6_* prefill gate set,
     // (The legacy id-250/251 old-family prefill kernels were removed 2026-07-21.)
     const ggml_tensor * bu = dst->src[4], * bg = dst->src[5];
-    dim3 grid((unsigned)(R/PXQ4_BM), (unsigned)tiles.size());
+    dim3 grid((unsigned)(R/PXQ4_BM), (unsigned)n_tiles);
 
     const int  wmma_env  = cc == 700 ? pxa_pxq6_wmma() : 0;   // K6: exactly Volta (sm_70)
     // v1 (modes 1/2) excludes 2/3-bit + mixed pairs; v2 (mode 3) covers P2/P3/P6/P6HQ + mixed
@@ -5337,7 +5657,7 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
             k_pxq4_glu<half><<<(unsigned)((k + 255)/256), 256, 0, stream>>>(
                     C_gate.get(), C_up.get(), H_f16.get(), k, unary, 1.702f, glu_limit);
         }
-        dim3 gridd((unsigned)(Rd/PXQ4_BM), (unsigned)tiles.size());
+        dim3 gridd((unsigned)(Rd/PXQ4_BM), (unsigned)n_tiles);
         if (scat) {
             // K3 SCATFUSE: down GEMM scatters straight to the MoE output rows
             pxq6_scat_fn kd = wmma2 && fmt_d != PXA_PXQ_FMT_P6R ? pxq6_pick_down_scat_wmma(fmt_d) : nullptr;
@@ -6615,6 +6935,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
     // In case we forget to do that in some kernel.
     ggml_cuda_set_device(ctx.device);
+
+    // PXA_X_CACHE validity clock: one tick per EXECUTED graph node. The activation-stage cache is
+    // only honoured when its conversion happened on the immediately preceding tick, which is what
+    // makes "nothing wrote through an alias of src1 in between" true rather than hoped for.
+    pxa_op_seq.fetch_add(1, std::memory_order_relaxed);
 
     auto next = i < cgraph->n_nodes - 1 ? cgraph->nodes[i+1] : nullptr;
 
@@ -8956,6 +9281,97 @@ GGML_CALL int ggml_backend_cuda_get_device_cc(int device) {
         return -1;
     }
     return ggml_cuda_info().devices[device].cc;
+}
+
+GGML_CALL const char * ggml_backend_cuda_get_device_pxa_path(int device) {
+    if (device < 0 || device >= ggml_cuda_info().device_count) {
+        return "";
+    }
+    return pxa_enhance_path_name(ggml_cuda_info().devices[device].cc);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Offline PXQ slab dequant for llama-pxq-export (2026-09-01).
+//
+// The PXQ types are 64-row panel-interleaved CUDA-consumer formats: their ggml type_traits
+// to_float/vec_dot are NULL on purpose, so llama-quantize refuses to requantize from them
+// ("cannot requantize from a PXQ slab type"). The un-lock-in path is to decode a PXQ file back
+// to F16 first, and the only decoder that is the exact inverse of the quantizer's writer is the
+// one the runtime already uses -- ggml_get_to_fp16_cuda(). This entry point exposes it to an
+// offline tool without dragging in a backend, a scheduler or a graph.
+//
+// It is deliberately host->host and stateless: the caller streams panel chunks (a 40-200 GB
+// model never fits anywhere), and each call is self-contained so the peak device footprint is
+// one chunk in + one chunk out, not one tensor.
+GGML_CALL bool pxa_pxq_dequant_host(int device, enum ggml_type src_type, enum ggml_type dst_type,
+                                    const void * src, size_t src_bytes,
+                                    int64_t nrows, int64_t n_per_row, void * dst) {
+    if (src == nullptr || dst == nullptr || nrows <= 0 || n_per_row <= 0) {
+        return false;
+    }
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return false;
+    }
+    // every PXQ kernel hard-aborts on a non-slab-aligned shape -- refuse here instead
+    if (nrows % 64 != 0 || n_per_row % 32 != 0) {
+        return false;
+    }
+
+    to_fp16_cuda_t to_fp16 = nullptr;
+    to_fp32_cuda_t to_fp32 = nullptr;
+    size_t dst_elem = 0;
+    if (dst_type == GGML_TYPE_F16) {
+        to_fp16 = ggml_get_to_fp16_cuda(src_type);
+        if (to_fp16 == nullptr) return false;
+        dst_elem = sizeof(half);
+    } else if (dst_type == GGML_TYPE_F32) {
+        to_fp32 = ggml_get_to_fp32_cuda(src_type);
+        if (to_fp32 == nullptr) return false;
+        dst_elem = sizeof(float);
+    } else {
+        return false;
+    }
+
+    const size_t dst_bytes = (size_t) nrows * (size_t) n_per_row * dst_elem;
+
+    ggml_cuda_set_device(device);
+
+    void * d_src = nullptr;
+    void * d_dst = nullptr;
+    bool ok = false;
+    if (cudaMalloc(&d_src, src_bytes) != cudaSuccess) {
+        cudaGetLastError();
+        goto cleanup;
+    }
+    if (cudaMalloc(&d_dst, dst_bytes) != cudaSuccess) {
+        cudaGetLastError();
+        goto cleanup;
+    }
+    if (cudaMemcpy(d_src, src, src_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError();
+        goto cleanup;
+    }
+    // stream 0: the tool is single-threaded and synchronizes below, so the legacy default
+    // stream costs nothing and keeps this independent of the backend's stream pool.
+    if (to_fp16) {
+        to_fp16(d_src, (half *) d_dst, nrows, n_per_row, 0);
+    } else {
+        to_fp32(d_src, (float *) d_dst, nrows, n_per_row, 0);
+    }
+    if (cudaStreamSynchronize(0) != cudaSuccess) {
+        cudaGetLastError();
+        goto cleanup;
+    }
+    if (cudaMemcpy(dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError();
+        goto cleanup;
+    }
+    ok = true;
+
+cleanup:
+    if (d_src) cudaFree(d_src);
+    if (d_dst) cudaFree(d_dst);
+    return ok;
 }
 
 // Read-only P2P topology probe: true iff every ordered device pair can peer-access.

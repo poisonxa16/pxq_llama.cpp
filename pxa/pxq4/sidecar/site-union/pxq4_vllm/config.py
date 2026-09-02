@@ -620,7 +620,7 @@ class PXQ4Config(QuantizationConfig):
         # FusedMoE. Returning None here installs UnquantizedFusedMoEMethod
         # (fused_moe/layer.py:357-358), which allocates the expert stacks DENSE in the model
         # dtype -- 216.0 GiB of fp16 expert weight for the 122B against 63.55 GiB of P100
-        # VRAM. That was blocker C in 122B-VLLM-FINDINGS.md; PXQ4MoEMethod is the fix.
+        # VRAM. That was blocker C in FABLE-122B-VLLM-FINDINGS.md; PXQ4MoEMethod is the fix.
         if type(layer).__name__ in ("FusedMoE", "RoutedExperts") or hasattr(layer, "moe_config"):
             if _matches(prefix, self.pxq4_modules):
                 from .moe import PXQ4MoEMethod

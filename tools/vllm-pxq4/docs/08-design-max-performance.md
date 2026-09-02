@@ -2,7 +2,7 @@
 
 Target: `KewaiiGamer/1Cat-vLLM` @ `2ceb15066`, Qwen3.8-27B (gguf arch `qwen35`), 4x V100-32GB (DGX, TP=4)
 and 2x V100-16GB (Unraid, TP=2). Artifact: `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
-Every line citation below is to a file that was read (either `<engine-tree>` @ `acf8f245`, or
+Every line citation below is to a file that was read (either `/path/to/engine-repo` @ `acf8f245`, or
 `/opt/1Cat-vLLM` inside the running container). **No GPU was run in this workflow. Every throughput
 number in this document is a PROJECTION and is labelled as such.**
 
@@ -122,7 +122,7 @@ Two hard invariants that the whole design is built around:
 ### 2.2 Files to patch in `/opt/1Cat-vLLM`
 
 **None. Zero. The design requires no fork patch.** This is deliberate and is what makes the work
-hand-ofrun to Kewaii as a package rather than a merge.
+hand-offable to Kewaii as a package rather than a merge.
 
 Three *optional* patches, each with a working no-patch fallback:
 
@@ -461,7 +461,7 @@ sharder slices rows assuming per-row-contiguous blocks, which panel interleave v
 
 The converter must emit the **exact tensor names the incumbent AWQ checkpoint uses**, because that
 checkpoint demonstrably loads into `qwen3_5.py` today. `tools/pxq4_names.py` is therefore *generated*
-by diffing against `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ/model.safetensors.index.json`
+by diffing against `/path/to/hf/<reference-hf-model>/model.safetensors.index.json`
 and the converter **fails loudly on any name it cannot map**. Known structural points:
 
 * `packed_modules_mapping` (`qwen3_5.py:665-675, 823-826`): `qkv_proj←[q_proj,k_proj,v_proj]`,

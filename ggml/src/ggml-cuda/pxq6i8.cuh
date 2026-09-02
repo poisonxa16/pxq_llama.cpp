@@ -184,6 +184,7 @@ k_pxqi8_gemm_grouped(const uint8_t * __restrict__ W,
     const int panels = R / PXQ4_BM, kslabs = K / PXQ4_QK;
     const int p = blockIdx.x;
     const pxq4_tile_info tile = tiles[blockIdx.y];
+    if (tile.nrows <= 0) return;   // padding tile of a device-built tile list (uniform over the block)
     const uint8_t * pan = pxq6_panel<POL>(W, tile.e, panels, p, kslabs);
     const uint8_t * Aqt = Aq + (size_t)tile.row0*K;
     const float   * Adt = Ad + (size_t)tile.row0*kslabs;

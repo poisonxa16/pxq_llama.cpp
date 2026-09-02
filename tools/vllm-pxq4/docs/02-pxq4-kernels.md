@@ -1,6 +1,6 @@
 # PXQ4 CUDA kernel inventory + vLLM reusability verdict
 
-Source tree: `<engine-tree>` (branch swa-kv, HEAD acf8f245), read-only over ssh.
+Source tree: `/path/to/engine-repo` (branch fable9-swa-kv, HEAD acf8f245), read-only over ssh.
 All line citations are from that tree. Nothing was built, run, or measured for this document.
 
 ---
@@ -299,7 +299,7 @@ provenance canary comment (pxq6.cuh:1-3) in the vendored copy.
 | edits to the vendored copy (deps 1,2,3,11,12 above; dst_t on the GEMM store; fp16 x staging) | ~60 | edited |
 | optional: `k_pxq6_gemm_grouped_wmma` + `pxq6_wmma_*` helpers (pxq6.cuh:2884-3010, 3038-3070) | ~200 | copied verbatim |
 | torch C++/CUDA shim: `torch::Tensor` entry points (`pxq4_dequant`, `pxq4_gemm`, `pxq4_gemv`), dtype/contiguity/shape checks, stream plumbing, `TORCH_LIBRARY` registration | ~350 | new |
-| Python `PXQ4Config(QuantizationConfig)` + `PXQ4LinearMethod(LinearMethodBase)`: `create_weights` (raw uint8 panel blob + per-tensor metadata), `apply` (M-threshold dispatch gemv/gemm), `process_weights_after_loading` (no-op — no repack needed, the on-disk layout is the kernel layout), plus the **mixed-type dispatch** (PXQ4 / q8_0 / q6_k / f16 / f32 per docs/lab/LEVERS.md backbone rev2) | ~400 | new |
+| Python `PXQ4Config(QuantizationConfig)` + `PXQ4LinearMethod(LinearMethodBase)`: `create_weights` (raw uint8 panel blob + per-tensor metadata), `apply` (M-threshold dispatch gemv/gemm), `process_weights_after_loading` (no-op — no repack needed, the on-disk layout is the kernel layout), plus the **mixed-type dispatch** (PXQ4 / q8_0 / q6_k / f16 / f32 per LEVERS.md backbone rev2) | ~400 | new |
 | offline GGUF→vLLM converter: read the mixed-type gguf, TP-shard PXQ4 by whole panels (column-parallel) or by slab byte-gather + header duplication (row-parallel), passthrough/dequant the q8_0 / q6_k / f16 tensors, emit safetensors + a `pxq4_meta.json` recording `pxa.pxq.backbone_rev`/`backbone_map` | ~600 | new |
 | bit-exactness harness against the CPU reference (see §5) | ~150 | new |
 | **TOTAL** | **~500 copied + ~1,560 new/edited** (range 1,300-1,900 depending on how much of the mixed-type converter is reused from existing tooling) | |
@@ -337,7 +337,7 @@ GPUs we are not allowed to run on in this workflow. **Do not rewrite.**
 
 ## 5. CPU reference for bit-exact validation — YES
 
-**`<engine-tree>`**, 360 lines, plain C.
+**`/path/to/engine-repo/ggml/src/pxq-cpu.c`**, 360 lines, plain C.
 
 - `pxa_deq_row_pxq6(base, row, k, dst, hq=false)` — pxq-cpu.c:135-158. The PXQ4 (id 252) row dequant:
   panel stride pxq-cpu.c:140, fp16 anchor pxq-cpu.c:141, `eff = anchor * sub[nibble]` pxq-cpu.c:150-151,

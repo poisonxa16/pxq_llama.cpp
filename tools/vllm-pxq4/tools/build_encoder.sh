@@ -12,7 +12,7 @@
 #
 # usage: build_encoder.sh [MGV_SRC] [OUT]
 set -euo pipefail
-MGV="${1:-${PXQ_ENGINE_SRC:-$(git rev-parse --show-toplevel 2>/dev/null)/ggml/src}}"
+MGV="${1:-/path/to/engine-repo/src}"
 OUT="${2:-libpxq4_encode.so}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 

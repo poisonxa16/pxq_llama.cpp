@@ -353,6 +353,29 @@ static inline bool pxa_p100_fp16_gemm() {
     return v;
 }
 
+// Name of the arch dispatch path the tier logic above ALREADY selects for a device, for the
+// product startup banner (src/llama.cpp). This is a REPORTER: it decides nothing and must
+// only ever restate what the resolvers on this page return.
+//   sm_60 -> pxa_p100_fp16_gemm(): dequant->fp16 + cublasGemmEx COMPUTE_16F (2:1 hfma2)
+//   sm_61 -> the DP4A integer path (mmq/mmvq dp4a; fast_fp16_available() excludes cc 610)
+//   sm_70 -> pxa_volta_cublas_ne11(): dense quantized GEMMs with ne11 >= N to fp16 cuBLAS
+// REFERENCE reports itself, because at level 0 every lever above is forced off.
+static inline const char * pxa_enhance_path_name(int cc) {
+    if (pxa_config_level() == 0) {
+        return "reference (all levers off)";
+    }
+    if (cc == 600) {
+        return pxa_p100_fp16_gemm() ? "sm_60 fp16-hfma2" : "sm_60 fp32-sgemm";
+    }
+    if (cc == 610) {
+        return "sm_61 dp4a";
+    }
+    if (cc >= 700 && cc < 750) {
+        return pxa_volta_cublas_ne11() > 0 ? "sm_70 fp16-tensor-core-prefill" : "sm_70 mmq";
+    }
+    return "generic";
+}
+
 // PXA_MODE=balance|max — the owner-facing POSTURE knob (2026-07-22). 0 = BALANCE (default),
 // 1 = MAX. The postures are the PRODUCT; the kernel levers are the means:
 //   BALANCE (the daily): -fa on, ub 2048-class. Best decode AND best-possible prefill IN the

@@ -191,6 +191,7 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+    GGML_API int                  ggml_backend_sched_get_n_replans(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API size_t               ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
@@ -206,6 +207,19 @@ extern "C" {
 
     // Reset all assignments and allocators - must be called before changing the node backends
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
+
+    // ---- PXA_KQ_MASK_PAD1 (house custom, DEFAULT OFF) ---------------------------------------
+    // The KQ mask input tensor is [n_kv, GGML_PAD(n_tokens,16)] and carries GGML_TENSOR_FLAG_INPUT,
+    // so ggml_backend_sched_copy_inputs copies the WHOLE tensor, synchronously, once per split
+    // that consumes it. At decode (n_tokens == 1) rows 1..15 are constant -inf padding that the
+    // ncols==1 flash-attention vec kernel never reads. These entry points let llama.cpp tell the
+    // scheduler how many mask rows are actually live for the ubatch being computed, so the copy
+    // can be trimmed to that prefix. Enabled only when PXA_KQ_MASK_PAD1=1 (or 2) is set AND the
+    // live row count is exactly 1. With the env unset every one of these is inert.
+    GGML_API void                 ggml_backend_pxa_set_kqmask_live_rows(int64_t rows);
+    GGML_API int                  ggml_backend_pxa_kqmask_mode(void);        // 0=off 1=trim copy 2=trim copy + skip host pad fill
+    GGML_API int64_t              ggml_backend_pxa_kqmask_trim_count(void);  // firing counter: trimmed copies so far
+    GGML_API int64_t              ggml_backend_pxa_kqmask_trim_saved_bytes(void);
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);

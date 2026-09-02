@@ -1,6 +1,6 @@
 # Flash-Next research record — 2026-08-27/28
 
-Everything established in this investigation, including the claims that were overturned
+Everything established in this session, including the claims that were overturned
 and why. Written so none of it has to be re-derived. Evidence tags:
 **[M]** measured on hardware · **[S]** read from source or a log · **[C]** computed
 here · **[I]** inferred.
@@ -11,7 +11,7 @@ here · **[I]** inferred.
 
 `run-flashnext.sh:25` defaults to the **public unsloth download**, not our codec:
 
-    MODEL=${MODEL:-<local-path>}
+    MODEL=${MODEL:-/path/to/models/qwen4exp-testfile/UD-IQ1_S/...}
 
 That file has **zero PXQ tensors** (`grep -ci pxq` on its tensor directory = 0).
 Census: F32 557 / Q8_0 244 / Q5_K 212 / IQ1_S 68 / IQ4_NL 49 / Q6_K 40 /
@@ -25,7 +25,7 @@ read as "the lever does not work" rather than "the lever was never engaged".
 `llama_model_loader: - type` and confirm `pxq4` tensors are present before
 trusting any number.**
 
-Our artifact: `<local-path>`, 114.67 GiB,
+Our artifact: `/path/to/models/qwen4exp/Qwen3.8-Flash-Next-PXQ4.gguf`, 114.67 GiB,
 384 pxq4 tensors, ~66 GiB across six cards with `per_layer_token_embd` on CPU.
 
 ## 1. Codec head-to-head — our PXQ4 vs the public quant
@@ -39,7 +39,7 @@ each arm's loaded quant types read out of its own log.
 | ours (PXQ4) | 28.80, 29.26 — **both 127 tokens** | **29.03 tok/s** | valid **[M]** |
 | public IQ1_S | 25.52 (57 tok), 25.18 (56 tok) | 25.35 | **VOID** — token counts differ **[M]** |
 
-**Our codec measures 29.03 tok/s (34.45 ms/token).** Logs: `<local-path>`.
+**Our codec measures 29.03 tok/s (34.45 ms/token).** Logs: `/path/to/models/codec-h2h/`.
 
 The public arm voided itself twice by hitting EOS at ~56-57 tokens against our
 127. **Always pass `--ignore-eos`** for any cross-model comparison; without it
@@ -59,7 +59,7 @@ after every node. It is instrumentation overhead, not codec speed. **[S/M]**
 
 ## 2. Where decode time actually goes
 
-Profile: `<local-path>`, taken on our PXQ4 file at `-c 2048`,
+Profile: `/path/to/models/fn-profile.log`, taken on our PXQ4 file at `-c 2048`,
 95 tokens. Op shares (op-computes=260000, total_gpu_us=7465342):
 
 | bucket | share |
@@ -188,13 +188,13 @@ recurrent/hybrid. Both hold here. **[S]**
 - Instruments, in order of preference:
   1. **nsys per-kernel capture** — true per-kernel time and inter-kernel gaps, no
      sync tax. Prices one kernel family directly instead of hunting a 2%
-     whole-model delta. NOT installed as of this writing; being added as
+     whole-model delta. NOT installed as of this session; being added as
      `pxa-sm60-dev:nsys`.
   2. **per-device `PXA_GRAPH` sums** — ~0.1 ms sensitivity, the right instrument
      for placement levers such as a `-ts` rebalance.
   3. **`PXA_PROFILE` name buckets** — per-node attribution to ~1 us.
      **Attribution only. Never a speed result.**
-- Two arms of one sweep stopped at **53 and 57 tokens** instead of
+- Two arms of one sweep this session stopped at **53 and 57 tokens** instead of
   127. Their tok/s is not comparable to a full-length control and was discarded.
   **Always state token count beside every number and void any mismatched arm.**
 

@@ -1161,6 +1161,15 @@ int main(int argc, char ** argv) {
 
     LOG_INFO("model loaded", {});
 
+    // PXA: the startup log says what the loaded FILE is (codec / bpw / pxa.pxq* provenance),
+    // so a serving box can be identified from its own log instead of from the filename.
+    {
+        char pxq_desc[256];
+        if (llama_model_pxq_file_desc(ctx_server.model, pxq_desc, sizeof(pxq_desc)) > 0) {
+            LOG_INFO(pxq_desc, {});
+        }
+    }
+
     const auto model_meta = ctx_server.model_meta();
 
     // print sample chat example to make it clear which template is used

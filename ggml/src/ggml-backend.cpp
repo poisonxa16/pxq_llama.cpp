@@ -1203,6 +1203,11 @@ struct ggml_backend_sched {
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
 
     bool only_active_experts;
+
+    // number of galloc re-plans this scheduler has done. Each one drains every backend, so a
+    // caller that can rebuild the graph at worst-case sizes uses this to notice that its
+    // reserved plan has been replaced by a narrow one and re-reserve.
+    int n_replans;
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
@@ -1998,6 +2003,32 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #ifndef NDEBUG
         fprintf(stderr, "%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
+        // PXA_SCHED_DEBUG: a re-plan drains every backend, which silently serializes any
+        // pipelined overlap; make it visible when asked (no behaviour change).
+        sched->n_replans++;
+        static const bool pxa_sched_debug = getenv("PXA_SCHED_DEBUG") != NULL;
+        if (pxa_sched_debug) {
+            const int n_replans = sched->n_replans;
+            fprintf(stderr, "%s: graph re-planned (#%d, n_nodes=%d, n_leafs=%d, backend_ids_changed=%d, n_copies=%d, cur_copy=%d) - full sync\n",
+                    __func__, n_replans, sched->graph.n_nodes, sched->graph.n_leafs, backend_ids_changed, sched->n_copies, sched->cur_copy);
+            // PXA_SCHED_DUMP=<dir>: write the node list of every re-planned graph so two
+            // shapes can be diffed offline (which nodes the reserve graph is missing).
+            static const char * pxa_sched_dump = getenv("PXA_SCHED_DUMP");
+            if (pxa_sched_dump) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/replan-%03d-n%d.txt", pxa_sched_dump, n_replans, sched->graph.n_nodes);
+                FILE * f = fopen(path, "w");
+                if (f) {
+                    for (int i = 0; i < sched->graph.n_nodes; i++) {
+                        ggml_tensor * n = sched->graph.nodes[i];
+                        fprintf(f, "%05d %-28s %-40s [%lld,%lld,%lld,%lld] b=%d\n", i, ggml_op_name(n->op), n->name,
+                                (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2], (long long)n->ne[3],
+                                sched->node_backend_ids[i]);
+                    }
+                    fclose(f);
+                }
+            }
+        }
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             fprintf(stderr, "%s: failed to allocate graph\n", __func__);
@@ -2005,6 +2036,86 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// PXA_KQ_MASK_PAD1 / PXA_KQ_MASK_TRACE  (house custom, BOTH DEFAULT OFF)
+//
+// inp_KQ_mask is [n_kv, GGML_PAD(n_tokens,16)] F16 with GGML_TENSOR_FLAG_INPUT, so the FLAG_INPUT
+// arm below does a full ggml_backend_synchronize() + whole-tensor ggml_backend_tensor_copy() for
+// EVERY split that consumes it -- a blocking H2D with provably zero overlap with any card's
+// compute. At decode n_tokens == 1, so 15 of the 16 rows are constant -inf padding.
+//
+// Who reads the mask at n_tokens == 1 on this fork (verified, not assumed):
+//   * ggml_cuda_flash_attn_ext() -> vec kernel (P100 sm_60: !fp16_mma_available, Q->ne[1] <= 8),
+//     and ggml_cuda_flash_attn_ext_vec_f16_case()/f32_case() pin cols_per_block = 1 on every
+//     NVIDIA card. The kernel indexes maskh = mask + nb31*ic0 with ic0 = blockIdx.x*ncols and
+//     reads maskh[j*ne11 + tid] for j in [0,ncols) -- with Q->ne[1] == 1 there is one block,
+//     ic0 == 0, j == 0. ROW 0 ONLY. (fattn-vec-f16.cuh:68,217 / fattn-vec-f32.cuh)
+//   * flash_attn_mask_to_KV_min_max<ncols1,...> also reads only rows [0,ncols1) -- and its launch
+//     gate (fattn-vec-common.cuh) requires Q->ne[1] >= 1024 || Q->ne[3] > 1 || SWA, so at decode
+//     with a non-SWA model it does not even launch.
+// Rows 1..15 are therefore dead on the device, and NO refill is ever needed -- which sidesteps
+// the unsound "refill the pad rows when n_kv changes" idea entirely (galloc is free to hand that
+// memory to unrelated activations; nobody reads it either way).
+//
+// This is why the gate is live_rows == 1 EXACTLY and nothing looser: at n_tokens in [2,8] the
+// same vec kernel still uses cols_per_block == 1 but launches gridDim.x = n_tokens blocks with
+// ic0 = blockIdx.x, so rows 1..n_tokens-1 ARE read. Trimming there would be silently wrong.
+//
+// The trim is keyed on the tensor NAME ("KQ_mask"/"KQ_mask_swa", set via cb() in
+// llm_build_context::build_inp_KQ_mask) plus a live-row count published by llama.cpp, because
+// FLAG_INPUT tensors can never reach the only_active_experts partial-copy arm further down
+// (that one is gated on buffer usage == WEIGHTS) -- there is no existing partial-copy machinery
+// to reuse here.
+// ---------------------------------------------------------------------------------------------
+static int pxa_kqmask_mode_cached() {
+    static const int mode = [] {
+        const char * e = getenv("PXA_KQ_MASK_PAD1");
+        int v = e ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v > 2) v = 2;
+        return v;
+    }();
+    return mode;
+}
+
+static bool pxa_kqmask_trace_on() {
+    static const bool on = [] {
+        const char * e = getenv("PXA_KQ_MASK_TRACE");
+        return e && e[0] != '0';
+    }();
+    return on;
+}
+
+// number of KQ-mask rows that carry live data for the ubatch currently being computed.
+// 0 means "unknown" and disables the trim. Published by llama_set_inputs().
+static int64_t   pxa_kqmask_live_rows      = 0;
+static int64_t   pxa_kqmask_trim_count     = 0;
+static int64_t   pxa_kqmask_trim_saved     = 0;
+// per-graph-compute trace accumulators
+static int64_t   pxa_tr_in_copies = 0, pxa_tr_in_bytes = 0, pxa_tr_in_us = 0;
+static int64_t   pxa_tr_kq_copies = 0, pxa_tr_kq_bytes = 0, pxa_tr_kq_us = 0;
+static int64_t   pxa_tr_step      = 0;
+
+void ggml_backend_pxa_set_kqmask_live_rows(int64_t rows) { pxa_kqmask_live_rows = rows; }
+int ggml_backend_pxa_kqmask_mode(void) { return pxa_kqmask_mode_cached(); }
+int64_t ggml_backend_pxa_kqmask_trim_count(void) { return pxa_kqmask_trim_count; }
+int64_t ggml_backend_pxa_kqmask_trim_saved_bytes(void) { return pxa_kqmask_trim_saved; }
+
+// true when `input` is a causal flash-attention KQ mask whose pad rows are provably dead
+static inline bool pxa_kqmask_trimmable(const struct ggml_tensor * input, size_t * live_bytes_out) {
+    if (pxa_kqmask_mode_cached() == 0)            return false;
+    if (pxa_kqmask_live_rows != 1)                return false;   // decode only, see note above
+    if (input->type != GGML_TYPE_F16)             return false;   // F16 == the flash_attn mask
+    if (input->ne[2] != 1 || input->ne[3] != 1)   return false;
+    if (input->ne[1] != GGML_KQ_MASK_PAD)         return false;   // exactly one padded row-group
+    if (!ggml_is_contiguous(input))               return false;
+    if (strcmp(input->name, "KQ_mask") != 0 && strcmp(input->name, "KQ_mask_swa") != 0) return false;
+    const size_t row_bytes = input->nb[1];
+    if (row_bytes == 0 || row_bytes >= ggml_nbytes(input)) return false;
+    *live_bytes_out = row_bytes;                                  // one row
     return true;
 }
 
@@ -2016,6 +2127,48 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t last_input_backend = nullptr;
     bool synced_on_input = false;
+
+    // With more than one copy slot, the slot this split's inputs land in was last read by
+    // the split backend two graphs ago (same slot). The per-input logic below only waits
+    // for that on the split backend's OWN stream (a no-op for the peer copies, which run
+    // on the SOURCE backend's stream), so a fast source device could overwrite a slot the
+    // split backend is still reading. Wait for the slot's event once per split, before any
+    // copy: asynchronously on each source stream when every input is a device tensor
+    // copied peer-to-peer, on the host otherwise (user inputs and host-side sources go
+    // through synchronous copies that need the host to block anyway). n_copies == 1 has no
+    // events and is unaffected.
+    if (sched->n_copies > 1 && sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_t slot_event = sched->events[split_backend_id][sched->cur_copy];
+        bool host_sync = false;
+        ggml_backend_t waited[GGML_SCHED_MAX_BACKENDS];
+        int n_waited = 0;
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input = split->inputs[j];
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+            ggml_backend_buffer_t input_buf = input->view_src ? input->view_src->buffer : input->buffer;
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input_backend == NULL || input_backend == split_backend ||
+                    input_backend->iface.event_wait == NULL || input_buf == NULL || ggml_backend_buffer_is_host(input_buf) ||
+                    !split_backend->iface.cpy_tensor_async) {
+                host_sync = true;
+                break;
+            }
+            bool seen = false;
+            for (int k = 0; k < n_waited; ++k) if (waited[k] == input_backend) { seen = true; break; }
+            if (!seen && n_waited < GGML_SCHED_MAX_BACKENDS) {
+                waited[n_waited++] = input_backend;
+            }
+        }
+        if (host_sync) {
+            ggml_backend_event_synchronize(slot_event);
+            synced_on_input = true;
+        } else {
+            for (int k = 0; k < n_waited; ++k) {
+                ggml_backend_event_wait(waited[k], slot_event);
+            }
+        }
+        needs_sync[split_backend_id] = k_set_sync;
+    }
+
     for (int j = 0; j < split->n_inputs; j++) {
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
@@ -2032,7 +2185,38 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 }
                 synced_on_input = true;
             }
-            ggml_backend_tensor_copy(input, input_cpy);
+            // ---- PXA_KQ_MASK_PAD1 (default OFF) ----
+            size_t pxa_live_bytes = 0;
+            const bool pxa_trim = pxa_kqmask_trimmable(input, &pxa_live_bytes) &&
+                                  ggml_backend_buffer_is_host(input->buffer) &&
+                                  input_cpy != nullptr &&
+                                  input_cpy->type  == input->type &&
+                                  input_cpy->nb[1] == input->nb[1] &&
+                                  ggml_nbytes(input_cpy) == ggml_nbytes(input);
+            const int64_t pxa_t0 = pxa_kqmask_trace_on() ? ggml_time_us() : 0;
+            if (pxa_trim) {
+                // rows 1..15 are dead at n_tokens == 1; row 0 is the contiguous prefix
+                ggml_backend_tensor_set(input_cpy, input->data, 0, pxa_live_bytes);
+                pxa_kqmask_trim_count++;
+                pxa_kqmask_trim_saved += ggml_nbytes(input) - pxa_live_bytes;
+                // firing proof: first hit, then every 4096th, so an A/B can never be run on a
+                // binary where the lever silently did nothing (that void has happened here before)
+                if (pxa_kqmask_trim_count == 1 || (pxa_kqmask_trim_count & 4095) == 0) {
+                    fprintf(stderr, "PXA_KQ_MASK_PAD1 fired: n=%lld tensor=%s full=%zu copied=%zu saved_total=%lld\n",
+                            (long long) pxa_kqmask_trim_count, input->name,
+                            ggml_nbytes(input), pxa_live_bytes, (long long) pxa_kqmask_trim_saved);
+                }
+            } else {
+                ggml_backend_tensor_copy(input, input_cpy);
+            }
+            if (pxa_kqmask_trace_on()) {
+                const int64_t dt = ggml_time_us() - pxa_t0;
+                const size_t  nb = pxa_trim ? pxa_live_bytes : ggml_nbytes(input);
+                pxa_tr_in_copies++; pxa_tr_in_bytes += nb; pxa_tr_in_us += dt;
+                if (strncmp(input->name, "KQ_mask", 7) == 0) {
+                    pxa_tr_kq_copies++; pxa_tr_kq_bytes += nb; pxa_tr_kq_us += dt;
+                }
+            }
         } else {
             // wait for the split backend to finish using the input before overwriting it
             if (needs_sync[split_backend_id]) {
@@ -2550,15 +2734,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this copy
-        if (split->n_inputs > 0) {
+        // record the event of this copy. With more than one slot, record after EVERY split
+        // so the slot event marks the backend's last work in this slot, not just its last
+        // split that had inputs (the waits in alloc_graph / copy_inputs rely on that).
+        if (split->n_inputs > 0 || sched->n_copies > 1) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
             }
         }
     }
 
-    sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+    // The copy slot is rotated in ggml_backend_sched_alloc_graph (before the graph is
+    // split), not here: a graph that is REUSED across compute calls skips alloc/split
+    // and its nodes keep pointing at the slot it was split with, so rotating per
+    // compute would copy the split inputs into one slot and read them from the other.
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2586,6 +2775,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *)malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **)malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+
+    // Initialise the whole table exactly once, here. PXA_SCHED_RESET_LAZY then only has to
+    // restore the entries flagged in the used bitmap, which relies on the invariant that an
+    // untouched entry is always (-1, NULL). Doing it unconditionally keeps the invariant true
+    // whichever way the gate is set.
+    memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t nodes_size = graph_size + GGML_SCHED_MAX_SPLITS*GGML_SCHED_MAX_SPLIT_INPUTS*2;
     sched->node_backend_ids = (int *)calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
@@ -2652,12 +2848,61 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
+// PXA_SCHED_RESET_LAZY=1 restores only the touched hash entries instead of memsetting the
+// whole table. Default OFF.
+static bool pxa_sched_reset_lazy_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_SCHED_RESET_LAZY");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // reset state for the next run
     if (!sched->is_reset) {
-        ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        // The hash table is sized from graph_size -- max_nodes(), tens of thousands of entries --
+        // while one graph fills a few thousand of them, so clearing it wholesale moves more than
+        // a megabyte per graph and shows up as the largest single host term around graph build.
+        // Walk the used bitmap instead and restore only what was touched; everything else is
+        // still (-1, NULL) from ggml_backend_sched_new. hv_tensor_backend_ids and
+        // hv_tensor_copies are only ever written after ggml_hash_find_or_insert has set the
+        // corresponding used bit, so the bitmap is an exact cover of the dirty entries.
+        //
+        // The hv_tensor_copies row is n_backends*n_copies wide, so with pipeline parallelism
+        // (n_copies > 1) the full memset is that many times larger again.
+        if (pxa_sched_reset_lazy_enabled()) {
+            const size_t n_words = ggml_bitset_size(sched->hash_set.size);
+            const size_t stride  = (size_t) sched->n_backends * sched->n_copies;
+
+            for (size_t w = 0; w < n_words; ++w) {
+                ggml_bitset_t bits = sched->hash_set.used[w];
+                if (bits == 0) {
+                    continue;
+                }
+
+                const size_t base = w << BITSET_SHR;
+
+                while (bits != 0) {
+                    const size_t b = (size_t) __builtin_ctz(bits);
+                    bits &= bits - 1;
+
+                    const size_t i = base + b;
+                    if (i >= sched->hash_set.size) {
+                        break;
+                    }
+
+                    sched->hv_tensor_backend_ids[i] = -1;
+                    memset(&sched->hv_tensor_copies[i*stride], 0, stride*sizeof(struct ggml_tensor *));
+                }
+            }
+
+            ggml_hash_set_reset(&sched->hash_set);
+        } else {
+            ggml_hash_set_reset(&sched->hash_set);
+            memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+            memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        }
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -2668,6 +2913,23 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+
+    // PXA_SCHED_DUMP=<dir>: dump the reserve graph too, so the reserve/real diff is a plain diff.
+    if (const char * pxa_sched_dump = getenv("PXA_SCHED_DUMP")) {
+        static int n_reserve = 0;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/reserve-%03d-n%d.txt", pxa_sched_dump, ++n_reserve, sched->graph.n_nodes);
+        FILE * f = fopen(path, "w");
+        if (f) {
+            for (int i = 0; i < sched->graph.n_nodes; i++) {
+                ggml_tensor * n = sched->graph.nodes[i];
+                fprintf(f, "%05d %-28s %-40s [%lld,%lld,%lld,%lld] b=%d\n", i, ggml_op_name(n->op), n->name,
+                        (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2], (long long)n->ne[3],
+                        sched->node_backend_ids[i]);
+            }
+            fclose(f);
+        }
+    }
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -2767,12 +3029,41 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
 
+    // A freshly split graph takes the next copy slot; a reused graph (no alloc, no split)
+    // keeps the slot it was split with. With n_copies == 1 this is a no-op.
+    if (sched->n_copies > 1) {
+        sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+    }
+
     ggml_backend_sched_split_graph(sched, graph);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
     ggml_sched_prepare_graph(sched);
+
+    // The caller writes this graph's user inputs (ggml_backend_tensor_set, a host-side
+    // copy that is not ordered against the compute streams) as soon as this returns. With
+    // n_copies > 1 those inputs sit in the slot that was last used two graphs ago, which
+    // may still be executing on the device that holds them; wait for each such device to
+    // pass its last recorded point in this slot before handing the slot out. In a steady
+    // pipeline these events are long done and the waits cost microseconds. Only the
+    // backends that own user inputs are waited for, so the other devices keep overlapping.
+    if (sched->n_copies > 1) {
+        bool waited[GGML_SCHED_MAX_BACKENDS] = { false };
+        for (int i = 0; i < sched->n_graph_inputs; i++) {
+            const int backend_id = tensor_backend_id(sched->graph_inputs[i]);
+            if (backend_id < 0 || waited[backend_id]) {
+                continue;
+            }
+            waited[backend_id] = true;
+            if (sched->events[backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(sched->backends[backend_id]);
+            }
+        }
+    }
 
     sched->is_alloc = true;
 
@@ -2796,7 +3087,32 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    // PXA_KQ_MASK_TRACE: this is the memcpy price tag for the FLAG_INPUT arm of
+    // ggml_backend_sched_copy_inputs(), measured on the host around the blocking copy itself.
+    // Everything it reports is OUTSIDE the CUDA graph launch and overlaps with nothing.
+    if (pxa_kqmask_trace_on()) {
+        pxa_tr_in_copies = pxa_tr_in_bytes = pxa_tr_in_us = 0;
+        pxa_tr_kq_copies = pxa_tr_kq_bytes = pxa_tr_kq_us = 0;
+    }
+    const enum ggml_status pxa_st = ggml_backend_sched_compute_splits(sched);
+    if (pxa_kqmask_trace_on()) {
+        static const int64_t every = [] {
+            const char * e = getenv("PXA_KQ_MASK_TRACE_EVERY");
+            int64_t v = e ? atoll(e) : 1;
+            return v > 0 ? v : 1;
+        }();
+        if (pxa_tr_step % every == 0) {
+            fprintf(stderr,
+                "PXA_KQMASK_TRACE step=%lld live_rows=%lld mode=%d | inputs: n=%lld bytes=%lld us=%lld"
+                " | KQ_mask: n=%lld bytes=%lld us=%lld | trimmed=%lld saved_bytes=%lld\n",
+                (long long) pxa_tr_step, (long long) pxa_kqmask_live_rows, pxa_kqmask_mode_cached(),
+                (long long) pxa_tr_in_copies, (long long) pxa_tr_in_bytes, (long long) pxa_tr_in_us,
+                (long long) pxa_tr_kq_copies, (long long) pxa_tr_kq_bytes, (long long) pxa_tr_kq_us,
+                (long long) pxa_kqmask_trim_count, (long long) pxa_kqmask_trim_saved);
+        }
+        pxa_tr_step++;
+    }
+    return pxa_st;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
@@ -2812,6 +3128,10 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     return sched->n_splits;
+}
+
+int ggml_backend_sched_get_n_replans(ggml_backend_sched_t sched) {
+    return sched->n_replans;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

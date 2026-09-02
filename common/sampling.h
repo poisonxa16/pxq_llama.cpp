@@ -267,6 +267,10 @@ struct common_sampler {
 
 
 
+// PXA_TOPK_RAW: counters for the harness. out[0]=fast-path samples taken (mode 1),
+// out[1]=shadow compares, out[2]=ties, out[3]=window mismatches, out[4]=genuine mismatches.
+void common_sampler_pxa_topk_raw_stats(int64_t out[5]);
+
 // Create a new sampling context instance.
 struct common_sampler * common_sampler_init(const struct llama_model * model, const struct common_params_sampling & params);
 

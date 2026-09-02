@@ -217,6 +217,15 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 # test-dsa-attn is deliberately registered WITHOUT PXA_DSA_ATTN=1: in that mode it
 # asserts the shipped default (DSA declined). Run it with PXA_DSA_ATTN=1 by hand to
 # exercise the kernel numerics.
+# PXA_KV_SEQ_SOA parity harnesses (CPU only, no model for the first; the second takes a tiny gguf).
+llama_build(test-kv-seq-shadow.cpp)
+target_include_directories(test-kv-seq-shadow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+llama_test(test-kv-seq-shadow)
+llama_build(test-kv-mask-parity.cpp)
+target_link_libraries(test-kv-mask-parity PRIVATE ggml)
+# PXA_TOPK_RAW shadow-compare harness (CPU only, takes a tiny gguf)
+llama_build(test-topk-raw-shadow.cpp)
+
 if (GGML_CUDA)
     llama_build(test-dsa-attn.cpp)
     target_link_libraries(test-dsa-attn PRIVATE ggml)
@@ -225,6 +234,14 @@ if (GGML_CUDA)
     llama_build(test-rope-flipped.cpp)
     target_link_libraries(test-rope-flipped PRIVATE ggml)
     llama_test(test-rope-flipped LABEL "cuda")
+
+    # Narrow-shape kernel gates (PXA_GETROWS_NARROW / PXA_CPY_FASTDIV /
+    # PXA_CONCAT_FLAT / PXA_NORM_REGCACHE). Registered WITHOUT the gates set: in
+    # that mode it asserts the shipped defaults. The bit-identity proof is a diff
+    # of two runs of this binary, gates off and gates on -- see the file header.
+    llama_build(test-narrow-kernel-parity.cpp)
+    target_link_libraries(test-narrow-kernel-parity PRIVATE ggml)
+    llama_test(test-narrow-kernel-parity LABEL "cuda")
 endif()
 
 

@@ -8,9 +8,15 @@
 //   PXQ4HQ (253)  128   1152       2         16         128    per  8 (anchor x SUB8,  4x4b)
 //   PXQ2 (254)    128    576       1          8          64    per 16 (anchor x SUB16)
 //   PXQ3 (255)    128    832       1         12          64    per 16 (anchor x SUB16)
-//   (ids 250 + 251, the retired MXFP4-repack and PXQ5 legacy types, were removed 2026-07-21.
-//    id 256, the 5-bit PXQ6 tier, has NO CPU fallback yet — pxa_pxq_is_cpu_supported returns
-//    false for it.)
+//   PXQ1 (248)    128    320       1          4          64    per 16 (anchor x SUB16)
+//   PXQ6 (256)    128   1344       1         20          64    per 16 (anchor x SUB16)
+//   (ids 250 + 251, the retired MXFP4-repack and PXQ5 legacy types, were removed 2026-07-21.)
+//
+//   PXQ1 + PXQ6 completed 2026-09-01 so that EVERY PXQ tier decodes without a GPU: that is what
+//   lets llama-quantize requantize from a PXQ source and llama-pxq-export run --cpu. Layout
+//   ground truth: ggml/include/ggml-pxq1-tables.h and the PXQ6R block of ggml-pxq6-tables.h,
+//   cross-read against the CUDA policies pxq6_pol_p1 (ggml-cuda/pxq23.cuh) and pxq6_pol_p6r
+//   (ggml-cuda/pxq6.cuh), which are the shipping decoders.
 //
 //   panel  = hdr (64 x fp16 row anchors when hdr==128) + (k/32) slabs; panels row-major.
 //   slab   = 64-row scale SoA + 64 code rows.
@@ -18,6 +24,10 @@
 //   8 B code rows (PXQ2): 2 bits/elem, elem j at bits 2*(j&3) of byte j>>2 (LE words).
 //   12 B code rows (PXQ3): bit-plane, three LE u32 words: w0 = low 2 bits of elems 0-15,
 //     w1 = low 2 bits of elems 16-31, w2 = bit2 plane (bit j = elem j, j = 0..31).
+//   4 B code rows (PXQ1): one LE u32, 1 bit/elem, elem j at bit j; book = {-1,+1}.
+//   20 B code rows (PXQ6): bytes 0-15 are the SAME nibble plane as PXQ4 (byte b = lo4(c[2b]) |
+//     lo4(c[2b+1]) << 4), bytes 16-19 are one LE u32 hi-bit plane (bit j = bit 4 of c[j]),
+//     giving 5-bit codes into the 32-entry LM32 book.
 //   dequant (E16-row family contract, parity-locked):
 //     eff = fp32(anchor_fp16) * SUB[s4];  w = eff * fp32(book[c])
 //
@@ -25,6 +35,7 @@
 // CUDA kernels) are honored so a custom-table model keeps working on the CPU path too.
 
 #include "pxq-cpu.h"
+#include "pxq-dot.h"   // integer-domain PXQ x Q8 dot for the 4-bit tiers (phase 2)
 
 #define GGML_COMMON_DECL_C
 #define GGML_COMMON_IMPL_C
@@ -37,6 +48,7 @@
 #include "ggml-pxq6-tables.h"
 #include "ggml-pxq2-tables.h"
 #include "ggml-pxq3-tables.h"
+#include "ggml-pxq1-tables.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -61,11 +73,13 @@ static float pxa_tab_sub16[16]     = PXQ6_SUB16_INIT;    // PXQ6-core / PXQ2 / P
 static float pxa_tab_sub8[16]      = PXQ6_SUB8_INIT;     // PXQ6HQ subs
 static float pxa_tab_lm4[4]        = PXQ2_BOOK_INIT;     // PXQ2 book
 static float pxa_tab_lm8[8]        = PXQ3_BOOK_INIT;     // PXQ3 book
+static float pxa_tab_lm32[32]      = PXQ6_LM32_INIT;     // PXQ6 (id 256) 5-bit book
+static float pxa_tab_sign[2]       = PXQ1_BOOK_INIT;     // PXQ1 sign book {-1,+1}
 
 static bool pxa_parse_n(const char * e, float * out, int want) {
     int n = 0;
-    float v[16];
-    char buf[512];
+    float v[32];   // 32: the PXQ6 LM32 book is the widest table an env override can carry
+    char buf[1024];   // 32 hex-float entries do not fit in 512
     snprintf(buf, sizeof(buf), "%s", e);
     for (char * t = strtok(buf, ","); t && n < want; t = strtok(NULL, ",")) v[n++] = strtof(t, NULL);
     if (n != want) return false;
@@ -82,10 +96,14 @@ static void pxa_pxq_ensure_tables(void) {
     static volatile int done = 0;
     if (done) return;
     const char * e;
-    float t[16];
+    float t[32];
     if ((e = getenv("PXA_PXQ6_BOOK"))   && pxa_parse_n(e, t, 16)) memcpy(pxa_tab_px16_book, t, sizeof(pxa_tab_px16_book));
     if ((e = getenv("PXA_PXQ6_SUB"))    && pxa_parse_n(e, t, 16)) memcpy(pxa_tab_sub16,     t, sizeof(pxa_tab_sub16));
     if ((e = getenv("PXA_PXQ6_SUB_HQ")) && pxa_parse_n(e, t, 16)) memcpy(pxa_tab_sub8,      t, sizeof(pxa_tab_sub8));
+    // PXA_PXQ6R_BOOK overrides the LM32 book on the CUDA side (pxq6_maybe_upload_tables);
+    // mirror it here or a custom-table PXQ6 file would decode differently on CPU than on GPU.
+    // There is no PXQ1 book override on either side: the sign book {-1,+1} is not tunable.
+    if ((e = getenv("PXA_PXQ6R_BOOK"))  && pxa_parse_n(e, t, 32)) memcpy(pxa_tab_lm32,      t, sizeof(pxa_tab_lm32));
     // PXA_PXQ_CEIL_V2 (2026-08-09): decode-side arm of the PXQ2/PXQ3 ceiling fix -- load the
     // v2 (max|book| == 1.0) LM4/LM8 books. Applied BEFORE the explicit PXA_PXQn_BOOK overrides
     // below so an explicit env table still wins. Default OFF: stock decode is byte-identical.
@@ -113,6 +131,13 @@ static void pxa_pxq_ensure_tables(void) {
     done = 1;
 }
 
+void pxa_pxq_float_tables(const float ** book16, const float ** sub16, const float ** sub8) {
+    pxa_pxq_ensure_tables();
+    if (book16) *book16 = pxa_tab_px16_book;
+    if (sub16)  *sub16  = pxa_tab_sub16;
+    if (sub8)   *sub8   = pxa_tab_sub8;
+}
+
 // ---------------------------------------------------------------------------------------------
 // per-type row dequant (row = global row index; data = 2D slice base)
 // ---------------------------------------------------------------------------------------------
@@ -123,6 +148,8 @@ bool pxa_pxq_is_cpu_supported(enum ggml_type type) {
         case GGML_TYPE_PXQ4HQ:
         case GGML_TYPE_PXQ2:
         case GGML_TYPE_PXQ3:
+        case GGML_TYPE_PXQ1:
+        case GGML_TYPE_PXQ6:
             return true;
         default:
             return false;
@@ -209,6 +236,55 @@ static void pxa_deq_row_pxq3(const uint8_t * base, int64_t row, int64_t k, float
     }
 }
 
+// PXQ1 (248): 1 bit/elem into the sign book; all magnitude is in eff = anchor x SUB16[s4].
+// Code row is ONE LE u32 at slab + 64 + row*4, element j at bit j -- the exact bit order
+// pxq6_pol_p1::pair() reads (elem 2b at bit 2b, elem 2b+1 at bit 2b+1).
+static void pxa_deq_row_pxq1(const uint8_t * base, int64_t row, int64_t k, float * dst) {
+    const int64_t KB = k/32;
+    const int64_t p = row >> 6;
+    const int     r = (int)(row & 63);
+    const uint8_t * panel = base + p*(PXQ1_HDR_BYTES + KB*PXQ1_SLAB_BYTES);
+    const float anchor = GGML_COMPUTE_FP16_TO_FP32(((const uint16_t *)panel)[r]);
+    for (int64_t kb = 0; kb < KB; ++kb) {
+        const uint8_t * slab = panel + PXQ1_HDR_BYTES + kb*PXQ1_SLAB_BYTES;
+        const float eff0 = anchor * pxa_tab_sub16[slab[r] & 0xf];   // elems  0-15
+        const float eff1 = anchor * pxa_tab_sub16[slab[r] >>  4];   // elems 16-31
+        const uint8_t * in = slab + 64 + r*4;
+        uint32_t w = 0;
+        for (int i = 0; i < 4; ++i) w |= (uint32_t)in[i] << (8*i);
+        float * o = dst + kb*32;
+        for (int j = 0; j < 32; ++j) {
+            o[j] = (j < 16 ? eff0 : eff1) * pxa_tab_sign[(w >> j) & 1];
+        }
+    }
+}
+
+// PXQ6 (256): 5-bit LM32 codes. Bytes 0-15 of the 20 B code row are the same nibble plane as
+// the 4-bit tiers (low 4 bits of each code); bytes 16-19 are one LE u32 whose bit j is bit 4
+// of code j. Mirrors pxq6_pol_p6r::pair().
+static void pxa_deq_row_pxq6r(const uint8_t * base, int64_t row, int64_t k, float * dst) {
+    const int64_t KB = k/32;
+    const int64_t p = row >> 6;
+    const int     r = (int)(row & 63);
+    const uint8_t * panel = base + p*(PXQ6R_HDR_BYTES + KB*PXQ6R_SLAB_BYTES);
+    const float anchor = GGML_COMPUTE_FP16_TO_FP32(((const uint16_t *)panel)[r]);
+    for (int64_t kb = 0; kb < KB; ++kb) {
+        const uint8_t * slab = panel + PXQ6R_HDR_BYTES + kb*PXQ6R_SLAB_BYTES;
+        const float eff0 = anchor * pxa_tab_sub16[slab[r] & 0xf];   // elems  0-15
+        const float eff1 = anchor * pxa_tab_sub16[slab[r] >>  4];   // elems 16-31
+        const uint8_t * in = slab + PXQ6R_CODE_OFF + r*20;
+        uint32_t hi = 0;
+        for (int i = 0; i < 4; ++i) hi |= (uint32_t)in[16 + i] << (8*i);
+        float * o = dst + kb*32;
+        for (int b = 0; b < 16; ++b) {
+            const int c0 = (in[b] & 0xf) | (int)(((hi >> (2*b))     & 1) << 4);
+            const int c1 = (in[b] >>  4) | (int)(((hi >> (2*b + 1)) & 1) << 4);
+            o[2*b]     = (2*b     < 16 ? eff0 : eff1) * pxa_tab_lm32[c0];
+            o[2*b + 1] = (2*b + 1 < 16 ? eff0 : eff1) * pxa_tab_lm32[c1];
+        }
+    }
+}
+
 void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, int64_t k, float * dst) {
     pxa_pxq_ensure_tables();
     PXA_PXQ_ASSERT(k % 32 == 0);
@@ -218,6 +294,8 @@ void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, in
         case GGML_TYPE_PXQ4HQ: pxa_deq_row_pxq6 (base, row, k, dst, true);  break;
         case GGML_TYPE_PXQ2:   pxa_deq_row_pxq2 (base, row, k, dst); break;
         case GGML_TYPE_PXQ3:   pxa_deq_row_pxq3 (base, row, k, dst); break;
+        case GGML_TYPE_PXQ1:   pxa_deq_row_pxq1 (base, row, k, dst); break;
+        case GGML_TYPE_PXQ6:   pxa_deq_row_pxq6r(base, row, k, dst); break;
         default: PXA_PXQ_ASSERT(!"pxa_pxq_dequant_row: not a PXQ type");
     }
 }
@@ -292,6 +370,32 @@ static inline double pxa_dot(const float * w, const float * x, int64_t k) {
     return acc;
 }
 
+// ---------------------------------------------------------------------------------------------
+// phase 2 fast path (pxq-dot.c): keep the weights in their nibble codes and take the dot in the
+// integer domain against int8 activations, instead of materialising the row as f32 and running
+// a double-precision f32 dot.
+//
+// The loop order flips as a result. The dequant path had to hoist the row decode out of the
+// activation loop (4*k bytes of f32 per row, far too expensive to redo per token), which forced
+// ix-outer/iy-inner with a k-float buffer in between. The integer path re-reads the row's CODES
+// per (ix, iy) instead -- k/2 bytes, an eighth of the f32 row, and resident in L1 across the
+// activation tile -- so the only thing that must be hoisted is the ACTIVATION quantisation.
+//
+// Activations are therefore quantised once per tile of PXA_PXQ_NYT rows and reused across every
+// weight row this thread owns. The tile keeps the scratch bounded (16 * k/32 * 36 B = 69 KiB at
+// k = 4096, an L2 resident) at the cost of re-walking the thread's weight rows once per tile;
+// at decode ny == 1 and there is exactly one tile.
+// ---------------------------------------------------------------------------------------------
+#define PXA_PXQ_NYT 16   // activation rows quantised per pass
+
+// scratch for one activation tile, as pxa_pxq_q8 blocks
+static struct pxa_pxq_q8 * pxa_q8_scratch(int64_t kb_n) {
+    static_assert(sizeof(struct pxa_pxq_q8) % sizeof(float) == 0,
+                  "pxa_pxq_q8 must be a whole number of floats to ride pxa_scratch");
+    return (struct pxa_pxq_q8 *)pxa_scratch((size_t)PXA_PXQ_NYT*(size_t)kb_n*
+                                            (sizeof(struct pxa_pxq_q8)/sizeof(float)));
+}
+
 void pxa_pxq_moe_up_gate_cpu(
         enum ggml_type type_up,   const void * up,
         enum ggml_type type_gate, const void * gate,
@@ -311,11 +415,44 @@ void pxa_pxq_moe_up_gate_cpu(
     const int64_t last  = first + chunk < nr0 ? first + chunk : nr0;
     if (first >= last) return;
 
-    float * u = pxa_scratch(2*(size_t)k);
-    float * g = u + k;
-
     const bool oai = unary_op == GGML_UNARY_OP_SWIGLU_OAI;
     const bool has_limit = limit > 1e-6f;
+
+    // fast path: both operands must be a tier pxq-dot.c covers. A mixed PXQ-UNIVERSAL pair with
+    // only one 4-bit side (e.g. gate=pxq2, up=pxq4) falls through to the dequant path below
+    // rather than running two different codecs in one loop.
+    if (pxa_pxq_dot_supported(type_up) && pxa_pxq_dot_supported(type_gate)) {
+        const int64_t kb_n = k/32;
+        struct pxa_pxq_q8 * q8 = pxa_q8_scratch(kb_n);
+        for (int64_t iy0 = 0; iy0 < ny; iy0 += PXA_PXQ_NYT) {
+            const int64_t nyt = ny - iy0 < PXA_PXQ_NYT ? ny - iy0 : PXA_PXQ_NYT;
+            for (int64_t t = 0; t < nyt; ++t) {
+                pxa_pxq_quantize_row_q8(pxa_x_row(src1f, nb11, nb12, rows, ne11, iy0 + t),
+                                        q8 + t*kb_n, k);
+            }
+            for (int64_t ix = first; ix < last; ++ix) {
+                const float ub = up_bias   ? up_bias[ix]   : 0.0f;
+                const float gb = gate_bias ? gate_bias[ix] : 0.0f;
+                for (int64_t t = 0; t < nyt; ++t) {
+                    const struct pxa_pxq_q8 * xq = q8 + t*kb_n;
+                    float gv  = pxa_pxq_dot_q8(type_gate, gate, ix, k, xq) + gb;
+                    float act = pxa_activate(unary_op, gv);
+                    if (has_limit && act > limit) act = limit;
+                    float uv = pxa_pxq_dot_q8(type_up, up, ix, k, xq) + ub;
+                    if (oai) {
+                        uv = 1.0f + (uv > 7.0f ? 7.0f : (uv < -7.0f ? -7.0f : uv));   // clamp_oai
+                    } else if (has_limit) {
+                        uv = uv > limit ? limit : (uv < -limit ? -limit : uv);
+                    }
+                    pxa_dst_row(dst, nb1, nb2, rows, iy0 + t)[ix] = uv*act;
+                }
+            }
+        }
+        return;
+    }
+
+    float * u = pxa_scratch(2*(size_t)k);
+    float * g = u + k;
 
     for (int64_t ix = first; ix < last; ++ix) {
         pxa_pxq_dequant_row(type_up,   up,   ix, k, u);
@@ -353,6 +490,25 @@ void pxa_pxq_mul_mat_cpu(
     const int64_t first = (int64_t)ith*chunk;
     const int64_t last  = first + chunk < nr0 ? first + chunk : nr0;
     if (first >= last) return;
+
+    if (pxa_pxq_dot_supported(type)) {
+        const int64_t kb_n = k/32;
+        struct pxa_pxq_q8 * q8 = pxa_q8_scratch(kb_n);
+        for (int64_t iy0 = 0; iy0 < ny; iy0 += PXA_PXQ_NYT) {
+            const int64_t nyt = ny - iy0 < PXA_PXQ_NYT ? ny - iy0 : PXA_PXQ_NYT;
+            for (int64_t t = 0; t < nyt; ++t) {
+                pxa_pxq_quantize_row_q8(pxa_x_row(src1f, nb11, nb12, rows, ne11, iy0 + t),
+                                        q8 + t*kb_n, k);
+            }
+            for (int64_t ix = first; ix < last; ++ix) {
+                for (int64_t t = 0; t < nyt; ++t) {
+                    pxa_dst_row(dst, nb1, nb2, rows, iy0 + t)[ix] =
+                        pxa_pxq_dot_q8(type, a, ix, k, q8 + t*kb_n);
+                }
+            }
+        }
+        return;
+    }
 
     float * w = pxa_scratch((size_t)k);
 

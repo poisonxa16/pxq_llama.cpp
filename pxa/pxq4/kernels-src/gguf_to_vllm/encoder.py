@@ -16,7 +16,7 @@ just a bandwidth one — gate G10 exists for exactly that and this module will h
 something that should not ship.
 
 THE ABI, frozen by plan §P2 (``tools/pxq4_encode/``, a pybind/C target that ``#include``s
-``<engine-tree>/src/pxq6-quantize.inc.cpp`` read-only so the file-static
+``/path/to/engine-repo/src/pxq6-quantize.inc.cpp`` read-only so the file-static
 ``pxq6_quantize_expert(src, dst, R, K, imx, tier, row0)`` becomes visible in its TU):
 
     int pxq4_encode(const float * src, uint8_t * dst, int R, int K, const float * imx_or_null)

@@ -10,7 +10,22 @@
 
     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
 */
-template <size_t n_experts, bool normalize>
+// PXA_TOPK_MOE_MULTIROW (default OFF): make the rows-per-block mapping safe when the fused
+// subgraph's outputs alias its logits input.
+//
+// This kernel already maps rows_per_block (4) gating rows onto one CUDA block, one warp each.
+// Every warp reads its whole row into registers before it writes anything, which makes the
+// aliasing safe WITHIN a row -- but the warps in a block are not synchronised with each other,
+// and `weights` advances by n_expert_used per row while `logits` advances by n_experts. So
+// warp 3's first weight store lands at offset 3*n_expert_used, which for a 512-expert top-10
+// router is inside the logits region that warp 0 may not have finished reading. If the graph
+// allocator has placed weights on top of logits, that is a race.
+//
+// The multi_row variant closes it with one block-wide barrier between the read phase and
+// everything that writes. It is only instantiated for n_rows > 1 (prefill / any multi-token
+// batch); single-row decode keeps the barrier-free code and is byte-for-byte what it was,
+// because a __syncthreads() also constrains instruction scheduling and FMA contraction.
+template <size_t n_experts, bool normalize, bool multi_row = false>
 __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * logits,
                                                                   float *       weights,
                                                                   int32_t *     ids,
@@ -18,13 +33,20 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                                                                   const int     n_rows,
                                                                   const int     n_expert_used) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= n_rows) {
-        return;
+    if constexpr (!multi_row) {
+        if (row >= n_rows) {
+            return;
+        }
     }
+    // With multi_row the out-of-range warps must still reach the barrier below, otherwise
+    // __syncthreads() deadlocks whenever n_rows is not a multiple of rows_per_block. They read
+    // row 0 and drop out immediately after it without ever storing anything.
+    const bool active = multi_row ? (row < n_rows) : true;
+    const int  row_c  = active ? row : 0;
 
-    logits += n_experts * row;
-    weights += n_expert_used * row;
-    ids += n_experts * row;
+    logits += n_experts * row_c;
+    weights += n_expert_used * row_c;
+    ids += n_experts * row_c;
 
     constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
 
@@ -34,6 +56,13 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     for (int i = 0; i < n_experts; i += WARP_SIZE) {
         const int expert        = i + threadIdx.x;
         logits_r[i / WARP_SIZE] = expert < n_experts ? logits[expert] + (bias ? bias[expert] : 0.0f) : -INFINITY;
+    }
+
+    if constexpr (multi_row) {
+        __syncthreads();
+        if (!active) {
+            return;
+        }
     }
 
     float max_val = logits_r[0];
@@ -150,7 +179,16 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void simple_moe_cuda(const float 
     }
 }
 
-template <bool normalize>
+// PXA_TOPK_MOE_MULTIROW=1 enables the block-wide aliasing barrier for n_rows > 1. Default OFF.
+static bool pxa_topk_moe_multirow_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_TOPK_MOE_MULTIROW");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+template <bool normalize, bool multi_row>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
                                  float *                     weights,
@@ -171,34 +209,34 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
 
     switch (n_expert) {
         case 1:
-            topk_moe_cuda<1, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<1, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 2:
-            topk_moe_cuda<2, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<2, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 4:
-            topk_moe_cuda<4, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<4, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 8:
-            topk_moe_cuda<8, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<8, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 16:
-            topk_moe_cuda<16, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<16, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 32:
-            topk_moe_cuda<32, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<32, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 64:
-            topk_moe_cuda<64, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<64, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 128:
-            topk_moe_cuda<128, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<128, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 256:
-            topk_moe_cuda<256, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<256, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 512:
-            topk_moe_cuda<512, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<512, normalize, multi_row><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         default:
             GGML_ASSERT(false && "fatal error");
@@ -231,12 +269,24 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context & ctx,
 
     cudaStream_t stream = ctx.stream();
 
+    // Only the n_rows > 1 launch pays for the aliasing barrier; the single-row decode path
+    // generates exactly the code it did before.
+    const bool multi = n_rows > 1 && pxa_topk_moe_multirow_enabled();
+
     if (weights->op == GGML_OP_DIV) {
         const int n_expert_used = weights->ne[0];
-        launch_topk_moe_cuda<true >(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        if (multi) {
+            launch_topk_moe_cuda<true , true >(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        } else {
+            launch_topk_moe_cuda<true , false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        }
     } else {
         const int n_expert_used = weights->ne[1];
-        launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        if (multi) {
+            launch_topk_moe_cuda<false, true >(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        } else {
+            launch_topk_moe_cuda<false, false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 
 Status: definitive. Supersedes `08-design-minimal-risk.md`, `08-design-max-performance.md`,
 `08-design-least-code.md`. Implementation agents build from this file.
-No GPU was run. No container was restarted. Nothing under `<engine-tree>` was modified.
+No GPU was run. No container was restarted. Nothing under `/path/to/engine-repo` was modified.
 
 ---
 
@@ -13,15 +13,15 @@ this box is ≈ +9% over the incumbent's measured 92.8 tok/s peak, and reaching 
 requires re-encoding three tensor classes that are *not* PXQ4 in the artifact today.
 The v1 that ships without re-encoding is a ~23% REGRESSION.**
 
-I re-derived this independently from both checkpoints this pass, and it confirms
+I re-derived this independently from both checkpoints this session, and it confirms
 `08-design-least-code`'s correction (max-performance got the direction right but the wrong
 magnitude; minimal-risk's 5.225 GiB/GPU over-counts).
 
-Measured inputs (FACT, both read this pass):
+Measured inputs (FACT, both read this session):
 
 | | source | bytes |
 |---|---|---:|
-| AWQ body (layers 0–63, excl. lm_head/embed/visual/mtp) | safetensors headers, `awq.py` this pass | 12,691,100,928 (11.820 GiB) |
+| AWQ body (layers 0–63, excl. lm_head/embed/visual/mtp) | safetensors headers, `awq.py` this session | 12,691,100,928 (11.820 GiB) |
 | AWQ `lm_head.weight` | **BF16, unquantized** — `ignore` list has `lm_head` | 2,542,796,800 |
 | AWQ `embed_tokens` | BF16 | 2,542,796,800 |
 | AWQ visual (333 tensors) | BF16, all in `ignore` | 921,460,192 |
@@ -31,7 +31,7 @@ Measured inputs (FACT, both read this pass):
 Per-tensor proof of the bpw gap: their `mlp.gate_proj` (17408×5120) costs
 `weight_packed 44,564,480 + weight_scale 1,392,640 + weight_zero_point 348,160 = 46,305,280 B`
 = **4.156 bpw** (group_size 128, 4-bit, asymmetric — `config.json quantization_config`, read
-this pass). Our PXQ4 `ffn_gate` of the same shape is **47,384,576 B = 4.2540 bpw**
+this session). Our PXQ4 `ffn_gate` of the same shape is **47,384,576 B = 4.2540 bpw**
 (`4.25 + 16/K`, `ggml.h:465-467`). **PXQ4 is 2.33% larger per tensor than their AWQ.**
 
 Decode bytes read per GPU at TP=4 (weights only; embed is a gather, not a read; MTP not loaded):
@@ -112,7 +112,7 @@ param loaders that silently mis-shard) and is achievable by policy alone.
 
 ## 2. Verified facts this plan rests on
 
-Everything below was read in source **this pass** unless marked otherwise.
+Everything below was read in source **this session** unless marked otherwise.
 
 ### 2.1 The plugin seam
 - `register_quantization_config(name)` — `quantization/__init__.py:57-102`. Appends to the
@@ -190,14 +190,14 @@ only `UnquantizedLinearMethod.process_weights_after_loading` sets (`:408`). Our 
 `_sm70_f16_force_enable = True` on every `qkv_proj`/`out_proj` — inert without `_prepared`,
 but set the forbid flag anyway.
 
-### 2.7 Toolchain (read this pass, inside the running container)
+### 2.7 Toolchain (read this session, inside the running container)
 Python 3.12.3 · torch **2.10.0+cu128** · nvcc **12.8** V12.8.93 · gcc 12.4.0 ·
 vllm `0.1.dev1+g2ceb15066` at `/opt/vllm-venv/lib/python3.12/site-packages/vllm`, source at
 `/opt/1Cat-vLLM`. **Container `/` is 100% full (207 G used, 0 avail); `/path/to/models` has 567 G.**
 Nothing may be installed into the image. Everything we ship lives under `/path/to/models` and is
 reached by `PYTHONPATH` + a hand-written `.dist-info` (see §7.4).
 
-### 2.8 PXQ4 device format (re-read this pass)
+### 2.8 PXQ4 device format (re-read this session)
 `pxq6_pol_p6` (`pxq6.cuh:317-346`): `SLAB=1088, HDR=128, CODE_OFF=64, NEFF=2`;
 `row_effs` = `eff[0]=anch*sub[b&0xf]` (elems 0–15), `eff[1]=anch*sub[b>>4]` (elems 16–31);
 `pair()` = `tab[byte&0xf], tab[byte>>4]`, LE byte `b` of the 16-byte code row.
@@ -317,7 +317,7 @@ by `struct` and `np.memmap`s the data section. (Existing working prototype:
 ```
 python -m pxq4_gguf.convert \
   --gguf     /path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
-  --ref-hf   /path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ \
+  --ref-hf   /path/to/hf/<reference-hf-model> \
   --out      /path/to/models/pxa-models/Qwen3.8-27B-PXQ4-vllm \
   --policy   {p1,p2a,p2b,p2c} \
   [--encoder /path/to/models/pxa-vllm-pxq4/build/pxq4_encode.so]      # P2 only
@@ -658,7 +658,7 @@ Namespace is `pxq4`, **not** `_C` — we must not collide with the fork's own `t
 Both ops preallocate nothing, allocate nothing, and are capture-safe.
 
 ### 7.2 Vendoring: what to copy, and the only three lines to change
-Copy **verbatim** from `<engine-tree>` (read-only source; do not edit that tree):
+Copy **verbatim** from `/path/to/engine-repo` (read-only source; do not edit that tree):
 
 | from | symbols |
 |---|---|
@@ -784,7 +784,7 @@ with no input from B or C. Agent C can reach G6 against A's `reference.dequant` 
 
 Estimated LOC: converter 850 · runtime python 420 · CUDA 900 (of which ~500 vendored verbatim)
 · tests 350 · encoder shim (P2) 180. **≈2,700 total, ≈2,200 hand-written.
-Files modified in `/opt/1Cat-vLLM` or `<engine-tree>`: 0.**
+Files modified in `/opt/1Cat-vLLM` or `/path/to/engine-repo`: 0.**
 
 ---
 

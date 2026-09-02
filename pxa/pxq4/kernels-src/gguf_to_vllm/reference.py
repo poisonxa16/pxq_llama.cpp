@@ -28,7 +28,7 @@ from .layout import (CODE_BYTES, CODE_OFF, PANEL_ROWS, SLAB_BYTES, SLAB_COLS)
 # ---------------------------------------------------------------------------------------------
 # The frozen tables, transcribed from ggml/include/ggml-pxq6-tables.h:33-44 as C99 hex float
 # literals exactly as they appear in the header. float.fromhex parses the same grammar C does,
-# so the transcription is difrun by eye against the header and cannot drift through decimal
+# so the transcription is diffable by eye against the header and cannot drift through decimal
 # rounding. (The same 32 values are also stored in the file as the gguf KVs pxa.pxq6.book /
 # pxa.pxq6.sub — the converter reads those and cross-checks them against these, because
 # PXA_PXQ6_BOOK / PXA_PXQ6_SUB can override the compiled-in tables at build time.)

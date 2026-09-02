@@ -35,7 +35,7 @@ identical alignment constants and identical loader mechanics.
 **column-parallel said YES (verified). moe-and-mixed said NOT VERIFIED and flagged it as one of
 the two largest remaining unknowns. column-parallel is RIGHT.**
 
-FACT, `<engine-tree>:1993-2007`
+FACT, `/path/to/engine-repo/src/llama-build-context.cpp:1993-2007`
 (`llm_build_mul_mat_qkv_gated`):
 ```
 auto Qaux     = llm_build_lora_mm(lctx, ctx0, wq, cur);              // :1994
@@ -128,7 +128,7 @@ Structural proof, not assertion:
 - The dequant contract has **zero cross-K and zero cross-row coupling**:
   `eff = fp32(anchor_fp16) * SUB16[s4]`, `w = eff * BOOK[code]`. The anchor is read **once** from the
   panel header before the K loop and never re-derived —
-  `<engine-tree>:141` (`const float anchor = GGML_COMPUTE_FP16_TO_FP32(((const uint16_t*)panel)[r]);`),
+  `/path/to/engine-repo/ggml/src/pxq-cpu.c:141` (`const float anchor = GGML_COMPUTE_FP16_TO_FP32(((const uint16_t*)panel)[r]);`),
   loop body `:143-157`. CUDA policy is identical (`ggml/src/ggml-cuda/pxq6.cuh:323-330`, consumed `:700-712`).
 - The kernels take **`kslabs` as a runtime argument** and derive the panel stride from it:
   `pxq6_panel_stride<POL>(kslabs) = POL::HDR + kslabs*POL::SLAB` (`pxq6.cuh:519-522`) and
@@ -147,7 +147,7 @@ Structural proof, not assertion:
 
 **The algorithm can today; the tooling cannot.** Checked, not assumed.
 
-FACT, `<engine-tree>:287-289`:
+FACT, `/path/to/engine-repo/src/pxq6-quantize.inc.cpp:287-289`:
 ```
 static void pxq6_quantize_expert(const float * src, uint8_t * dst, int64_t R, int64_t K,
                                  const float * imx, int tier,
@@ -185,7 +185,7 @@ Bottom line: **we are not blocked on quantizer capability, and we do not need to
   `pxa_pxq_dequant_row`), constants in `ggml/include/ggml-pxq6-tables.h:21-27`
   (`QK 32 / TYPE_SIZE 17 / BM 64 / SLAB 1088 / HDR 128 / ROW_META 2`). Port from **pxq6.cuh**.
 - **The incumbent AWQ ignore list is more generous than assumed** (read from
-  `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ/config.json`, 311 entries):
+  `/path/to/hf/<reference-hf-model>/config.json`, 311 entries):
   it contains `lm_head`, every `mtp.*` linear, all `visual.*`, and per-layer
   `linear_attn`, `linear_attn.norm`, `linear_attn.in_proj_b`, `linear_attn.in_proj_a`.
   So **their 4.64 GiB/GPU carries an fp16 lm_head and an fp16 MTP block** — confirming the moe agent's

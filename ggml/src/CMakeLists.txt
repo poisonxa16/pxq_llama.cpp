@@ -1507,6 +1507,8 @@ add_library(ggml
             ggml-quants.h
             pxq-cpu.c
             pxq-cpu.h
+            pxq-dot.c
+            pxq-dot.h
             pxq-cpu-ops.cpp
             pxq-cpu-ops.h
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}

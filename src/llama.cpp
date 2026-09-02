@@ -891,7 +891,7 @@ static void llama_kv_swa_evict(llama_context & lctx, const llama_batch & batch, 
     for (uint32_t i = 0; i < cache.size; ++i) {
         const auto & cell = cache.cells[i];
         if (cell.pos < 0) continue;
-        for (auto s : cell.seq_id) {
+        for (auto s : cell.seqs()) {
             auto it = ref.find(s);
             if (it == ref.end() || it->second < cell.pos) ref[s] = cell.pos;
         }
@@ -917,14 +917,14 @@ static void llama_kv_swa_evict(llama_context & lctx, const llama_batch & batch, 
         if (cell.pos < 0 || cell.is_empty()) continue;
 
         bool live = false;
-        for (auto s : cell.seq_id) {
+        for (auto s : cell.seqs()) {
             auto it = ref.find(s);
             // a sequence with no reference position cannot be shown to have moved past this cell
             if (it == ref.end() || it->second - cell.pos < n_keep) { live = true; break; }
         }
         if (live) continue;
 
-        cell.seq_id.clear();
+        cell.clear_seq();
         cell.pos   = -1;
         cell.delta = 0;
         cache.used--;
@@ -996,7 +996,7 @@ static bool llama_kv_swa_find_slot(llama_kv_cache & cache, const llama_batch & b
     for (uint32_t i = 0; i < n; ++i) {
         cache.cells[cache.head + i].pos = batch.pos[i];
         for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
-            cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
+            cache.cells[cache.head + i].add_seq(batch.seq_id[i][j]);
         }
     }
     cache.used += n;
@@ -1012,7 +1012,7 @@ static void llama_kv_swa_release_slot(llama_kv_cache & cache, uint32_t head, uin
         if (cell.pos >= 0) {
             cell.pos = -1;
             cell.delta = 0;
-            cell.seq_id.clear();
+            cell.clear_seq();
             cache.used--;
         }
     }
@@ -1606,7 +1606,7 @@ static bool llama_kv_cache_find_slot(
         cache.cells[cache.head + i].pos = batch.pos[i];
 
         for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
-            cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
+            cache.cells[cache.head + i].add_seq(batch.seq_id[i][j]);
         }
     }
 
@@ -2154,7 +2154,7 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     for (int32_t i = 0; i < (int32_t) cache.size; ++i) {
         cache.cells[i].pos = -1;
         cache.cells[i].src = i;
-        cache.cells[i].seq_id.clear();
+        cache.cells[i].clear_seq();
     }
     cache.head = 0;
     cache.used = 0;
@@ -2198,9 +2198,9 @@ static bool llama_kv_cache_seq_rm(
     for (uint32_t i = 0; i < cache.size; ++i) {
         if (cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
             if (seq_id < 0) {
-                cache.cells[i].seq_id.clear();
+                cache.cells[i].clear_seq();
             } else if (cache.cells[i].has_seq_id(seq_id)) {
-                cache.cells[i].seq_id.erase(seq_id);
+                cache.cells[i].erase_seq(seq_id);
             } else {
                 continue;
             }
@@ -2242,9 +2242,9 @@ static void llama_kv_cache_seq_cp(
 
             // preserve the "keep or clear" status of the copied sequence
             if (cache.cells[seq_id_src].has_seq_id(seq_id_src)) {
-                cache.cells[seq_id_dst].seq_id.insert(seq_id_dst);
+                cache.cells[seq_id_dst].add_seq(seq_id_dst);
             } else {
-                cache.cells[seq_id_dst].seq_id.erase(seq_id_dst);
+                cache.cells[seq_id_dst].erase_seq(seq_id_dst);
             }
 
             cache.do_copy = true;
@@ -2274,7 +2274,7 @@ static void llama_kv_cache_seq_cp(
 
     for (uint32_t i = 0; i < cache.size; ++i) {
         if (cache.cells[i].has_seq_id(seq_id_src) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
-            cache.cells[i].seq_id.insert(seq_id_dst);
+            cache.cells[i].add_seq(seq_id_dst);
         }
     }
 }
@@ -2290,11 +2290,11 @@ static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id 
             if (has_qnext_state) {
                 cache.cells[i].src = i;
             }
-            cache.cells[i].seq_id.clear();
+            cache.cells[i].clear_seq();
             if (new_head == cache.size) new_head = i;
         } else {
-            cache.cells[i].seq_id.clear();
-            cache.cells[i].seq_id.insert(seq_id);
+            cache.cells[i].clear_seq();
+            cache.cells[i].add_seq(seq_id);
         }
     }
 
@@ -2337,7 +2337,7 @@ static void llama_kv_cache_seq_add(
                     cache.used--;
                 }
                 cache.cells[i].pos = -1;
-                cache.cells[i].seq_id.clear();
+                cache.cells[i].clear_seq();
                 if (new_head == cache.size) {
                     new_head = i;
                 }
@@ -4677,6 +4677,46 @@ static bool llm_load_tensors(
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+// PXA PXQ census (2026-09-01) -- the one place that knows which ggml types are PXQ slabs, so
+// the load banner and llama_model_pxq_file_desc() can never disagree about what a file is.
+// Order of the counters: pxq1, pxq2, pxq3, pxq4 (incl. PXQ4HQ), pxq6.
+enum { LLAMA_PXQ_TIER_COUNT = 5 };
+
+static void llama_pxq_census_add(enum ggml_type type, int counts[LLAMA_PXQ_TIER_COUNT]) {
+    switch (type) {
+        case GGML_TYPE_PXQ1:   counts[0]++; break;
+        case GGML_TYPE_PXQ2:   counts[1]++; break;
+        case GGML_TYPE_PXQ3:   counts[2]++; break;
+        case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ: counts[3]++; break;
+        case GGML_TYPE_PXQ6:   counts[4]++; break;
+        default: break;
+    }
+}
+
+static int llama_pxq_census_total(const int counts[LLAMA_PXQ_TIER_COUNT]) {
+    int n = 0;
+    for (int i = 0; i < LLAMA_PXQ_TIER_COUNT; ++i) {
+        n += counts[i];
+    }
+    return n;
+}
+
+// The named codec is the tier holding the most tensors. Callers print the full per-tier
+// census alongside it, so this headline can never hide a mixed (--pxq-universal) file.
+static const char * llama_pxq_census_codec(const int counts[LLAMA_PXQ_TIER_COUNT]) {
+    static const char * const names[LLAMA_PXQ_TIER_COUNT] = { "PXQ1", "PXQ2", "PXQ3", "PXQ4", "PXQ6" };
+    int best = -1;
+    int best_i = 3;   // PXQ4 -- only reached when every counter is 0, and callers gate on that
+    for (int i = 0; i < LLAMA_PXQ_TIER_COUNT; ++i) {
+        if (counts[i] > best) {
+            best   = counts[i];
+            best_i = i;
+        }
+    }
+    return names[best_i];
+}
+
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     try {
         llama_model_loader ml(fname, params.ncmoe, params.use_mmap, params.check_tensors,
@@ -4758,6 +4798,42 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             ggml_pxa_set_model_profile(&prof);
         }
 
+        // PXA product startup banner (2026-09-01). Two facts an operator needs before the
+        // first token and cannot otherwise get without reading the GGUF by hand: which PXQ
+        // codec THIS file carries, and which arch dispatch path the tier logic picks for each
+        // CUDA device. Pure reporting — the census below feeds no dispatch decision, and the
+        // path string is restated from the resolvers in pxa-enhance.cuh, never decided here.
+        {
+            int counts[LLAMA_PXQ_TIER_COUNT] = {};
+            for (const auto & w : ml.weights) {
+                if (w.tensor) {
+                    llama_pxq_census_add(w.tensor->type, counts);
+                }
+            }
+            const int n_slab = llama_pxq_census_total(counts);
+            if (n_slab == 0) {
+                LLAMA_LOG_INFO("pxq_llama: engine | codec=off\n");
+            } else {
+                char pxq1_extra[32] = "";
+                if (counts[0] > 0) {
+                    snprintf(pxq1_extra, sizeof(pxq1_extra), ", pxq1 %d", counts[0]);
+                }
+                LLAMA_LOG_INFO("pxq_llama: engine | codec=%s (%d tensors; pxq2 %d, pxq3 %d, pxq4 %d, pxq6 %d%s)\n",
+                        llama_pxq_census_codec(counts), n_slab,
+                        counts[1], counts[2], counts[3], counts[4], pxq1_extra);
+            }
+#ifdef GGML_USE_CUDA
+            for (int dev = 0; dev < ggml_backend_cuda_get_device_count(); ++dev) {
+                char dev_name[256] = {};
+                ggml_backend_cuda_get_device_description(dev, dev_name, sizeof(dev_name));
+                const int cc = ggml_backend_cuda_get_device_cc(dev);
+                LLAMA_LOG_INFO("pxq_llama: dev %d %s cc %d.%d -> path: %s\n",
+                        dev, dev_name, cc / 100, (cc % 100) / 10,
+                        ggml_backend_cuda_get_device_pxa_path(dev));
+            }
+#endif // GGML_USE_CUDA
+        }
+
         if (model.vocab.get_type() != LLAMA_VOCAB_TYPE_NONE &&
             model.hparams.n_vocab != model.vocab.n_tokens()) {
             throw std::runtime_error("vocab size mismatch");
@@ -4814,6 +4890,88 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 // different widths, so the sliding mask gets its own pass. The per-element rule is deliberately
 // identical to the fused path (same seq/causality test, same "pos - cell.pos >= n_swa" cut), so the
 // SET of contributing K/V rows is unchanged - only where those rows physically live.
+// ---- PXA_HOST_TIMING (house custom, DEFAULT OFF) -------------------------------------------
+// PXA_HOST_TIMING=N: per-decode-step host wall-time buckets, one summary line to stderr every N
+// recorded steps. A step is recorded when its llama_decode carries < 32 tokens (decode and
+// spec-verify shapes); prefill ubatches reset the accumulators and are not recorded. One record is
+// one inter-token interval, measured from the end of the previous recorded llama_decode to the end
+// of this one, so it contains, in µs:
+//   sync   : ggml_backend_sched_synchronize wait, i.e. the GPU time of the PREVIOUS step as the host sees it
+//   sample : common_sampler_sample of the previous step (reported via llama_pxa_host_timing_add_sample)
+//   build  : scheduler reset + llama_build_graph of this step (0 when the cached graph is reused)
+//   alloc  : ggml_backend_sched_alloc_graph (0 on reuse)
+//   mask   : the causal KQ-mask fill inside llama_set_inputs
+//   setinp : the rest of llama_set_inputs (positions, tokens, ...)
+//   submit : ggml_backend_sched_graph_compute_async (CPU-resident splits execute inline here)
+//   getout : logits / embeddings copy-out enqueue (only blocks if the host buffer is pageable)
+//   other  : wall - sum of the above (server bookkeeping, batch build, streaming, tokenizer, ...)
+// Median and mean of each column over the N records, plus tok/s = N / sum(wall).
+// Zero cost when unset: every hook is guarded by one static int compare. Single-decode-thread
+// instrument: it is process-global, so read it only from a process with one decoding thread.
+namespace {
+enum pxa_ht_bucket { PXA_HT_BUILD, PXA_HT_ALLOC, PXA_HT_MASK, PXA_HT_SETINP, PXA_HT_SUBMIT, PXA_HT_SYNC, PXA_HT_GETOUT, PXA_HT_SAMPLE, PXA_HT_NB };
+constexpr const char * pxa_ht_names[PXA_HT_NB + 2] = {"build", "alloc", "mask", "setinp", "submit", "sync", "getout", "sample", "other", "wall"};
+struct pxa_host_timing {
+    int64_t cur[PXA_HT_NB] = {};
+    int64_t t_prev_end = 0;
+    std::vector<std::array<int64_t, PXA_HT_NB + 2>> rows;
+};
+int pxa_ht_every() {
+    static const int v = [] { const char * e = getenv("PXA_HOST_TIMING"); const int n = e ? atoi(e) : 0; return n > 0 ? n : 0; }();
+    return v;
+}
+pxa_host_timing & pxa_ht() { static pxa_host_timing s; return s; }
+inline void pxa_ht_add(int b, int64_t us) { pxa_ht().cur[b] += us; }
+void pxa_ht_close_step(uint32_t n_tokens_all) {
+    auto & h = pxa_ht();
+    const int64_t now = ggml_time_us();
+    if (n_tokens_all >= 32 || h.t_prev_end == 0) {
+        // prefill, or the first step after start: not an inter-token interval
+        for (auto & c : h.cur) c = 0;
+        h.t_prev_end = now;
+        return;
+    }
+    std::array<int64_t, PXA_HT_NB + 2> row{};
+    int64_t sum = 0;
+    for (int b = 0; b < PXA_HT_NB; ++b) { row[b] = h.cur[b]; sum += h.cur[b]; h.cur[b] = 0; }
+    const int64_t wall = now - h.t_prev_end;
+    row[PXA_HT_NB]     = wall - sum;
+    row[PXA_HT_NB + 1] = wall;
+    h.t_prev_end = now;
+    h.rows.push_back(row);
+    if ((int) h.rows.size() < pxa_ht_every()) {
+        return;
+    }
+    const size_t n = h.rows.size();
+    double wall_sum = 0;
+    for (const auto & r : h.rows) wall_sum += (double) r[PXA_HT_NB + 1];
+    fprintf(stderr, "PXA_HOST_TIMING n=%zu tok/s=%.2f us(med/mean):", n, wall_sum > 0 ? n*1e6/wall_sum : 0.0);
+    std::vector<int64_t> col(n);
+    for (int b = 0; b < PXA_HT_NB + 2; ++b) {
+        double mean = 0;
+        for (size_t i = 0; i < n; ++i) { col[i] = h.rows[i][b]; mean += (double) col[i]; }
+        std::nth_element(col.begin(), col.begin() + n/2, col.end());
+        fprintf(stderr, " %s=%lld/%lld", pxa_ht_names[b], (long long) col[n/2], (long long) (mean/n));
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    h.rows.clear();
+}
+} // namespace
+
+// ---- PXA_KV_SEQ_SOA (house custom, DEFAULT OFF) -------------------------------------------
+// =1: the causal KQ-mask fill answers "does cell i belong to seq s" from the inline shadow in
+// llama_kv_cell (one int compare) instead of std::set::find into a heap node per cell. The
+// predicate is unchanged; only the lookup is. The shadow is maintained unconditionally by the
+// cell accessors, so this is a read-side switch that can be A/B'd at will.
+static bool pxa_kv_seq_soa_enabled() {
+    static const bool v = [] { const char * e = getenv("PXA_KV_SEQ_SOA"); return e && atoi(e) != 0; }();
+    return v;
+}
+static inline bool pxa_cell_has_seq(const llama_kv_cell & c, llama_seq_id s, bool soa) {
+    return soa ? c.has_seq_fast(s) : c.has_seq_id(s);
+}
+
 static void llama_set_inp_KQ_mask_swa(llama_context & lctx, const llama_batch & batch) {
     const auto & hparams = lctx.model.hparams;
     const auto & cparams = lctx.cparams;
@@ -4844,7 +5002,7 @@ static void llama_set_inp_KQ_mask_swa(llama_context & lctx, const llama_batch & 
                 const auto & cell = kv.cells[i];
 
                 float f;
-                if (!cell.has_seq_id(seq_id) || cell.pos > pos || cell.pos < 0) {
+                if (!pxa_cell_has_seq(cell, seq_id, pxa_kv_seq_soa_enabled()) || cell.pos > pos || cell.pos < 0) {
                     f = -INFINITY;
                 } else if (hparams.use_alibi) {
                     f = -std::abs(cell.pos - pos);
@@ -4951,6 +5109,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     const auto & hparams = lctx.model.hparams;
     const auto & cparams = lctx.cparams;
     const auto & kv_self = lctx.kv_self;
+
+    // PXA_KQ_MASK_PAD1 (default OFF): tell the scheduler how many rows of the [n_kv, PAD(n_tokens,16)]
+    // KQ mask carry live data for THIS ubatch, so the blocking whole-tensor H2D in
+    // ggml_backend_sched_copy_inputs() can be trimmed to that prefix at decode. Published
+    // unconditionally and re-published on every ubatch so a decode value can never leak into a
+    // prefill graph; with the env unset the scheduler ignores it entirely.
+    ggml_backend_pxa_set_kqmask_live_rows(batch.n_tokens);
 
     if (batch.token && lctx.inp_tokens) {
 #if IK_PRINT_TIMING == 2
@@ -5159,6 +5324,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #if IK_PRINT_TIMING == 2
         auto tim1 = ggml_time_us();
 #endif
+        const int64_t pxa_ht_mask0 = pxa_ht_every() ? ggml_time_us() : 0;
         // NOTE: hparams.causal_attn indicates the model is capable of generation and uses the kv cache.
         if (cparams.causal_attn && !lctx.is_encoding) {
             const llama_kv_cache & mask_kv_self =
@@ -5199,11 +5365,24 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 llama_set_inp_KQ_mask_swa(lctx, batch);
             }
 
-            auto noalibi_f16 = [&mask_kv_self, &hparams, n_kv, data_f16, data_swa_f16] (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
+            const bool soa = pxa_kv_seq_soa_enabled();
+
+            auto noalibi_f16 = [&mask_kv_self, &hparams, n_kv, data_f16, data_swa_f16, soa] (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
                 ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
                 ggml_half h_zero = ggml_fp32_to_fp16(0.f);
+                if (soa && data_f16 && !data_swa_f16) {
+                    // PXA_KV_SEQ_SOA=1: the decode-shaped fill (one f16 row, no sliding mask).
+                    // Same predicate as below, read off the cell shadow; no set lookups.
+                    const llama_kv_cell * cells = mask_kv_self.cells.data();
+                    ggml_half * row = data_f16 + (size_t) j*n_kv;
+                    for (int i = first; i < last; ++i) {
+                        const llama_kv_cell & c = cells[i];
+                        row[i] = (c.has_seq_fast(seq_id) && c.pos <= pos) ? h_zero : h_inf;
+                    }
+                    return;
+                }
                 for (int i = first; i < last; ++i) {
-                    ggml_half h = !mask_kv_self.cells[i].has_seq_id(seq_id) || mask_kv_self.cells[i].pos > pos ? h_inf : h_zero;
+                    ggml_half h = !pxa_cell_has_seq(mask_kv_self.cells[i], seq_id, soa) || mask_kv_self.cells[i].pos > pos ? h_inf : h_zero;
                     if (data_f16) data_f16[j*n_kv + i] = h;
                     if (data_swa_f16) {
                         if (h != h_inf) {
@@ -5226,7 +5405,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             if (n_kv >= 1024 && n_tokens >= 32) {
                 int n_thread = std::max(1, int(std::thread::hardware_concurrency()/2));
                 int npt = (n_kv + n_thread - 1)/n_thread;
-                auto compute = [&batch, &mask_kv_self, &hparams, &cparams, &noalibi_f16, n_tokens, n_kv, npt, data, data_swa, data_f16, data_swa_f16] (int ith) {
+                auto compute = [&batch, &mask_kv_self, &hparams, &cparams, &noalibi_f16, n_tokens, n_kv, npt, data, data_swa, data_f16, data_swa_f16, soa] (int ith) {
                     int first = ith * npt;
                     int last  = std::min(int(n_kv), first + npt);
                     if (last <= first) return;
@@ -5241,7 +5420,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
                         for (int i = first; i < last; ++i) {
                             float f;
-                            if (!mask_kv_self.cells[i].has_seq_id(seq_id) || mask_kv_self.cells[i].pos > pos) {
+                            if (!pxa_cell_has_seq(mask_kv_self.cells[i], seq_id, soa) || mask_kv_self.cells[i].pos > pos) {
                                 f = -INFINITY;
                             } else {
                                 if (hparams.use_alibi) {
@@ -5322,7 +5501,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
                     for (int i = 0; i < n_kv; ++i) {
                         float f;
-                        if (!mask_kv_self.cells[i].has_seq_id(seq_id) || mask_kv_self.cells[i].pos > pos) {
+                        if (!pxa_cell_has_seq(mask_kv_self.cells[i], seq_id, soa) || mask_kv_self.cells[i].pos > pos) {
                             f = -INFINITY;
                         } else {
                             if (hparams.use_alibi) {
@@ -5362,7 +5541,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
 
                 int64_t n_tokens_padded = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
-                if (n_tokens_padded > n_tokens) {
+                // PXA_KQ_MASK_PAD1=2 (default OFF): with the device copy trimmed to row 0 the pad
+                // rows are never uploaded, so filling them on the host is pure cost (a
+                // single-threaded 15*n_kv*2 B memset per decoded token -- the threading gate above
+                // needs n_tokens >= 32 and this branch is n_tokens == 1). The conditions here are
+                // the same ones pxa_kqmask_trimmable() checks, so the fill is skipped ONLY when the
+                // trim is guaranteed to fire; mode 1 keeps the fill.
+                const bool pxa_skip_pad_fill =
+                    ggml_backend_pxa_kqmask_mode() >= 2 && n_tokens == 1 && cparams.flash_attn &&
+                    (!lctx.inp_KQ_mask     || lctx.inp_KQ_mask->ne[1]     == GGML_KQ_MASK_PAD) &&
+                    (!lctx.inp_KQ_mask_swa || lctx.inp_KQ_mask_swa->ne[1] == GGML_KQ_MASK_PAD) &&
+                    data == nullptr && data_swa == nullptr;
+                if (n_tokens_padded > n_tokens && !pxa_skip_pad_fill) {
                     if (data) {
                         std::fill(data + int64_t(n_tokens)*n_kv, data + n_tokens_padded*n_kv, -INFINITY);
                     }
@@ -5384,6 +5574,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             auto tim2 = ggml_time_us();
             printf("set_inputs(mask1): %d us\n", int(tim2-tim1));
 #endif
+            if (pxa_ht_every()) pxa_ht_add(PXA_HT_MASK, ggml_time_us() - pxa_ht_mask0);
         } else {
             // when using kv cache, the mask needs to match the kv cache size
             const int64_t n_tokens = batch.n_tokens;
@@ -5584,7 +5775,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
                 // ensure current sequences will be kept
                 if (!has_self_seq && kv_cell.pos >= 0) {
-                    kv_cell.seq_id.insert(seq_id);
+                    kv_cell.add_seq(seq_id);
                 }
             }
         }
@@ -5655,7 +5846,22 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             const llama_seq_id seq = seq_of(i);
             if (snap.count(seq)) continue;
             auto & hst = lctx.ple_hist[seq];
-            if (hst.next_pos != pos_of(i)) { hst.next_pos = pos_of(i); hst.toks.clear(); }
+            if (hst.next_pos != pos_of(i)) {
+                hst.next_pos = pos_of(i); hst.toks.clear();
+                // The conv-input window of this sequence is just as stale as the token
+                // window: a request that does not continue the previous one (a new
+                // prompt on the same slot, a rewind, a cache clear) must start from the
+                // zero window a fresh sequence gets, not from the tail of whatever the
+                // slot computed last. Without this the second request on a slot inherited
+                // the first request's conv history.
+                auto it = lctx.ple_conv_hist.find(seq);
+                if (it != lctx.ple_conv_hist.end()) {
+                    std::fill(it->second.begin(), it->second.end(), 0.0f);
+                }
+                if (lctx.ple_conv_hist_seq == seq) {
+                    lctx.ple_conv_hist_prev.clear();
+                }
+            }
             if ((int64_t) hst.toks.size() > n_gram - 1) {
                 hst.toks.erase(hst.toks.begin(), hst.toks.end() - (n_gram - 1));
             }
@@ -5732,6 +5938,26 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
                 lctx.ple_conv_hist_seq = seqs.empty() ? 0 : *seqs.begin();
                 lctx.ple_conv_n_tokens = (int32_t) n_tokens;
+            }
+            // PXA_PIPELINE_PP: the window is device-resident and carried in-graph; the only
+            // host write is the keep flag. 1 = this ubatch continues the sequence the
+            // window belongs to; 0 = fresh window (new request, rewind, cache clear) -
+            // the discontinuity test ple_hist applies to the n-gram token window above.
+            if (lctx.inp_ple_conv_keep && lctx.inp_ple_conv_keep->buffer) {
+                const llama_seq_id seq0 = seqs.empty() ? 0 : *seqs.begin();
+                const llama_pos    pos0 = n_tokens > 0 ? pos_of(0) : 0;
+                const bool cont = lctx.ple_conv_dev_valid &&
+                                  lctx.ple_conv_dev_seq == seq0 &&
+                                  lctx.ple_conv_dev_next_pos == pos0;
+                const float keep = cont ? 1.0f : 0.0f;
+                ggml_backend_tensor_set(lctx.inp_ple_conv_keep, &keep, 0, sizeof(keep));
+                lctx.ple_conv_dev_valid    = true;
+                lctx.ple_conv_dev_seq      = seq0;
+                lctx.ple_conv_dev_next_pos = n_tokens > 0 ? pos_of(n_tokens - 1) + 1 : pos0;
+                if (getenv("PXA_QWEN4EXP_PLE_DEBUG")) {
+                    fprintf(stderr, "PLE_DBG keep: seq=%d pos0=%d keep=%.0f next=%d\n",
+                            (int) seq0, (int) pos0, keep, (int) lctx.ple_conv_dev_next_pos);
+                }
             }
         }
 
@@ -6027,6 +6253,10 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     return n_outputs_max;
 }
 
+
+// defined below, next to llama_kv_cache_update_internal (the other re-reserve site)
+static bool pxa_sched_reserve_real_enabled();
+static bool pxa_reserve_real_graph(struct llama_context & lctx, int n_tokens);
 
 static void llama_graph_compute(
         llama_context & lctx,
@@ -6643,6 +6873,8 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
+        const bool pxa_ht_on = pxa_ht_every() != 0;
+        int64_t pxa_ht_t0 = pxa_ht_on ? ggml_time_us() : 0;
         auto & prev = cparams.mtp_op_type == MTP_OP_NONE ? lctx.prev : lctx.prev_mtp;
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
@@ -6657,6 +6889,50 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+            if (pxa_ht_on) { const int64_t t = ggml_time_us(); pxa_ht_add(PXA_HT_BUILD, t - pxa_ht_t0); pxa_ht_t0 = t; }
+
+            // PXA_SCHED_RESERVE_REAL: does the plan galloc holds cover this ubatch? Letting
+            // ggml_backend_sched_alloc_splits answer that costs a full backend sync AND records
+            // the replacement plan at this ubatch's own n_kv, so every later ubatch of the same
+            // prefill overflows it and syncs again - 12 drains in one 20k prefill.
+            //
+            // The plan covers this ubatch only if all three keys hold. Node count alone does
+            // not: a warmup 2-token graph and a 2048-token prefill graph have the same node
+            // count, so a plan reserved for 2 tokens looked like a match and every prefill
+            // ubatch then re-planned against it. Width catches that. The re-plan counter
+            // catches a plan replaced behind our back (the warmup decode's own re-plan, a
+            // K-shift re-reserve), which leaves the node count matching but the sizes not ours.
+            if (pxa_sched_reserve_real_enabled()) {
+                const int width_now = (int) u_batch.n_tokens;
+                const int n_replans = ggml_backend_sched_get_n_replans(lctx.sched);
+                const bool covered  = gf->n_nodes == lctx.pxa_reserved_nodes &&
+                                      width_now  <= lctx.pxa_reserved_width  &&
+                                      n_replans  == lctx.pxa_reserved_replans;
+                // a 1-token graph at n_eval == 0 is the all-experts warmup shape, which is not
+                // the shape any later decode builds - never install a plan from it
+                const bool buildable = width_now > 1 || lctx.n_eval > 0;
+                if (!covered && buildable) {
+                    const int expect = gf->n_nodes;
+                    // never narrower than this ubatch: a prefill reserves the widest ubatch the
+                    // context allows, so the remaining ubatches of the same prefill all fit
+                    const int width = width_now > 1
+                                    ? std::max(width_now, (int) std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch))
+                                    : 1;
+                    // the reserve reallocates the compute buffers; under n_copies > 1 the
+                    // previous ubatch may still be reading them
+                    if (ggml_backend_sched_get_n_copies(lctx.sched) > 1) {
+                        ggml_backend_sched_synchronize(lctx.sched);
+                    }
+                    pxa_reserve_real_graph(lctx, width);
+                    if (lctx.pxa_reserved_nodes != expect) {
+                        LLAMA_LOG_WARN("%s: reserve at n_tokens = %d built %d nodes, this ubatch has %d - it will re-plan\n",
+                                __func__, width, lctx.pxa_reserved_nodes, expect);
+                    }
+                    lctx.reset_scheduler();
+                    ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+                    gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+                }
+            }
             // PXA_GRAPH_DUMP (R2 deltanet-fusion, 2026-07-06): one-shot decode-graph node dump for fusion analysis
             if (getenv("PXA_GRAPH_DUMP") && u_batch.n_tokens == 1) {
                 static int pxa_gd_count = 0;
@@ -6684,6 +6960,7 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (pxa_ht_on) { const int64_t t = ggml_time_us(); pxa_ht_add(PXA_HT_ALLOC, t - pxa_ht_t0); pxa_ht_t0 = t; }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -6701,6 +6978,15 @@ static int llama_decode_internal(
         } else {
             //printf("Reusing graph with n_kv = %d, n_tokens = %d\n", (int)prev->n_kv, (int)prev->n_tokens);
             gf = prev->graph;
+            // PXA_PIPELINE_PP: a reused graph keeps its scheduler copy slot, so its inputs are
+            // rewritten in place below (llama_set_inputs). Under n_copies > 1 the previous
+            // run of this very graph may still be in flight (back-to-back ubatches of one
+            // llama_decode with no logits read between them); drain first. n_copies == 1
+            // (PXA_PIPELINE_PP off) never gets here, and in single-stream decode the sampler
+            // has already synchronized, so this costs nothing there.
+            if (ggml_backend_sched_get_n_copies(lctx.sched) > 1) {
+                ggml_backend_sched_synchronize(lctx.sched);
+            }
         }
 
         if (cparams.mtp_op_type != MTP_OP_NONE) {
@@ -6782,7 +7068,14 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING == 1
         tim1 = ggml_time_us();
 #endif
+        const int64_t pxa_ht_maskacc0 = pxa_ht_on ? pxa_ht().cur[PXA_HT_MASK] : 0;
+        if (pxa_ht_on) pxa_ht_t0 = ggml_time_us();
         llama_set_inputs(lctx, u_batch);
+        if (pxa_ht_on) {
+            const int64_t t = ggml_time_us();
+            pxa_ht_add(PXA_HT_SETINP, (t - pxa_ht_t0) - (pxa_ht().cur[PXA_HT_MASK] - pxa_ht_maskacc0));
+            pxa_ht_t0 = t;
+        }
 #if IK_PRINT_TIMING == 1
         tim2 = ggml_time_us();
         printf("set_inputs(...): %d us\n", int(tim2-tim1));
@@ -6792,6 +7085,7 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         llama_graph_compute(lctx, gf, n_threads);
+        if (pxa_ht_on) { const int64_t t = ggml_time_us(); pxa_ht_add(PXA_HT_SUBMIT, t - pxa_ht_t0); pxa_ht_t0 = t; }
 #if IK_PRINT_TIMING
         llama_synchronize(&lctx);
         tim2 = ggml_time_us();
@@ -6818,6 +7112,7 @@ static int llama_decode_internal(
         //}
 
         // extract logits
+        if (pxa_ht_on) pxa_ht_t0 = ggml_time_us();
         if (res) {
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
@@ -6934,6 +7229,7 @@ static int llama_decode_internal(
             printf("get_embedding(...): %d us\n", int(tim2-tim1));
 #endif
         }
+        if (pxa_ht_on) pxa_ht_add(PXA_HT_GETOUT, ggml_time_us() - pxa_ht_t0);
         n_outputs_prev += lctx.n_outputs;
         {
             // PXA_MTP_LAZY_WARMUP_v1: a clamped (prompt-sized, lazy) ubatch wrote row 0 only and
@@ -6987,6 +7283,7 @@ static int llama_decode_internal(
         auto tim2 = ggml_time_us();
         printf("sched_reset(...): %d us\n", int(tim2-tim1));
 #endif
+    if (pxa_ht_every()) pxa_ht_close_step(n_tokens_all);
 
     return 0;
 }
@@ -7415,6 +7712,102 @@ static bool get_can_shift(struct llama_context & lctx) {
     return !no_shift;
 }
 
+// PXA_SCHED_RESERVE_REAL (default ON, =0 disables): reserve galloc against the graph the real
+// decode path builds, with the KV window opened to the whole context.
+//
+// The worst-case reserve done at context creation builds with worst_case = true. That graph is
+// not structurally the graph llama_decode builds for a real prefill ubatch, and galloc keys its
+// plan on the node and leaf counts: the first real graph therefore fails
+// ggml_gallocr_alloc_graph, and ggml_backend_sched_alloc_splits drains every backend and
+// re-plans - on THAT ubatch's sizes, whose n_kv is one ubatch wide. Every later ubatch of the
+// same prefill then overflows the recorded per-node sizes (the KQ mask and the attention
+// intermediates grow with n_kv) and re-plans again, one full sync per ubatch. That is a
+// serializer for pipeline parallelism and a per-ubatch cost for the non-pipelined path too.
+//
+// Building the same graph through the real path, but with kv.n at kv.size (and n_outputs at the
+// worst-case width), records a plan that is both structurally what the prefill produces and
+// sized for the largest KV window it can reach, so no ubatch re-plans. Compute buffers only
+// ever grow in ggml_gallocr_reserve_n, so this never gives back what the worst-case reserve
+// already claimed.
+static bool pxa_sched_reserve_real_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("PXA_SCHED_RESERVE_REAL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static bool pxa_reserve_real_graph(struct llama_context & lctx, int n_tokens) {
+    if (!pxa_sched_reserve_real_enabled() || n_tokens <= 0) {
+        return true;
+    }
+    // llama_build_graph turns a 1-token BOS batch at n_eval == 0 into the warmup graph
+    // (n_expert_used = n_expert), which is not a shape any real decode builds
+    if (n_tokens == 1 && lctx.n_eval == 0) {
+        return true;
+    }
+    if (n_tokens > (int) lctx.cparams.n_ubatch) {
+        n_tokens = (int) lctx.cparams.n_ubatch;
+    }
+
+    auto & kv  = lctx.kv_self;
+    auto & swa = lctx.kv_swa;
+
+    const uint32_t kv_n0 = kv.n,  kv_h0 = kv.head;
+    const uint32_t sw_n0 = swa.n, sw_h0 = swa.head;
+    const int32_t  nout0 = lctx.n_outputs;
+
+    if (kv.size > 0) {
+        kv.n    = kv.size;
+        kv.head = kv.recurrent ? 0 : (kv.size > (uint32_t) n_tokens ? kv.size - n_tokens : 0);
+    }
+    if (swa.size > 0) {
+        swa.n    = swa.size;
+        swa.head = swa.recurrent ? 0 : (swa.size > (uint32_t) n_tokens ? swa.size - n_tokens : 0);
+    }
+    lctx.n_outputs = lctx.cparams.worst_graph_tokens > 0
+                   ? std::min<int32_t>(lctx.cparams.worst_graph_tokens, n_tokens)
+                   : n_tokens;
+
+    llama_token token  = llama_token_bos(&lctx.model);
+    const int   n_past = (int) lctx.cparams.n_ctx - n_tokens;
+
+    lctx.reset_scheduler();
+    ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx,
+            llama_batch_get_one(&token, n_tokens, n_past, 0), /* worst_case */ false, 0);
+    const bool ok = ggml_backend_sched_reserve(lctx.sched, gf);
+
+    kv.n  = kv_n0;  kv.head  = kv_h0;
+    swa.n = sw_n0;  swa.head = sw_h0;
+    lctx.n_outputs = nout0;
+
+    if (ok) {
+        lctx.pxa_reserved_nodes   = gf->n_nodes;
+        lctx.pxa_reserved_width   = n_tokens;
+        lctx.pxa_reserved_replans = ggml_backend_sched_get_n_replans(lctx.sched);
+        LLAMA_LOG_INFO("%s: reserved the real-path graph at n_tokens = %d, n_kv = %u (nodes = %d)\n",
+                __func__, n_tokens, kv.size, gf->n_nodes);
+        // the compute buffers this plan claims - the worst-case reserve's printout is taken
+        // before this call, so without these lines the real per-device figure is invisible
+        if (!lctx.pxa_reserve_sizes_logged) {
+            lctx.pxa_reserve_sizes_logged = true;
+            for (auto * backend : lctx.backends) {
+                const size_t sz = ggml_backend_sched_get_buffer_size(lctx.sched, backend);
+                if (sz > 1) {
+                    LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+                            ggml_backend_name(backend), sz / 1024.0 / 1024.0);
+                }
+            }
+        }
+    } else {
+        lctx.pxa_reserved_nodes   = -1;
+        lctx.pxa_reserved_width   =  0;
+        lctx.pxa_reserved_replans = -1;
+        LLAMA_LOG_WARN("%s: real-path graph reserve failed; keeping the worst-case plan\n", __func__);
+    }
+    return ok;
+}
+
 static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
     bool need_reserve = false;
 
@@ -7524,6 +7917,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         if (!ggml_backend_sched_reserve(lctx.sched, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         }
+        // ... and then with the real-path graph, so the next ubatch does not re-plan
+        pxa_reserve_real_graph(lctx, n_tokens);
     }
     return 0;
 }
@@ -7884,6 +8279,7 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.ffn_gat_inp_type            =*/ GGML_TYPE_COUNT,
         /*.extra_output_type           =*/ GGML_TYPE_COUNT,
         /*.allow_requantize            =*/ false,
+        /*.allow_double_lossy           =*/ false,
         /*.quantize_output_tensor      =*/ true,
         /*.only_copy                   =*/ false,
         /*.pure                        =*/ false,
@@ -7936,8 +8332,59 @@ bool llama_supports_gpu_offload(void) {
 #endif
 }
 
+// PXA lab-knob advisory (2026-09-01). Everything under PXA_*/PXQ* other than the three
+// user-facing knobs below is a LAB lever: each was measured on ONE model on ONE rig, and
+// carrying it to another config is normally a slowdown rather than a win. A lab knob left in
+// a shell profile is how a box ends up quietly serving a bad config for weeks, so name them
+// once at startup. NAMES ONLY -- the values are never read here and nothing about the run
+// changes; the resolvers that own each knob read it as they always did.
+#if defined(_WIN32)
+#define LLAMA_PXA_ENVIRON _environ
+#else
+extern char ** environ;
+#define LLAMA_PXA_ENVIRON environ
+#endif
+
+static void llama_pxa_report_lab_knobs(void) {
+    static const char * const user_facing[] = { "PXA_ENHANCE", "PXA_MODE", "PXA_REFERENCE" };
+
+    std::string names;
+    int n = 0;
+    for (char ** e = LLAMA_PXA_ENVIRON; e && *e; ++e) {
+        const char * eq = strchr(*e, '=');
+        if (eq == nullptr) {
+            continue;
+        }
+        const std::string name(*e, eq - *e);
+        if (name.rfind("PXA_", 0) != 0 && name.rfind("PXQ", 0) != 0) {
+            continue;
+        }
+        bool is_user_facing = false;
+        for (const char * uf : user_facing) {
+            if (name == uf) {
+                is_user_facing = true;
+                break;
+            }
+        }
+        if (is_user_facing) {
+            continue;
+        }
+        if (n++ > 0) {
+            names += ' ';
+        }
+        names += name;
+    }
+    if (n == 0) {
+        return;
+    }
+    LLAMA_LOG_WARN("pxq_llama: lab knobs set: %s (measured on one config; usually slower elsewhere — see docs/LEVERS.md)\n",
+            names.c_str());
+}
+
 void llama_backend_init(void) {
     ggml_time_init();
+
+    llama_pxa_report_lab_knobs();
 
     // needed to initialize f16 tables
     {
@@ -8854,18 +9301,34 @@ struct llama_context * llama_init_from_model(
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+            //
+            // PXA_PIPELINE_PP=1 is the single switch: OFF (default) keeps n_copies = 1 for
+            // every model, which is what the shipped GGML_SCHED_MAX_COPIES=1 binaries did.
+            // ON relaxes two of the gates below:
+            //  - a tensor override is allowed when it only relocated GET_ROWS-consumed tables
+            //    (the 51.9 GB per_layer_token_embd on the CPU); the gather runs in a small CPU
+            //    split whose output is copied to the device, nothing else moves off the GPUs
+            //  - QWEN4EXP is allowed despite being hybrid: its recurrent state is read and
+            //    written on one device stream per layer, the PLE conv window is carried
+            //    in-graph on one device (build_qwen4exp_ple), and the reused-graph copy-slot
+            //    bug that made pipelined hybrid graphs read stale inputs is fixed in
+            //    ggml_backend_sched_alloc_graph (the slot now rotates per split, not per compute).
+            const bool pxa_pp = pxa_pipeline_pp_enabled();
             bool pipeline_parallel =
+                pxa_pp &&
                 llama_get_device_count(*model) > 1 &&
                 model->n_gpu_layers > (int)model->hparams.n_layer &&
                 model->split_mode == LLAMA_SPLIT_MODE_LAYER &&
-                params.offload_kqv && !model->has_tensor_overrides() &&
+                params.offload_kqv &&
+                (!model->has_tensor_overrides() || model->tensor_overrides_get_rows_only()) &&
                 // PXA_PIPELINE_RECURRENT_FIX: pipeline parallelism (n_copies>1, async
                 // overlap of consecutive decode steps) races the in-place RMW of the
                 // persistent delta-net recurrent state (ggml_concat_inplace fast path) ->
                 // hybrid/recurrent models produce garbage under -sm layer. At np=1 the
                 // tokens are autoregressively dependent so there is no legit overlap to
                 // lose; disable pipeline-parallel for these arches to keep -sm layer coherent.
-                !llm_arch_is_recurrent(model->arch) && !llm_arch_is_hybrid(model->arch) &&
+                ((!llm_arch_is_recurrent(model->arch) && !llm_arch_is_hybrid(model->arch)) ||
+                 model->arch == LLM_ARCH_QWEN4EXP) &&
                 // PXA: gpt-oss (OPENAI_MOE) shared-KV ggml_cpy write races the next overlapped
                 // decode step under n_copies>1 (GGML_SCHED_MAX_COPIES=4) -> exact-x4 token repetition
                 // in decode at non-lucky geometries. Serialize decode for it (like recurrent/hybrid).
@@ -8882,6 +9345,11 @@ struct llama_context * llama_init_from_model(
 
             if (pipeline_parallel) {
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
+            } else if (pxa_pp) {
+                LLAMA_LOG_WARN("%s: PXA_PIPELINE_PP=1 but pipeline parallelism stays off (devices=%d, ngl=%d/%d, split_mode=%d, offload_kqv=%d, overrides=%d get_rows_only=%d, arch=%s)\n",
+                        __func__, llama_get_device_count(*model), model->n_gpu_layers, (int)model->hparams.n_layer,
+                        (int)model->split_mode, (int)params.offload_kqv, (int)model->has_tensor_overrides(),
+                        (int)model->tensor_overrides_get_rows_only(), llama_model_arch_name(model->arch));
             }
 
             llama_repack_up_gate_exps(*ctx);
@@ -8922,8 +9390,16 @@ struct llama_context * llama_init_from_model(
             int n_splits = ggml_backend_sched_get_n_splits(ctx->sched);
             LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, gf->n_nodes);
             LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits);
+
+            // Re-reserve with the graph the real decode path builds (KV window wide open), so
+            // the first prefill ubatch does not throw the plan away and re-plan per ubatch.
+            pxa_reserve_real_graph(*ctx, n_tokens);
         }
     }
+
+    // PXA_KQ_MASK_PAD1 build banner -- artifact proof that this binary carries the lever.
+    LLAMA_LOG_INFO("%s: PXA_KQ_MASK_PAD1 build present; mode = %d (0=off 1=trim decode KQ_mask H2D to row 0 2=+skip host pad fill)\n",
+            __func__, ggml_backend_pxa_kqmask_mode());
 
     if (params.offload_policy) {
         const std::vector<std::pair<int, int>>& policy = *(const std::vector<std::pair<int, int>>*)params.offload_policy;
@@ -9445,6 +9921,57 @@ int32_t llama_model_meta_val_str(const struct llama_model * model, const char * 
     return snprintf(buf, buf_size, "%s", it->second.c_str());
 }
 
+// PXA self-describing files (2026-09-01). A PXQ GGUF already carries its own provenance --
+// the codec in its tensor types, the backbone revision and codec tier in its pxa.pxq* keys --
+// but nothing surfaced it, so answering "what is this file?" meant a hex dump. Render it as
+// one line. Fields with no key in the file report "n/a" rather than a guessed value.
+int32_t llama_model_pxq_file_desc(const struct llama_model * model, char * buf, size_t buf_size) {
+    int counts[LLAMA_PXQ_TIER_COUNT] = {};
+    for (const auto & it : model->tensors_by_name) {
+        if (it.second) {
+            llama_pxq_census_add(it.second->type, counts);
+        }
+    }
+    const int n_slab = llama_pxq_census_total(counts);
+
+    const auto kv = [&model](const char * key) -> const char * {
+        const auto it = model->gguf_kv.find(key);
+        return it == model->gguf_kv.end() ? nullptr : it->second.c_str();
+    };
+
+    const char * backbone_rev = kv("pxa.pxq.backbone_rev");
+    const char * tier         = kv("pxa.pxq6.tier");
+    // The quantizer writes no source-dtype key today, so this reports n/a rather than
+    // restating the OUTPUT ftype under a "source" label.
+    const char * source       = kv("pxa.pxq.source_dtype");
+
+    if (n_slab == 0 && backbone_rev == nullptr && tier == nullptr && source == nullptr) {
+        if (buf_size > 0) {
+            buf[0] = '\0';
+        }
+        return -1;
+    }
+
+    // bits per weight over the WHOLE file (every tensor, coded or not) -- the number that
+    // matches the file size on disk, which is the one a reader is checking against.
+    char bpw[32] = "n/a";
+    if (model->n_elements > 0) {
+        snprintf(bpw, sizeof(bpw), "%.2f", (double) model->n_bytes * 8.0 / (double) model->n_elements);
+    }
+
+    char tier_extra[64] = "";
+    if (tier != nullptr) {
+        snprintf(tier_extra, sizeof(tier_extra), " tier=%s", tier);
+    }
+
+    return snprintf(buf, buf_size, "pxq_llama: file: codec=%s bpw=%s backbone_rev=%s%s source=%s",
+            n_slab > 0 ? llama_pxq_census_codec(counts) : "off",
+            bpw,
+            backbone_rev ? backbone_rev : "n/a",
+            tier_extra,
+            source ? source : "n/a");
+}
+
 int32_t llama_model_meta_count(const struct llama_model * model) {
     return (int)model->gguf_kv.size();
 }
@@ -9713,7 +10240,7 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
     int32_t max_contig_idx = -1;
 
     for (int32_t i = 0; i < int32_t(ctx->kv_self.size); i++, c_curr++, cs_curr += view->n_seq_max) {
-        const size_t curr_size = kv_cells[i].seq_id.size();
+        const size_t curr_size = kv_cells[i].n_seq();
         token_count += curr_size;
         c_curr->pos = kv_cells[i].pos + kv_cells[i].delta;
 
@@ -9728,7 +10255,7 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
         }
 
         int seq_idx = 0;
-        for (const llama_seq_id it : kv_cells[i].seq_id) {
+        for (const llama_seq_id it : kv_cells[i].seqs()) {
             if (seq_idx >= view->n_seq_max) {
                 break;
             }
@@ -9760,7 +10287,7 @@ int32_t llama_get_kv_cache_token_count(const struct llama_context * ctx) {
     int result = 0;
 
     for (uint32_t i = 0; i < ctx->kv_self.size; i++) {
-        result += ctx->kv_self.cells[i].seq_id.size();
+        result += ctx->kv_self.cells[i].n_seq();
     }
 
     return result;
@@ -10116,7 +10643,7 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
         // a negative seq_id targets every sequence
         std::set<llama_seq_id> seqs;
         for (uint32_t i = 0; i < ctx->kv_swa.size; ++i) {
-            for (auto s : ctx->kv_swa.cells[i].seq_id) seqs.insert(s);
+            for (auto s : ctx->kv_swa.cells[i].seqs()) seqs.insert(s);
         }
         bool all_ok = true;
         for (auto s : seqs) {
@@ -10303,13 +10830,13 @@ struct llama_data_write {
             for (uint32_t i = range.first; i < range.second; ++i) {
                 const auto & cell = kv_self.cells[i];
                 const llama_pos pos      = cell.pos;
-                const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
+                const uint32_t  n_seq_id = seq_id == -1 ? cell.n_seq() : 0;
 
                 write(&pos,      sizeof(pos));
                 write(&n_seq_id, sizeof(n_seq_id));
 
                 if (n_seq_id) {
-                    for (auto seq_id : cell.seq_id) {
+                    for (auto seq_id : cell.seqs()) {
                         write(&seq_id, sizeof(seq_id));
                     }
                 }
@@ -10669,7 +11196,7 @@ struct llama_data_read {
                         return false;
                     }
 
-                    cell.seq_id.insert(seq_id);
+                    cell.add_seq(seq_id);
                 }
             }
 
@@ -11716,7 +12243,13 @@ void llama_synchronize(struct llama_context * ctx) {
             if (el > 500) fprintf(stderr, "PXA_SYNC_BISECT backend=%d (%s) us=%lld\n", i, ggml_backend_name(b), (long long) el);
         }
     }
-    ggml_backend_sched_synchronize(ctx->sched);
+    if (pxa_ht_every()) {
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_sched_synchronize(ctx->sched);
+        pxa_ht_add(PXA_HT_SYNC, ggml_time_us() - t0);
+    } else {
+        ggml_backend_sched_synchronize(ctx->sched);
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -12808,6 +13341,9 @@ llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_
 
 // PXA_SOFTFAIL_BREAKER_v1: expose whether the most recent rng token-sample degraded to the
 // unsampleable-distribution fallback, so the server can bound a degenerate request per-slot.
+bool llama_pxa_host_timing_enabled(void) { return pxa_ht_every() != 0; }
+void llama_pxa_host_timing_add_sample(int64_t us) { pxa_ht_add(PXA_HT_SAMPLE, us); }
+
 bool llama_get_last_sample_softfailed(struct llama_context * ctx) {
     // Read-AND-CLEAR: only the temp>0 rng path clears the flag at entry; greedy (temp==0),
     // temp<0, mirostat and adaptive-p paths do not touch it. Without clearing on read, one

@@ -724,17 +724,22 @@ static void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, ggml_bf16_t 
                    "that has a CPU kernel.", tname, detail);                                     \
     }
 
-// PXQ1 (248) and PXQ6 (256): the two PXQ slab tiers that pxa_pxq_is_cpu_supported()
-// (ggml/src/pxq-cpu.c:120) does NOT list, so the panel-dequant early return in
-// ggml_compute_forward_mul_mat / _mul_mat_id never claims them and they fall through to the
-// chunked path. .to_float / .from_float / .vec_dot must stay absent for the slab types (see the
-// PXQ note further down: a 64-row panel interleave makes a single row pointer meaningless), so
-// the fix is not a per-row codec here -- it is panel dequant in pxq-cpu.c for these two tiers,
-// after which they join the early-return list. Until then, refuse by name.
+// PXQ1 (248) and PXQ6 (256): these two were the PXQ slab tiers pxa_pxq_is_cpu_supported()
+// did NOT list, so the panel-dequant early return in ggml_compute_forward_mul_mat / _mul_mat_id
+// never claimed them, they fell through to the chunked path, and .vec_dot -- which must stay
+// absent for a panel format (see the PXQ note further down: a 64-row interleave makes a single
+// row pointer meaningless) -- was a null call. These stubs refused by name instead.
+//
+// 2026-09-01: pxq-cpu.c gained panel dequant for both tiers (pxa_deq_row_pxq1 /
+// pxa_deq_row_pxq6r), so they are now in pxa_pxq_is_cpu_supported() and the early return
+// claims them. These stubs are kept as a BACKSTOP, not as the policy: if some future path
+// reaches vec_dot for a slab type anyway, it must abort with a diagnosis rather than call NULL.
 PXA_NO_CPU_VEC_DOT(pxa_vec_dot_pxq1_no_cpu, "pxq1",
-        "the PXQ1 tier has no panel dequant in pxq-cpu.c and is not in pxa_pxq_is_cpu_supported")
+        "a PXQ panel format has no per-row vec_dot by construction; the CPU path is the "
+        "panel dequant in pxq-cpu.c, which mul_mat should have taken before reaching here")
 PXA_NO_CPU_VEC_DOT(pxa_vec_dot_pxq6_no_cpu, "pxq6",
-        "the PXQ6 tier has no panel dequant in pxq-cpu.c and is not in pxa_pxq_is_cpu_supported")
+        "a PXQ panel format has no per-row vec_dot by construction; the CPU path is the "
+        "panel dequant in pxq-cpu.c, which mul_mat should have taken before reaching here")
 
 // bf16_r16: .to_float/.from_float/.vec_dot are commented out in its entry below while
 // .vec_dot_type = GGML_TYPE_BF16 stays live, so the generic path happily quantizes the
@@ -1250,9 +1255,9 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 32,
         .type_size                = 5,
         .is_quantized             = true,
-        // NOT in pxa_pxq_is_cpu_supported() (pxq-cpu.c:120), unlike PXQ4/PXQ4HQ/PXQ2/PXQ3
-        // above, so mul_mat's panel-dequant early return does not claim this type and the
-        // chunked path calls .vec_dot. Left NULL, that was a null-pointer call. Refuse by name.
+        // In pxa_pxq_is_cpu_supported() since 2026-09-01, like PXQ4/PXQ4HQ/PXQ2/PXQ3, so
+        // mul_mat's panel-dequant early return claims this type and the chunked path is not
+        // reached. .vec_dot stays wired to the refusal stub as a backstop against a NULL call.
         // .vec_dot_type stays at the default 0 == GGML_TYPE_F32 on purpose: src1 is F32, so
         // src1->type == vec_dot_type and mul_mat skips activation quantization entirely.
         .vec_dot                  = pxa_vec_dot_pxq1_no_cpu,
@@ -1270,8 +1275,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 32,
         .type_size                = 21,
         .is_quantized             = true,
-        // Same hole as PXQ1 above: no pxq-cpu.c panel dequant, so not in
-        // pxa_pxq_is_cpu_supported(), so the chunked path reaches .vec_dot. Refuse by name.
+        // Same as PXQ1 above: pxq-cpu.c has panel dequant for this tier since 2026-09-01, so
+        // it is in pxa_pxq_is_cpu_supported() and .vec_dot is only a backstop.
         .vec_dot                  = pxa_vec_dot_pxq6_no_cpu,
         .nrows                    = 1,
         .row_meta_size            = 2,

@@ -148,21 +148,37 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
     ggml_set_name(normalized, "ple_conv_in");
     ggml_build_forward_expand(gf, normalized);
 
-    // Copy the conv input of THIS ubatch into the persistent capture buffer. ggml_set_output
-    // on `normalized` was not enough: it lives in the graph arena, the scheduler reuses that
-    // memory across splits, and the post-compute read came back clobbered -- decode capture
-    // RMS 1.35 against a prefill 0.028, mostly zeros. Because the window is carried forward,
-    // that error compounded and the output collapsed after ~30 tokens.
-    if (lctx.ple_conv_capture != nullptr) {
-        GGML_ASSERT(lctx.ple_conv_capture->ne[0] == hc_dim);
-        GGML_ASSERT(lctx.ple_conv_capture->ne[1] >= n_tokens);
-        ggml_tensor * cap = ggml_view_2d(ctx0, lctx.ple_conv_capture, hc_dim, n_tokens,
-                lctx.ple_conv_capture->nb[1], 0);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, normalized, cap));
+    const bool pp_carry = pxa_pipeline_pp_enabled();
+    ggml_tensor * hist_in = nullptr;
+    if (pp_carry) {
+        // PXA_PIPELINE_PP: the window lives on this device (ple_conv_hist_dev) and is
+        // carried in-graph, see the trailing ggml_cpy below. inp_ple_conv_keep is 1 for a
+        // continuing sequence and 0 for a fresh one, which zeroes the carried window the
+        // way an EOS-padded prefix would - the same reset ple_hist applies to the n-gram
+        // token window, done here as a broadcast multiply so it needs no host sync and
+        // survives graph reuse.
+        GGML_ASSERT(lctx.ple_conv_hist_dev != nullptr && lctx.inp_ple_conv_keep != nullptr);
+        GGML_ASSERT(lctx.ple_conv_hist_dev->ne[0] == hc_dim && lctx.ple_conv_hist_dev->ne[1] == hist);
+        hist_in = ggml_mul(ctx0, lctx.ple_conv_hist_dev, lctx.inp_ple_conv_keep);
+        cb(hist_in, "ple_conv_hist_in", il);
+    } else {
+        // Copy the conv input of THIS ubatch into the persistent capture buffer. ggml_set_output
+        // on `normalized` was not enough: it lives in the graph arena, the scheduler reuses that
+        // memory across splits, and the post-compute read came back clobbered -- decode capture
+        // RMS 1.35 against a prefill 0.028, mostly zeros. Because the window is carried forward,
+        // that error compounded and the output collapsed after ~30 tokens.
+        if (lctx.ple_conv_capture != nullptr) {
+            GGML_ASSERT(lctx.ple_conv_capture->ne[0] == hc_dim);
+            GGML_ASSERT(lctx.ple_conv_capture->ne[1] >= n_tokens);
+            ggml_tensor * cap = ggml_view_2d(ctx0, lctx.ple_conv_capture, hc_dim, n_tokens,
+                    lctx.ple_conv_capture->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, normalized, cap));
+        }
+        hist_in = lctx.inp_ple_conv_hist;
     }
 
     // [hc_dim, hist + n_tokens] with the carried history in front
-    ggml_tensor * padded = ggml_concat(ctx0, lctx.inp_ple_conv_hist, normalized, 1);
+    ggml_tensor * padded = ggml_concat(ctx0, hist_in, normalized, 1);
     cb(padded, "ple_conv_padded", il);
 
     // Depthwise causal conv DILATED by the n-gram size, as a sum of shifted copies:
@@ -201,6 +217,23 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
     conv_out = ggml_silu(ctx0, conv_out);
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
+
+    if (pp_carry) {
+        // Carry the window forward on-device: the last `hist` columns of the padded conv
+        // input (columns [n_tokens, n_tokens + hist) - if the ubatch is shorter than the
+        // window this keeps the still-valid older part, shifted, exactly like the host
+        // path did). n_tokens here is the real ubatch width, not a padded one, so no
+        // host-side column bookkeeping is needed. The conv reads of `padded` are expanded
+        // first so the write-back lands after them in node order; the read of
+        // ple_conv_hist_dev (hist_in above) precedes both. All on one device stream, so a
+        // pipelined next ubatch (n_copies > 1) sees this window only after it is written.
+        ggml_build_forward_expand(gf, conv_out);
+        ggml_tensor * tail = ggml_view_2d(ctx0, padded, hc_dim, hist,
+                padded->nb[1], (size_t) n_tokens*padded->nb[1]);
+        ggml_tensor * carry = ggml_cpy(ctx0, tail, lctx.ple_conv_hist_dev);
+        cb(carry, "ple_conv_hist_carry", il);
+        ggml_build_forward_expand(gf, carry);
+    }
 
     return ggml_add(ctx0, hidden, ggml_add(ctx0, ggml_reshape_3d(ctx0, gated, n_embd, hc, n_tokens), conv_out));
 }
@@ -273,13 +306,29 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         cb(lctx.inp_ple_rows, "inp_ple_rows", -1);
         ggml_set_input(lctx.inp_ple_rows);
 
-        lctx.inp_ple_conv_hist = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, hist);
-        cb(lctx.inp_ple_conv_hist, "inp_ple_conv_hist", -1);
-        ggml_set_input(lctx.inp_ple_conv_hist);
+        const bool pp_carry = pxa_pipeline_pp_enabled();
+        if (pp_carry) {
+            // PXA_PIPELINE_PP: one F32 scalar input per ubatch instead of the [hc_dim, hist]
+            // window upload; the window itself stays on the device (below).
+            lctx.inp_ple_conv_keep = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+            cb(lctx.inp_ple_conv_keep, "inp_ple_conv_keep", -1);
+            ggml_set_input(lctx.inp_ple_conv_keep);
+            // one window is carried, so one PLE layer is what this build supports (the host
+            // path has the same single-window limit, silently)
+            int n_ple_layers = 0;
+            for (int lp = 0; lp < n_layer; ++lp) if (hparams.is_ple(lp)) ++n_ple_layers;
+            GGML_ASSERT(n_ple_layers == 1 && "PXA_PIPELINE_PP carries one PLE conv window; more than one PLE layer is not supported");
+        } else {
+            lctx.inp_ple_conv_hist = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, hist);
+            cb(lctx.inp_ple_conv_hist, "inp_ple_conv_hist", -1);
+            ggml_set_input(lctx.inp_ple_conv_hist);
+        }
 
         // One-time persistent capture buffer (see llama-context.h). Sized to the largest
-        // padded ubatch so the existing host-side windowing needs no change.
-        if (lctx.ple_conv_capture == nullptr) {
+        // padded ubatch so the existing host-side windowing needs no change. Under
+        // PXA_PIPELINE_PP the same one-time allocation holds the [hc_dim, hist] device
+        // window instead (no capture needed: nothing is read back).
+        if (lctx.ple_conv_capture == nullptr && lctx.ple_conv_hist_dev == nullptr) {
             const int64_t cap_cols = std::max<int64_t>(n_tokens, lctx.cparams.n_ubatch);
             ggml_init_params cap_params = {
                 /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -287,9 +336,15 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
                 /*.no_alloc   =*/ true,
             };
             lctx.ctx_ple_capture = ggml_init(cap_params);
-            lctx.ple_conv_capture = ggml_new_tensor_2d(
-                    lctx.ctx_ple_capture, GGML_TYPE_F32, hc_dim, cap_cols);
-            ggml_set_name(lctx.ple_conv_capture, "ple_conv_capture");
+            if (pp_carry) {
+                lctx.ple_conv_hist_dev = ggml_new_tensor_2d(
+                        lctx.ctx_ple_capture, GGML_TYPE_F32, hc_dim, hist);
+                ggml_set_name(lctx.ple_conv_hist_dev, "ple_conv_hist_dev");
+            } else {
+                lctx.ple_conv_capture = ggml_new_tensor_2d(
+                        lctx.ctx_ple_capture, GGML_TYPE_F32, hc_dim, cap_cols);
+                ggml_set_name(lctx.ple_conv_capture, "ple_conv_capture");
+            }
             // Allocate the capture on the SAME backend that holds the PLE weights,
             // NOT on the CPU. A CPU buffer makes the ggml_cpy below a device->host
             // copy INSIDE the graph, which forces an extra scheduler split and a
@@ -309,6 +364,7 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
                     lctx.ctx_ple_capture, cap_buft);
             GGML_ASSERT(lctx.buf_ple_capture && "failed to allocate the PLE capture buffer");
             ggml_backend_buffer_clear(lctx.buf_ple_capture, 0);
+            lctx.ple_conv_dev_valid = false;
         }
     }
 

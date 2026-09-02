@@ -5,9 +5,9 @@ the final byte-writing is exercised by ``--dry-run``, which plans the entire con
 the GGUF header alone and runs every structural self-check.
 
     python -m gguf_to_vllm.convert \
-      --gguf   /models/Qwen3.8-27B-PXQ4.gguf \
-      --ref-hf /models/hf/<reference-hf-model> \
-      --out    /models/Qwen3.8-27B-PXQ4-vllm \
+      --gguf   /path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
+      --ref-hf /path/to/hf/<reference-hf-model> \
+      --out    /path/to/models/pxa-models/Qwen3.8-27B-PXQ4-vllm \
       --policy p1 [--encoder .../pxq4_encode.so] [--shard-size-gb 4] [--dry-run]
 
 WHAT COMES OUT

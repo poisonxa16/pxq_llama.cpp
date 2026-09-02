@@ -83,7 +83,7 @@ scales** — it folds `weight_scale * weight_global_scale` to fp16 offline (`:26
 perfect structural match, and the whole s884 HMMA mainloop would be inherited.
 
 It fails on the codebook, and I can now prove it from the artifact itself. The file stores its book
-(`pxa.pxq6.book`, read out of the GGUF this pass):
+(`pxa.pxq6.book`, read out of the GGUF this session):
 
 ```
 [-0.98779, -0.73535, -0.55859, -0.41968, -0.30103, -0.19446, -0.09552, 0.0,
@@ -110,7 +110,7 @@ Feasible (sources ship, Apache-2.0, `nvcc` 12.8 is in the container), high value
 
 That last row is the difference between policy A and policy B — 0.5 GiB/GPU/token for ~90 LOC.
 
-**One more seam this pass found, which removes a whole class of converter work.** The fork's
+**One more seam this session found, which removes a whole class of converter work.** The fork's
 `load_weights` expects the GDN input projection **already split on disk** as four separate tensors
 (`qwen3_5.py:493-494, 506-507`):
 
@@ -187,7 +187,7 @@ MTP spec-decode model — is inherited untouched.
 
 ### 3.4 Existing files to patch
 
-**None in `/opt/1Cat-vLLM`. None in `<engine-tree>`.** Both trees are read-only in this design.
+**None in `/opt/1Cat-vLLM`. None in `/path/to/engine-repo`.** Both trees are read-only in this design.
 The only "patch" is deployment-side: the serving container must `pip install pxq4-vllm` (or mount it on
 `PYTHONPATH`) and pass `--quantization pxq4` is *not even needed* — `override_quantization_method`
 self-selects from `config.json`.
@@ -276,7 +276,7 @@ by declared attributes.
   **ignores `packed_factor`** — verified. `slabs.narrow(1, kb0, kbn)` = the slab subrange of every panel.
   The anchor has **no `input_dim`**, so it falls through to a full copy (assert at `linear.py:1760`) —
   which *is* the "duplicate the 128 B header on a K-split" step the format requires. Free.
-- **Merged column-parallel with a tuple shard id** — the GDN `in_proj_qkv` case. Read this pass at
+- **Merged column-parallel with a tuple shard id** — the GDN `in_proj_qkv` case. Read this session at
   `linear.py:968-1035`: the tuple branch walks `output_sizes[first:last+1]`, divides both offset and size
   by `packed_factor` when `packed_dim == output_dim` (`:1013-1018`), narrows the loaded tensor, and
   recurses; the per-shard branch computes `shard_offset = sum(output_sizes[:id]) // tp_size` then
@@ -416,7 +416,7 @@ def _(out, x, slabs, anchor, n, k): return None
 Also add `vllm::pxq4_gemv` to nothing — we do **not** need a `splitting_ops` entry; a leaf custom op
 inside a piecewise region is captured normally.
 
-Build environment, from this pass's recon: `nvcc` 12.8, gcc, cmake, ninja and `torch 2.10.0+cu128`
+Build environment, from this session's recon: `nvcc` 12.8, gcc, cmake, ninja and `torch 2.10.0+cu128`
 are present in the container, and `site-packages/vllm` is a **copied** install (not editable-linked to
 `/opt/1Cat-vLLM`, so edits there are inert at runtime — another reason the plugin is the right seam).
 Two operational constraints: the production container's overlay is **100% full, 0 bytes available**, so
@@ -460,7 +460,7 @@ Six shapes only: 5120x6144 (48), 5120x10240 (48), 5120x12288 (17), 5120x17408 (1
 17408x5120 (65). `bytes = (rows/64)*(128 + (K/32)*1088)` reproduces all six on-disk sizes to the byte,
 with no inter-tensor padding.
 
-### 6.3 Name map (authoritative — taken from the incumbent checkpoint's own keys this pass)
+### 6.3 Name map (authoritative — taken from the incumbent checkpoint's own keys this session)
 
 Prefix depends on the registered architecture. With `Qwen3_5ForCausalLM` (§1 seam 2) it is
 `model.layers.N.`; with `Qwen3_5ForConditionalGeneration` it is `model.language_model.layers.N.`.
@@ -532,7 +532,7 @@ directory — the two models are the same base, and our GGUF KVs agree with it (
 ## 7. MoE
 
 **There is none, and the effort delta is zero.** Verified directly against the artifact by raw GGUF
-header parse this pass: 866 tensors, `general.architecture = qwen35`, **zero `*_exps` tensors and zero
+header parse this session: 866 tensors, `general.architecture = qwen35`, **zero `*_exps` tensors and zero
 expert KVs**; `ffn_gate`/`ffn_up`/`ffn_down` are dense on all 65 blocks. The brief's "40x256 routed
 experts" belongs to **Sky-35B**, a different model. No `FusedMoEMethodBase`, no `RoutedExperts` path, no
 dequant fallback, **0 GiB of fallback VRAM cost** — the line item does not exist.
@@ -688,7 +688,7 @@ makes prefill competitive. Scope it separately after S6 gives a real measurement
 Policy A alone (drop `pxq4_encode.py`, `mxfp4_repack.py`, `mxfp4.py`) is ~1,600 total / ~1,150
 hand-written — and ships a 15% regression. The extra ~690 LOC *is* the project.
 
-Patches to `/opt/1Cat-vLLM`: **0 files.** Patches to `<engine-tree>`: **0 files.**
+Patches to `/opt/1Cat-vLLM`: **0 files.** Patches to `/path/to/engine-repo`: **0 files.**
 
 ---
 

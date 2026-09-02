@@ -497,6 +497,7 @@ extern "C" {
         enum ggml_type ffn_gate_inp_type;    // routed experts probabilities typy (relevant for MoE models only)
         enum ggml_type extra_output_type;    // routed experts probabilities typy (relevant for MoE models only)
         bool allow_requantize;               // allow quantizing non-f32/f16 tensors
+        bool allow_double_lossy;             // consent to requantizing from an already-lossy Q8_0 or PXQ source
         bool quantize_output_tensor;         // quantize output.weight
         bool only_copy;                      // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
         bool pure;                           // quantize all tensors to the default type
@@ -804,6 +805,12 @@ extern "C" {
     // Get metadata value as a string by index
     LLAMA_API int32_t llama_model_meta_val_str_by_index(const struct llama_model * model, int32_t i, char * buf, size_t buf_size);
 
+    // Render the PXQ self-description this model's GGUF carries (codec, bits/weight and the
+    // pxa.pxq* provenance keys the quantizer wrote) into buf. Returns the number of chars
+    // written, or -1 when the file carries no PXQ tensors and no pxa.pxq* keys -- so a caller
+    // can stay silent on a stock file instead of printing a row of "n/a".
+    LLAMA_API int32_t llama_model_pxq_file_desc(const struct llama_model * model, char * buf, size_t buf_size);
+
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
 
@@ -1054,6 +1061,12 @@ extern "C" {
     // PXA_SOFTFAIL_BREAKER_v1: true if the most recent rng token-sample degraded to the
     // unsampleable-distribution fallback (all-non-finite logits).
     LLAMA_API bool llama_get_last_sample_softfailed(struct llama_context * ctx);
+
+    // PXA_HOST_TIMING=N (house custom, default OFF): per-decode-step host timing buckets, one
+    // summary line to stderr every N steps (see the block comment in src/llama.cpp). The
+    // sampler reports its own bucket through add_sample; enabled() is a static check.
+    LLAMA_API bool llama_pxa_host_timing_enabled(void);
+    LLAMA_API void llama_pxa_host_timing_add_sample(int64_t us);
 
     // PXA_SWA_TRUNCATE_GUARD_v1: sliding-window attention size (0 on non-SWA arches).
     LLAMA_API uint32_t llama_model_n_swa(const struct llama_model * model);

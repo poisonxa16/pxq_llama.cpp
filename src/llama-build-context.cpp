@@ -129,6 +129,7 @@ void llm_build_context::init() {
     // the carried PLE conv window was corrupted on every speculative round.
     lctx.inp_ple_rows      = nullptr;
     lctx.inp_ple_conv_hist = nullptr;
+    lctx.inp_ple_conv_keep = nullptr;
     lctx.inp_pos_bucket    = nullptr;
     lctx.inp_embd_enc      = nullptr;
     lctx.inp_KQ_mask_cross = nullptr;

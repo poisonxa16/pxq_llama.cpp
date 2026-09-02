@@ -564,7 +564,340 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+// ---- PXA_TOPK_RAW (house custom, DEFAULT OFF) ----------------------------------------------
+// Bounded top-K sampling straight off the raw `float * logits` row, for the resolved sampler chain
+// that a decode instance actually runs:
+//     [no-op samplers]* TOP_K [TOP_P | MIN_P | TEMPERATURE | DIST | no-op samplers]*  then rng pick
+// (DIST in this fork is an unnormalized softmax that only fills the p fields, size unchanged)
+// or  temp == 0 (greedy argmax), with optional logit_bias / repetition penalties / server biases.
+// The default path materializes n_vocab llama_token_data (3 MB at a 248k vocab) and partial_sorts
+// them per token; this keeps a W <= 128 sorted window (W = min(max(top_k, min_keep), n_vocab)) and
+// does one threshold compare per vocab entry (AVX2-prefiltered), then runs the SAME llama_sample_*
+// calls over the window, so float arithmetic, min_keep handling and rng draws are identical.
+//
+// Exactness notes (the plan's two failure modes, both handled):
+//   * penalties are applied IN PLACE on `logits` for the <= penalty_last_n penalized ids BEFORE the
+//     scan (so the window is the true post-penalty top-W, including a penalty that RAISES a negative
+//     logit under repeat_penalty < 1), and restored afterwards so the row reads exactly like the
+//     default path left it (logit_bias applied, penalties not) for anything that inspects it later
+//     (n_probs, spec verify);
+//   * server_biases (an n_vocab vector) are folded into the scan on the fly and never written back;
+//     penalties + server_biases together are gated OFF (the default path penalizes logit+bias and
+//     the nl-token exception then drops the bias -- not reproducible without a second pass);
+//   * the gate is on the RESOLVED per-request chain: DRY/TFS/typical/XTC/top-n-sigma must be at
+//     their no-op parameters, anything before TOP_K in the sequence must be a no-op, no grammar, no
+//     reasoning-budget FORCING, no mirostat / adaptive-p / dynatemp / expiring-logit-bias, temp >= 0;
+//   * ties: partial_sort's order among equal logits is unspecified, this window keeps the earliest
+//     id first. Same distribution; the drawn token can differ on an exact fp32 tie. Shadow mode
+//     classifies those as "tie" (both ids carry the identical post-chain logit), not mismatches.
+//
+// PXA_TOPK_RAW=1  fast path live.
+// PXA_TOPK_RAW=2  shadow-compare: the default path is authoritative; the fast path runs first on a
+//                 saved copy of (logits, rng), the post-chain windows and the drawn ids are compared,
+//                 a genuine mismatch is logged once and the fast path disables itself.
+// PXA_TOPK_RAW=3  shadow-compare that aborts on a genuine mismatch (harness use).
+// A stats line (compared / tie / mismatch counts) goes to stderr every 1000 compares in modes 2/3.
+#include <unordered_map>
+#include <cmath>
+
+static int pxa_topk_raw_mode() {
+    static const int v = [] { const char * e = getenv("PXA_TOPK_RAW"); const int m = e ? atoi(e) : 0; return m < 0 ? 0 : m; }();
+    return v;
+}
+
+static bool g_pxa_topk_raw_disabled = false;
+static int64_t g_pxa_topk_raw_stats[5] = {0, 0, 0, 0, 0};   // taken, compared, tie, window_mismatch, mismatch
+
+void common_sampler_pxa_topk_raw_stats(int64_t out[5]) {
+    for (int i = 0; i < 5; ++i) out[i] = g_pxa_topk_raw_stats[i];
+}
+
+static bool pxa_topk_raw_penalties_active(const common_sampler * cs) {
+    const auto & p = cs->params;
+    const int32_t penalty_last_n = p.penalty_last_n < 0 ? p.n_prev : p.penalty_last_n;
+    const auto & penalty_tokens  = p.use_penalty_prompt_tokens ? p.penalty_prompt_tokens : cs->prev;
+    const int used = std::min((int) penalty_tokens.size(), penalty_last_n);
+    return used > 0 && !(p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f);
+}
+
+// Returns the window width W > 0 when the resolved chain is the safe subset, 0 otherwise.
+static int pxa_topk_raw_window(const common_sampler * cs, const llama_context * ctx_cfg, bool grammar_first, int n_vocab) {
+    const auto & p = cs->params;
+    if (grammar_first || ctx_cfg != nullptr || cs->grammar != nullptr) return 0;
+    if (cs->rbudget && common_reasoning_budget_get_state(cs->rbudget) == REASONING_BUDGET_FORCING) return 0;
+    if (cs->elb_states.size() > cs->elb_idx) return 0;               // expiring logit bias mutates its own state
+    if (p.mirostat != 0) return 0;
+    if (cs->adapt_p_ctx != nullptr) return 0;                          // adaptive-p branch / ADAPTIVE_P queue entry
+    if (!(p.temp >= 0.0f)) return 0;                                   // temp < 0 (greedy with probs) and NaN
+    if (p.dynatemp_range > 0.0f) return 0;
+    const bool pen_active  = pxa_topk_raw_penalties_active(cs);
+    const bool bias_active = cs->server_biases != nullptr && cs->server_biases->size() == (size_t) n_vocab;
+    if (pen_active && bias_active) return 0;
+    if (p.temp == 0.0f) {
+        // greedy: argmax over the penalized row; cur_p differs in content from the default path
+        // (window vs the whole unsorted vocab), so only when nothing reads it
+        return p.n_probs > 0 ? 0 : 1;
+    }
+    bool seen_top_k = false;
+    for (const auto st : p.samplers_sequence) {
+        switch (st) {
+            case llama_sampler_type::DRY:
+                if (!(p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n == 0)) return 0;
+                break;
+            case llama_sampler_type::TOP_K:
+                if (p.top_k <= 0) return 0;
+                seen_top_k = true;
+                break;
+            case llama_sampler_type::TFS_Z:       if (p.tfs_z < 1.0f) return 0; break;
+            case llama_sampler_type::TYPICAL_P:   if (p.typical_p < 1.0f) return 0; break;
+            case llama_sampler_type::XTC:         if (!(p.xtc_probability <= 0.0f || p.xtc_threshold > 0.5f)) return 0; break;
+            case llama_sampler_type::TOP_N_SIGMA: if (p.top_n_sigma > 0.0f) return 0; break;
+            case llama_sampler_type::TOP_P:       if (!seen_top_k && p.top_p < 1.0f) return 0; break;
+            case llama_sampler_type::MIN_P:       if (!seen_top_k && p.min_p > 0.0f) return 0; break;
+            case llama_sampler_type::TEMPERATURE: break;               // per-element scale, commutes with the top-W selection
+            case llama_sampler_type::ADAPTIVE_P:  if (cs->adapt_p_ctx != nullptr) return 0; break;
+            case llama_sampler_type::DIST:        break;               // unnormalized softmax p-fill: p_i = exp(l_i - max), per element, size unchanged
+            default: return 0;                                         // anything new
+        }
+    }
+    if (!seen_top_k) return 0;
+    const int W = std::min(std::max(p.top_k, std::max(1, p.min_keep)), n_vocab);
+    return W <= 128 ? W : 0;
+}
+
+// Sorted-descending window insert; among equal values the earlier id stays first, and an element
+// equal to the current minimum of a full window does not enter.
+struct pxa_topk_window {
+    int   W   = 0;
+    int   cnt = 0;
+    float thr = -INFINITY;   // = wl[W-1] once full
+    float wl[128];
+    int   wid[128];
+
+    inline void push(float x, int id) {
+        if (cnt == W) {
+            if (!(x > thr)) return;
+            int j = W - 1;
+            while (j > 0 && wl[j-1] < x) { wl[j] = wl[j-1]; wid[j] = wid[j-1]; --j; }
+            wl[j] = x; wid[j] = id;
+            thr = wl[W-1];
+            return;
+        }
+        int j = cnt;
+        while (j > 0 && wl[j-1] < x) { wl[j] = wl[j-1]; wid[j] = wid[j-1]; --j; }
+        wl[j] = x; wid[j] = id;
+        if (++cnt == W) thr = wl[W-1];
+    }
+};
+
+static void pxa_topk_scan_scalar(const float * logits, const float * bias, int n, int i0, pxa_topk_window & w) {
+    if (bias) {
+        for (int i = i0; i < n; ++i) w.push(logits[i] + bias[i], i);
+    } else {
+        for (int i = i0; i < n; ++i) w.push(logits[i], i);
+    }
+}
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+__attribute__((target("avx2")))
+static void pxa_topk_scan_avx2(const float * logits, const float * bias, int n, pxa_topk_window & w) {
+    // fill the window from the head, then threshold-prefilter 8 lanes at a time
+    int i = 0;
+    for (; i < n && w.cnt < w.W; ++i) w.push(bias ? logits[i] + bias[i] : logits[i], i);
+    alignas(32) float xb[8];
+    for (; i + 8 <= n; i += 8) {
+        __m256 x = _mm256_loadu_ps(logits + i);
+        if (bias) x = _mm256_add_ps(x, _mm256_loadu_ps(bias + i));
+        const int m = _mm256_movemask_ps(_mm256_cmp_ps(x, _mm256_set1_ps(w.thr), _CMP_GT_OQ));
+        if (m == 0) continue;
+        _mm256_store_ps(xb, x);
+        for (int b = 0; b < 8; ++b) {
+            if (m & (1 << b)) w.push(xb[b], i + b);   // push re-checks against the (possibly raised) threshold
+        }
+    }
+    pxa_topk_scan_scalar(logits, bias, n, i, w);
+}
+#endif
+
+static void pxa_topk_scan(const float * logits, const float * bias, int n, pxa_topk_window & w) {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
+    if (has_avx2 && n >= 8) { pxa_topk_scan_avx2(logits, bias, n, w); return; }
+#endif
+    pxa_topk_scan_scalar(logits, bias, n, 0, w);
+}
+
+// The fast path proper. Leaves ctx_sampling->cur_p = the post-chain window, the rng advanced by
+// exactly the draw the default path makes, and `logits` as the default path leaves it.
+static llama_token pxa_topk_raw_sample(struct common_sampler * cs, struct llama_context * ctx_main, const int idx, const int W) {
+    const auto & params = cs->params;
+    const llama_model * model = llama_get_model(ctx_main);
+    const int n_vocab = llama_n_vocab(model);
+    float * logits = llama_get_logits_ith(ctx_main, idx);
+
+    // 1. logit_bias in place, exactly as llama_sampling_prepare_impl does it (and leaves it)
+    for (auto it = params.logit_bias.begin(); it != params.logit_bias.end(); ++it) {
+        logits[it->first] += it->second;
+    }
+    const float * bias = (cs->server_biases != nullptr && cs->server_biases->size() == (size_t) n_vocab) ? cs->server_biases->data() : nullptr;
+
+    // 2. repetition penalties in place on the penalized ids, originals kept for the restore
+    struct saved { llama_token id; float v; };
+    std::vector<saved> restore;
+    if (pxa_topk_raw_penalties_active(cs)) {
+        const int32_t penalty_last_n = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
+        const auto & penalty_tokens  = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : cs->prev;
+        const int used = std::min((int) penalty_tokens.size(), penalty_last_n);
+        const llama_token nl_token = llama_token_nl(model);
+        const float nl_logit = nl_token != LLAMA_TOKEN_NULL ? logits[nl_token] : 0.0f;
+        std::unordered_map<llama_token, int> token_count;
+        const llama_token * last = penalty_tokens.data() + penalty_tokens.size() - used;
+        for (int i = 0; i < used; ++i) token_count[last[i]]++;
+        restore.reserve(token_count.size());
+        for (const auto & kv : token_count) {
+            const llama_token id = kv.first;
+            if (id < 0 || id >= n_vocab) continue;   // the default path's full scan never matches these either
+            float & l = logits[id];
+            restore.push_back({id, l});
+            if (l <= 0) { l *= params.penalty_repeat; } else { l /= params.penalty_repeat; }
+            l -= float(kv.second) * params.penalty_freq + float(kv.second > 0) * params.penalty_present;
+        }
+        if (!params.penalize_nl && nl_token != LLAMA_TOKEN_NULL) {
+            logits[nl_token] = nl_logit;
+        }
+    }
+
+    // 3. bounded top-W scan
+    pxa_topk_window w;
+    w.W = W;
+    pxa_topk_scan(logits, bias, n_vocab, w);
+
+    // 4. restore the row
+    for (const auto & r : restore) logits[r.id] = r.v;
+
+    // 5. the window becomes the candidate array (sorted descending)
+    auto & cur = cs->cur;
+    cur.resize(w.cnt);
+    for (int i = 0; i < w.cnt; ++i) cur[i] = llama_token_data{w.wid[i], w.wl[i], 0.0f};
+    cs->cur_p = { cur.data(), (size_t) w.cnt, 0, true };
+    llama_token_data_array & cur_p = cs->cur_p;
+
+    if (params.temp == 0.0f) {
+        // greedy, no probs: first maximal id, softfail flag set exactly like the default path
+        return llama_sample_token_greedy(ctx_main, &cur_p);
+    }
+
+    // 6. the rest of the chain, in the request's order, over the window
+    const size_t min_keep = std::max(1, params.min_keep);
+    for (const auto st : params.samplers_sequence) {
+        switch (st) {
+            case llama_sampler_type::TOP_P:       llama_sample_top_p(ctx_main, &cur_p, params.top_p, min_keep); break;
+            case llama_sampler_type::MIN_P:       llama_sample_min_p(ctx_main, &cur_p, params.min_p, min_keep); break;
+            case llama_sampler_type::TEMPERATURE: llama_sample_temp (ctx_main, &cur_p, params.temp); break;
+            case llama_sampler_type::DIST:        llama_sample_dist (ctx_main, &cur_p); break;
+            default: break;   // TOP_K is the window itself; everything else was verified to be a no-op
+        }
+    }
+    return llama_sample_token_with_rng(ctx_main, &cur_p, cs->rng);
+}
+
+static llama_token llama_sampling_sample_impl_default(struct common_sampler *, struct llama_context *, struct llama_context *, int, bool);
+
+static llama_token pxa_topk_raw_shadow(struct common_sampler * cs, struct llama_context * ctx_main, struct llama_context * ctx_cfg, const int idx, bool grammar_first, const int W, const int mode) {
+    int64_t & n_cmp = g_pxa_topk_raw_stats[1]; int64_t & n_tie = g_pxa_topk_raw_stats[2]; int64_t & n_win_bad = g_pxa_topk_raw_stats[3]; int64_t & n_bad = g_pxa_topk_raw_stats[4];
+    const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
+    float * logits = llama_get_logits_ith(ctx_main, idx);
+    const std::vector<float> logits_copy(logits, logits + n_vocab);
+    const std::mt19937 rng_copy = cs->rng;
+
+    const llama_token id_new = pxa_topk_raw_sample(cs, ctx_main, idx, W);
+    const std::vector<llama_token_data> win_new(cs->cur_p.data, cs->cur_p.data + cs->cur_p.size);
+
+    std::copy(logits_copy.begin(), logits_copy.end(), logits);
+    cs->rng = rng_copy;
+    const llama_token id_old = llama_sampling_sample_impl_default(cs, ctx_main, ctx_cfg, idx, grammar_first);
+    const llama_token_data_array & cur_old = cs->cur_p;
+
+    ++n_cmp;
+    bool ok = true;
+    std::string why;
+    if (cs->params.temp != 0.0f) {
+        // post-chain windows: same length, same logit sequence (both sorted descending)
+        if (cur_old.size != win_new.size()) {
+            ok = false; why = "window size " + std::to_string(cur_old.size) + " vs " + std::to_string(win_new.size());
+        } else {
+            for (size_t i = 0; i < win_new.size(); ++i) {
+                if (cur_old.data[i].logit != win_new[i].logit) {
+                    ok = false; why = "window logit[" + std::to_string(i) + "] " + std::to_string(cur_old.data[i].logit) + " vs " + std::to_string(win_new[i].logit);
+                    break;
+                }
+            }
+        }
+        if (!ok) ++n_win_bad;
+    }
+    if (ok && id_old != id_new) {
+        // exact tie? both ids must carry the identical post-chain logit
+        float l_old = NAN, l_new = NAN;
+        if (cs->params.temp == 0.0f) {
+            // the default greedy path leaves cur_p as the whole vocab in identity order with the
+            // post-penalty logits, which is the value the argmax actually compared
+            if ((size_t) id_old < cur_old.size && cur_old.data[id_old].id == id_old) l_old = cur_old.data[id_old].logit;
+            if ((size_t) id_new < cur_old.size && cur_old.data[id_new].id == id_new) l_new = cur_old.data[id_new].logit;
+        } else {
+            // each id in its own path's post-chain window: on a tie at a top_p / min_p cut the two
+            // windows hold the same logit sequence (checked above) but can keep different ids
+            for (size_t i = 0; i < cur_old.size; ++i) if (cur_old.data[i].id == id_old) l_old = cur_old.data[i].logit;
+            for (size_t i = 0; i < win_new.size(); ++i) if (win_new[i].id == id_new) l_new = win_new[i].logit;
+        }
+        if (l_old == l_new) {
+            ++n_tie;
+        } else {
+            ok = false; why = "id " + std::to_string(id_old) + " (logit " + std::to_string(l_old) + ") vs " + std::to_string(id_new) + " (logit " + std::to_string(l_new) + ")";
+        }
+    }
+    if (!ok) {
+        ++n_bad;
+        fprintf(stderr, "PXA_TOPK_RAW shadow MISMATCH #%lld after %lld compares: %s | W=%d top_k=%d top_p=%g min_p=%g temp=%g min_keep=%d rep=%g freq=%g pres=%g last_n=%d bias=%d\n",
+                (long long) n_bad, (long long) n_cmp, why.c_str(), W, cs->params.top_k, cs->params.top_p, cs->params.min_p, cs->params.temp, cs->params.min_keep,
+                cs->params.penalty_repeat, cs->params.penalty_freq, cs->params.penalty_present, cs->params.penalty_last_n, cs->server_biases != nullptr);
+        if (mode >= 3) {
+            GGML_ABORT("PXA_TOPK_RAW=3: shadow mismatch");
+        }
+        if (!g_pxa_topk_raw_disabled) {
+            g_pxa_topk_raw_disabled = true;
+            fprintf(stderr, "PXA_TOPK_RAW: fast path DISABLED for the rest of this process (shadow mismatch)\n");
+        }
+    }
+    if (n_cmp % 1000 == 0 || !ok) {
+        fprintf(stderr, "PXA_TOPK_RAW shadow stats: compared=%lld tie=%lld window_mismatch=%lld mismatch=%lld\n",
+                (long long) n_cmp, (long long) n_tie, (long long) n_win_bad, (long long) n_bad);
+    }
+    return id_old;
+}
+
 static llama_token llama_sampling_sample_impl(
+                  struct common_sampler * ctx_sampling,
+                  struct llama_context * ctx_main,
+                  struct llama_context * ctx_cfg,
+                  const int idx,
+                  bool grammar_first) {
+    const int mode = pxa_topk_raw_mode();
+    if (mode != 0 && !g_pxa_topk_raw_disabled) {
+        const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
+        const int W = pxa_topk_raw_window(ctx_sampling, ctx_cfg, grammar_first, n_vocab);
+        if (W > 0) {
+            if (mode == 1) {
+                ++g_pxa_topk_raw_stats[0];
+                return pxa_topk_raw_sample(ctx_sampling, ctx_main, idx, W);
+            }
+            return pxa_topk_raw_shadow(ctx_sampling, ctx_main, ctx_cfg, idx, grammar_first, W, mode);
+        }
+    }
+    return llama_sampling_sample_impl_default(ctx_sampling, ctx_main, ctx_cfg, idx, grammar_first);
+}
+// ---- end PXA_TOPK_RAW ----------------------------------------------------------------------
+
+static llama_token llama_sampling_sample_impl_default(
                   struct common_sampler * ctx_sampling,
                   struct llama_context * ctx_main,
                   struct llama_context * ctx_cfg,
@@ -652,7 +985,7 @@ static llama_token llama_sampling_sample_impl(
             // Restore logits from the copy
             std::copy(original_logits.begin(), original_logits.end(), logits);
 
-            return llama_sampling_sample_impl(ctx_sampling, ctx_main, ctx_cfg, idx, /* is_resampling= */ true);
+            return llama_sampling_sample_impl_default(ctx_sampling, ctx_main, ctx_cfg, idx, /* is_resampling= */ true);
         }
     }
     ctx_sampling->n_valid = temp == 0.0f ? 0 : cur_p.size;
@@ -769,8 +1102,16 @@ llama_token common_sampler_sample(
     struct llama_context * ctx_main,
     const int idx,
     bool grammar_first) {
-    // Call the implementation function with is_resampling set to false by default
-    return llama_sampling_sample_impl(ctx_sampling, ctx_main, nullptr, idx, /* is_resampling= */ grammar_first);
+    // PXA_HOST_TIMING: the whole sampler call is one bucket of the per-step host timing
+    static const bool pxa_ht = llama_pxa_host_timing_enabled();
+    if (!pxa_ht) {
+        // Call the implementation function with is_resampling set to false by default
+        return llama_sampling_sample_impl(ctx_sampling, ctx_main, nullptr, idx, /* is_resampling= */ grammar_first);
+    }
+    const int64_t t0 = ggml_time_us();
+    const llama_token id = llama_sampling_sample_impl(ctx_sampling, ctx_main, nullptr, idx, /* is_resampling= */ grammar_first);
+    llama_pxa_host_timing_add_sample(ggml_time_us() - t0);
+    return id;
 }
 
 llama_token_data_array llama_sampling_prepare(

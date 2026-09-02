@@ -15,7 +15,7 @@
  *   - The env-var table overrides (PXA_PXQ6_BOOK / PXA_PXQ6_SUB, pxq-cpu.c:80-82). Omitted:
  *     the artifact records its tables in the gguf KVs and the converter cross-checks them.
  *
- * Nothing in the engine tree was modified to produce this; the source lines were read
+ * Nothing in /path/to/engine-repo was modified to produce this; the source lines were read
  * with sed and copied here.
  *
  * build: cc -O2 -std=c11 -o oracle gguf_to_vllm_oracle.c

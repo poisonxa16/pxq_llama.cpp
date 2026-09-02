@@ -218,6 +218,14 @@ int main(int argc, char ** argv) {
         LOG_TEE("%s: error: unable to load model\n", __func__);
         return 1;
     }
+    // PXA: under --verbose, say what the loaded FILE is (codec / bpw / pxa.pxq* provenance).
+    if (params.verbosity > 0) {
+        char pxq_desc[256];
+        if (llama_model_pxq_file_desc(model, pxq_desc, sizeof(pxq_desc)) > 0) {
+            LOG_TEE("%s\n", pxq_desc);
+        }
+    }
+
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
 
     const int n_ctx_train = llama_n_ctx_train(model);

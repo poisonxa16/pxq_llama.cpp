@@ -227,7 +227,23 @@ in the model column. That is a cosmetic naming artifact, not a sign the wrong co
 
 Nothing is required. `PXA_ENHANCE=1` is the one tune worth setting; the auto-detect already
 picks sane per-card defaults without it, and the PXQ codecs load with no environment at all.
-Everything else in `docs/lab/LEVERS.md` is a lab knob — see the README's Run section.
+Everything else in `docs/LEVERS.md` is a lab knob — see the README's Run section.
+
+### 4.5 What the startup banner means
+
+Every run prints a `pxq_llama:` banner before the first token. `engine | codec=off` means the
+file holds no PXQ tensors and the PXQ kernels are idle; `engine | codec=PXQ4 (140 tensors;
+pxq2 0, pxq3 0, pxq4 140, pxq6 0)` names the tier holding the most tensors and then the full
+per-tier count, so a mixed file cannot hide behind one name. One `dev N <name> cc X.Y -> path:
+...` line follows per CUDA device, naming the arch path that card will actually dispatch on —
+`sm_60 fp16-hfma2`, `sm_61 dp4a` or `sm_70 fp16-tensor-core-prefill` — which is the fastest way
+to confirm a card was detected as the arch you expected. A `lab knobs set: ...` line appears
+only when the environment holds a `PXA_`/`PXQ` variable outside `PXA_ENHANCE`, `PXA_MODE` and
+`PXA_REFERENCE`: those are lab levers measured on one config and usually a slowdown elsewhere,
+so the line names them and changes nothing. Under `llama-cli --verbose`, and in the server's
+startup log, a `file:` line adds what the GGUF says about itself — codec, whole-file bits per
+weight, and the backbone revision and codec tier the quantizer recorded, with `n/a` for
+anything the file does not carry.
 
 ---
 

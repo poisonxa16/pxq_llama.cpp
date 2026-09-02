@@ -442,6 +442,7 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
             LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overriden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));
+            model.override_tensor_names.push_back(name);
             ctx = ctx_for_buft(o.second);
             break;
         }

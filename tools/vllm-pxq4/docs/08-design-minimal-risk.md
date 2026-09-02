@@ -68,7 +68,7 @@ RUNTIME (in-container, out-of-tree pip package `pxq4-vllm`)
                                    vendored slice of ggml/src/ggml-cuda/pxq6.cuh)
 ```
 
-Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<engine-tree>` is modified.
+Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `/path/to/engine-repo` is modified.
 
 ---
 
@@ -81,7 +81,7 @@ Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<engine-tree>` is modified.
 | `tools/pxq4_gguf/gguf_raw.py` | 130 | Raw GGUF v3 struct parser: magic/version/`n_tensors`/`n_kv`, KV table (all 13 GGUF value types incl. arrays), tensor table (name, n_dims, dims, **raw type id as an int — never an enum**), aligned data base. Derived from the working scanner already run against the artifact (`scratchpad/pxq-vllm/ggufscan.py`). **This is the whole reason option (b) is cheap** — `gguf.GGMLQuantizationType(252)` raises `ValueError` inside `GGUFReader._build_tensors`, killing the entire file open (FACT, 05 §B1). |
 | `tools/pxq4_gguf/pxq4_codec.py` | 120 | The PXQ4 (id 252) codec. `split_panels(buf,R,K) -> (anchor fp16 [R//64,64], slabs uint8 [R//64,K//32,1088])` — a pure byte de-interleave, the only transform the converter applies to PXQ4 tensors. `dequant(anchor,slabs) -> fp32 [R,K]` — the vectorised reference from 01 §6: `w = hdr[:,None,:,None] * eff * BOOK[nib]`, then `transpose(0,2,1,3).reshape(R,K)`. Constants `HDR=128`, `SLAB=1088`, `QK=32`, `BM=64`, `CODE_OFF=64` (FACT, `ggml/include/ggml-pxq6-tables.h:21-27`). BOOK/SUB16 are **read from the file's `pxa.pxq6.book` / `pxa.pxq6.sub` KVs** (FACT, `src/llama-quantize.cpp:1980-1983`; both confirmed present in the artifact, 06 §3), never hard-coded — `PXA_PXQ6_BOOK`/`PXA_PXQ6_SUB` can override at build time (`ggml-cuda/pxq6.cuh:288-302`). |
 | `tools/pxq4_gguf/legacy_codec.py` | 170 | Dequantisers for the tail types: Q8_0 (id 8, 132 tensors), Q6_K (id 14, 1 tensor), MXFP4 (id 39, 48 tensors), F32/F16 passthrough. All standard ggml block formats, all row-contiguous — none of the panel machinery applies. |
-| `tools/pxq4_gguf/namemap.py` | 220 | ggml→HF/vLLM name mapping + the fusion/split policy (§5.3). Ships a `--check-against <awq_twin_dir>` mode that diffs the produced key set against `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ`'s key set and **fails the build on any mismatch**. This is the cheapest possible gate on the fiddliest part of the job. |
+| `tools/pxq4_gguf/namemap.py` | 220 | ggml→HF/vLLM name mapping + the fusion/split policy (§5.3). Ships a `--check-against <awq_twin_dir>` mode that diffs the produced key set against `/path/to/hf/<reference-hf-model>`'s key set and **fails the build on any mismatch**. This is the cheapest possible gate on the fiddliest part of the job. |
 | `tools/pxq4_gguf/convert.py` | 200 | CLI driver. `--emit fp16` (stage S0) or `--emit pxq4` (S1+); `--tail-policy fp16|native`; writes sharded safetensors, `config.json` (copied from the AWQ twin with `quantization_config` replaced), and `pxq4_book.json`. |
 | `tools/pxq4_gguf/verify.py` | 150 | The correctness gates of §7: dequant-vs-CPU-reference bit-exactness, shard-then-dequant vs dequant-then-shard bit-exactness, geometry asserts, byte-size reproduction `(R/64)*(128+(K/32)*1088)`. |
 
@@ -94,7 +94,7 @@ Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<engine-tree>` is modified.
 | `pxq4_vllm/linear.py` | 300 | `PXQ4LinearMethod(LinearMethodBase)` — §3.2. Includes the pure-torch dequant used by S1 and as the permanent CPU/meta fallback. |
 | `pxq4_vllm/mxfp4.py` | 90 | Phase 2 only: `PXQ4MXFP4LinearMethod`, delegating to the fork's already-built `torch.ops._C.mxfp4_sm70_prepare` / `mxfp4_gemm_sm70_out` (FACT, `csrc/torch_bindings.cpp:198-200`; `sm70_turbomind.py:229-253`). |
 | `pxq4_vllm/ops.py` | 100 | `torch.ops.pxq4.*` wrappers + `@register_fake` meta kernels for **every** op. §4.4. |
-| `pxq4_vllm/csrc/pxq4_pxa.cuh` | 560 | **Vendored verbatim** from `<engine-tree>` (~500 lines) + ~60 lines of edits. Slice list in §4.2. |
+| `pxq4_vllm/csrc/pxq4_pxa.cuh` | 560 | **Vendored verbatim** from `/path/to/engine-repo/ggml/src/ggml-cuda/pxq6.cuh` (~500 lines) + ~60 lines of edits. Slice list in §4.2. |
 | `pxq4_vllm/csrc/pxq4_sm70.cu` | 320 | Torch shim: `TORCH_LIBRARY(pxq4, m)`, dtype/shape/device `TORCH_CHECK`s, stream plumbing, launch config. §4.3. |
 | `setup.py` | 70 | `CUDAExtension` with `-gencode arch=compute_70,code=sm_70`. §4.5. |
 | `pyproject.toml` | 30 | `[project.entry-points."vllm.general_plugins"] pxq4 = "pxq4_vllm:register"`. |
@@ -114,7 +114,7 @@ Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<engine-tree>` is modified.
 `site-packages/vllm` is a *copied* install, not an editable link to `/opt/1Cat-vLLM`, so edits
 there are inert at runtime anyway (FACT, 05 §A2).
 
-**In `<engine-tree>` (our llama.cpp tree): NONE.** Read-only by rule. The vendored kernel
+**In `/path/to/engine-repo` (our llama.cpp tree): NONE.** Read-only by rule. The vendored kernel
 slice is a copy, with the provenance canary comment (`pxq6.cuh:1-3`) preserved and a
 `// VENDORED FROM mgv-wt@acf8f245 ggml/src/ggml-cuda/pxq6.cuh:<range>` banner per block so a
 future re-sync is mechanical.
@@ -352,7 +352,7 @@ in v1 and must raise a clear error, not silently misbehave.
 
 ### 4.2 The vendored slice (`pxq4_pxa.cuh`, ~500 copied + ~60 edited LOC)
 
-Copy verbatim from `<engine-tree>` (**not** `pxq4.cuh` — that
+Copy verbatim from `/path/to/engine-repo/ggml/src/ggml-cuda/pxq6.cuh` (**not** `pxq4.cuh` — that
 file documents the retired id-250 MXFP4-repack format and contains no id-252 compute kernel at
 all; FACT, `pxq4.cuh:1-17`, `:59-60`, `:117-119`):
 

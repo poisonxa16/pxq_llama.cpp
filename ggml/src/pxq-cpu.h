@@ -1,9 +1,9 @@
 // pxq-cpu.h — CPU panel-dequant + slow-but-correct matmul fallbacks for the PXQ slab types
 // (A5: CPU PXQ panel-dequant fallback, 2026-07-21).
 //
-// The PXQ tensor types (PXQ4 252, PXQ4HQ 253, PXQ2 254, PXQ3 255; the retired legacy ids
-// 250 + 251 were removed 2026-07-21, and the 5-bit PXQ6 id 256 has no CPU fallback yet)
-// are 64-row PANEL-interleaved CUDA-consumer formats: there is no
+// The PXQ tensor types (PXQ1 248, PXQ4 252, PXQ4HQ 253, PXQ2 254, PXQ3 255, PXQ6 256; the
+// retired legacy ids 250 + 251 were removed 2026-07-21) are 64-row PANEL-interleaved
+// CUDA-consumer formats: there is no
 // per-row CPU codec (a ggml to_float/vec_dot gets a single row pointer, but a PXQ row's
 // bytes are scattered across the slabs of its 64-row panel), so their type_traits
 // to_float/from_float/vec_dot stay NULL on purpose. These entry points instead operate
@@ -11,7 +11,9 @@
 // and let the CPU backend run partial-offload (--cpu-moe / -ngl < 99) instead of hitting
 // GGML_ABORT in ggml.c's fused-MoE / mul_mat(_id) paths.
 //
-// Layout ground truth: src/pxq{2,3,6}-quantize.inc.cpp + ggml/include/ggml-pxq{2,3,6}-tables.h.
+// Layout ground truth: src/pxq{1,2,3,6,6r}-quantize.inc.cpp + ggml/include/ggml-pxq{1,2,3,6}-tables.h.
+// Every tier decodes here as of 2026-09-01 (PXQ1 + PXQ6 completed), which is what lets
+// llama-quantize requantize FROM a PXQ source and llama-pxq-export run without a GPU.
 // This is a COMPATIBILITY fallback: correct and coherent, not fast, and not required to
 // be bit-exact with the CUDA GEMM kernels (which snap products to fp16 inside the MMA).
 // The dequant itself IS the parity-locked contract (fp32 eff/book products).
@@ -37,6 +39,16 @@ struct pxa_pxq_rowmap {
 
 // true for the PXQ slab types this CPU fallback can decode
 bool pxa_pxq_is_cpu_supported(enum ggml_type type);
+
+// the live numeric tables, after the frozen-header defaults and any PXA_PXQ*_BOOK / _SUB env
+// override have been applied. Any of the three out-pointers may be NULL. Calling this is what
+// forces the (idempotent) table init, so a consumer that needs the tables and nothing else --
+// pxq-dot.c builds its int8 book image from the PX16 book here -- can ask for them directly
+// instead of duplicating the env parsing and drifting from the dequant path.
+//   book16 : 16-entry PX16 book   (PXQ4 / PXQ4-HQ codes)
+//   sub16  : 16-entry SUB16 subs  (every tier's per-16-element sub-scale)
+//   sub8   : 16-entry SUB8 subs   (PXQ4-HQ's per-8-element sub-scale)
+void pxa_pxq_float_tables(const float ** book16, const float ** sub16, const float ** sub8);
 
 // dequant one row (global row index into the panel-interleaved 2D matrix) to k floats.
 // data = base of the 2D [k x nrows] slice (e.g. expert base = tensor->data + e*nb[2]).

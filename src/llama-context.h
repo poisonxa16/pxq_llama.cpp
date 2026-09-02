@@ -9,6 +9,7 @@
 struct llama_model;
 
 #include <vector>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <memory>
@@ -18,10 +19,46 @@ struct llama_kv_cell {
     llama_pos delta = 0;
     int32_t   src   = 0; // used by recurrent state models to copy states
 
+    // PXA_KV_SEQ_SOA (house custom): the set of sequence ids is PRIVATE. Every mutation goes
+    // through add_seq/erase_seq/clear_seq so that the inline shadow `seq0` below can never drift
+    // from the set -- a missed mutation site is a compile error, not a stale mask. Whole-cell
+    // copies (defrag moves, checkpoint snapshots, `= llama_kv_cell()`) carry the shadow along.
+    //
+    // seq0 encodes the set for the O(1) has_seq_fast() read used by the decode KQ-mask fill when
+    // PXA_KV_SEQ_SOA=1 (the OFF path keeps the red-black-tree has_seq_id() lookup):
+    //   -1        : empty
+    //   -2        : two or more ids (consult the set; only seq_cp creates these)
+    //   otherwise : the single id
+    // It lives in the 4-byte hole after `src`, so the cell stays 64 bytes on libstdc++.
+    static constexpr int32_t SEQ_NONE  = -1;
+    static constexpr int32_t SEQ_MULTI = -2;
+
+private:
+    int32_t seq0 = SEQ_NONE;
     std::set<llama_seq_id> seq_id;
 
+    void sync_shadow() {
+        seq0 = seq_id.empty() ? SEQ_NONE : (seq_id.size() == 1 ? *seq_id.begin() : SEQ_MULTI);
+    }
+
+public:
+    void add_seq(llama_seq_id id)   { seq_id.insert(id); sync_shadow(); }
+    void erase_seq(llama_seq_id id) { seq_id.erase(id);  sync_shadow(); }
+    void clear_seq()                { seq_id.clear();    seq0 = SEQ_NONE; }
+
+    // read-only views of the set
+    const std::set<llama_seq_id> & seqs() const { return seq_id; }
+    size_t n_seq() const { return seq_id.size(); }
+    int32_t seq_shadow() const { return seq0; }
+
+    // the original predicate (default path, PXA_KV_SEQ_SOA unset)
     bool has_seq_id(const llama_seq_id & id) const {
         return seq_id.find(id) != seq_id.end();
+    }
+
+    // same predicate, answered from the inline shadow; falls back to the set only for multi-id cells
+    bool has_seq_fast(const llama_seq_id & id) const {
+        return seq0 >= 0 ? seq0 == id : (seq0 == SEQ_MULTI && seq_id.find(id) != seq_id.end());
     }
 
     bool is_empty() const {
@@ -233,6 +270,17 @@ struct llama_control_vector {
     }
 };
 
+// PXA_PIPELINE_PP: opt-in prefill pipeline parallelism (scheduler n_copies > 1) plus the
+// in-graph PLE conv-history carry it needs. OFF (default) is today's behaviour: n_copies
+// stays 1 and no extra graph nodes, inputs or syncs exist.
+static inline bool pxa_pipeline_pp_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("PXA_PIPELINE_PP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 struct llama_context {
 
     llama_context(const llama_model & model);
@@ -396,6 +444,14 @@ struct llama_context {
     // F32 [hc_dim, (conv_kernel-1)*ngram_size]: the PLE conv input of the positions just
     // before this ubatch, carried across calls because it cannot be recomputed from the cache.
     struct ggml_tensor * inp_ple_conv_hist = nullptr;  // same contract as inp_ple_rows above
+    // PXA_PIPELINE_PP=1 replaces the host round trip above with a device-resident window
+    // (ple_conv_hist_dev below) that the graph itself carries forward. This F32 [1] input
+    // is the only per-ubatch host write left: 1 keeps the carried window, 0 zeroes it for
+    // a sequence that does not continue the one the window belongs to (new request, a
+    // rewind, a cache clear) - the same discontinuity test ple_hist applies to the token
+    // n-gram window. An input rather than a baked-in scale so a reused graph and an
+    // in-flight pipelined graph both stay correct. Same nullptr contract as inp_ple_rows.
+    struct ggml_tensor * inp_ple_conv_keep = nullptr;
     // Destination for the conv-input capture. It lives in its OWN backend buffer, NOT in
     // the graph arena. Marking a mid-graph tensor ggml_set_output does not keep it
     // materialised: the scheduler still reuses that memory across splits (11 of them here,
@@ -406,6 +462,15 @@ struct llama_context {
     struct ggml_context * ctx_ple_capture = nullptr;
     ggml_backend_buffer_t buf_ple_capture = nullptr;
     struct ggml_tensor  * ple_conv_capture = nullptr;
+    // PXA_PIPELINE_PP=1: persistent F32 [hc_dim, hist] window on the PLE backend, allocated
+    // in the same buffer as the capture. Read by the graph (concat in front of this
+    // ubatch's conv input) and rewritten by a trailing ggml_cpy of the last hist real
+    // columns, both on one device stream, so consecutive pipelined ubatches order
+    // themselves and no host sync / readback / re-upload happens per ubatch.
+    struct ggml_tensor  * ple_conv_hist_dev = nullptr;
+    bool                  ple_conv_dev_valid    = false; // window belongs to (seq, next_pos) below
+    llama_seq_id          ple_conv_dev_seq      = 0;
+    llama_pos             ple_conv_dev_next_pos = 0;
     std::map<llama_seq_id, std::vector<float>> ple_conv_hist;
     std::vector<float> ple_conv_hist_prev;
     llama_seq_id       ple_conv_hist_seq = 0;
@@ -440,6 +505,23 @@ struct llama_context {
 
     void reset_scheduler();
     bool can_reuse_graph(const llama_batch & u_batch);
+
+    // PXA_SCHED_RESERVE_REAL: identity of the plan galloc currently holds, as installed by
+    // pxa_reserve_real_graph (real decode path, KV window wide open). A ubatch whose graph does
+    // not fit this plan would make ggml_backend_sched_alloc_splits re-plan - on that ubatch's
+    // own narrow sizes - so the decode loop re-reserves instead. Three keys, because any one of
+    // them alone lets a narrow plan survive:
+    //   nodes   - the shape. Necessary, not sufficient: a 2-token graph and a 2048-token graph
+    //             have the SAME node count, so node count alone accepted the warmup's 2-token
+    //             plan as covering the whole prefill.
+    //   width   - the ubatch the plan was built at. A wider ubatch overflows the per-node sizes.
+    //   replans - ggml_backend_sched_get_n_replans() right after the reserve. If it has moved,
+    //             something else (a warmup decode, a K-shift) re-planned and the plan in galloc
+    //             is no longer the one reserved here, whatever its node count.
+    int  pxa_reserved_nodes   = -1;
+    int  pxa_reserved_width   =  0;
+    int  pxa_reserved_replans = -1;
+    bool pxa_reserve_sizes_logged = false;
 
     struct CacheCopy {
         ggml_tensor * cpy = nullptr;

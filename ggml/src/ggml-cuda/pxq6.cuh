@@ -2622,6 +2622,7 @@ k_pxq6_gemm_grouped(const uint8_t * __restrict__ W, const half * __restrict__ A,
     const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
     const int p = blockIdx.x;
     const pxq4_tile_info tile = tiles[blockIdx.y];
+    if (tile.nrows <= 0) return;   // padding tile of a device-built tile list (uniform over the block)
     const uint8_t * pan = pxq6_panel<POL>(W, tile.e, panels, p, kslabs);
     const half    * At  = A + (size_t)tile.row0*K;
     float         * Ct  = C + (size_t)tile.row0*R + (size_t)p*PXQ6_BM;
@@ -2739,6 +2740,7 @@ k_pxq6_gemm_gufuse(const uint8_t * __restrict__ Wu, const uint8_t * __restrict__
     const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
     const int p = blockIdx.x;
     const pxq4_tile_info tile = tiles[blockIdx.y];
+    if (tile.nrows <= 0) return;   // padding tile of a device-built tile list (uniform over the block)
     const uint8_t * panU = pxq6_panel<POL>(Wu, tile.e, panels, p, kslabs);
     const uint8_t * panG = pxq6_panel<POL>(Wg, tile.e, panels, p, kslabs);
     const half    * At  = A + (size_t)tile.row0*K;
@@ -2872,6 +2874,7 @@ k_pxq6_gemm_down_scat(const uint8_t * __restrict__ W, const half * __restrict__ 
     const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
     const int p = blockIdx.x;
     const pxq4_tile_info tile = tiles[blockIdx.y];
+    if (tile.nrows <= 0) return;   // padding tile of a device-built tile list (uniform over the block)
     const uint8_t * pan = pxq6_panel<POL>(W, tile.e, panels, p, kslabs);
     const half    * At  = A + (size_t)tile.row0*K;
 
@@ -3019,6 +3022,7 @@ k_pxq6_gemm_grouped_wmma(const uint8_t * __restrict__ W, const half * __restrict
     const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
     const int p = blockIdx.x;
     const pxq4_tile_info tile = tiles[blockIdx.y];
+    if (tile.nrows <= 0) return;   // padding tile of a device-built tile list (uniform over the block)
     const uint8_t * pan = pxq6_panel<POL>(W, tile.e, panels, p, kslabs);
     const half    * At  = A + (size_t)tile.row0*K;
     float         * Ct  = C + (size_t)tile.row0*R + (size_t)p*PXQ6_BM;
@@ -3185,6 +3189,7 @@ k_pxq6_gemm_gufuse_wmma(const uint8_t * __restrict__ Wu, const uint8_t * __restr
     const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
     const int p = blockIdx.x;
     const pxq4_tile_info tile = tiles[blockIdx.y];
+    if (tile.nrows <= 0) return;   // padding tile of a device-built tile list (uniform over the block)
     const uint8_t * panU = pxq6_panel<POLU>(Wu, tile.e, panels, p, kslabs);
     const uint8_t * panG = pxq6_panel<POLG>(Wg, tile.e, panels, p, kslabs);
     const half    * At  = A + (size_t)tile.row0*K;
@@ -3320,6 +3325,7 @@ k_pxq6_gemm_down_scat_wmma(const uint8_t * __restrict__ W, const half * __restri
     const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
     const int p = blockIdx.x;
     const pxq4_tile_info tile = tiles[blockIdx.y];
+    if (tile.nrows <= 0) return;   // padding tile of a device-built tile list (uniform over the block)
     const uint8_t * pan = pxq6_panel<POL>(W, tile.e, panels, p, kslabs);
     const half    * At  = A + (size_t)tile.row0*K;
 

@@ -825,8 +825,25 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+// PXA_SCHED_DEBUG: a galloc re-plan drains every backend (ggml_backend_sched_alloc_splits
+// synchronizes before reserving), which serializes pipelined ubatches. The stock "why" prints
+// are behind NDEBUG and so absent from Release builds; this reports the first offending
+// node/leaf in any build when the env var is set. Diagnostic only - no behaviour change.
+static bool ggml_gallocr_pxa_debug(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("PXA_SCHED_DEBUG") != NULL ? 1 : 0;
+    }
+    return v != 0;
+}
+
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    const bool pxa_dbg = ggml_gallocr_pxa_debug();
+
     if (galloc->n_nodes != graph->n_nodes) {
+        if (pxa_dbg) {
+            fprintf(stderr, "%s: PXA re-plan cause: n_nodes %d -> %d\n", __func__, galloc->n_nodes, graph->n_nodes);
+        }
 #ifndef NDEBUG
         fprintf(stderr, "%s: graph has different number of nodes\n", __func__);
 #endif
@@ -834,6 +851,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
+        if (pxa_dbg) {
+            fprintf(stderr, "%s: PXA re-plan cause: n_leafs %d -> %d\n", __func__, galloc->n_leafs, graph->n_leafs);
+        }
 #ifndef NDEBUG
         fprintf(stderr, "%s: graph has different number of leafs\n", __func__);
 #endif
@@ -845,6 +865,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
+            if (pxa_dbg) {
+                const int bid = node_alloc->dst.buffer_id;
+                const size_t need = (bid >= 0 && bid < galloc->n_buffers)
+                    ? ggml_backend_buft_get_alloc_size(galloc->bufts[bid], node) : 0;
+                fprintf(stderr, "%s: PXA re-plan cause: node[%d] %s (%s) [%lld,%lld,%lld,%lld] needs %zu > reserved %zu\n",
+                        __func__, i, node->name, ggml_op_name(node->op),
+                        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3],
+                        need, node_alloc->dst.size_max);
+            }
 #ifndef NDEBUG
             fprintf(stderr, "%s: node %s is not valid\n", __func__, node->name);
 #endif
@@ -857,6 +886,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
+                if (pxa_dbg) {
+                    const int bid = node_alloc->src[j].buffer_id;
+                    const size_t need = (bid >= 0 && bid < galloc->n_buffers)
+                        ? ggml_backend_buft_get_alloc_size(galloc->bufts[bid], src) : 0;
+                    fprintf(stderr, "%s: PXA re-plan cause: src%d %s (%s) of node[%d] %s [%lld,%lld,%lld,%lld] needs %zu > reserved %zu\n",
+                            __func__, j, src->name, ggml_op_name(src->op), i, node->name,
+                            (long long)src->ne[0], (long long)src->ne[1], (long long)src->ne[2], (long long)src->ne[3],
+                            need, node_alloc->src[j].size_max);
+                }
 #ifndef NDEBUG
                 fprintf(stderr, "%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif

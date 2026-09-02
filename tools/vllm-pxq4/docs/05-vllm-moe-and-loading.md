@@ -28,7 +28,7 @@ no expert KV of any kind**. Per-class tensor census below. There is no fused-MoE
 2. The PXQ4 artifact is **five** types, not the four the brief listed, and it contains **no f16
    tensor at all**. Measured histogram (ggml type id → count):
    `{0 (F32): 360, 8 (Q8_0): 132, 14 (Q6_K): 1, 39 (MXFP4): 48, 252 (PXQ4): 325}`.
-   `GGML_TYPE_MXFP4 = 39` confirmed at `<engine-tree>:424`.
+   `GGML_TYPE_MXFP4 = 39` confirmed at `/path/to/engine-repo/ggml/include/ggml.h:424`.
    **`ssm_out.weight` (all 48 GDN layers) is MXFP4, not PXQ4** — the backbone map
    (`pxa.pxq.backbone_map` KV, read from the file) lists
    `attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=tier+1` and `ssm_out` is not in
@@ -382,7 +382,7 @@ which matters if this is going to be offered upstream.
      vLLM handles that).
 3. Rename ggml names → HF/vLLM names (`blk.N.ffn_gate` → `model.language_model.layers.N.mlp.gate_proj`,
    etc.). The mapping is already implied by the AWQ twin's tensor names — dump them from
-   `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ` and match one-for-one.
+   `/path/to/hf/<reference-hf-model>` and match one-for-one.
    **Fuse `attn_qkv` (10240 rows) + `attn_gate` (6144 rows) → `linear_attn.in_proj_qkvz`
    (16384 rows)** by concatenating panels along dim 0 — legal because panels are self-contained
    (`pxq-cpu.h:1-17`). Keep `ssm_alpha`/`ssm_beta` as `in_proj_a`/`in_proj_b` (separate, per §A5).

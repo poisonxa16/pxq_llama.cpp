@@ -72,10 +72,14 @@ static __global__ void k_pxq4_gather_a_f16(const char * __restrict__ src1, half 
                                            const int64_t K, const int64_t ne11,
                                            const size_t nb11, const size_t nb12) {
     const int i = blockIdx.x;
+    half * dst = A + (size_t)i*K;
+    if (map[i].i1 < 0) {   // device-built map: slot past the routed total, no source row
+        for (int64_t j = threadIdx.x; j < K; j += blockDim.x) dst[j] = __float2half(0.0f);
+        return;
+    }
     const int32_t i11 = map[i].i1 % ne11;
     const int32_t i12 = map[i].i2;
     const float * src = (const float *)(src1 + i11*nb11 + i12*nb12);
-    half * dst = A + (size_t)i*K;
     for (int64_t j = threadIdx.x; j < K; j += blockDim.x) {
         dst[j] = __float2half(src[j]);
     }

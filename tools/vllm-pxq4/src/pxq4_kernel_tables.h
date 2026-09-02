@@ -2,11 +2,11 @@
 // geometry constants, vendored VERBATIM from the pxq_llama engine tree.
 //
 // SOURCE OF TRUTH (read-only, do not edit either copy by hand):
-//   <engine-tree>/ggml/include/ggml-pxq6-tables.h:21-44
+//   /path/to/engine-repo/ggml/include/ggml-pxq6-tables.h:21-44
 //     PXQ6_QK / PXQ6_TYPE_SIZE / PXQ6_BM / PXQ6_SLAB_BYTES / PXQ6_HDR_BYTES / PXQ6_ROW_META
 //     PXQ6_BOOK_INIT (frozen PX16 16-entry book)
 //     PXQ6_SUB16_INIT (E16-row 4-bit energy-weighted sublevels, core tier)
-//   <engine-tree>/ggml/src/ggml-cuda/pxq4.cuh:114   PXQ4_MMV_KSEG
+//   /path/to/engine-repo/ggml/src/ggml-cuda/pxq4.cuh:114   PXQ4_MMV_KSEG
 //
 // FILE-NAME TRAP, restated here because it has already misled readers once:
 // the kernels that serve ggml type id 252 live in ggml/src/ggml-cuda/**pxq6.cuh**, not in

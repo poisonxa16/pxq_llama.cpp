@@ -151,16 +151,51 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size>
+// PXA_NORM_REGCACHE (default OFF): keep the row in registers across the two passes.
+//
+// The rms/l2 norm kernels read x twice -- once for the sum of squares, once to scale. At
+// single-token decode the grid is one block, so the kernel occupies one SM and is limited by
+// the bytes it pulls through it; dropping the second read is worth roughly a fifth of the
+// launch. It only pays when the row needs more than one value per thread and still fits in a
+// small fixed register array, so it is confined to the block_size == 1024 instantiations and
+// to rows of at most 4*block_size.
+//
+// The cached value is exactly the value the second pass would have re-read, and the scaling
+// expression is otherwise untouched, so the output is bit-identical.
+#define PXA_NORM_MAX_CACHE 4
+
+// PXA_NORM_REGCACHE=1 enables the register-cached norm variants. Default OFF.
+static bool pxa_norm_regcache_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_NORM_REGCACHE");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+template <int block_size, bool regcache = false>
 static __global__ void rms_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
     float tmp = 0.0f; // partial sum for thread in warp
 
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[row*ncols + col];
-        tmp += xi * xi;
+    const bool cached = regcache && ncols > block_size && ncols <= PXA_NORM_MAX_CACHE*block_size;
+    float xv[regcache ? PXA_NORM_MAX_CACHE : 1];
+
+    if (cached) {
+#pragma unroll
+        for (int k = 0; k < (regcache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+            const int   col = tid + k*block_size;
+            const float xi  = col < ncols ? x[row*ncols + col] : 0.0f;
+            xv[k] = xi;
+            tmp  += xi * xi;
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[row*ncols + col];
+            tmp += xi * xi;
+        }
     }
 
     // sum up partial sums
@@ -180,21 +215,44 @@ static __global__ void rms_norm_f32(const float * x, float * dst, const int ncol
     const float mean = tmp / ncols;
     const float scale = rsqrtf(mean + eps);
 
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[row*ncols + col] = scale * x[row*ncols + col];
+    if (cached) {
+#pragma unroll
+        for (int k = 0; k < (regcache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                dst[row*ncols + col] = scale * xv[k];
+            }
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[row*ncols + col] = scale * x[row*ncols + col];
+        }
     }
 }
 
-template <int block_size>
+template <int block_size, bool regcache = false>
 static __global__ void l2_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
     float tmp = 0.0f;
 
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[row * ncols + col];
-        tmp += xi * xi;
+    const bool cached = regcache && ncols > block_size && ncols <= PXA_NORM_MAX_CACHE*block_size;
+    float xv[regcache ? PXA_NORM_MAX_CACHE : 1];
+
+    if (cached) {
+#pragma unroll
+        for (int k = 0; k < (regcache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+            const int   col = tid + k*block_size;
+            const float xi  = col < ncols ? x[row*ncols + col] : 0.0f;
+            xv[k] = xi;
+            tmp  += xi * xi;
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[row * ncols + col];
+            tmp += xi * xi;
+        }
     }
 
     tmp = warp_reduce_sum(tmp);
@@ -212,8 +270,18 @@ static __global__ void l2_norm_f32(const float * x, float * dst, const int ncols
 
     const float scale = rsqrtf(fmaxf(tmp, eps * eps));
 
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[row * ncols + col] = scale * x[row * ncols + col];
+    if (cached) {
+#pragma unroll
+        for (int k = 0; k < (regcache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                dst[row*ncols + col] = scale * xv[k];
+            }
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[row * ncols + col] = scale * x[row * ncols + col];
+        }
     }
 }
 
@@ -305,12 +373,20 @@ static __global__ void l2_norm_f32_nc(
     }
 }
 
-template <int block_size, typename src_t>
+// The q8_0 source is deliberately NOT cached: its scaling pass evaluates
+// scale * y[col] * (float)d * qs, and folding d*qs into one cached value re-associates the
+// product and would change the last bit. Every other source type re-reads a value that
+// converts to exactly the cached float, so those stay bit-identical.
+template <int block_size, typename src_t, bool regcache = false>
 static __global__ void fused_rms_norm_f32(const src_t * x, const float * y, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
     float tmp = 0.0f; // partial sum for thread in warp
+
+    constexpr bool can_cache = regcache && !std::is_same_v<src_t, block_q8_0>;
+    const bool cached = can_cache && ncols > block_size && ncols <= PXA_NORM_MAX_CACHE*block_size;
+    float xv[can_cache ? PXA_NORM_MAX_CACHE : 1];
 
     if constexpr (std::is_same_v<src_t, block_q8_0>) {
         static_assert(block_size % QK8_0 == 0);
@@ -320,14 +396,34 @@ static __global__ void fused_rms_norm_f32(const src_t * x, const float * y, floa
             tmp += xi * xi;
         }
     } else if constexpr (std::is_same_v<src_t, nv_bfloat16>) {
-        for (int col = tid; col < ncols; col += block_size) {
-            const float xi = __bfloat162float(x[row*ncols + col]);
-            tmp += xi * xi;
+        if (cached) {
+#pragma unroll
+            for (int k = 0; k < (can_cache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+                const int   col = tid + k*block_size;
+                const float xi  = col < ncols ? __bfloat162float(x[row*ncols + col]) : 0.0f;
+                xv[k] = xi;
+                tmp  += xi * xi;
+            }
+        } else {
+            for (int col = tid; col < ncols; col += block_size) {
+                const float xi = __bfloat162float(x[row*ncols + col]);
+                tmp += xi * xi;
+            }
         }
     } else {
-        for (int col = tid; col < ncols; col += block_size) {
-            const float xi = (float)x[row*ncols + col];
-            tmp += xi * xi;
+        if (cached) {
+#pragma unroll
+            for (int k = 0; k < (can_cache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+                const int   col = tid + k*block_size;
+                const float xi  = col < ncols ? (float)x[row*ncols + col] : 0.0f;
+                xv[k] = xi;
+                tmp  += xi * xi;
+            }
+        } else {
+            for (int col = tid; col < ncols; col += block_size) {
+                const float xi = (float)x[row*ncols + col];
+                tmp += xi * xi;
+            }
         }
     }
 
@@ -352,6 +448,14 @@ static __global__ void fused_rms_norm_f32(const src_t * x, const float * y, floa
         auto xr = x + (row*ncols)/QK8_0;
         for (int col = tid; col < ncols; col += block_size) {
             dst[row*ncols + col] = scale * y[col] * (float)xr[col / QK8_0].d * xr[col / QK8_0].qs[col % QK8_0];
+        }
+    } else if (cached) {
+#pragma unroll
+        for (int k = 0; k < (can_cache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                dst[row*ncols + col] = scale * y[col] * xv[k];
+            }
         }
     } else if constexpr (std::is_same_v<src_t, nv_bfloat16>) {
         for (int col = tid; col < ncols; col += block_size) {
@@ -507,7 +611,11 @@ static void rms_norm_f32_cuda(const float * x, float * dst, const int ncols, con
         rms_norm_f32<kBlockSize><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        rms_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        if (pxa_norm_regcache_enabled()) {
+            rms_norm_f32<1024, true><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        } else {
+            rms_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        }
     }
 }
 
@@ -532,7 +640,11 @@ static void l2_norm_f32_cuda(const float * x, float * dst, const int ncols, cons
         l2_norm_f32<kBlockSize><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        l2_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        if (pxa_norm_regcache_enabled()) {
+            l2_norm_f32<1024, true><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        } else {
+            l2_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
+        }
     }
 }
 
@@ -590,7 +702,11 @@ static void fused_rms_norm_f32_cuda(const src_t * x, const float * y, float * ds
             fused_rms_norm_f32<kBlockSize><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
         } else {
             const dim3 block_dims(1024, 1, 1);
-            fused_rms_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+            if (pxa_norm_regcache_enabled()) {
+                fused_rms_norm_f32<1024, src_t, true><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+            } else {
+                fused_rms_norm_f32<1024><<<nrows, block_dims, 0, stream>>>(x, y, dst, ncols, eps);
+            }
         }
     }
 }

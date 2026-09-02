@@ -2,7 +2,7 @@
  * harness can compare against the real thing instead of a transcription of it.
  *
  * vendor/ is a verbatim READ-ONLY copy of the files needed to compile
- * ggml/src/pxq-cpu.c out of the engine tree (production tree, never modified).
+ * ggml/src/pxq-cpu.c out of /path/to/engine-repo (production tree, never modified).
  * pxa_pxq_dequant_2d() is the parity-locked contract (pxq-cpu.h:16-18): the CUDA GEMMs
  * are explicitly allowed to differ (fp16 MMA snap), the DEQUANT is not.
  *

@@ -2,7 +2,7 @@
 // the pxq_llama engine and re-addressed for vLLM's two-tensor parameter split.
 //
 // PROVENANCE. Every device function below is a line-for-line copy of the corresponding
-// function in <engine-tree>/ggml/src/ggml-cuda/pxq6.cuh (read-only; nothing in that
+// function in /path/to/engine-repo/ggml/src/ggml-cuda/pxq6.cuh (read-only; nothing in that
 // tree was modified). The ONLY permitted edits are ADDRESSING edits, listed exhaustively here:
 //
 //   1. The engine stores one contiguous blob per tensor and computes

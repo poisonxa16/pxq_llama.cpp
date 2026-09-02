@@ -643,6 +643,23 @@ struct llama_model {
         return tensor_overrides;
     }
 
+    // Names of the tensors a buffer-type override actually matched at load time
+    // (create_tensors_helper::get_context_for_tensor). Lets the pipeline-parallel gate tell
+    // an override that moves compute weights (a CPU split per layer, no overlap to gain)
+    // from one that only relocates a gather table read by GET_ROWS.
+    std::vector<std::string> override_tensor_names;
+
+    // true when every override matched only GET_ROWS-consumed tables (token_embd,
+    // per_layer_token_embd); false if anything else was moved or nothing was recorded.
+    bool tensor_overrides_get_rows_only() const {
+        if (!tensor_overrides) return true;
+        if (override_tensor_names.empty()) return false;
+        for (const auto & n : override_tensor_names) {
+            if (n != "token_embd.weight" && n != "per_layer_token_embd.weight") return false;
+        }
+        return true;
+    }
+
     bool is_mla_model() const {
         return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4;
     }

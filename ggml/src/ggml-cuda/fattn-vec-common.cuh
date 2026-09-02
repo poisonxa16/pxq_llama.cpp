@@ -11,6 +11,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
 
 #define FATTN_KQ_STRIDE       256
@@ -705,6 +706,69 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// =================================================================================================
+// PXA_FA_KEYS_PER_SPLIT (2026-09-01) — a keys-per-split ladder for the D=256 decode vec kernels.
+//
+// WHY. The stock `parallel_blocks` heuristic below is an OCCUPANCY heuristic: it picks the
+// smallest split count that fills one wave of `nsm * max_blocks_per_sm` blocks and then stops as
+// soon as the wave-fill efficiency reaches 90%. On this card the D=256 vec kernel compiles to
+// >190 registers, so max_blocks_per_sm == 1 and blocks_per_wave == nsm == 56; with ntiles_total =
+// n_head(24) * 1 token, the loop settles at parallel_blocks = 7 (168 blocks, 3 waves at 100%).
+// That is optimal for wave packing and terrible for latency: at n_kv = 150k each CTA then walks
+// 150000/7 ~= 21.4k keys SERIALLY, and the whole op is one long dependent chain per CTA. The
+// tensor allows up to ntiles_KQ = n_kv/256 = 586 splits.
+//
+// The idea is borrowed (mechanism only, no code) from the ninfer V100 decode launcher, which
+// sizes the split by KEYS PER CTA rather than by wave fill and clamps at the tensor ceiling:
+// past a certain n_kv, extra waves of short CTAs beat fewer waves of long ones, because the
+// per-CTA K/V walk is a latency chain that no amount of wave packing shortens.
+//
+// WHAT. PXA_FA_KEYS_PER_SPLIT=<n> replaces the heuristic result with
+//     parallel_blocks = clamp(ceil_div(n_kv, n), 1, ntiles_KQ)
+// so each CTA walks at most ~n keys. 0 (default) keeps the stock heuristic bit-for-bit. Applies
+// only to the decode vec path (ncols1 == 1) at DV == 256 -- the two D=256 callers in
+// fattn-vec-f32.cuh, i.e. BOTH the stock kernel and the PXA_FA_GQA_PACK kernel, since they
+// share this launcher. Everything else (prefill tile/mma, other head sizes) is untouched.
+//
+// dst_tmp / dst_tmp_meta and the combine pass are sized from `parallel_blocks` by the existing
+// code below, so they follow automatically; the combine kernel is already generic in the split
+// count (its only fixed cost is parallel_blocks*8 bytes of shared memory -- 4.7 KB at the 586
+// ceiling, well inside the 48 KB budget).
+//
+// NOT BIT-IDENTICAL WHEN ARMED. Changing the split count changes which keys land in which CTA
+// and therefore the order in which the online-softmax partials are combined, both inside a CTA
+// and in the final reduction. The values are equivalent to fp32 round-off, not identical.
+// =================================================================================================
+static inline int pxa_fa_keys_per_split() {
+    static const int v = [](){
+        const char * e = getenv("PXA_FA_KEYS_PER_SPLIT");
+        const int n = e ? atoi(e) : 0;
+        if (n < 0) {
+            fprintf(stderr, "PXA_FA_KEYS_PER_SPLIT: %d is negative -- treated as 0 (stock)\n", n);
+            return 0;
+        }
+        if (n) {
+            fprintf(stderr, "PXA_FA_KEYS_PER_SPLIT: armed, n=%d keys per CTA on the D=256 decode "
+                            "vec path (split-KV reduction order CHANGES -- not bit-identical; "
+                            "PXA_FA_KEYS_PER_SPLIT=0 reverts)\n", n);
+        }
+        return n;
+    }();
+    return v;
+}
+
+// Fires once per (n_kv bucket) so an A/B can prove engagement rather than assume it; an arm
+// without this banner in the run log is void.
+static inline void pxa_fa_keys_per_split_log(int n_kv, int pb_stock, int pb_new, int ntiles_KQ) {
+    static std::atomic<int> fired{0};
+    const int f = fired.fetch_add(1);
+    if (f < 4 || (f % 4096) == 0) {
+        fprintf(stderr, "PXA_FA_KEYS_PER_SPLIT: ENGAGED n_kv=%d parallel_blocks %d -> %d "
+                        "(ceiling %d, ~%d keys/CTA) [fire #%d]\n",
+                n_kv, pb_stock, pb_new, ntiles_KQ, (n_kv + pb_new - 1)/pb_new, f + 1);
+    }
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_all(int x) {
     if constexpr (width == WARP_SIZE) { //ggml_cuda_get_physical_warp_size()) {
@@ -1013,6 +1077,22 @@ void launch_fattn(
             nwaves_best = nwaves;
             efficiency_percent_best = efficiency_percent;
             parallel_blocks = parallel_blocks_test;
+        }
+    }
+
+    // PXA_FA_KEYS_PER_SPLIT: override the occupancy-derived split with a keys-per-CTA ladder.
+    // Gated to the D=256 single-column decode path (see the header block above).
+    if (DV == 256 && ncols1 == 1) {
+        const int kps = pxa_fa_keys_per_split();
+        if (kps > 0) {
+            const int n_kv = (int) K->ne[1];
+            int pb_new = (n_kv + kps - 1) / kps;
+            pb_new = std::max(pb_new, 1);
+            pb_new = std::min(pb_new, ntiles_KQ);
+            if (pb_new != parallel_blocks) {
+                pxa_fa_keys_per_split_log(n_kv, parallel_blocks, pb_new, ntiles_KQ);
+                parallel_blocks = pb_new;
+            }
         }
     }
 
