@@ -67,29 +67,36 @@ pass; V100 +12–13%. Same-quant decode is a near no-op: **+2.7–3.3%**, V100 b
 
 ## Codec-only: PXQ4 vs MXFP4, including the cell we lose
 
-Same engine, same cards, `llama-server /completion`, temp 0, n=7 median.
+Re-run 2026-09-02 on the candidate engine (the "next engine build" below), same cards, same
+protocol as the original table (`llama-server /completion`, temp 0, n=7 median, MTP off both
+sides). Full tables, the artifact census, and the raw reps: `bench/fair-battle.md`.
 
 | cell | PXQ4 | MXFP4 | result |
 |---|---|---|---|
-| **Dense prefill**, 2×P100 | 128.0 | 107.4 | **+19.2%** |
-| **Dense decode**, 2×P100 | 15.18 | 14.32 | **+6.0%** |
-| **Dense decode**, 2×V100 (MMVQ-armed) | 33.82 | 36.38 | **−7.0% — MXFP4 wins here** |
-| **MoE prefill**, 2×V100 ‡ | 1394.0 | 1172.8 | **+18.9%** |
+| **Dense prefill** @3k / @20k, 2×P100 | 227.4 / 203.3 | 178.7 / 163.7 | **+27% / +24%** |
+| **Dense decode**, 2×P100 | 18.3 | 14.4 | **+27%** |
+| **Dense prefill** @3k / @20k, 2×V100 | 798.1 / 577.0 | 364.0 / 312.9 | **+119% / +84%** |
+| **Dense decode**, 2×V100 | 34.5 | 37.7 | **−8% — MXFP4 still wins here** |
+| **MoE prefill** @3k / @20k, 2×V100 ‡ | 2,093.8 / 1,467.2 | 1,614.6 / 1,256.8 | **+30% / +17%** |
+| **MoE decode**, 2×V100 ‡ | 218.4 | 188.0 | **+16%** |
 
-**‡** that MoE row and its paired decode figure trace to one artifact that turned out to be only
-27% PXQ4 by tensor count; the decode figure did not reproduce and is **withdrawn**, and the
-prefill figure is relabelled as an expert-codec delta rather than a whole-model one. Full
-accounting: `docs/lab/LEVERS.md` §0a.
+**‡** the MoE row compares a merge (`PXA-Fusion4-35B`, PXQ4) against the stock 35B-A3B model
+(MXFP4) — same architecture and size class, not byte-identical base weights. The PXQ4 artifact's
+own codec census shows only the expert stacks are PXQ4 (120 of its tensors); everything else is
+other types. Call it an expert-codec delta, not a whole-model one. This replaces the earlier
+MoE-decode row this repo withdrew for the same underlying reason — this time the composition is
+disclosed up front and the number reproduces.
 
-**The Volta dense-decode loss is real and understood:** MXFP4's block layout maps onto DP4A with
-one scale fixup per 32 values; PXQ4's sub-scale hierarchy costs a second fixup and a second cache
-line. At equal bit width against a kernel already near HBM peak, that's a structural tie-or-lose,
-not a tuning gap — eight separate kernel attempts have not closed it. What you get for the 7%:
+**The Volta dense-decode loss is unchanged and still understood the same way:** MXFP4's block
+layout maps onto DP4A with one scale fixup per 32 values; PXQ4's sub-scale hierarchy costs a
+second fixup and a second cache line. At equal bit width against a kernel already near HBM peak,
+that's a structural tie-or-lose, not a tuning gap. What you get for the loss on that one cell:
 PXQ4 is byte-for-byte the same 4.25 bpw file but ~38% lower reconstruction error and **6.0% lower
-perplexity** (6.9704 → 6.5527, paired, same bytes).
+perplexity** (6.9704 → 6.5527, paired, same bytes) — unchanged from the original measurement.
 
-**Recipe:** Pascal (P100) → **PXQ4**, on both axes. Volta, dense, decode-bound → **MXFP4**. Volta
-MoE, or long-prompt/interactive workloads → **PXQ4** (prefill win, better fidelity).
+**Recipe, unchanged:** Pascal (P100) → **PXQ4**, on both axes. Volta, dense, decode-bound →
+**MXFP4**. Volta MoE, or long-prompt/interactive workloads → **PXQ4** (prefill win, better
+fidelity).
 
 ## The reproducible proof: a 35B MoE on one 16 GB P100
 
@@ -106,25 +113,87 @@ same engine and codec scale to multi-card MoE below.
 | 35B MoE, 4-bit flagship | 2× P100 or V100 | PXQ4 (18.7 GB, doesn't fit one 16 GB card) | 55.7 t/s decode |
 | 35B MoE, budget card | 1× GTX 1080 Ti 11 GB | PXQ2 (+opt-in int8 prefill) | ~71 t/s decode, 709 t/s prefill |
 | 35B MoE, 12 GB card | 1× 12 GB card | PXQU-12 | 58.4 t/s (P100) / 97.6 t/s (V100) decode |
+| 4× P100 rig, hybrid MoE (next engine build) | 4× Tesla P100 16 GB | PXQ_UNIVERSAL 4-bit | ~485 t/s prefill @3k, ~19 t/s decode @86k fill |
+| 2× V100 rig, 27B dense (vLLM sm_70 line) | 2× Tesla V100 16 GB | PXQ4 | 1,006 t/s prefill @3k, 298 t/s aggregate @16 streams |
 
 Exact commands and expected numbers for each: [`docs/COOKBOOK.md`](docs/COOKBOOK.md).
 
-## Scales up: 4×P100, a 122B-class hybrid MoE
+## The 2026-09-01/09-02 speed campaign: two rigs, before → after
 
-Measured 2026-09-01 on the 2026.08.31 engine — a Qwen3.8-80B-A3B-class GDN-hybrid MoE, PXQU
-quantized, on 4× Tesla P100-PCIE-16GB. Protocol: `llama-server /completion`, temp 0,
-`cache_prompt=false`, n=7 median (1 warmup discarded), `-c 150016 -b 2048 -ub 2048 -wgt 8
--ts 5079,12612,12612,11897 -sm layer`.
+Twenty-four hours of measurement across both rigs this project runs day to day. Naming: the
+**4× P100 rig** runs a Qwen3.8 Flash-Next-class hybrid MoE on this llama.cpp-based engine,
+PXQ_UNIVERSAL 4-bit; the **2× V100 rig** runs a Qwen3.8-27B dense-hybrid model, PXQ4, on the
+separate vLLM-based sm_70 serving line ([`docs/PXA-SM70-SERVING.md`](docs/PXA-SM70-SERVING.md)).
+Full protocol, every raw rep, and everything that didn't pan out:
+[`RELEASE-NOTES-2026-09-02.md`](RELEASE-NOTES-2026-09-02.md).
 
-| context fill | prefill | decode |
-|---|---|---|
-| 3,121 tok | 475–490 tok/s | 27.5 tok/s |
-| 20,801 tok | ~400 tok/s | — |
-| 86,401 tok | 229.6 tok/s | 13.2 tok/s |
+**4× P100 rig** — `llama-server /completion`, temp 0, `cache_prompt=false`, n=7 median (1 warmup
+discarded), `-c 150016 -b 2048 -ub 2048 -wgt 8 -ts 5079,12612,12612,11897 -sm layer`:
 
-This is not yet a named cookbook recipe — the harness that automates this exact sweep ships in
-the next release. Today, reproduce the protocol above by hand against your own PXQU map
-(`docs/PXQU-CONVERT.md`).
+| metric | before | after | change |
+|---|---|---|---|
+| decode, low fill | 26.1 t/s | 27.8 t/s | +7% |
+| decode, 86,401-tok fill | 12.5 t/s | 19.4 t/s | **+55%** |
+| prefill @3,121 | 476.8 t/s | 484.9 t/s | +2% |
+| prefill @20,801 | 397.6 t/s | 406.8 t/s | +2% |
+
+The deep-fill decode line is the single biggest number in the campaign: `PXA_FA_GQA_PACK=4` reads
+each attention key/value once per query group instead of once per head, which only pays off once
+the number of re-reads is large — flat at low fill, +40% decode on its own at 86k tokens, stacked
+here with five bit-identical host-overhead cuts (below) for the rest of the gap.
+
+**2× V100 rig** — vLLM `/completion`, `--tensor-parallel-size 2 --dtype float16`, n=7, interleaved
+boots (protocol and the NCCL finding: [`docs/PXA-SM70-SERVING.md`](docs/PXA-SM70-SERVING.md)):
+
+| metric | before | after | change |
+|---|---|---|---|
+| prefill @3k | 919 t/s | 1,006 t/s | +9% |
+| prefill @20k | 880 t/s | 983 t/s | +12% |
+| decode, single stream | 48.5 t/s | 50.3 t/s | +4% |
+| decode, aggregate @8 streams | 129 t/s | 187 t/s | +45% |
+| decode, aggregate @16 streams | 129 t/s | 298 t/s | **+131%** |
+
+The aggregate line is mostly one kernel — a Volta tensor-core path for the PXQ4 decode GEMV at
+batch sizes of 5 and up (`PXQ4_MMV_MMA=1`, kernel v12). The prefill line is mostly not a kernel at
+all — see the NCCL finding below.
+
+### Engine: what the next build adds
+
+Not yet in a tagged release. The full ship list, every rejected lever, and the known limits:
+[`RELEASE-NOTES-2026-09-02.md`](RELEASE-NOTES-2026-09-02.md). Headline items:
+
+- **Pipelined prefill.** Two scheduler bugs — a full graph re-plan on every prompt chunk instead
+  of once per request, and a host-side sync inside every batched MoE layer — were hiding the
+  overlap a second CUDA stream should have bought. Fixed, byte-identical: **+21% prefill @20,801**
+  at `-c 32768`. It doesn't fit at the rig's real `-c 150016` yet — the second stream's KV and
+  mask buffers need roughly 1.5–2 GB more VRAM per card than is free there today.
+- **GQA-packed attention**, above: +40% decode at 86k-token fill, flat at low fill,
+  output-identical.
+- **Host-overhead cuts** — bounded top-k sampling off raw logits, a struct-of-arrays KV-sequence
+  mask, a trimmed KQ-mask upload, and four more bit-identical micro-fixes: per-token host time at
+  deep fill drops from 6.0 ms to 1.6 ms.
+- **Device-side MoE row map.** The expert-routing table used to round-trip through the host once
+  per batched MoE layer; it's built on-device now, self-checked bit-identical against the old
+  host path.
+- **PXQ on CPU.** An AVX2 int8 dot product makes CPU-only and partial-offload PXQ inference real
+  instead of a technically-working fallback: **7.7× prefill** on a 12-thread Xeon E5-2699 v3
+  (14.3 → 110.6 t/s at 128 tokens, cross-checked to 0 ULP against the CUDA decode).
+- **An export tool.** `llama-pxq-export` turns a PXQ GGUF back into plain F16/F32, and
+  `llama-quantize --allow-requantize` now accepts a PXQ source — the lock-in objection in
+  "Two products, not one" above has an answer: quantize to PXQ, decide later you want something
+  else, export and requantize instead of redoing the original conversion.
+- **Correctness fixes.** A get_rows grid-overflow bug at large expert counts, an MMQ fusion-chain
+  guard for non-MMQ quant types, and a quantized-cpy launch-config fix, all three ported from
+  ik_llama.cpp upstream (`docs/DELTA-SINCE-IK.md`). Plus one found here: a per-slot attention
+  state window on the hybrid architecture that was never reset between requests, so a second
+  request could inherit the first's window.
+
+### Already shipped
+
+Landed in the launcher on 2026-09-01, no rebuild required: `-ub 2048 -wgt 8` on the P100 rig
+(zeroes a vocab-sized logits reservation so the larger micro-batch fits, +5–8% prefill); on the
+V100 rig, `--max-num-batched-tokens 4096` (+2.5–3.3% prefill, six interleaved boots, no decode or
+KV-pool cost) and `--gpu-memory-utilization 0.92` (+44% KV pool, capacity only).
 
 ## One switch
 
