@@ -22,11 +22,11 @@ behaviour:
 2. **It refuses rather than silently dropping** a parameter that does not
    translate between engines.
 3. **It says `UNMEASURED` out loud** instead of guessing quietly.
-4. **It makes no claim it cannot back**, including no health claim about the seat
+4. **It makes no claim it cannot back**, including no health claim about the instance
    it starts — it `exec`s the server, so it cannot observe anything afterwards.
 
 A launcher that quietly picks differently turns every performance question into a
-debugging session about the launcher.
+debugging exercise about the launcher.
 
 ---
 
@@ -180,7 +180,7 @@ The launcher prints a standing caveat with this: the llama.cpp side (D1) is **on
 boot**, below this bench's own two-boot bar, and the graphs-on dense arm (D2) was
 never launched. The *direction* is not in doubt; the exact ratios are single-boot.
 
-#### MoE models → a split seat, decided by concurrency
+#### MoE models → a split instance, decided by concurrency
 
 This is the important branch. MoE 35B PXQ4, 2× P100 sm_60:
 
@@ -226,7 +226,7 @@ unreachable on the very hardware every vLLM cell in the table was measured on
 
 The narrow true statement is: **no vLLM decode-or-prefill throughput number on
 sm_70 exists at all.** The only sm_70 vLLM figure on record is a 3.76×
-shared-prefix win, which is not a seat decision.
+shared-prefix win, which is not an instance decision.
 
 So eligibility is *probed*, in this order, and the probe that failed is always
 named:
@@ -304,7 +304,7 @@ plus a runtime the tag alone does not describe.
 
 An even split is llama.cpp's default and it is **wrong on any pool where the cards
 are not equally free**. On a real five-card pool, one 16 GiB card was already
-carrying another seat (7865 of 16384 MiB free) and one was an 11 GiB 1080 Ti also
+carrying another instance (7865 of 16384 MiB free) and one was an 11 GiB 1080 Ti also
 in use — an even five-way split puts ~9.2 GiB of weights on a card with 7.8 GiB
 free.
 
@@ -326,10 +326,10 @@ Two details carry all the weight:
   (282 MiB @ c8192 → 786 MiB @ c262144, at ub1024).
 
 - **The headroom term is the whole point.** *A config that loads is not a config
-  that runs.* At c=262144 a five-card seat loaded, printed every buffer, then died
+  that runs.* At c=262144 a five-card instance loaded, printed every buffer, then died
   on the **first token** with `CUDA error: out of memory` in `llama_decode` —
   the split had left one card with 51 MiB. Decode allocates transient buffers that
-  the init-time buffer report does not include. The same seat at c=163840 kept
+  the init-time buffer report does not include. The same instance at c=163840 kept
   807–1803 MiB free per card and ran. Hence the 1200 MiB reserve.
 
 If any card has no capacity left, the launcher **declines to emit a split** rather
@@ -343,7 +343,7 @@ AUTO -ts DECLINED: card(s) [0, 1] have no capacity left after 1200 MiB headroom
 > **`-ts` and `-ub` are coupled.** `-ts` partitions **bytes, not layers**, and
 > llama.cpp folds a per-device compute allowance into the same walk — so changing
 > `-ub` *repacks the layers*, and a split tuned at one `-ub` can OOM at another.
-> This was measured: a six-card PXQ4 seat at ub2048 pushed a 16140 MiB V100 over
+> This was measured: a six-card PXQ4 instance at ub2048 pushed a 16140 MiB V100 over
 > with the ub512-tuned split. If you force `--ub`, re-derive `--ts`.
 
 ### 7. Pick the micro-batch
@@ -387,7 +387,7 @@ So it belongs in host RAM. When the launcher sees it, it emits:
 
 **This is not an optimisation.** Without it the gather table is offloaded with
 everything else and the load dies on a `cudaMalloc` of the whole tensor on one
-card — measured at 16089.57 MiB on device 2 of a five-card seat.
+card — measured at 16089.57 MiB on device 2 of a five-card instance.
 
 Two subtleties:
 
@@ -397,7 +397,7 @@ Two subtleties:
 
 - **The VRAM check subtracts it.** R-17B compares *GPU-resident* bytes, not file
   bytes. A PLE table pinned to host RAM never reaches VRAM, so counting it would
-  refuse seats that fit. Measured: a 96.77 GiB file of which 51.15 GiB is PLE has
+  refuse instances that fit. Measured: a 96.77 GiB file of which 51.15 GiB is PLE has
   a GPU-resident remainder of 46.70 GiB and runs on five cards (75 GiB) with room
   for a 3.75 GiB KV cache at 160k context. Uncorrected, R-17B refused it outright.
   If the PLE's ggml type is not in the block-geometry table, the bytes are **not**
@@ -466,7 +466,7 @@ Everything else warns:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--mmproj PATH` | auto | Vision projector. Auto-resolves **only** if the model carries vision tensors and exactly one candidate sits beside it; two or more is R-24. |
-| `--no-mmproj` | off | Suppress projector resolution. The launcher still lists what it *would* have found and states the seat is text-only. |
+| `--no-mmproj` | off | Suppress projector resolution. The launcher still lists what it *would* have found and states the instance is text-only. |
 
 ### Speculation
 
@@ -522,7 +522,7 @@ than enforced, because this process `exec`s the server and cannot observe it.
 |---|---|
 | **R-07** | Forced `--engine vllm` with **no eligible card**. Not a warning: with no eligible card the parallel degree collapses to 1, `CUDA_VISIBLE_DEVICES` is never set, and the server inherits **every GPU on the host**. |
 | **R-20** | A card with a resident process, or >512 MiB resident with no compute app listed. This may be a shared, live box. Escape: `--allow-busy`. |
-| **R-29** | A PXQ4-converted vLLM directory when llama.cpp wins the seat — llama.cpp cannot read safetensors. Names *why* llama.cpp won. |
+| **R-29** | A PXQ4-converted vLLM directory when llama.cpp wins the instance — llama.cpp cannot read safetensors. Names *why* llama.cpp won. |
 
 ### Parameters that do not translate
 
@@ -666,7 +666,7 @@ and the automatic split appears:
 Both cards are physically identical 16 GiB V100s with identical free memory — yet
 the split is **697/303, not 500/500**, because the *head* card (the last in the
 selection) is charged the 980 MiB output-head buffer against the ordinary card's
-282 MiB. That asymmetry is the difference between a seat that runs and a seat that
+282 MiB. That asymmetry is the difference between an instance that runs and an instance that
 OOMs on its first token.
 
 If the cards are too full, the launcher declines rather than emitting a bad split:
@@ -777,7 +777,7 @@ Three load-bearing details:
   cards are named.
 
 `VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE` is **never** set: it crash-looped
-the container at warmup 3/3 boots and left a seat in a restart loop.
+the container at warmup 3/3 boots and left an instance in a restart loop.
 
 ---
 
@@ -785,10 +785,10 @@ the container at warmup 3/3 boots and left a seat in a restart loop.
 
 The launcher `exec`s the server, so it can observe nothing afterwards — and
 therefore **makes no health claim at all**. Instead it prints the checks whoever
-owns the seat must run:
+owns the instance must run:
 
 1. **Capture mode** (vLLM): grep the log for the *installed* cudagraph mode. If it
-   is not `FULL_DECODE_ONLY`, the seat is not healthy — shut it down. *Passing a
+   is not `FULL_DECODE_ONLY`, the instance is not healthy — shut it down. *Passing a
    flag is not evidence the flag took effect:* an image can parse
    `FULL_DECODE_ONLY`, boot healthy, and silently override it back from its own
    compile policy. A derived image is the fix, not a flag.
@@ -871,7 +871,7 @@ Use it after changing images, drivers or card layout to see what the launcher
 | Path | What it holds |
 |---|---|
 | `docs/lab/LEVERS.md` | The supported `PXA_*` levers, defaults and measurements |
-| `docs/PXA-SM60-SERVING.md` | Reproduced sm_60 seat numbers and the shipping recipe |
+| `docs/PXA-SM60-SERVING.md` | Reproduced sm_60 instance numbers and the shipping recipe |
 | `docs/PXA-SM70-SERVING.md` | The same for sm_70 |
 | `scripts/pxa-serve-sm60.sh`, `scripts/pxa-serve-sm70.sh` | The recipes themselves |
 | `tools/vllm-pxq4/` | The vLLM PXQ4 backend and `gguf_to_vllm.convert` |

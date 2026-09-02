@@ -1,7 +1,7 @@
 # PXQ4 as a first-class quantization backend in 1Cat-vLLM (sm_70) — maximum-performance design
 
 Target: `KewaiiGamer/1Cat-vLLM` @ `2ceb15066`, Qwen3.8-27B (gguf arch `qwen35`), 4x V100-32GB (DGX, TP=4)
-and 2x V100-16GB (Unraid, TP=2). Artifact: `/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
+and 2x V100-16GB (Unraid, TP=2). Artifact: `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
 Every line citation below is to a file that was read (either `<engine-tree>` @ `acf8f245`, or
 `/opt/1Cat-vLLM` inside the running container). **No GPU was run in this workflow. Every throughput
 number in this document is a PROJECTION and is labelled as such.**
@@ -413,7 +413,7 @@ target_link_libraries(pxq4_sm70 PRIVATE ${TORCH_LIBRARIES})
 Operational constraints (FACT from recon): nvcc 12.8, gcc, cmake, ninja and torch 2.10.0+cu128 are
 present in the container image; but **the production container's overlay is 100% full (0 bytes
 available)** and the DGX root filesystem is full. Therefore: build in a **fresh** container from the
-same image with a volume mounted under `/mnt/models`, never inside `vllm-qwen38-27b-cyber-1`, never
+same image with a volume mounted under `/path/to/models`, never inside `vllm-qwen38-27b-cyber-1`, never
 writing to `/` or host `/tmp`. Also note `site-packages/vllm` is a *copied* install, not
 editable-linked to `/opt/1Cat-vLLM` — edits to `/opt/1Cat-vLLM` are inert at runtime, which is another
 reason the no-patch design is the right one.
@@ -461,7 +461,7 @@ sharder slices rows assuming per-row-contiguous blocks, which panel interleave v
 
 The converter must emit the **exact tensor names the incumbent AWQ checkpoint uses**, because that
 checkpoint demonstrably loads into `qwen3_5.py` today. `tools/pxq4_names.py` is therefore *generated*
-by diffing against `/mnt/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ/model.safetensors.index.json`
+by diffing against `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ/model.safetensors.index.json`
 and the converter **fails loudly on any name it cannot map**. Known structural points:
 
 * `packed_modules_mapping` (`qwen3_5.py:665-675, 823-826`): `qkv_proj←[q_proj,k_proj,v_proj]`,
@@ -641,7 +641,7 @@ Ranked by expected damage × probability. Each has a detection point and a kill 
    will not propagate. *Mitigate:* `PXQ4_VENDOR_SRC_COMMIT` macro, `pxq4_vendor_edits.md`, and S2's
    bit-exact gate re-run on every re-sync (it is a 30-second test).
 7. **Container/build friction.** Production overlay is 100% full; DGX `/` is 100% full;
-   `site-packages/vllm` is a copy, not editable. *Mitigate:* fresh container + `/mnt/models` volume,
+   `site-packages/vllm` is a copy, not editable. *Mitigate:* fresh container + `/path/to/models` volume,
    never touch `vllm-qwen38-27b-cyber-1` beyond `docker exec`-to-read.
 8. **fp16 accumulation in the GEMM path.** `k_pxq6_gemm_grouped` snaps products to fp16
    (`pxq6.cuh:2594-2611`); the WMMA twin is explicitly not bit-exact (`pxq6.cuh:53-59`). Long-context

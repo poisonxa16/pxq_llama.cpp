@@ -13,10 +13,10 @@ and is paid once per configuration.
 
 ## Where things are
 
-    /mnt/models/pxa-int-v6/site/            the vLLM plugin (PYTHONPATH target)
-    /mnt/models/pxa-int-v6/site/pxq4_vllm/_lib/libpxq4_sm70.so   the built kernel
-    /mnt/models/pxa-int-v6/src/             kernel sources + host simulator + gates
-    /mnt/models/pxa-models/Qwen3.8-27B-PXQ4-vllm-p2a-nf/         the model
+    /path/to/models/pxa-int-v6/site/            the vLLM plugin (PYTHONPATH target)
+    /path/to/models/pxa-int-v6/site/pxq4_vllm/_lib/libpxq4_sm70.so   the built kernel
+    /path/to/models/pxa-int-v6/src/             kernel sources + host simulator + gates
+    /path/to/models/pxa-models/Qwen3.8-27B-PXQ4-vllm-p2a-nf/         the model
 
 ## How it measures against AWQ W4A16
 

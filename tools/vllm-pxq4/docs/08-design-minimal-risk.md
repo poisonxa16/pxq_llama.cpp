@@ -1,7 +1,7 @@
 # 08 — PXQ4 as a vLLM quantization backend: minimal-risk design
 
 Target: `1Cat-vLLM` fork @ `2ceb15066` (`v0.1.dev1+g2ceb15066.cu128`), 4x V100-SXM2-32GB (sm_70),
-TP=4, `dtype=float16`. Artifact: `/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
+TP=4, `dtype=float16`. Artifact: `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
 Slant: **minimal risk / fastest to first correct token.** No GPU runs were performed for this
 document; every throughput number is a labelled PROJECTION.
 
@@ -81,7 +81,7 @@ Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `<engine-tree>` is modified.
 | `tools/pxq4_gguf/gguf_raw.py` | 130 | Raw GGUF v3 struct parser: magic/version/`n_tensors`/`n_kv`, KV table (all 13 GGUF value types incl. arrays), tensor table (name, n_dims, dims, **raw type id as an int — never an enum**), aligned data base. Derived from the working scanner already run against the artifact (`scratchpad/pxq-vllm/ggufscan.py`). **This is the whole reason option (b) is cheap** — `gguf.GGMLQuantizationType(252)` raises `ValueError` inside `GGUFReader._build_tensors`, killing the entire file open (FACT, 05 §B1). |
 | `tools/pxq4_gguf/pxq4_codec.py` | 120 | The PXQ4 (id 252) codec. `split_panels(buf,R,K) -> (anchor fp16 [R//64,64], slabs uint8 [R//64,K//32,1088])` — a pure byte de-interleave, the only transform the converter applies to PXQ4 tensors. `dequant(anchor,slabs) -> fp32 [R,K]` — the vectorised reference from 01 §6: `w = hdr[:,None,:,None] * eff * BOOK[nib]`, then `transpose(0,2,1,3).reshape(R,K)`. Constants `HDR=128`, `SLAB=1088`, `QK=32`, `BM=64`, `CODE_OFF=64` (FACT, `ggml/include/ggml-pxq6-tables.h:21-27`). BOOK/SUB16 are **read from the file's `pxa.pxq6.book` / `pxa.pxq6.sub` KVs** (FACT, `src/llama-quantize.cpp:1980-1983`; both confirmed present in the artifact, 06 §3), never hard-coded — `PXA_PXQ6_BOOK`/`PXA_PXQ6_SUB` can override at build time (`ggml-cuda/pxq6.cuh:288-302`). |
 | `tools/pxq4_gguf/legacy_codec.py` | 170 | Dequantisers for the tail types: Q8_0 (id 8, 132 tensors), Q6_K (id 14, 1 tensor), MXFP4 (id 39, 48 tensors), F32/F16 passthrough. All standard ggml block formats, all row-contiguous — none of the panel machinery applies. |
-| `tools/pxq4_gguf/namemap.py` | 220 | ggml→HF/vLLM name mapping + the fusion/split policy (§5.3). Ships a `--check-against <awq_twin_dir>` mode that diffs the produced key set against `/mnt/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ`'s key set and **fails the build on any mismatch**. This is the cheapest possible gate on the fiddliest part of the job. |
+| `tools/pxq4_gguf/namemap.py` | 220 | ggml→HF/vLLM name mapping + the fusion/split policy (§5.3). Ships a `--check-against <awq_twin_dir>` mode that diffs the produced key set against `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ`'s key set and **fails the build on any mismatch**. This is the cheapest possible gate on the fiddliest part of the job. |
 | `tools/pxq4_gguf/convert.py` | 200 | CLI driver. `--emit fp16` (stage S0) or `--emit pxq4` (S1+); `--tail-policy fp16|native`; writes sharded safetensors, `config.json` (copied from the AWQ twin with `quantization_config` replaced), and `pxq4_book.json`. |
 | `tools/pxq4_gguf/verify.py` | 150 | The correctness gates of §7: dequant-vs-CPU-reference bit-exactness, shard-then-dequant vs dequant-then-shard bit-exactness, geometry asserts, byte-size reproduction `(R/64)*(128+(K/32)*1088)`. |
 
@@ -462,10 +462,10 @@ the runtime ABI exactly. The `_GLIBCXX_USE_CXX11_ABI` flag must agree with the p
 
 1. The production container's overlay is `207G used, 0 avail, 100%`. **You cannot build in
    `vllm-qwen38-27b-cyber-1`,** and you must not try — it is the box owner's production service.
-   Build in a *fresh* container from the same image with a writable volume under `/mnt/models`,
+   Build in a *fresh* container from the same image with a writable volume under `/path/to/models`,
    then `pip install` the resulting wheel into the deployment.
 2. The DGX root filesystem is 100% full. Everything — build tree, wheel, converted checkpoint —
-   lives under `/mnt/models`. Never `/` and never host `/tmp`.
+   lives under `/path/to/models`. Never `/` and never host `/tmp`.
 
 No GPU lease is needed for any of the build steps or for stages S0-S2's offline gates.
 
@@ -578,7 +578,7 @@ mismatched table can be detected later.
 **There are no routed experts. The "40×256 routed experts" line item is void, and this is
 measured, not assumed.**
 
-FACT (05 §0, 06 §1): the GGUF header of `/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf` was parsed
+FACT (05 §0, 06 §1): the GGUF header of `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf` was parsed
 with a raw struct parser — 866 tensors, `general.architecture = qwen35`, **zero `*_exps` tensors
 and zero expert KVs of any kind**. `ffn_gate`/`ffn_up`/`ffn_down` are dense on all 65 blocks
 (6 distinct PXQ4 shapes, none expert-stacked). This is consistent with the brief's own statement
@@ -707,7 +707,7 @@ costed.
 
 **R6 — build/ABI.** `_GLIBCXX_USE_CXX11_ABI` disagreement with the prebuilt `_C.abi3.so`; the
 production container cannot be built in (100% full overlay) and must not be touched. Mitigated by
-building in a fresh container with a `/mnt/models` volume.
+building in a fresh container with a `/path/to/models` volume.
 
 **R7 — vendoring forks the kernel.** Future fixes in `mgv-wt`'s `pxq6.cuh` will not propagate.
 Mitigated by per-block provenance banners and the C0/C5 bit-exactness gates, which will catch any

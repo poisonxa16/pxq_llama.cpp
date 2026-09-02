@@ -224,8 +224,8 @@ that only handles id 252 never needs it.
 env vars `PXA_PXQ6_BOOK` / `PXA_PXQ6_SUB` / `PXA_PXQ6_SUB_HQ` replace the tables at runtime,
 fp16-snapped (`pxq6.cuh:288-302`, `pxq6-quantize.inc.cpp:140-176`). The file records the
 tables actually used in gguf KVs — see §8. **For the shipped
-`/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`, assume the frozen tables unless the KVs say
-otherwise (ASSUMPTION — I did not read that file's KVs in this task; verify
+`/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`, assume the frozen tables unless the KVs say
+otherwise (ASSUMPTION — I did not read that file's KVs in this pass; verify
 `pxa.pxq6.book` / `pxa.pxq6.sub` before trusting the literals above for it).**
 
 **Answer to "per-tensor / per-row / global":**
@@ -482,7 +482,7 @@ invariant; only the code plane changes.
 
 ## 12. Open items / not verified
 
-- I did **not** open `/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf` in this task. Its
+- I did **not** open `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf` in this pass. Its
   actual per-tensor type map and its `pxa.pxq6.book` / `pxa.pxq6.sub` KVs are **not
   verified** here; §9 predicts the map from the backbone table source, and §4 gives the
   compiled-in defaults.

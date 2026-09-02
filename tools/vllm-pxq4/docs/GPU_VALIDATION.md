@@ -74,4 +74,4 @@ The DGX is lent, not ours. GPUs 0-3 (the owner's) were never touched; no contain
 was stopped, killed or removed; only `docker run --rm` with
 `NVIDIA_VISIBLE_DEVICES=7`; free memory was checked before and after every run
 (minimum seen 2601 MiB against a 1200 MiB abort threshold); nothing under
-`/mnt/models/pxa*` or `/mnt/models/hf` was deleted.
+`/path/to/models/pxa*` or `/path/to/models/hf` was deleted.

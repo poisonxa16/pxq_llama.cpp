@@ -1,6 +1,6 @@
 # Flash-Next research record — 2026-08-27/28
 
-Everything established in this session, including the claims that were overturned
+Everything established in this investigation, including the claims that were overturned
 and why. Written so none of it has to be re-derived. Evidence tags:
 **[M]** measured on hardware · **[S]** read from source or a log · **[C]** computed
 here · **[I]** inferred.
@@ -188,13 +188,13 @@ recurrent/hybrid. Both hold here. **[S]**
 - Instruments, in order of preference:
   1. **nsys per-kernel capture** — true per-kernel time and inter-kernel gaps, no
      sync tax. Prices one kernel family directly instead of hunting a 2%
-     whole-model delta. NOT installed as of this session; being added as
+     whole-model delta. NOT installed as of this writing; being added as
      `pxa-sm60-dev:nsys`.
   2. **per-device `PXA_GRAPH` sums** — ~0.1 ms sensitivity, the right instrument
      for placement levers such as a `-ts` rebalance.
   3. **`PXA_PROFILE` name buckets** — per-node attribution to ~1 us.
      **Attribution only. Never a speed result.**
-- Two arms of one sweep this session stopped at **53 and 57 tokens** instead of
+- Two arms of one sweep stopped at **53 and 57 tokens** instead of
   127. Their tok/s is not comparable to a full-length control and was discarded.
   **Always state token count beside every number and void any mismatched arm.**
 

@@ -9,7 +9,7 @@ read-only via `docker exec`. No GPU was used; no container was modified.
 ## 0. Headline
 
 **MoE effort delta = ZERO.** FACT, from the artifact itself: I parsed the GGUF header of
-`/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf` directly (raw struct parser, not the `gguf`
+`/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf` directly (raw struct parser, not the `gguf`
 package). 866 tensors, `general.architecture = qwen35`, and there is **no `*_exps` tensor and
 no expert KV of any kind**. Per-class tensor census below. There is no fused-MoE port, no
 `FusedMoEMethodBase`, no `RoutedExperts` path to implement. Delete that line item.
@@ -134,7 +134,7 @@ and the w4a4/w4a16 fp4 schemes.
 * **Operational blockers, both real:**
   - `df -h /` inside the container reports `overlay 207G used 198G, 0 avail, 100%`. **You cannot
     build in this container.** Build in a fresh container from the same base image with a
-    writable volume under `/mnt/models`, then install the resulting wheel.
+    writable volume under `/path/to/models`, then install the resulting wheel.
   - `site-packages/vllm` is a **copied install**, not an editable link to `/opt/1Cat-vLLM`
     (`ls -la` shows a real directory, and `vllm.__file__` →
     `/opt/vllm-venv/lib/python3.12/site-packages/vllm/__init__.py`). Editing `/opt/1Cat-vLLM/vllm/*.py`
@@ -382,7 +382,7 @@ which matters if this is going to be offered upstream.
      vLLM handles that).
 3. Rename ggml names → HF/vLLM names (`blk.N.ffn_gate` → `model.language_model.layers.N.mlp.gate_proj`,
    etc.). The mapping is already implied by the AWQ twin's tensor names — dump them from
-   `/mnt/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ` and match one-for-one.
+   `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ` and match one-for-one.
    **Fuse `attn_qkv` (10240 rows) + `attn_gate` (6144 rows) → `linear_attn.in_proj_qkvz`
    (16384 rows)** by concatenating panels along dim 0 — legal because panels are self-contained
    (`pxq-cpu.h:1-17`). Keep `ssm_alpha`/`ssm_beta` as `in_proj_a`/`in_proj_b` (separate, per §A5).
@@ -434,7 +434,7 @@ solved.**
 1. **Converter output size.** Dequantizing `token_embd` (Q6_K) and `output.weight` (Q8_0) to fp16
    costs ~4.8 GiB on top of the 14.64 GiB artifact. Per-GPU at TP=4 this is fine (embeddings and
    LM head are vocab/column parallel), but the on-disk safetensors will be ~19 GiB. Confirm free
-   space **under `/mnt/models`** — never `/` (100% full).
+   space **under `/path/to/models`** — never `/` (100% full).
 2. **Name mapping is the fiddly part**, not the bytes. Budget the time there, and validate by
    diffing the converted key set against the AWQ twin's key set before any load attempt.
 3. **`in_proj_qkvz` panel concatenation** assumes the four sub-projections' row counts are each
@@ -464,4 +464,4 @@ solved.**
      parameter declarations of §A4 and the three-way `get_quant_method` of §B3.
    * entry point in group `vllm.general_plugins`.
 3. Build it in a **fresh** container from the same image with a writable volume under
-   `/mnt/models` — the production container's overlay is 100% full and must not be written to.
+   `/path/to/models` — the production container's overlay is 100% full and must not be written to.

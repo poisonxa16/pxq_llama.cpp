@@ -157,9 +157,10 @@ wrong.
 
 ## Serving stack under version control
 
-The serving stack — hive, seat keeper, affinity/cache proxy, launch scripts, tools, tests and
-templates — is now tracked. Previously loose files on one box: untracked, and therefore
-unmergeable. The stack is operational infrastructure and is not part of this public release.
+The serving stack — the orchestration daemon, instance keeper, affinity/cache proxy, launch
+scripts, tools, tests and templates — is now tracked. Previously loose files on one box:
+untracked, and therefore unmergeable. The stack is operational infrastructure and is not part
+of this public release.
 
 ---
 

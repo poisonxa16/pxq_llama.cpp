@@ -83,6 +83,7 @@ the failure it produced says nothing about whether the 16-token graph is legal.
 
 ## Cards
 
-Cards 1 and 6 are the free P100s. Card 0 carries a production seat and card 3 is
-the protected 1080 Ti; the launcher refuses both by explicit check, and the
+Cards 1 and 6 are the free P100s. Card 0 keeps a smaller split because it is shared
+with another production service, and card 3 is the protected 1080 Ti; the launcher
+refuses both by explicit check, and the
 container boundary excludes everything not listed in `NVIDIA_VISIBLE_DEVICES`.

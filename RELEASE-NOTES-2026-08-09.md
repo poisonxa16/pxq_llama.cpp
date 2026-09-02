@@ -68,7 +68,7 @@ PXA_FA_GQA_PACK=4 PXA_FA_GQA_QSMEM=1 ./build/bin/llama-server …
 
 Cell: 122B-A10B PXQU48-core, 4× P100, `-sm layer -c 32768 -np 1 -b 512 -ub 512 -fa on`, f16 KV,
 `PXA_ENHANCE=1 PXA_P100_FP16_GEMM=1 PXA_ROUTER_FUSE=3`, temp 0, fill 8881, n=3 medians, both
-binaries alternating in one session, engagement asserted from the server banner in every cell:
+binaries alternating in one run, engagement asserted from the server banner in every cell:
 
 | cell | levers | deep decode | shallow | prefill |
 |---|---|---:|---:|---:|
@@ -84,7 +84,7 @@ quantize-time flag only.
 
 **The 122B/P100 decode campaign** — 122B-A10B PXQU48-core, 4× P100, `-sm layer -c 32768 -np 1
 -b 512 -ub 512 -fa on`, f16 KV, `PXA_ENHANCE=1 PXA_P100_FP16_GEMM=1 PXA_ROUTER_FUSE=3`, temp 0,
-fill 8881, n=3 medians, both binaries alternating in one session, engagement asserted from the banner
+fill 8881, n=3 medians, both binaries alternating in one run, engagement asserted from the banner
 in every cell:
 
 | cell | levers | deep decode | shallow | prefill |
@@ -132,7 +132,7 @@ hash, which is the designed outcome for a sourcing-only change.
 
 `PXA_AUTO_SPEC` arms the measured-best drafter per model family. One row ships
 (`qwen35moe` → `ngram-mod:n_max=4,n_min=2`): **first-request decode +23.0% on code traffic, +4.6% on
-prose, prefill neutral** (262.63 → 259.16). Cell as above, ~14–15k fill, control in the same session.
+prose, prefill neutral** (262.63 → 259.16). Cell as above, ~14–15k fill, control in the same run.
 
 ⚠ **Do not quote the median-of-3 figures (+38.8%/+35.7%).** The bench replays one prompt three
 times, so reps 2–3 hit an already-warm n-gram table — prose acceptance 1.000 is the tell. Warm

@@ -26,8 +26,9 @@ It will never see a P100. The experts have to come down, and only the experts.
 
 ## Budget
 
-Four P100s are cards 0, 1, 5, 6. **Card 0 carries the production granite seat (~8.4 GiB)**,
-which is not evictable, so the honest budget is 64.0 - 8.4 = **55.6 GiB**.
+Four P100s are cards 0, 1, 5, 6. **Card 0 keeps a smaller split because it is shared with
+another production service (~8.4 GiB)**, which is not evictable, so the honest budget is
+64.0 - 8.4 = **55.6 GiB**.
 
     55.6  physical
    - 1.20 CUDA context + cuBLAS handle, 4 cards
@@ -61,7 +62,8 @@ go to ~504 MiB: 3 x 504 MiB + 1.98 GiB = 3.46 GiB over four cards.
 | all four free, 150k KV f16 | 53.03 | 64.0 | 10.97 GiB |
 
 A second map, `pxqu64-177b-flashnext.tiers` (50.37 GiB experts, 3.582 bpw, PXQ3/PXQ4),
-exists for the case where card 0 is ever freed. Do not deploy it while granite is resident.
+exists for the case where card 0 is ever freed. Do not deploy it while the other service
+still holds its share of card 0.
 
 ## Why this beats the reference artifact
 

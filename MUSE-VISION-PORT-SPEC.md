@@ -1,8 +1,9 @@
 # MUSE-GLIMMER VISION PORT — worktree spec (mgv-wt @ e53cb091 = build-fug baseline)
 
 Goal: register PROJECTOR_TYPE_MUSE_GLIMMER in OUR examples/mtmd so our llama-server serves vision on
-the PXQ4 reviewer seat. Baseline commit e53cb091 (== build-fug) so the text-path byte-identical gate is
-meaningful. BUILD INTO A FRESH DIR (build-fugv), NEVER build-fug (serves the live :8231 seat).
+a production PXQ4 instance. Baseline commit e53cb091 (== build-fug) so the text-path byte-identical
+gate is meaningful. BUILD INTO A FRESH DIR (build-fugv), NEVER build-fug (serves the live production
+instance).
 
 ## Status
 - [x] enum PROJECTOR_TYPE_MUSE_GLIMMER + name "muse-glimmer" added to clip-impl.h (registration).
@@ -67,7 +68,7 @@ is the older ik-fork shape — adapt muse_glimmer_grid_size (aspect-preserving, 
 patch_area, PIL stretch resize, no pad) to our preprocess signature. Reference grid fn is self-contained.
 
 ## BUILD + GATES
-Build: docker run --runtime=nvidia (a FREE 2-card set; NOT 3, NOT the seat's 2,4 if busy) with the CUDA
+Build: docker run --runtime=nvidia (a FREE 2-card set; NOT 3, NOT a production instance's 2,4 if busy) with the CUDA
 image, cmake -B build-fugv -DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=70 ... ; cmake --build build-fugv
 -j --target llama-server. (mtmd is already linked; --mmproj is live.)
 Gate 1: launch build-fugv llama-server -m <base Q4_K_XL or abl PXQ4> --mmproj <mmproj-*.gguf> on a free

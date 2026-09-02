@@ -38,7 +38,7 @@ after. The older binary was not correct, only lucky.
 `--model` + `--cards` is enough; it derives the tensor split, the micro-batch and
 the CPU offload itself, prints the evidence, and refuses rather than guessing.
 
-Nothing here changes numerics on an existing PXQ4 seat.
+Nothing here changes numerics on an existing PXQ4 instance.
 
 ---
 
@@ -50,15 +50,15 @@ until now lived in a separate repository:
 | piece | what it is |
 |---|---|
 | `tools/vllm-pxq4/` | the PXQ4 quantization backend / vLLM plugin |
-| `scripts/pxa-serve-sm70.sh` | V100 seat, measured: 51.46 tok/s single, 135.78 aggregate @8 |
-| `scripts/pxa-serve-sm60.sh` | P100 seat, measured: 24.0-26.4 single, 70-72 aggregate @8 |
-| `scripts/pxa-serve-flashnext.sh` | Flash-Next PXQU seat, 4x P100 + 1080 Ti, 160k context |
+| `scripts/pxa-serve-sm70.sh` | V100 instance, measured: 51.46 tok/s single, 135.78 aggregate @8 |
+| `scripts/pxa-serve-sm60.sh` | P100 instance, measured: 24.0-26.4 single, 70-72 aggregate @8 |
+| `scripts/pxa-serve-flashnext.sh` | Flash-Next PXQU instance, 4x P100 + 1080 Ti, 160k context |
 | `pxa/pxq4/` | 6 kernel libraries, 75 kernel sources, README + MANIFEST with md5s |
 
 Before `pxa/pxq4` was vendored, none of it was in version control anywhere — the
 kernel sources existed only in a scratch directory on a single machine.
 
-Both seats were restarted from this tree's own copies and verified by generating,
+Both instances were restarted from this tree's own copies and verified by generating,
 including tool calling, which needs `--enable-auto-tool-choice` and
 `--tool-call-parser qwen3_coder`; without those every `tools=` request returns 400.
 
@@ -165,7 +165,7 @@ clean EOS.
 win: 46.7 GiB of GPU-resident weights against PXQ4's 65.0, so four or five cards
 instead of six, with 160k context.
 
-**vLLM seats** (unchanged this cycle, restored in rc2): sm70 51.46 single /
+**vLLM instances** (unchanged this cycle, restored in rc2): sm70 51.46 single /
 135.78 aggregate @8; sm60 24.0–26.4 single / 70–72 aggregate @8.
 
 ---
@@ -193,7 +193,7 @@ produced a confident wrong answer rather than saying UNMEASURED:
 card its larger compute buffer, reserves decode headroom, and **declines loudly**
 if any card has no room. Validated against a hand-tuned split that was already
 known good: the launcher independently produced `111,267,95,267,260` against
-`110,268,94,268,261` — within 1 part in 1000 per card — and the seat was then
+`110,268,94,268,261` — within 1 part in 1000 per card — and the instance was then
 restarted on the launcher's own numbers and generated correctly.
 
 Also: the sm_60 image recipe still named `libpxq4_sm60_v8.so`; bumped to v10, which
@@ -204,11 +204,11 @@ fails raw-prompt correctness.
 
 ## Operational notes that cost real time
 
-**A config that loads is not a config that runs.** At c=262144 the Flash-Next seat
+**A config that loads is not a config that runs.** At c=262144 the Flash-Next instance
 loaded cleanly, printed every buffer, then died on the first token with
 `CUDA error: out of memory` in `llama_decode` — the split had left one card 51 MiB.
 Decode allocates transient buffers the init-time report does not include. Leave
-~1200 MiB free per card *after* load. The same seat at 163840 keeps 807–1803 MiB
+~1200 MiB free per card *after* load. The same instance at 163840 keeps 807–1803 MiB
 free per card and runs.
 
 **Run this model from NVMe, never from a parity array.** `per_layer_token_embd` is
@@ -219,7 +219,7 @@ until the read drains.
 
 **`-ub` and `-ts` are coupled.** llama.cpp folds a per-device compute allowance into
 the `-ts` walk, so changing `-ub` repacks the layers. A split tuned at one `-ub` can
-overflow a card at another — that is exactly how ub2048 OOM'd a six-card seat whose
+overflow a card at another — that is exactly how ub2048 OOM'd a six-card instance whose
 split was tuned at ub512.
 
 **Tool calling needs two flags that no launcher passed.** Without
@@ -234,7 +234,7 @@ Choosing hermes would have returned *empty* tool calls rather than an error.
 
 - vision tower and MTP tensors are not converted for qwen4exp
 - 154 pxq3 clipping warnings in the PXQU build; no imatrix, by instruction
-- ub2048 on the six-card PXQ4 seat needs its own `-ts`; not derived
+- ub2048 on the six-card PXQ4 instance needs its own `-ts`; not derived
 - the hybrid-attention KV correction is MEASURED for qwen4exp only. `qwen35moe`
   takes the same correction but remains `[INFERRED]` — nobody booted it
 - QSA top-k sparsity is still not wired: full-attention layers attend densely.

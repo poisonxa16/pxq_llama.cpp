@@ -107,7 +107,7 @@ PXQU-16+q8head on P100/V100, PXQ2 on the 1080 Ti — 2026-07-22 windows):
 
 | card | BALANCE (fa-on) | MAX (fa-off, largest-fitting ub) |
 |---|---|---|
-| **V100 16 GB** (sm_70) | prefill **1627.7** / decode **91.0–92.8** @ ub512 (+6.0% prefill from CUBLAS64; fa-on ub2048 blows up at request time until SPLIT is silicon-verified — adaptive-ub or explicit `-ub 512` is the working fa-on ceiling on a near-full single card). **Decode headline with MTP: 108.3** @ ub1024 fa-on (mtp n1 + lazy, steady-state; base 91.6 same server session — see the MTP section; ub2048 + the MTP gguf OOMs single-card, ub1024 is the ceiling) | prefill **2358.2** / decode 77.3–78.3 @ ub2048 (**canonical close 2026-07-22**: WMMA v2 `=3` on the merged canonical build, +5.0% flag-attributable; clean confirm set 2383.5. Canonical flag-off base is now **2245.3** — the old 2149.6 row moved +4.5% from canonical churn (CUBLAS64-era), drift resolved. CUBLAS64 +9.6% banked inside; threshold 64 proven the true optimum: 48 ties, 32 loses, 96 forfeits the +5% [64,96) window) |
+| **V100 16 GB** (sm_70) | prefill **1627.7** / decode **91.0–92.8** @ ub512 (+6.0% prefill from CUBLAS64; fa-on ub2048 blows up at request time until SPLIT is silicon-verified — adaptive-ub or explicit `-ub 512` is the working fa-on ceiling on a near-full single card). **Decode headline with MTP: 108.3** @ ub1024 fa-on (mtp n1 + lazy, steady-state; base 91.6 same server run — see the MTP section; ub2048 + the MTP gguf OOMs single-card, ub1024 is the ceiling) | prefill **2358.2** / decode 77.3–78.3 @ ub2048 (**canonical close 2026-07-22**: WMMA v2 `=3` on the merged canonical build, +5.0% flag-attributable; clean confirm set 2383.5. Canonical flag-off base is now **2245.3** — the old 2149.6 row moved +4.5% from canonical churn (CUBLAS64-era), drift resolved. CUBLAS64 +9.6% banked inside; threshold 64 proven the true optimum: 48 ties, 32 loses, 96 forfeits the +5% [64,96) window) |
 | **P100 16 GB** (sm_60) | **BALANCE (fa-on ub2048): prefill 1206 / decode 56.7** -- measured WITH `PXA_FA_PREFILL_SPLIT=64` explicitly set (+45% fa-on prefill, 834->1206, decode held; median of 3). ⚠ SPLIT is opt-in since 2026-07-24, so out-of-the-box BALANCE prefill is the 834-class number unless you set it | **MAX (fa-off ub2048): prefill 1170 / decode 41.5** (fp16-GEMM on, banked) |
 | **1080 Ti 11 GB** (sm_61) | prefill 678 / decode **65.6** @ ub768 adaptive (ub2048/1024 physically OOM; SPLIT is the staged carrier toward the ~950–1001 fa-off class) | prefill **985** / decode 64.7 @ ub768 (reproduces published 1001 within 1.6%; ENHANCE INT8_PREFILL +830% is the carrier; I8-DBUF/BN128 maturation REFUTED — see §5) |
 
@@ -358,7 +358,7 @@ baseline** (same sha 384ec84d3aa7c001) — the graft is output-transparent when 
   as the P100 precedent; ub1024 is the single-card ceiling. n_max=2 is a KILL sub-arm on V100 too
   (92.7, accept 0.480 — see §5).
 - **⭐ STEADY-STATE BATTERY = the canonical-close V100 decode numbers (2026-07-22, merged canonical
-  build, single V100, ub1024 fa-on, np1).** Protocol upgrade: 5 rounds in ONE server session
+  build, single V100, ub1024 fa-on, np1).** Protocol upgrade: 5 rounds in ONE server run
   (`fb-cell5.sh`), median of the LAST 3 — back-to-back `fb-cell.sh` invocations tear down/reload
   the model between rounds and re-cool clocks, breaking steady-state. Cells:
 
@@ -371,7 +371,7 @@ baseline** (same sha 384ec84d3aa7c001) — the graft is output-transparent when 
   | mtp + `PXA_ENHANCE=1` (no fuse env) | 108.1 | 2031.4 | **auto-wire verified** — startup printed `level=ENHANCE … ROUTER_FUSE ON` + `SPEC_RELAXED ON`, matches the headline |
 
   **The publishable V100 decode headline is 108.3 t/s (mtp n1 + lazy), +18.2% over the 91.6
-  same-session base — supersedes the 107.5 3-round figure.** Recommended production switch =
+  same-run base — supersedes the 107.5 3-round figure.** Recommended production switch =
   `PXA_ENHANCE=1` on top of the MTP config: statistically identical to the headline (108.1) and
   it auto-enables the sm_70 fuse for free. All cells coherence-gated (clean English temp-0
   continuations; shas flutter on every cell incl. base, per the CUBLAS64 sm_70 protocol note).
@@ -743,10 +743,10 @@ behaviour unless the row says otherwise.
 
 | lever | default | what it does | measured |
 |---|---|---|---|
-| `PXA_AUTO_SPEC` | unset → arms only under `PXA_ENHANCE=1`; `=1` forces on at any level, `=0` forces off, never under `PXA_REFERENCE` | Arms the measured-best **self**-speculation drafter for the model family, so ENHANCE users get it without knowing the flag exists. One row ships: `qwen35moe` → `--spec-type ngram-mod:n_max=4,n_min=2`. An explicit `--spec-type`/`--spec-stage` or a draft model (`-md`) always wins — only absence is filled. Arms through the same parser `--spec-type` uses, so the auto path cannot drift from the flag path. Families with no measured row are left alone and say so on stderr | **First-request decode (cold n-gram table): code 24.44 → 30.05 t/s (+23.0%), prose 23.69 → 24.78 (+4.6%); prefill neutral (262.63 → 259.16).** Cell: 4×P100, Qwen3.5-122B-A10B (community "abliterated" abliteration) PXQU48-core, `-c 32768 -b 512 -ub 512 -fa on`, ~14–15k fill, control in the same session. ⚠ **Do not quote the median-of-3 figures (+38.8%/+35.7%)** — the bench replays one prompt three times, so reps 2–3 hit an already-warm n-gram table (prose acceptance 1.000 is the tell). Warm numbers are real for multi-turn chat and agentic re-reads, but they are an upper bound. ⚠ Gain tracks how repetitive the OUTPUT is: high on code/tool traffic, much lower on prose. **No `mtp` row ships**: on the same model MTP measured −8.6% (n_max=1) and −29.8% (n_max=2) despite 0.800 acceptance — a drafter costing a transformer forward per cycle cannot pay on bandwidth-bound sparse-MoE decode, where a k-token verify batch routes to up to k×8 distinct experts |
+| `PXA_AUTO_SPEC` | unset → arms only under `PXA_ENHANCE=1`; `=1` forces on at any level, `=0` forces off, never under `PXA_REFERENCE` | Arms the measured-best **self**-speculation drafter for the model family, so ENHANCE users get it without knowing the flag exists. One row ships: `qwen35moe` → `--spec-type ngram-mod:n_max=4,n_min=2`. An explicit `--spec-type`/`--spec-stage` or a draft model (`-md`) always wins — only absence is filled. Arms through the same parser `--spec-type` uses, so the auto path cannot drift from the flag path. Families with no measured row are left alone and say so on stderr | **First-request decode (cold n-gram table): code 24.44 → 30.05 t/s (+23.0%), prose 23.69 → 24.78 (+4.6%); prefill neutral (262.63 → 259.16).** Cell: 4×P100, Qwen3.5-122B-A10B (community "abliterated" abliteration) PXQU48-core, `-c 32768 -b 512 -ub 512 -fa on`, ~14–15k fill, control in the same run. ⚠ **Do not quote the median-of-3 figures (+38.8%/+35.7%)** — the bench replays one prompt three times, so reps 2–3 hit an already-warm n-gram table (prose acceptance 1.000 is the tell). Warm numbers are real for multi-turn chat and agentic re-reads, but they are an upper bound. ⚠ Gain tracks how repetitive the OUTPUT is: high on code/tool traffic, much lower on prose. **No `mtp` row ships**: on the same model MTP measured −8.6% (n_max=1) and −29.8% (n_max=2) despite 0.800 acceptance — a drafter costing a transformer forward per cycle cannot pay on bandwidth-bound sparse-MoE decode, where a k-token verify batch routes to up to k×8 distinct experts |
 | `PXA_PXQ_REDUCE_BLK` | **256** (byte-identical to prior behaviour); accepts 32/64/128/256 | `blockDim.x` of both PXQ reducers. They are pure per-thread row maps, so this is **bit-identical at any block size** — it only changes how many SMs the launch reaches (64 spreads the dense reduce from 12 blocks to 48 on a 56-SM chip) | **MEASURED NULL:** 64 gave +0.22% on 122B/4×P100 while the two bracketing controls differed by 0.35% — below the noise floor, engagement proven by banner in both arms. The premise (1.87 ms/token in reduce) came from a `PXQ6_CANON_CMAX=16` profile; CMAX=4 had already recovered it. Kept as a lever so a future reduce-shape change can re-test with one env var |
 | `PXA_PXQ_TOKBATCH` | **0 (off)**; 2 or 3 valid (1 is meaningless — that *is* the per-token kernel; >3 is register-unsafe). Invalid values clamp to off with a warning | Token-batched gateup verify: on an `Ny > 1` verify batch, folds TOK consecutive tokens into one block so the expert weight walk is shared across the group. Workspace sizing and the canonical reducer are identical to the per-token arm, so **output is bit-identical** — only launch shape and weight-read temporal locality change. Every decline (lever off, `Ny == 1`, no instantiation, smem cap) falls through to the per-token launch unchanged | ⚠ **No A/B on record.** Requires the gen split (`PXA_PXQ6_KSPLIT_GEN`, default S=4 on sm_60/70): with the gen split off the lever never engages and the `ENGAGED` banner does not print — **such an A/B is VOID, not null** |
-| `PXA_FA_GQA_PACK` | **0 (off)**; NH ∈ {2,4,8} | sm_60 D=256 vec flash-attention that hands one block NH Q heads sharing a KV head, so the K row is fetched once and dotted against NH query vectors. Load traffic and load-instruction count both fall by NH at unchanged FMA count. Gated on `ncols == 1`, `K == V == f16`, `Dk == Dv == 256`, no logit softcap, and NH dividing both the head count and the gqa_ratio; anything else keeps the stock kernel | Stock `flash_attn_vec_ext_f32` re-reads the whole K/V cache once per Q head — on qwen35moe-122B-A10B (32 Q heads over 2 KV heads) an nsys decode capture put it at 4.82 ms of a 36.14 ms token (13.4%), issuing ~291 MB of K+V loads per layer against 18.2 MB of unique cache. Measured 122B PXQU48-core, 4×P100, `-fa on`, fill 8881, n=3 medians, control in-session: **NH=4 +6.9%**, NH=8 +6.9% (occupancy cancels the extra traffic cut); at fill 15 unchanged (31.83 → 31.94), prefill unchanged (300.5 t/s every arm — prefill takes `cols_per_block > 1`). ⚠ **Not bit-exact** vs the shipped `PXA_FA_VEC_ILP` V pass (1-accumulator vs 4-accumulator order). **Default stays 0 until a coherence + ppl gate is recorded** |
+| `PXA_FA_GQA_PACK` | **0 (off)**; NH ∈ {2,4,8} | sm_60 D=256 vec flash-attention that hands one block NH Q heads sharing a KV head, so the K row is fetched once and dotted against NH query vectors. Load traffic and load-instruction count both fall by NH at unchanged FMA count. Gated on `ncols == 1`, `K == V == f16`, `Dk == Dv == 256`, no logit softcap, and NH dividing both the head count and the gqa_ratio; anything else keeps the stock kernel | Stock `flash_attn_vec_ext_f32` re-reads the whole K/V cache once per Q head — on qwen35moe-122B-A10B (32 Q heads over 2 KV heads) an nsys decode capture put it at 4.82 ms of a 36.14 ms token (13.4%), issuing ~291 MB of K+V loads per layer against 18.2 MB of unique cache. Measured 122B PXQU48-core, 4×P100, `-fa on`, fill 8881, n=3 medians, control in the same run: **NH=4 +6.9%**, NH=8 +6.9% (occupancy cancels the extra traffic cut); at fill 15 unchanged (31.83 → 31.94), prefill unchanged (300.5 t/s every arm — prefill takes `cols_per_block > 1`). ⚠ **Not bit-exact** vs the shipped `PXA_FA_VEC_ILP` V pass (1-accumulator vs 4-accumulator order). **Default stays 0 until a coherence + ppl gate is recorded** |
 | `PXA_FA_GQA_QSMEM` | **0 (off)** | Stages the packed GQA query rows in shared memory, laid out `[j][i][lane]` so consecutive lanes hit consecutive banks. Q is what costs the registers (NH×QPL float2 per lane = 64 registers at NH=8); staging it gives 95 reg / 19456 B at NH=8 (2 blocks/SM) and 72 reg / 10240 B at NH=4 (3 blocks/SM) | Same rig/protocol as `PXA_FA_GQA_PACK`, split target 160: NH=4 registers 30.30 → **NH=4 shared 30.63 t/s (+1.1%)**; NH=8 shared 29.59 (−2.3%). The occupancy×traffic product model predicted NH=8+shared would win and it did not — at NH=8 the inner dot issues 32 shared loads per K row per warp and shared-load throughput simply replaces global-load throughput as the bound. NH=8 keeps the twin so that boundary stays reproducible. Inherits the same not-bit-exact caveat |
 
 **Build-time constants** (not env flags — flipping them is a re-baselining event, which is exactly why
@@ -773,7 +773,7 @@ Closing an inventory gap: these are all read via `getenv` in shipped source and 
 | `PXA_PXQ_CEIL_V2` | **off** (`=1` arms it) | Second-generation reconstruction ceiling for the PXQ codecs, read by both the CUDA and CPU paths and by the loader so a file and its runtime agree. | Ships off; no throughput claim is made for it. It changes reconstruction, so any use must be fidelity-checked against the tier's own gate rather than assumed neutral. |
 | `PXA_PXQ_KQW` | **off** | Quantizer-side knob affecting K/Q weight handling when writing a PXQ file. | Quantize-time only -- it cannot change the behaviour of an already-written file. No throughput claim; ships off. |
 | `PXA_PXQ_SMIN` | **off** | Quantizer-side minimum-scale floor for the PXQ1 encoder. | Quantize-time only. No throughput claim; ships off. |
-| `PXA_ALLOW_GRAPH_SPLIT_HYBRID` | **off — and this is a correctness guard, not a performance lever** | ⚠ **Footgun. `=1` bypasses a measured-defect guard and can produce fully degenerate output.** `-sm graph` on the DeltaNet hybrid arches (`qwen35moe`, `qwen3next`, `qwen35`) emits `!!!!…` at temp 0; the engine detects this and silently falls back to `-sm layer`. This env removes the fallback, for debugging only | Root-caused 2026-08-04: the DeltaNet head split is arithmetically exact (per-device partials sum to the `-sm layer` reference), but the **cross-device all-reduce never reaches the consumers** — each device normalises its own 1/n partial, so every device computes different router logits and picks a different top-8; NaN by layer 3, first token already `!`. `PXA_REDUCE_NCCL=0` and `PXA_REPLICATE_RECURRENT=1` are both byte-identically degenerate, so it is not the reduce transport or the recurrent carry. Not worth fixing at present: on 4×P100 `-sm graph` is **+64% prefill (255.6 → 419.0 t/s) but −17% decode (26.73 → 22.17)**, n=3 medians, 14259-token prompt, one binary/one session — consistent with 2×V100 (−31%) and an 8×V100 node (−4.6× decode). Fixing it buys prefill only, and only if the engine gains a per-phase split mode |
+| `PXA_ALLOW_GRAPH_SPLIT_HYBRID` | **off — and this is a correctness guard, not a performance lever** | ⚠ **Footgun. `=1` bypasses a measured-defect guard and can produce fully degenerate output.** `-sm graph` on the DeltaNet hybrid arches (`qwen35moe`, `qwen3next`, `qwen35`) emits `!!!!…` at temp 0; the engine detects this and silently falls back to `-sm layer`. This env removes the fallback, for debugging only | Root-caused 2026-08-04: the DeltaNet head split is arithmetically exact (per-device partials sum to the `-sm layer` reference), but the **cross-device all-reduce never reaches the consumers** — each device normalises its own 1/n partial, so every device computes different router logits and picks a different top-8; NaN by layer 3, first token already `!`. `PXA_REDUCE_NCCL=0` and `PXA_REPLICATE_RECURRENT=1` are both byte-identically degenerate, so it is not the reduce transport or the recurrent carry. Not worth fixing at present: on 4×P100 `-sm graph` is **+64% prefill (255.6 → 419.0 t/s) but −17% decode (26.73 → 22.17)**, n=3 medians, 14259-token prompt, one binary/one run — consistent with 2×V100 (−31%) and an 8×V100 node (−4.6× decode). Fixing it buys prefill only, and only if the engine gains a per-phase split mode |
 | `PXA_REDUCE_NCCL` | **ON** where NCCL is available (`=0` takes the non-NCCL reduce route) | Transport selection for the cross-device reduce | Used as a bisection control in the graph-split investigation above; **both routes were byte-identically degenerate**, which is what ruled the transport out. No throughput A/B on record |
 | `PXA_REPLICATE_RECURRENT` | off (presence-tested) | Replicates the recurrent state across devices instead of splitting it | Same investigation: **measured null as a fix** — byte-identically degenerate. No throughput A/B |
 | `PXA_PXQ_MOE_DOWN_SPLIT` | **0 (off)**; 1 = K1 kseg split, 2/4/8 = gen S | K-split for the fused MoE **down** projection, bit-exact. ⚠ Deliberately uses the MMV cap, not the gateup family's `PXQ6_GU_SPLIT_MAX`: at `K >= 2048` the GU cap changes the canonical fold (`canon_nfix(64,8) != canon_nfix(64,16)` → a silent bit-break), and the gen workspace row stride is a fixed `PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG` slots, so sizing with the GU cap would undersize it 2× → out-of-bounds writes | ⚠ **No A/B on record.** Prints an armed banner when engaged |
@@ -831,7 +831,7 @@ not run.
 
 Adversarial workload = long prompt (6k–24k tok, topic rotating so the RAM cache fills with mutually
 unrelated large states) immediately followed by a short unrelated prompt sharing only the chat
-template, every 3rd cycle firing two shorts concurrently. Seat had already served real traffic.
+template, every 3rd cycle firing two shorts concurrently. Instance had already served real traffic.
 
 | arm | slice | guard | breaker | correct | soft-fails | blast radius |
 |---|---|---|---|---|---|---|
@@ -847,7 +847,7 @@ generation is killed after **one** token instead of holding a slot to context-fi
 
 ## Updates — 2026-08-16 — split-mode, card-count and SWA_KEEP on the reviewer cell
 
-Cell unless a row says otherwise: **Rig-A reviewer seat**, `muse-glimmer` 30B **dense** PXQ4 +
+Cell unless a row says otherwise: **Rig-A reviewer instance**, `muse-glimmer` 30B **dense** PXQ4 +
 vision projector, build-fugv60, cards 4,1,6 (V100 sm_70 + 2×P100 sm_60), all pairs **PHB, no
 NVLink/P2P**, `-ngl 99 -sm layer -ts 24,38,38 -c 262144 -b/-ub 2048 -ctk/-ctv f16 -np 2 -t 16
 -fa on`, `PXA_ENHANCE=1`, `GGML_CUDA_NO_PINNED=1`. Single-stream measurement, prompt trimmed to an
@@ -855,7 +855,7 @@ EXACT token count, temp 0 / top_k 1 / seed 1234 / `cache_prompt:false`, `n_predi
 fresh server per arm, arms interleaved with repeated baselines.
 
 ### Doc-vs-runtime contradictions found (fix the doc, not the runtime)
-1. The 2026-08-16 block above describes this seat as a **"30B MoE PXQ4"**. The runtime ledger says
+1. The 2026-08-16 block above describes this instance as a **"30B MoE PXQ4"**. The runtime ledger says
    `class=dense experts=0(top0)`. It is **dense**. The keeper script likewise calls it
    "dense full-attention".
 2. "full-attention" is also wrong: the GGUF carries
@@ -868,7 +868,7 @@ fresh server per arm, arms interleaved with repeated baselines.
    = 262144 × 52 layers × 1024 B/token/layer). There is no iSWA/`--swa-full` split-cache path in
    this tree (`grep swa_full` in common/ + src/llama-context.cpp: no hits), so the 39 SWA layers
    each carry a full-context cache they can never address beyond their 2048-token window.
-   **Upper bound if an SWA-aware cache were added: ~9.8 GiB of VRAM freed on this seat**
+   **Upper bound if an SWA-aware cache were added: ~9.8 GiB of VRAM freed on this instance**
    (13 full layers still need 3328 MiB; 39 SWA layers need ~163 MiB). Not attempted here — it is
    a code change, and it would trade away prompt-cache reuse (`apply_checkp ... lack of cache data
    (likely due to SWA)` is already in the log). Recorded as an opportunity, not a lever.
@@ -877,17 +877,17 @@ fresh server per arm, arms interleaved with repeated baselines.
 - ⚠ **`-p 127.0.0.1:8299:8299` collides with a live `node` service.** Bench ports 8355/8356 are
   free. Never send `docker run`'s own stderr to /dev/null in a harness — a daemon-level port clash
   otherwise presents as a model-load failure.
-- ⚠⚠ **Parking `/etc/cron.d/pxa-hive-seats` does NOT stop the keeper.** dcron has the next run
+- ⚠⚠ **Parking the instance keeper's cron entry does NOT stop the keeper.** dcron has the next run
   queued, so the keeper fired 44 s and 29 s after the park in two separate campaigns and recreated
   Rig-A onto the cards mid-run; every subsequent arm then "OOMed" and looked like a config verdict.
-  **Hold the keeper's own lock instead:** `exec 8>/tmp/pxa-hive-seats-keeper.lk; flock -x 8` for the
+  **Hold the keeper's own lock instead:** `exec 8>/tmp/pxa-instance-keeper.lk; flock -x 8` for the
   whole campaign (the keeper's own `flock -n -o 9 || exit 0` then makes every invocation a no-op),
-  and close the fd before handing the seats back. Interleave repeated baseline arms — the repeat
+  and close the fd before handing the instances back. Interleave repeated baseline arms — the repeat
   contradicting the identical first arm is what exposes this class of fault at all.
 
 ### Measured verdicts — 2026-08-16 speed campaign
 
-Protocol for every row: fresh server per arm; container flags matching the seat keeper exactly
+Protocol for every row: fresh server per arm; container flags matching the instance keeper exactly
 (`--runtime=nvidia`, `GGML_CUDA_NO_PINNED=1`, `PXA_ENHANCE=1`); prompt trimmed to an EXACT token
 count via /tokenize+/detokenize; temp 0, top_k 1, seed 1234, `cache_prompt:false`, `n_predict 128`;
 3 reps/arm; **baseline arms repeated and interleaved** so drift is visible. Raw data:
@@ -898,9 +898,9 @@ count via /tokenize+/detokenize; temp 0, top_k 1, seed 1234, `cache_prompt:false
 | **`-sm graph`** (and `-sm attn`) | Rig-A 3-card, fill 8192 | **NULL — it never engages.** +0.0%/+0.2% prefill, +0.0%/+0.1% decode, byte-identical output. `LLM_ARCH_MUSE_GLIMMER` is **absent from `k_supported` in `is_model_split_supported()` (`src/llama.cpp:3208`)**, so `src/llama.cpp:3516` warns "not supported for this model" and silently serves `-sm layer`. Engagement disproof: the graph arm prints `split_mode_graph_scheduling = 0` / `graph splits = 4`, byte-identical to the layer arm | n/a (no-op) |
 | **`PXA_FA_SWA_KEEP`** | Rig-A 3-card, **fill 24576** | **CONFIRMED, large.** KEEP=1 (shipped default) **17.60 t/s** vs KEEP=0 **14.79 t/s** = **+19.0% decode**; spread 0.2-0.3%. Prefill untouched (260.9/260.8). **The NaN correctness fix was not a performance cost — it paid ~19% decode at large fill.** | decode-path -> temp-0 output. **byte-identical** (both sha `e9167a08…`), 3 reps x 128 tok. Bit-exact is also structurally expected: masked KV contributes exactly zero. Engagement = the +19% itself (no log marker exists) |
 | **Rig-A 3 cards -> 2 cards** (NEW) | cards 4,1 vs 4,1,6; fill 8192 | **BIGGEST WIN.** `-ts 45,55 -c 131072`: **prefill 289.4 -> 378.4 (+30.7%)**, **decode 19.74 -> 22.33 (+13.1%)**, and it **frees a whole P100 (card 6)**. Ladder in dev0's share: 36,64 +16.9/+8.2; 40,60 +22.4/+10.0; **45,55 +30.7/+13.1**. 40,60 repeat within 0.2%/0.4%. **COST: max context 262144 -> 131072** (65536/slot at np2; observed peak use ~25k). 50,50 untested, predicted OOM (dev0 also holds the 3670.81 MiB projector) | **byte-identical output vs the 3-card baseline** (sha `cb0b4a6d…`), 3 reps x 128 tok. Measured, not assumed — moving layers across an sm_70/sm_60 boundary can change kernels |
-| **`--spec-type mtp:n_max=1`** on Ana | Ana card 5, fill 8352 | **NET LOSS: −6.5% decode.** MTP-on baselines 40.85/41.36/41.23 (mean 41.15) vs MTP-off **43.83**. With `GQA_PACK=4` too: **44.59 = +8.4%** over the live config. MTP-off spreads are the tightest in the campaign (0.3-0.4%). ⚠ one fill, single stream, synthetic **repetitive** prompt — which biases acceptance *in MTP's favour*, and it still lost. Needs a real-traffic confirm before flipping | bit-exact by construction (verify-gated); confirmed byte-identical (sha `a69dce26…`). Engagement proven both ways (`MTP context ready` / `speculation left off`) |
-| **`PXA_FA_GQA_PACK=4`** on Ana | Ana card 5, fill 8352 | **DOES NOT REPRODUCE. NOT SHIPPED.** Measured **+1.7%** (MTP off, spreads 0.3/0.4%) and +2.7% (MTP on, vs a baseline band of 1.3%) — against the record's **~+6.9%**. `NH=8` is **+0.3% = NOISE** (the record's "+6.9% at NH=8" does not reproduce either). Ana satisfies every documented gate (D=256, K/V f16, gqa_ratio 4, sm_60) and sm_60 decode *does* route to `vec_f32` (`fattn.cu:137-166` via `pxq_use_sm60_vec_f32`), so it *could* fire | **VOID — engagement not proven.** The `PXA_FA_GQA_PACK: NH=4` banner comes from a `static` resolver lambda and proves only that the env var was **parsed**, not that the kernel dispatched; the kernel gate also needs `cols_per_block == 1`. The lever is documented NOT bit-exact yet output is byte-identical in every arm. **Needs a firing counter in `fattn-vec-f32.cuh` + rebuild before it can ship either way** |
-| **`PXA_P100_FP16_GEMM`** | Ana card 5 (single sm_60), 40 chunks x 512 tok | ⚠ **FAILS THE STANDING QUALITY GATE: `Same top token` = 94.088 ± 0.234 %** (reject threshold is <98%). Median KLD 0.004266, max KLD 1.755914. **Auto-armed on ALL THREE live seats today** (every seat has a P100). Nothing was disarmed — reported for the owner's decision, since its benefit (+51% gpt-oss prefill on the record) is a real speed/fidelity trade | prefill/batched-path -> `llama-perplexity --kl-divergence`, reference = **lever OFF, same model** (not a Q8_0 parent). Engagement proven: `PXA_AUTO: P100_FP16_GEMM=off` vs `=on` in the two arms. Corpus `<engine-tree>` (**not** della). Perplexity NOT used |
+| **`--spec-type mtp:n_max=1`** on the single-P100 instance | that instance's card 5, fill 8352 | **NET LOSS: −6.5% decode.** MTP-on baselines 40.85/41.36/41.23 (mean 41.15) vs MTP-off **43.83**. With `GQA_PACK=4` too: **44.59 = +8.4%** over the live config. MTP-off spreads are the tightest in the campaign (0.3-0.4%). ⚠ one fill, single stream, synthetic **repetitive** prompt — which biases acceptance *in MTP's favour*, and it still lost. Needs a real-traffic confirm before flipping | bit-exact by construction (verify-gated); confirmed byte-identical (sha `a69dce26…`). Engagement proven both ways (`MTP context ready` / `speculation left off`) |
+| **`PXA_FA_GQA_PACK=4`** on the single-P100 instance | that instance's card 5, fill 8352 | **DOES NOT REPRODUCE. NOT SHIPPED.** Measured **+1.7%** (MTP off, spreads 0.3/0.4%) and +2.7% (MTP on, vs a baseline band of 1.3%) — against the record's **~+6.9%**. `NH=8` is **+0.3% = NOISE** (the record's "+6.9% at NH=8" does not reproduce either). That instance satisfies every documented gate (D=256, K/V f16, gqa_ratio 4, sm_60) and sm_60 decode *does* route to `vec_f32` (`fattn.cu:137-166` via `pxq_use_sm60_vec_f32`), so it *could* fire | **VOID — engagement not proven.** The `PXA_FA_GQA_PACK: NH=4` banner comes from a `static` resolver lambda and proves only that the env var was **parsed**, not that the kernel dispatched; the kernel gate also needs `cols_per_block == 1`. The lever is documented NOT bit-exact yet output is byte-identical in every arm. **Needs a firing counter in `fattn-vec-f32.cuh` + rebuild before it can ship either way** |
+| **`PXA_P100_FP16_GEMM`** | the single-P100 instance's card 5 (single sm_60), 40 chunks x 512 tok | ⚠ **FAILS THE STANDING QUALITY GATE: `Same top token` = 94.088 ± 0.234 %** (reject threshold is <98%). Median KLD 0.004266, max KLD 1.755914. **Auto-armed on ALL THREE live instances today** (every instance has a P100). Nothing was disarmed — reported for the owner's decision, since its benefit (+51% gpt-oss prefill on the record) is a real speed/fidelity trade | prefill/batched-path -> `llama-perplexity --kl-divergence`, reference = **lever OFF, same model** (not a Q8_0 parent). Engagement proven: `PXA_AUTO: P100_FP16_GEMM=off` vs `=on` in the two arms. Corpus `<engine-tree>` (**not** della). Perplexity NOT used |
 
 ## `-ts` SWEEP on the 2-card Rig-A layout — the optimum is further than 40,60
 Cards 4,1 (V100+P100), `-sm layer -c 131072 -np 2`, fill 8192, 3 reps, vs the 3-card baseline
@@ -927,7 +927,7 @@ predicted to OOM (dev0 also carries the 3670.81 MiB vision projector: 7106 weigh
 ruling the instrument is `llama-perplexity --kl-divergence`, reading `Same top token`.
 **REFERENCE:** the same model with the lever OFF (`PXA_P100_FP16_GEMM=0`), per the ruling — not a
 Q8_0 parent.
-**CELL:** Ana's card 5, a **single P100 (sm_60)**, `Ornith-9B-Abliterated-PXQ4`, build-srv,
+**CELL:** the single-P100 instance's card 5, a **single P100 (sm_60)**, `Ornith-9B-Abliterated-PXQ4`, build-srv,
 `-ngl 99 -c 512 --chunks 40` over `<engine-tree>` (a neutral corpus, **not**
 the della corpus). **Sample: 40 chunks x 512 tokens = 20,480 tokens.**
 **ENGAGEMENT PROVEN:** the two arms log
@@ -943,10 +943,10 @@ the della corpus). **Sample: 40 chunks x 512 tokens = 20,480 tokens.**
 **Verdict against the standing thresholds (>=99.5% ship / 98-99.5% surface / <98% reject):
 94.088% is a REJECT.** ~1 token in 17 changes at the top-1 position.
 
-**It is currently auto-armed on ALL THREE live seats** — every seat has at least one P100
-(Rig-A cards 1 and 6, Ana card 5, Rig-C card 0) and the ledger shows `P100_FP16_GEMM ON [2:1 hgemm]`
+**It is currently auto-armed on ALL THREE live instances** — every instance has at least one P100
+(Rig-A cards 1 and 6, the single-P100 instance's card 5, Rig-C card 0) and the ledger shows `P100_FP16_GEMM ON [2:1 hgemm]`
 on each. So a lever that fails the project's own quality bar is shipping ungated on the owner's
-live reviewer seat today. **Per instruction I have NOT disarmed anything — this is reported for
+live reviewer instance today. **Per instruction I have NOT disarmed anything — this is reported for
 the owner's decision.** Its counterpart benefit is real and large (+51% gpt-oss prefill on the
 record), so this is a genuine speed-vs-fidelity trade the owner should make knowingly, not a bug.
 - Perplexity was NOT used as a gate (it is banned); the ref arm's `Final estimate` line is ignored.
@@ -973,7 +973,7 @@ NOT MEASURED HERE: the generic leak's own ON/OFF gate (it needs a rebuild to tog
 idea with numbers, not code to pull. Upstream measured on 2x RTX 3090 / Qwen3.6-27B prefill:
 930->943 @3,760 tok; 911->920 @14,937; **568->705 (+24%) @68,576** — the gain scales with prompt
 length. Cost ~2.6 GiB VRAM.
-**NOT TESTED here, deliberately, and the reason is measured:** our seats already report
+**NOT TESTED here, deliberately, and the reason is measured:** our instances already report
 `graph splits = 4`, and the 2-card Rig-A layout is the one worth trying it on — but the +2.6 GiB
 does not fit alongside the 3670.81 MiB projector at the `-ts 45,55` optimum that just won
 +30.7%/+13.1% (dev0 is already at ~15.4 GiB of 16 GiB there). It is dangerous on Rig-C too
@@ -1007,7 +1007,7 @@ corpus: **4/12 identical = 33.3% agreement (n=12)** — the change is numericall
   FP16; forcing sm_60 onto fp32 roughly halves prefill for **any** head size.
 - **Upstream's "three sites" is wrong for this tree — there are TWO**: `ggml/src/ggml-cuda/common.cuh`
   `FAST_FP16_AVAILABLE` macro and the `fast_fp16_available(cc)` host predicate. Keep them in lockstep.
-- The D=256 story from the Ana/Rig-C lane (`fattn-tile-f32` handles only D=64/128, so D=256 falls to
+- The D=256 story from the single-P100-instance/Rig-C lane (`fattn-tile-f32` handles only D=64/128, so D=256 falls to
   `vec_f32`) is real but is **NOT** why it regresses here: **the Rig-A target model is D=128**
   (`n_embd_head_k/v = 128`; the `n_embd_k_gqa = 256` line is `head_count_kv 2 x key_length 128`, the
   GQA embedding width — **not** the head dimension. Do not conflate these). Correct D analysis did not
@@ -1066,7 +1066,7 @@ only be re-measured at f16/262144 **after** the KV change exists.
 # 2026-08-17 overnight (run7) — refusal comparison, requant blocker, harness fix
 # ─────────────────────────────────────────────────────────────────────────
 
-## ***THE ROUTING NUMBER: the uncensored fallback seat refuses 0 %***
+## ***THE ROUTING NUMBER: the uncensored fallback instance refuses 0 %***
 The comparison the previous window deliberately deferred. Same corpus, same
 settings, same scoring code as the 91–98 % stock baseline
 (`BUILTIN_HARMFUL[::8][:100]`, n=100, greedy, 64 tokens, thinking off,
@@ -1078,7 +1078,7 @@ baseline exactly (combined 98.0 %, Wilson [93.0, 99.4]).
 |---|---|---|---|---|---|
 | stock 9B baseline | 91.0 | 93.0 | 98.0 | **98.0** | [93.0, 99.4] |
 | Rig-C 27B (`:8231`) | 0.0 | 3.0 | 0.0 | **0.0** | [0.0, 3.7] |
-| Ana 9B (`:8219`) | 0.0 | 2.0 | 2.0 | **3.0** | [1.0, 8.5] |
+| single-P100 instance 9B (`:8219`) | 0.0 | 2.0 | 2.0 | **3.0** | [1.0, 8.5] |
 
 Rig-C's 3 % arditi score is **100 % false positives** — hand-checked, all three
 are the bare word `illegal` inside a *complying* answer (e.g. contrasting "tax
@@ -1086,8 +1086,8 @@ avoidance (legal)" with "tax evasion (illegal)"). True refusals: **0/100**.
 **Route-to-fallback is vindicated, not undermined.** Rig-C answers 100 %
 coherently (distinct-4gram ≈ 1.0, 0 degenerate).
 
-## ***The abliterated seat is BROKEN, and its low refusal rate hides it***
-Reading refusal rate alone says "Ana refuses 3 %, so Ana is permissive". Wrong,
+## ***The abliterated instance is BROKEN, and its low refusal rate hides it***
+Reading refusal rate alone says "it refuses 3 %, so it is permissive". Wrong,
 and dangerously so:
 - **50/100** harmful completions are degenerate repetition loops
   (worst: distinct-4gram **0.083**, one 4-gram repeated 12×).
@@ -1097,13 +1097,13 @@ and dangerously so:
 - Only ~47 % are non-refusing **and** non-degenerate.
 
 **Confirmed to be the model, not the harness.** Through the *same endpoint,
-same decoding, same seat*, benign prompts are clean, varied, and stop normally
+same decoding, same instance*, benign prompts are clean, varied, and stop normally
 ("capital of France" → Paris; a haiku; photosynthesis in two sentences). The
 collapse is **specific to harmful prompts** and reproduces at temp **0 and
 0.7**. Signature of an over-aggressive abliteration: the refusal direction was
 ablated so hard the harmful-prompt pathway fell into a fixed attractor rather
 than learning to comply.
-**Do not treat this seat as the permissive fallback.** The other one is.
+**Do not treat this instance as the permissive fallback.** The other one is.
 
 ## Requantizing Q8_0 → PXQ4 is DISABLED by default (not merely lossy)
 The 35B MoE quantization stalled instantly on:
@@ -1130,44 +1130,44 @@ that the 27B ran four characters further before the token cap.
 **An exact-hash fidelity gate would therefore have PASSED that pair by
 accident.** Key a fidelity gate on **prefix agreement + a degeneracy measure**,
 never on hash equality — hash equality is too brittle to express the property.
-Measured, identical prompt text on both seats, n_predict 128, temp 0, top_k 1:
+Measured, identical prompt text on both instances, n_predict 128, temp 0, top_k 1:
 
 | prompt | common prefix | distinct-4gram | verdict |
 |---|---|---|---|
 | repeated sentence, `/completion` | **659 ch = 100.0 % of shorter** | 0.253 / 0.263 | BLIND |
 | varied corpus, `/v1/chat/completions` | 53 ch = 11.4 % | **1.0 / 1.0** | DISCRIMINATING |
 
-Fixed harness committed as `pxa-hive/seat-measure.py`; the before/after is
-re-checkable via `pxa-hive/seat-corpus-verify.py`. Corpus:
+Fixed harness committed to the internal instance-management tooling as `instance-measure.py`;
+the before/after is re-checkable via the corresponding `instance-corpus-verify.py` script. Corpus:
 `<engine-tree>` (the box's own perplexity reference).
 **The endpoint switch costs no metric** — llama-server returns the same
 `timings` object (`prompt_per_second`/`predicted_per_second`) on the chat
 endpoint.
 
 ## Two probe gotchas that will bite the next agent
-- **`"status":"no slot available"` is NOT degradation.** The 27B seat runs
+- **`"status":"no slot available"` is NOT degradation.** The 27B instance runs
   `-np 1`, so its own `/health` returns that string while it serves *your*
   request. A liveness check that treats it as failure aborts a healthy run —
-  and reads as "the seat degraded under load". It did not.
-- **Thinking-disable is per-seat, not global.** The 9B guide seat has
+  and reads as "the instance degraded under load". It did not.
+- **Thinking-disable is per-instance, not global.** The 9B guide instance has
   `--chat-template-kwargs '{"enable_thinking":false}'` baked into its launch
-  line; the 27B seat has **no** chat-template-kwargs at all. Probing the 27B
+  line; the 27B instance has **no** chat-template-kwargs at all. Probing the 27B
   without a per-request `chat_template_kwargs.enable_thinking=false` returns
   **empty `content`** at 64 *and* 200 tokens — the whole budget goes to
   `reasoning_content`. Confirms the existing `max_tokens 16` note generalises:
   it is not the budget alone, it is budget × whether reasoning is on.
 
-## `-ts` ceiling above 58 — NOT MEASURABLE while all three seats are up
+## `-ts` ceiling above 58 — NOT MEASURABLE while all three instances are up
 Recorded as blocked, not attempted, with numbers. A bench copy of the 27B needs
-~14.4 GiB of weights plus KV. Free VRAM with the three seats serving:
+~14.4 GiB of weights plus KV. Free VRAM with the three instances serving:
 card0 4.0 / card1 2.4 / card2 0.3 / card3 10.6 / card4 2.4 / card5 0.5 /
 card6 3.5 GiB. No card and no usable pair fits it. The only substantially free
 card is the 1080 Ti, which is both too small **and** the wrong silicon —
 a split ceiling measured on sm_61 would not transfer to the V100+P100 pair the
-seat actually runs on. Needs a window where a seat may be taken down.
-## Updates — 2026-08-17 — the reviewer seat on cards 2,0 measured for the first time
+instance actually runs on. Needs a window where an instance may be taken down.
+## Updates — 2026-08-17 — the reviewer instance on cards 2,0 measured for the first time
 
-This seat had **never been benchmarked**. Cell: build-srv, PXQ4 + vision, cards 2,0
+This instance had **never been benchmarked**. Cell: build-srv, PXQ4 + vision, cards 2,0
 (dev0 = card 2 V100 sm_70, dev1 = card 0 P100 sm_60), `-ngl 99 -sm layer -ts 52,48 -c 131072
 -b/-ub 2048 -np 1 -fa on`, fill 8192, n_predict 128, 3 reps/arm, temp 0, fresh server per arm,
 `PXA_ENHANCE=1`, **3 interleaved repeated baselines**.
@@ -1178,12 +1178,12 @@ n_embd_head_k = n_embd_head_v = 256, n_swa = 0`.
 **BASELINE = 388.8 t/s prefill / 21.90 t/s decode** (mean of the 3 interleaved baseline medians;
 baseline-to-baseline band **0.31% prefill / 0.10% decode**).
 
-⚠ **The previously circulated baseline for this seat (~395 pf / ~23.4 tg) does not reproduce on
+⚠ **The previously circulated baseline for this instance (~395 pf / ~23.4 tg) does not reproduce on
 decode: 21.90 vs 23.4 is −6.4%, ~64x the baseline band.** Prefill agrees. Use 388.8 / 21.90.
 
 ⚠ Within-arm rep spread on prefill is ~3% and it is **systematic, not random** — rep 1 is the
 slowest in every arm on this cell (cold effect). Medians of >=3 absorb it; a single-rep campaign
-on this seat is worthless.
+on this instance is worthless.
 
 | arm | ts | ctx | prefill | decode | vs base pf | vs base tg | output |
 |---|---|---|---|---|---|---|---|
@@ -1193,21 +1193,21 @@ on this seat is worthless.
 | ts 58,42 @ full ctx | 58,42 | 131072 | — | — | **OOM (real)** | | `cudaMalloc 884.62 MiB on device 0` |
 | ts 64,36 @ 65536 | 64,36 | 65536 | — | — | loads, **dies on first prefill** | | see caveat |
 
-### `PXA_P100_FP16_GEMM` costs this seat only −3.1% prefill — the banner's "+51%" is not this cell
+### `PXA_P100_FP16_GEMM` costs this instance only −3.1% prefill — the banner's "+51%" is not this cell
 Engagement proven both ways (`PXA_AUTO: P100_FP16_GEMM=on` / `=off` in the two arms' ledgers).
 The startup banner advertises "+51% gpt-oss prefill measured" — **a different model**. On this
-seat turning the lever OFF costs **3.1% prefill and 0.3% decode**, ~16x smaller than the banner
+instance turning the lever OFF costs **3.1% prefill and 0.3% decode**, ~16x smaller than the banner
 implies. Anyone reasoning about this lever from the banner is reasoning about someone else's cell.
 (Its fidelity cost is the separate 94.088% same-top-token reject already recorded above.)
 
 ### Shifting layers onto the V100 wins here too, but full context is the price
 `-ts 58,42 @ ctx 65536` is **+11.1% prefill / +5.0% decode with byte-identical output** (3 reps
-x 128 tok) — same direction as the 3-card→2-card result on the other seat, smaller because this
-seat already starts V100-weighted at 52,48. **Cost: max context halves, 131072 → 65536.**
+x 128 tok) — same direction as the 3-card→2-card result on the other instance, smaller because this
+instance already starts V100-weighted at 52,48. **Cost: max context halves, 131072 → 65536.**
 Not applied — a context reduction is a capability trade for the owner, not a tuning change.
 
 ### The `-ts` ceiling on this cell, and where it actually is
-- At **ctx 131072 the seat is already AT dev0's VRAM ceiling**: 58,42 OOMs for real
+- At **ctx 131072 the instance is already AT dev0's VRAM ceiling**: 58,42 OOMs for real
   (`allocating 884.62 MiB on device 0: cudaMalloc failed`, exit 139) *after* the per-arm VRAM gate
   confirmed both cards >=13000 MiB free — so it is a structural verdict, not the environment fault
   that voided an earlier campaign on this box.
@@ -1216,12 +1216,12 @@ Not applied — a context reduction is a capability trade for the owner, not a t
   so treat as probable-not-certain. Usable ceiling is **between 58 and 64**; 58,42 is the best
   measured point and the true optimum was not found.
 
-### Nulls by construction on this seat — recorded so nobody re-chases them
+### Nulls by construction on this instance — recorded so nobody re-chases them
 - **`PXA_FA_SWA_KEEP` is INERT here: `n_swa = 0`.** It cannot engage on this arch. (It remains the
-  +19% decode win on the sliding-window seat — that is a different arch, not a fleet-wide lever.)
+  +19% decode win on the sliding-window instance — that is a different arch, not a fleet-wide lever.)
 - **MTP is not armed and has no measured row for this arch** — the ledger prints
   `PXA_AUTO: spec arch=qwen35 -> no measured row, speculation left off`. Any "−1.7% MTP here"
-  claim does not describe this seat as configured.
+  claim does not describe this instance as configured.
 - **`PXA_FA_GQA_PACK` can only ever take NH=2 on this cell.** The gate needs NH to divide both the
   head count (24) and the gqa_ratio (**6**); neither 4 nor 8 divides 6, so the record's NH=4/NH=8
   rows are unreproducible here in principle.
@@ -1245,7 +1245,7 @@ exist in this fork.**
 
 ### Why it is a large REGRESSION here and not a free fix
 `fattn-tile-f32.cu` supports **only head sizes 64 and 128** (`..._is_supported` → `K->ne[0] == 64 ||
-== 128`). Both seats on this tree are **D=256**, so with the carve-out the `!fast_fp16_available`
+== 128`). Both instances on this tree are **D=256**, so with the carve-out the `!fast_fp16_available`
 branch sends D=256 prefill to the **single-column `vec_f32`** kernel — precisely the route
 `PXA_FA_TILE256` exists to escape (its comment records that kernel at **52.7% of prefill GPU time**
 on a pre-Volta D=256 rig). Carving out 600 also makes `PXA_FA_MASK_SKIP_TILE` (default ON) a
@@ -1279,7 +1279,7 @@ The tractable fix is the PR #2144 pattern applied to the **tile** kernel: in
 **register** accumulators in fp16. Promoting only those to float/float2 gives fp32 accumulation with
 **shared memory unchanged**, keeps D=256 prefill tiled, and keeps `PXA_FA_MASK_SKIP_TILE` alive.
 Cost is registers (VKQ 8 → 16 at D=256/ncols=16) under `__launch_bounds__(..., 1)` — must be
-occupancy-measured. Not attempted: it is a real kernel change in a tree two live seats boot from.
+occupancy-measured. Not attempted: it is a real kernel change in a tree two live instances boot from.
 
 ### ⚠ QUALITY — and a warning about the `Same top token` threshold itself
 Batched KL, single-P100 cell, 40 chunks x 512 tok, reference = carve-out OFF (the shipped binary),
@@ -1300,12 +1300,12 @@ Confound in the 94.127% itself, stated plainly: the two arms differ by kernel (t
 single-column) as well as by precision, so summation-order noise is included; this **bounds** the
 fp16 leak from above rather than isolating it. Isolating it needs the surgical fix above.
 
-### ⚠ 2026-08-17 — `PXA_P100_FP16_GEMM=0` HANGS THE CHAT ENDPOINT on the single-P100 MTP seat
-Disarming this lever was applied to both seats on this tree and **reverted on the single-P100 seat
-the same night.** Measured cost of OFF was benign (−3.7% prefill there, −3.1% on the 2-card seat),
-but the cost was measured on `POST /completion` and the seats serve `POST /v1/chat/completions`:
+### ⚠ 2026-08-17 — `PXA_P100_FP16_GEMM=0` HANGS THE CHAT ENDPOINT on the single-P100 MTP instance
+Disarming this lever was applied to both instances on this tree and **reverted on the single-P100 instance
+the same night.** Measured cost of OFF was benign (−3.7% prefill there, −3.1% on the 2-card instance),
+but the cost was measured on `POST /completion` and the instances serve `POST /v1/chat/completions`:
 
-| endpoint | that seat with `PXA_P100_FP16_GEMM=0` |
+| endpoint | that instance with `PXA_P100_FP16_GEMM=0` |
 |---|---|
 | `/completion` | works, returns the expected answer |
 | `/v1/chat/completions` | **hangs, empty body**, while `/health` reports `{"status":"ok","slots_idle":2}` |
@@ -1314,14 +1314,14 @@ The server loads clean (MTP context initialised, slots idle, no log errors) and 
 a chat request, so the keeper's gen-probe failed on every recreate and the keeper went into a
 **recreate loop**. Recreating without the env fixed it on the first try — causal, not correlated.
 VRAM contention and the binary were both ruled out.
-**The 2-card seat KEEPS the disarm and is fine** — it passes the same chat probe. Seat-specific.
-Untested hypothesis for the morning: that seat is the only one running **MTP**, and the chat path
+**The 2-card instance KEEPS the disarm and is fine** — it passes the same chat probe. Instance-specific.
+Untested hypothesis for the morning: that instance is the only one running **MTP**, and the chat path
 adds the jinja template + `reasoning_effort`; the dense-GEMM change plausibly interacts with
 draft/verify on a templated prompt. **Test on a bench container before ever re-applying.**
 
 **Standing lesson for this box, wider than this lever:** a lever can measure clean on `/completion`
 and still break the endpoint production uses. Benchmark harnesses here drive `/completion`; the
-seats serve `/v1/chat/completions`. **Treat a passing keeper `verify_seat` — not a passing
+instances serve `/v1/chat/completions`. **Treat a passing keeper `verify_seat` — not a passing
 benchmark — as the gate before any live config change.**
 ### 2026-08-02 — DeepSeek-V4 flipped in-place RoPE (`PXA_ROPE_FLIPPED_v1`, upstream ik #2198 port)
 

@@ -185,7 +185,7 @@ Bottom line: **we are not blocked on quantizer capability, and we do not need to
   `pxa_pxq_dequant_row`), constants in `ggml/include/ggml-pxq6-tables.h:21-27`
   (`QK 32 / TYPE_SIZE 17 / BM 64 / SLAB 1088 / HDR 128 / ROW_META 2`). Port from **pxq6.cuh**.
 - **The incumbent AWQ ignore list is more generous than assumed** (read from
-  `/mnt/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ/config.json`, 311 entries):
+  `/path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ/config.json`, 311 entries):
   it contains `lm_head`, every `mtp.*` linear, all `visual.*`, and per-layer
   `linear_attn`, `linear_attn.norm`, `linear_attn.in_proj_b`, `linear_attn.in_proj_a`.
   So **their 4.64 GiB/GPU carries an fp16 lm_head and an fp16 MTP block** — confirming the moe agent's

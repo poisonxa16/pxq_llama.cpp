@@ -13,15 +13,15 @@ this box is ≈ +9% over the incumbent's measured 92.8 tok/s peak, and reaching 
 requires re-encoding three tensor classes that are *not* PXQ4 in the artifact today.
 The v1 that ships without re-encoding is a ~23% REGRESSION.**
 
-I re-derived this independently from both checkpoints this session, and it confirms
+I re-derived this independently from both checkpoints this pass, and it confirms
 `08-design-least-code`'s correction (max-performance got the direction right but the wrong
 magnitude; minimal-risk's 5.225 GiB/GPU over-counts).
 
-Measured inputs (FACT, both read this session):
+Measured inputs (FACT, both read this pass):
 
 | | source | bytes |
 |---|---|---:|
-| AWQ body (layers 0–63, excl. lm_head/embed/visual/mtp) | safetensors headers, `awq.py` this session | 12,691,100,928 (11.820 GiB) |
+| AWQ body (layers 0–63, excl. lm_head/embed/visual/mtp) | safetensors headers, `awq.py` this pass | 12,691,100,928 (11.820 GiB) |
 | AWQ `lm_head.weight` | **BF16, unquantized** — `ignore` list has `lm_head` | 2,542,796,800 |
 | AWQ `embed_tokens` | BF16 | 2,542,796,800 |
 | AWQ visual (333 tensors) | BF16, all in `ignore` | 921,460,192 |
@@ -31,7 +31,7 @@ Measured inputs (FACT, both read this session):
 Per-tensor proof of the bpw gap: their `mlp.gate_proj` (17408×5120) costs
 `weight_packed 44,564,480 + weight_scale 1,392,640 + weight_zero_point 348,160 = 46,305,280 B`
 = **4.156 bpw** (group_size 128, 4-bit, asymmetric — `config.json quantization_config`, read
-this session). Our PXQ4 `ffn_gate` of the same shape is **47,384,576 B = 4.2540 bpw**
+this pass). Our PXQ4 `ffn_gate` of the same shape is **47,384,576 B = 4.2540 bpw**
 (`4.25 + 16/K`, `ggml.h:465-467`). **PXQ4 is 2.33% larger per tensor than their AWQ.**
 
 Decode bytes read per GPU at TP=4 (weights only; embed is a gather, not a read; MTP not loaded):
@@ -112,7 +112,7 @@ param loaders that silently mis-shard) and is achievable by policy alone.
 
 ## 2. Verified facts this plan rests on
 
-Everything below was read in source **this session** unless marked otherwise.
+Everything below was read in source **this pass** unless marked otherwise.
 
 ### 2.1 The plugin seam
 - `register_quantization_config(name)` — `quantization/__init__.py:57-102`. Appends to the
@@ -190,14 +190,14 @@ only `UnquantizedLinearMethod.process_weights_after_loading` sets (`:408`). Our 
 `_sm70_f16_force_enable = True` on every `qkv_proj`/`out_proj` — inert without `_prepared`,
 but set the forbid flag anyway.
 
-### 2.7 Toolchain (read this session, inside the running container)
+### 2.7 Toolchain (read this pass, inside the running container)
 Python 3.12.3 · torch **2.10.0+cu128** · nvcc **12.8** V12.8.93 · gcc 12.4.0 ·
 vllm `0.1.dev1+g2ceb15066` at `/opt/vllm-venv/lib/python3.12/site-packages/vllm`, source at
-`/opt/1Cat-vLLM`. **Container `/` is 100% full (207 G used, 0 avail); `/mnt/models` has 567 G.**
-Nothing may be installed into the image. Everything we ship lives under `/mnt/models` and is
+`/opt/1Cat-vLLM`. **Container `/` is 100% full (207 G used, 0 avail); `/path/to/models` has 567 G.**
+Nothing may be installed into the image. Everything we ship lives under `/path/to/models` and is
 reached by `PYTHONPATH` + a hand-written `.dist-info` (see §7.4).
 
-### 2.8 PXQ4 device format (re-read this session)
+### 2.8 PXQ4 device format (re-read this pass)
 `pxq6_pol_p6` (`pxq6.cuh:317-346`): `SLAB=1088, HDR=128, CODE_OFF=64, NEFF=2`;
 `row_effs` = `eff[0]=anch*sub[b&0xf]` (elems 0–15), `eff[1]=anch*sub[b>>4]` (elems 16–31);
 `pair()` = `tab[byte&0xf], tab[byte>>4]`, LE byte `b` of the 16-byte code row.
@@ -264,7 +264,7 @@ problem instead of coding around it. Cost of the deferral: 0.366 GiB/GPU during 
 
 One git repo, **on this machine** at
 `<scratch>/pxq-vllm/pxq4-vllm/`,
-deployed to the DGX at `/mnt/models/pxa-vllm-pxq4/` (never to `/`, never to container `/`).
+deployed to the DGX at `/path/to/models/pxa-vllm-pxq4/` (never to `/`, never to container `/`).
 
 ```
 pxq4-vllm/
@@ -316,11 +316,11 @@ by `struct` and `np.memmap`s the data section. (Existing working prototype:
 ### 5.2 CLI
 ```
 python -m pxq4_gguf.convert \
-  --gguf     /mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
-  --ref-hf   /mnt/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ \
-  --out      /mnt/models/pxa-models/Qwen3.8-27B-PXQ4-vllm \
+  --gguf     /path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
+  --ref-hf   /path/to/models/hf/philbert440/Qwen3.8-27B-Uncensored-Cyber-W4A16-AWQ \
+  --out      /path/to/models/pxa-models/Qwen3.8-27B-PXQ4-vllm \
   --policy   {p1,p2a,p2b,p2c} \
-  [--encoder /mnt/models/pxa-vllm-pxq4/build/pxq4_encode.so]      # P2 only
+  [--encoder /path/to/models/pxa-vllm-pxq4/build/pxq4_encode.so]      # P2 only
   [--shard-size-gb 4]
 ```
 `--ref-hf` is mandatory: the converter **copies** `config.json` (rewriting only
@@ -727,19 +727,19 @@ Standalone `.so` linked against libtorch only; **no vLLM headers, no vLLM rebuil
 nvcc -O3 -std=c++17 -gencode arch=compute_70,code=sm_70 \
      --expt-relaxed-constexpr -Xcompiler -fPIC -shared
 ```
-Build in a **throwaway container from the same image** with `-v /mnt/models:/mnt/models`,
-writing only under `/mnt/models`. The production container's `/` is 100% full and must not be
+Build in a **throwaway container from the same image** with `-v /path/to/models:/path/to/models`,
+writing only under `/path/to/models`. The production container's `/` is 100% full and must not be
 written to; the production container must not be restarted.
 
 Installation without touching the image:
 ```
-/mnt/models/pxa-vllm-pxq4/site/
+/path/to/models/pxa-vllm-pxq4/site/
     pxq4_vllm/…                              (package)
     pxq4_vllm-0.1.0.dist-info/METADATA
     pxq4_vllm-0.1.0.dist-info/entry_points.txt   ->  [vllm.general_plugins]
                                                      pxq4 = pxq4_vllm:register
 ```
-launched with `PYTHONPATH=/mnt/models/pxa-vllm-pxq4/site`. `importlib.metadata` discovers
+launched with `PYTHONPATH=/path/to/models/pxa-vllm-pxq4/site`. `importlib.metadata` discovers
 `.dist-info` directories on `sys.path`, so the entry point resolves with nothing installed.
 `pyproject.toml` stays in the repo for normal `pip install -e .` on machines with disk.
 
