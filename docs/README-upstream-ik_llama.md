@@ -7,6 +7,8 @@
 > + ENHANCE + MoE/kernel fixes on top). That commit is now in this repo's history, so **git
 > merge-base** resolves to it and `git log --oneline 1520eda98056..HEAD` lists this project's own
 > 501 commits on top — cherry-picks against upstream resolve as an ordinary three-way merge.
+> For what those commits actually change, and where they don't help, see
+> [`docs/DELTA-SINCE-IK.md`](DELTA-SINCE-IK.md).
 
 ## TL;DR
 
