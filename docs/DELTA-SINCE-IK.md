@@ -98,6 +98,40 @@ pure tax). The win instead landed in the separate vLLM-PXQ4 sidecar tool, where 
 sm_60 move decode **3.9 → 14.9 tok/s** (commit `dd55c8d2`) — a different serving stack, cited here
 so the number isn't confused with the llama.cpp-based engine above.
 
+## Engine, next build (2026-09-02, not yet tagged)
+
+Not yet in a tagged release — the ship list and full measurements are in
+`RELEASE-NOTES-2026-09-02.md`. One line each:
+
+- **Pipeline scheduler fixes.** The graph allocator now reserves against the real decode graph
+  instead of re-planning on every prompt chunk, and the per-batch MoE row-mapping step no longer
+  forces a host sync inside the layer loop — together these were the reason a second CUDA stream
+  bought almost nothing; fixed, byte-identical, **+21% prefill @20,801** at reduced context.
+- **Device-side MoE row map.** The expert-routing table used to round-trip through the host once
+  per batched MoE layer; it now builds on-device, self-checked bit-identical against the old path.
+- **GQA-packed attention**, revisited. An earlier version of this same lever (see "D=256
+  GQA-packed decode" above) measured as noise at low context fill; re-measured at 86,401 tokens
+  it is **+40% decode**, output-identical — the mechanism (one key/value read per query group
+  instead of per head) only pays for itself once the re-read volume is large.
+- **Host-overhead cuts.** Bounded top-k sampling off raw logits, a struct-of-arrays KV-sequence
+  mask, a trimmed KQ-mask host upload, and four more bit-identical prefill micro-fixes together
+  cut measured per-token host time at deep fill from 6.0 ms to 1.6 ms.
+- **PXQ on CPU.** An AVX2 int8 dot product (panel-tiled, matching PXQ's 64-row panel layout)
+  makes CPU-only and partial-offload PXQ inference real: **7.7× prefill** on a 12-thread Xeon
+  E5-2699 v3, cross-checked to 0 ULP against the CUDA decode path.
+- **Export and requantize.** `llama-pxq-export` decodes a PXQ GGUF back to plain F16/F32
+  tensor-by-tensor, and `llama-quantize --allow-requantize` now accepts a PXQ source — the
+  lock-in objection in `README.md` ("Lock-in, stated plainly") has an answer now.
+- **Product surface.** The server now prints its resolved codec, tensor census, and per-device
+  kernel path at startup and in `--verbose` (`pxq_llama: engine | codec=… | file: …`), plus a
+  warning when a lab-only `PXA_*`/`PXQ_*` env var is set outside the two documented ones.
+
+Three additional upstream fixes have since been ported (branch `spd/upstream-fixes`, part of the
+same candidate build): upstream `78ce50c1` (a get_rows grid-overflow bug at large expert counts),
+`c49f7db3` (an MMQ fusion-chain guard for non-MMQ quant types), and `7642ac3e` (a quantized-cpy
+kernel launched with 1-thread blocks). They are correctness fixes, not speed levers, and they are
+not yet in a tagged release either.
+
 ## Codec: PXQ2/3/4/6/UNIVERSAL
 
 PXQ is a family of CUDA-only slab-layout quant types (`README.md`, "Lock-in, stated plainly") built
@@ -151,6 +185,6 @@ implementation everything else, including this tree, is ultimately checked again
 This project does not track ik_llama.cpp or mainline llama.cpp release-for-release; it
 cherry-picks model-graph ports and upstream bug fixes on its own schedule when they're useful on
 Pascal/Volta (the `port:` commits throughout `git log 1520eda98056..HEAD` are exactly this, e.g.
-commits `76b0c96d`, `c464871d`, `b4323fb2`) — three additional upstream fixes were queued for
-porting as of this writing (upstream `78ce50c1`, `c49f7db3`, `7642ac3e`) but are not yet present
-in this tree.
+commits `76b0c96d`, `c464871d`, `b4323fb2`) — the three upstream fixes named just above
+(`78ce50c1`, `c49f7db3`, `7642ac3e`) were queued as of the previous revision of this document and
+have since been ported, but on the not-yet-tagged next engine build, not the current release.
