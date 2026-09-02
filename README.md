@@ -28,9 +28,12 @@ covered below — they're scaling proof, not the pitch.
 The engine loads **83 model architectures** (`src/llama-arch.cpp`) — dense (Qwen, Llama, Gemma,
 Mistral, …), GDN hybrids (`qwen3next`), MoE, `gpt-oss`, DeepSeek-V4 (`deepseek4`), GLM
 (`glm4moe`, `glm-dsa`), MiniMax (`minimax-m2`), Cohere (`cohere2`, `cohere2_moe`), Laguna,
-`gemma4`. The engine-level fixes below (sm_60 fp16-GEMM path, flash-attention regime routing,
-the MoE path, `np>1` hybrid concurrency, wide-K f16 GEMV) help **any** quant on these cards, not
-just PXQ — a stock Q4_K, MXFP4, or IQ_K GGUF benefits too.
+`gemma4`. **Every one of the engine-level fixes below — the sm_60 fp16-GEMM path,
+flash-attention regime routing, the MoE path, `np>1` hybrid concurrency, and the wide f16
+GEMV — applies to stock GGUF files (Q4_K, MXFP4, IQ_K) with no PXQ file required.** Point this
+engine at a stock Q4_K_M, MXFP4, or IQ_K GGUF you already have and the fixes apply as-is; see
+`docs/COOKBOOK.md` → "stock-gguf-on-pxq-engine" for the exact command and the engine-only numbers
+that back it.
 
 ## Two products, not one
 
@@ -76,7 +79,7 @@ Same engine, same cards, `llama-server /completion`, temp 0, n=7 median.
 **‡** that MoE row and its paired decode figure trace to one artifact that turned out to be only
 27% PXQ4 by tensor count; the decode figure did not reproduce and is **withdrawn**, and the
 prefill figure is relabelled as an expert-codec delta rather than a whole-model one. Full
-accounting: `docs/LEVERS.md` §0a.
+accounting: `docs/lab/LEVERS.md` §0a.
 
 **The Volta dense-decode loss is real and understood:** MXFP4's block layout maps onto DP4A with
 one scale fixup per 32 values; PXQ4's sub-scale hierarchy costs a second fixup and a second cache
@@ -136,9 +139,13 @@ not for GLM/MLA models).
 
 Everything else — every other `PXA_*` var — is the lab: experiment records and measured *losses*
 kept for the paper trail, gated per-architecture, and usually **slower** if you set them by hand.
-The full reference, including which knobs are dead ends: [`docs/LEVERS.md`](docs/LEVERS.md).
+The full reference, including which knobs are dead ends: [`docs/lab/LEVERS.md`](docs/lab/LEVERS.md).
 
 ## Origin
+
+**Do they rebase? No.** This is the Pascal/Volta engine, not a fork that tracks `ik_llama.cpp`
+main: ikawrakow/ik_llama.cpp @ `1520eda98056` is treated as a parts bin — model graphs and bug
+fixes are cherry-picked from it on a case-by-case basis, nothing more.
 
 pxq_llama started as a fork of **ikawrakow/ik_llama.cpp @ `1520eda98056`** (2026-06-04). Since
 then, measured against that pinned commit: 20 of 340 `ggml-cuda` files are new PXA kernels and 34

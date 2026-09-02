@@ -2,7 +2,7 @@
 
 Best-vs-best per card: upstream at its own documented best (pinned 2026-07-18 HEAD,
 `GGML_CUDA_F16=ON` build per its docs, its best-fitting IQ_K quant, f16 KV), pxq_llama at its
-documented best (`docs/LEVERS.md` recommended env; `PXA_PXQ_INT8_PREFILL=1` on sm_61). Same 35B
+documented best (`docs/lab/LEVERS.md` recommended env; `PXA_PXQ_INT8_PREFILL=1` on sm_61). Same 35B
 MoE architecture, same card, same protocol both sides.
 
 **Protocol:** single `/completion`, cold 5,801-token prompt, `n_predict=200`, `temperature=0`,
