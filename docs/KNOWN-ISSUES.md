@@ -36,6 +36,31 @@ llama-quantize --imatrix model.imatrix --pxq-universal my-16gb.tiers \
 
 The argument is a path to a `.tiers` map; see `docs/PXQU-CONVERT.md` for the format.
 
+## The same three `ERROR: ... result=11` lines before `llama-server` starts
+
+Same cause as above, same verdict: harmless. Inside an `nvidia/cuda` container the runtime's
+driver probe prints
+
+```
+ERROR: driverInitFileInfo 578 result=11
+ERROR: init 664 result=11
+ERROR: init 250 result=11
+```
+
+and then `llama-server` prints its own first line, which in a container is
+
+```
+PXA_CONTAINER_AWARE_v1: runtime=container (/.dockerenv present (docker))
+```
+
+That second line is not an error either. It is the server saying it detected Docker, so that a
+wedge or a fatal GPU fault will make it exit (codes 41/42) and let the container restart policy
+bring it back, instead of sitting there answering health checks with a dead GPU. Bare-metal runs
+print `runtime=host` instead. `PXA_IN_CONTAINER=0` or `=1` overrides the detection.
+
+If the server stops after that line, the real reason is in the lines that follow it (model path,
+VRAM, `-ngl`, or the `-ot` regex). Please paste from the banner to the exit when reporting.
+
 ## llama-imatrix crashes on CPU / partial-offload configs (pre-existing; fix pending)
 
 **Symptom:** an imatrix capture run (`llama-imatrix`, or any `cb_eval`-based activation capture)
