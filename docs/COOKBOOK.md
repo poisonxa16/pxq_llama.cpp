@@ -123,6 +123,90 @@ Same command shape as PXQU-16 with `fusion2-35b-U12.gguf`. Measured on the 16 GB
 - Vision: add `--mmproj mmproj-fusion2-f16.gguf` (projector loads on the first CUDA device).
 - MTP speculative decode (flagship-MTP file only): `--spec-type mtp:n_max=3,p_min=0.5`.
 
+## 4xp100-flashnext — 4× Tesla P100, hybrid MoE, next engine build
+
+⚠ **Needs the next engine build, not yet in a tagged release.** The lever set below only exists
+on branches merged into the candidate engine described in `RELEASE-NOTES-2026-09-02.md`
+(pipeline-scheduler fixes, host-overhead cuts, the ported upstream correctness fixes). It will
+not run on today's tagged binary — track the release notes for when it lands.
+
+```bash
+export PXA_ENHANCE=1
+export PXA_FA_GQA_PACK=4 PXA_KQ_MASK_PAD1=1 PXA_KV_SEQ_SOA=1 PXA_TOPK_RAW=1 \
+       PXA_TOPK_MOE_MULTIROW=1 PXA_GETROWS_NARROW=1 PXA_CPY_FASTDIV=1 \
+       PXA_CONCAT_FLAT=1 PXA_NORM_REGCACHE=1 PXA_SCHED_RESET_LAZY=1 \
+       PXA_MOE_DEVICE_MAP=1
+
+./build/bin/llama-server -m your-flashnext-hybrid-PXQU.gguf \
+  -ngl 99 -ts 5079,12612,12612,11897 \
+  -ot 'per_layer_token_embd\.weight=CPU' \
+  -c 150016 -b 2048 -ub 2048 -wgt 8 -t 16 \
+  --jinja --temp 1.0 --top-p 0.95 --top-k 20 --host 0.0.0.0 --port 8080
+```
+
+The lever set is the campaign's full bit-identical stack, measured on top of `PXA_ENHANCE=1`:
+`PXA_FA_GQA_PACK=4` (deep-fill decode, the biggest single win), `PXA_KQ_MASK_PAD1`,
+`PXA_KV_SEQ_SOA`, `PXA_TOPK_RAW` (host-overhead cuts), `PXA_TOPK_MOE_MULTIROW` (a router aliasing
+guard — correctness, not speed, keep it on), `PXA_GETROWS_NARROW`, `PXA_CPY_FASTDIV`,
+`PXA_CONCAT_FLAT`, `PXA_NORM_REGCACHE`, `PXA_SCHED_RESET_LAZY` (small bit-identical prefill
+micro-fixes), and `PXA_MOE_DEVICE_MAP=1` (the device-side expert-routing table).
+
+Expected, `-c 150016`, temp 0, n=7 median (1 warmup discarded), `/completion`:
+
+| context fill | prefill | decode |
+|---|---|---|
+| ~3,000 tok | ~485 t/s | ~28 t/s |
+| ~20,000 tok | ~407 t/s | — |
+| ~86,000 tok | ~230 t/s | ~18.4–19.4 t/s |
+
+Full raw reps, the arm-by-arm ladder, and what each lever's number depends on:
+`RELEASE-NOTES-2026-09-02.md`.
+
+> **Lab footnote:** this is the campaign's shipped set, not the whole lab. `PXA_FA_KEYS_PER_SPLIT`
+> and `PXA_GEMV_RPB` were measured in the same session and are **negative** at this fill depth —
+> left off deliberately, not omitted by oversight. See `docs/lab/LEVERS.md` and
+> `RELEASE-NOTES-2026-09-02.md`'s rejected-levers list before re-trying either.
+
+## 2xv100-27b-vllm — 2× Tesla V100, 27B dense, vLLM sm_70 serving line
+
+This recipe runs the separate vLLM-based sm_70 serving line, not the llama.cpp-based engine
+above — see `docs/PXA-SM70-SERVING.md` for the full build and why the two exist. PXQ4 codec,
+tensor-parallel across both cards.
+
+```bash
+export PXQ4_LIB=libpxq4_sm70_v12.so
+export PXQ4_MMV_MMA=1
+export PXQ4_MMV_SPLIT_MAX_BLOCKS=300
+export NCCL_P2P_LEVEL=SYS
+export NCCL_BUFFSIZE=1048576
+
+vllm serve your-27b-dense-hybrid-pxq4 \
+  --quantization pxq4 --attention-backend FLASH_ATTN_V100 \
+  --tensor-parallel-size 2 --dtype float16 --enable-prefix-caching \
+  --gpu-memory-utilization 0.88 --max-model-len 32768 \
+  --max-num-seqs 16 --max-num-batched-tokens 4096 \
+  --compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,16]}'
+```
+
+`PXQ4_MMV_MMA=1` arms the v12 tensor-core decode path (batch ≥5); `NCCL_P2P_LEVEL=SYS` +
+`NCCL_BUFFSIZE=1048576` fix the two V100s defaulting to a non-P2P NCCL path on a PCIe x4/PHB
+topology, which was costing prefill far more than any kernel (`docs/PXA-SM70-SERVING.md`).
+`--gpu-memory-utilization 0.88`, not the usual 0.92, because the inductor autotune pass OOMs at
+0.92 once P2P is on. Quote the `cudagraph_capture_sizes` string exactly — bash brace-expands the
+unquoted JSON.
+
+Expected, temp 0, n=7 median, `/completion`:
+
+| metric | value |
+|---|---|
+| prefill @3k | ~1,006 t/s |
+| prefill @20k | ~983 t/s |
+| decode, single stream | ~50.3 t/s |
+| decode, aggregate @8 streams | ~187 t/s |
+| decode, aggregate @16 streams | ~298 t/s |
+
+Full raw reps and the arm-by-arm NCCL/GMU ladder: `RELEASE-NOTES-2026-09-02.md`.
+
 ## Quantizing your own model
 
 See the README "Quantize your own" section — pure tiers (`PXQ4`, `PXQ3`, `PXQ2`) or a
