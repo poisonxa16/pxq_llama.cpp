@@ -148,8 +148,9 @@ architectures and 4 more are modified; 52 are untouched. `src/llama-quantize.cpp
 1,785 to 2,791 lines, mostly PXQ. The shared ik/llama.cpp lineage carries the rest of the tree —
 tokenizer, GGUF I/O, sampling, and every architecture this project didn't need to touch. The
 original work is concentrated exactly where cards with no DP4A and no tensor cores need it: the
-MoE and PXQ-codec hot paths. (No git merge-base exists with upstream — this repo's history is
-flattened — so diff against that exact commit if you want to see it yourself.)
+MoE and PXQ-codec hot paths. (The upstream base commit is in the history now — `git merge-base`
+resolves to it, and `git log --oneline 1520eda98056..HEAD` lists this project's own 501 commits
+on top of it — diff against that exact commit if you want to see it yourself.)
 
 ## Build (CUDA)
 

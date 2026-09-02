@@ -4,8 +4,9 @@
 
 > **pxq_llama upstream base.** pxq_llama is based on **ikawrakow/ik_llama.cpp @ `1520eda98056`**
 > (2026-06-04, _"prompt cache: Fix assertion ... (#1913)"_), developed independently since (PXQ tiers
-> + ENHANCE + MoE/kernel fixes on top). This repo's history is flattened, so there is **no git
-> merge-base** with upstream — to diff or cherry-pick against upstream, use that exact commit.
+> + ENHANCE + MoE/kernel fixes on top). That commit is now in this repo's history, so **git
+> merge-base** resolves to it and `git log --oneline 1520eda98056..HEAD` lists this project's own
+> 501 commits on top — cherry-picks against upstream resolve as an ordinary three-way merge.
 
 ## TL;DR
 
