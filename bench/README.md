@@ -86,7 +86,7 @@ Cells we didn't measure are absent, not implied. PRs with measured numbers welco
 - **`PXA_G2_ADDFUSE=1` (late 2026-07-19, bit-exact):** residual-add fusion measured on top of
   the rows above by paired interleaved A/B: V100 100.1 → **102.0** (+1.9%, quiet window);
   P100 62.25 → **63.0** (+1.2%). Its siblings NORMFUSE/QUANTFOLD measured no additional gain
-  and REDFUSE measured a loss — all stay in-tree default-OFF (`docs/LEVERS.md`).
+  and REDFUSE measured a loss — all stay in-tree default-OFF (`docs/lab/LEVERS.md`).
 
 ## Model files
 

@@ -82,5 +82,5 @@
   <line x1="24" y1="466" x2="896" y2="466" stroke="#263140" stroke-width="1"/>
   <text x="24" y="488" font-size="12" fill="#D7DFE9" font-weight="600">Per-metric best regime for BOTH sides: prefill rows -fa off · decode rows -fa on · all -b 2048. Bars scaled within each pair.</text>
   <text x="24" y="506" font-size="12" fill="#A9B6C6">Same-quant control — upstream's own IQ_K ggufs on our build: decode +2.7–3.3% on every card (V100 bit-identical output).</text>
-  <text x="24" y="528" font-size="11.5" fill="#6E7C8E">Upstream pinned @ 2026-07-18 HEAD · pxq_llama env: docs/LEVERS.md recommended set · raw runs + FA-regime sweep: bench/fair-battle.md</text>
+  <text x="24" y="528" font-size="11.5" fill="#6E7C8E">Upstream pinned @ 2026-07-18 HEAD · pxq_llama env: docs/lab/LEVERS.md recommended set · raw runs + FA-regime sweep: bench/fair-battle.md</text>
 </svg>

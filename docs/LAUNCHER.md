@@ -870,7 +870,7 @@ Use it after changing images, drivers or card layout to see what the launcher
 
 | Path | What it holds |
 |---|---|
-| `docs/LEVERS.md` | The supported `PXA_*` levers, defaults and measurements |
+| `docs/lab/LEVERS.md` | The supported `PXA_*` levers, defaults and measurements |
 | `docs/PXA-SM60-SERVING.md` | Reproduced sm_60 seat numbers and the shipping recipe |
 | `docs/PXA-SM70-SERVING.md` | The same for sm_70 |
 | `scripts/pxa-serve-sm60.sh`, `scripts/pxa-serve-sm70.sh` | The recipes themselves |

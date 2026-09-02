@@ -200,9 +200,9 @@ MXFP4 `ssm_out` 6144x5120 row-shards to K=3072/1536, both %32=0 (MXFP4 block=32)
    fails at load on 181 of 866 tensors.
 2. **MXFP4 is the newly-discovered work item.** 48 `ssm_out` GEMMs (6144→5120,
    one per GDN layer = 74% of layers) are MXFP4. INFERENCE: the rev-2 backbone
-   table simply does not claim the `ssm` class (see `docs/LEVERS.md:430` —
+   table simply does not claim the `ssm` class (see `docs/lab/LEVERS.md:430` —
    `ssm_*` is only reachable via the `PXA_PXQ_NATIVE=ssm` research override, and
-   `LEVERS.md:430` states an unclaimed/failing tensor "is demoted to MXFP4 by the
+   `docs/lab/LEVERS.md:430` states an unclaimed/failing tensor "is demoted to MXFP4 by the
    caller"), so the quantizer's default fallback took it. **Mitigation is cheap:**
    `ssm_out` in vLLM is a RowParallelLinear whose weight can be dequantized offline
    to fp16 (0.75 GiB → 1.5 GiB total, 0.375 GiB/GPU at TP=4) or re-quantized —

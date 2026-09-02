@@ -25,7 +25,7 @@ latency.
 ## Performance
 
 **`PXA_FA_TILE_VOLTA`** (new, default off) — routes sm_70 flash-attention to the tile kernel instead
-of WMMA. **+6.9% prefill**, decode unchanged. Full measurement in `docs/LEVERS.md`.
+of WMMA. **+6.9% prefill**, decode unchanged. Full measurement in `docs/lab/LEVERS.md`.
 
 **Ubatch guidance.** On the dense 30B, prefill peaks at `-ub 1024` and is flat from 2048 upward,
 while decode is ubatch-insensitive. The effect is large enough to dominate several kernel levers, so
@@ -45,6 +45,6 @@ MMVQ launches, **+14.7%** on sm_70, bit-identical), `PXA_F32PREC_F16GEMM`, and a
 half-accumulate mask query-row stride (`ne11` → `nb31`) that produced garbage output on sm_70
 sliding-window models at depth.
 
-Every gated flag in this release has a row in `docs/LEVERS.md` giving its mechanism, its default,
+Every gated flag in this release has a row in `docs/lab/LEVERS.md` giving its mechanism, its default,
 and -- where a throughput claim is made for it -- the measurement and the exact configuration that
 produced it. Levers that ship without a throughput claim say so rather than implying one.

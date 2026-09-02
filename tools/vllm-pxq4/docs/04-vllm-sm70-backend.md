@@ -287,7 +287,7 @@ answer correctly:
    **Our `PXQ4Config` must expose an `ignored_layers`-shaped attribute** whose contents mirror
    what the offline converter actually left unquantized, or the module layout will not match the
    weights we produce. This is a direct consequence of the mixed-type backbone table
-   (`docs/LEVERS.md` PXA_PXQ_BACKBONE rev2): attn_k/attn_v→q8_0, per-head attn_gate→f16,
+   (`docs/lab/LEVERS.md` PXA_PXQ_BACKBONE rev2): attn_k/attn_v→q8_0, per-head attn_gate→f16,
    token_embd→q6_k, output→q8_0, ssm_*/nextn.*/router/norms untouched.
 
 2. **`maybe_disable_tp(quant_config)`** — `qwen_gdn_linear_attn.py:2363-2379`. Returns True

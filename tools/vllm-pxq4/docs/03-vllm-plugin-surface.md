@@ -249,7 +249,7 @@ class PXQ4LinearMethod(LinearMethodBase):        # panel-packed 4-bit path
 class PXQ8LinearMethod(LinearMethodBase):        # q8_0 tier: attn_k / attn_v / geometry failures
     ...same four members...
 ```
-Plus, from the mixed-checkpoint reality (`docs/LEVERS.md` PXA_PXQ_BACKBONE rev2), `PXQ4Config.get_quant_method` must dispatch **per tensor class**:
+Plus, from the mixed-checkpoint reality (`docs/lab/LEVERS.md` PXA_PXQ_BACKBONE rev2), `PXQ4Config.get_quant_method` must dispatch **per tensor class**:
 
 | checkpoint tier | vLLM method to return |
 |---|---|

@@ -290,7 +290,7 @@ PXA_ENHANCE=1 ./build/bin/llama-server -m your-model.gguf -ngl 99 -c 8192 -fa on
 `PXA_ENHANCE=1` selects the measured-good kernel levers for each card in the box — a
 mixed-card machine gets a per-GPU decision — and prints a ledger of what it chose and why.
 That is the whole recommended configuration. Everything else in
-[`LEVERS.md`](LEVERS.md) is a lab knob, recorded with its measurement; you do not need any
+[`LEVERS.md`](lab/LEVERS.md) is a lab knob, recorded with its measurement; you do not need any
 of it to run.
 
 Or let the launcher choose engine, image and parameters for you:
@@ -309,7 +309,7 @@ python3 tools/pxa-launch.py --model your-model.gguf --cards 0,1 --explain
 |---|---|
 | [`BUILD-FROM-SOURCE.md`](../BUILD-FROM-SOURCE.md) | the complete build path, and the exact error for every trap |
 | [`COOKBOOK.md`](COOKBOOK.md) | copy-paste command lines per card, with the measured numbers they produce |
-| [`LEVERS.md`](LEVERS.md) | every shipping `PXA_*` lever, its default, and the measurement behind it |
+| [`LEVERS.md`](lab/LEVERS.md) | every shipping `PXA_*` lever, its default, and the measurement behind it |
 | [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md) | standing traps and their workarounds |
 | [`PXQU-CONVERT.md`](PXQU-CONVERT.md) | quantize your own model into a mixed-tier PXQU map |
 | [`VLLM.md`](VLLM.md) | the PXQ4 vLLM backend: tier support, conversion, serving, tuning and tool calling |

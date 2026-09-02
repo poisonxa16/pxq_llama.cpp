@@ -206,7 +206,7 @@ natural, spilled, −27.7%).
 
 ## Documentation
 
-`docs/LEVERS.md` now carries a row for **every** `PXA_*` environment variable the engine reads —
+`docs/lab/LEVERS.md` now carries a row for **every** `PXA_*` environment variable the engine reads —
 138 of them, verified in both directions: none documented-but-absent, none present-but-undocumented.
 That includes the ones that measured null, the one that is unmeasured, and seven flags the engine
 had been reading with no documentation at all — among them `PXA_ALLOW_GRAPH_SPLIT_HYBRID`, which
@@ -217,7 +217,7 @@ bypasses a correctness guard and is now labelled as the footgun it is.
 
 ## Documentation
 
-`docs/LEVERS.md` gains a row for every gated flag added in this release, each with its measured
+`docs/lab/LEVERS.md` gains a row for every gated flag added in this release, each with its measured
 effect and the exact cell it was measured on, including the ones that measured null. Two build-time
 constants (`PXQ6_CANON_CMAX`, `PXQ_GU_MINBLK`) are documented as constants rather than env flags,
 because flipping them changes the canonical fp32 fold and is a re-baselining event.

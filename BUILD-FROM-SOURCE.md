@@ -227,7 +227,7 @@ in the model column. That is a cosmetic naming artifact, not a sign the wrong co
 
 Nothing is required. `PXA_ENHANCE=1` is the one tune worth setting; the auto-detect already
 picks sane per-card defaults without it, and the PXQ codecs load with no environment at all.
-Everything else in `docs/LEVERS.md` is a lab knob — see the README's Run section.
+Everything else in `docs/lab/LEVERS.md` is a lab knob — see the README's Run section.
 
 ---
 
