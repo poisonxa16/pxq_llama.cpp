@@ -89,3 +89,50 @@ dxA_pxq2_b2048_faoff_c6144,OK,1000.6,34.2 | dxB_pxq2_b2048_faon_c8192,OK,667.3,6
 dxC_pxq2_b768_faoff_c8192,OK,975.7,33.9
 dxD_vik_iq2ks_b2048_faoff_c6144,OK,1153.6,30.0 | dxE_vik_iq2ks_b2048_faon_c8192,OK,738.8,52.2
 ```
+
+## Codec-only re-run, 2026-09-02 (candidate engine, next release)
+
+A separate comparison from everything above: same engine on both sides of every row, PXQ4 vs
+MXFP4 at matched engine — isolating the codec, per `bench/fair/protocol.md`. `llama-server
+/completion`, `temp=0`, `seed=42`, n=7 median, 1 warmup discarded, `cache_prompt=false`, unique
+prompt per repeat, MTP off both sides, artifacts sha-checked against
+`bench/fair/weights/MANIFEST.sha256`. Run on the candidate engine described in
+`RELEASE-NOTES-2026-09-02.md` (pipeline-scheduler fixes, host-overhead cuts, the ported upstream
+correctness fixes) — not yet in a tagged release.
+
+### Dense, 2×P100 (Qwable-27B, `-c 32768 -b/-ub 2048 -fa on`)
+
+| | PXQ4-core | MXFP4-lite | result |
+|---|---|---|---|
+| prefill @3,121 | 227.4 | 178.7 | **+27%** |
+| prefill @20,801 | 203.3 | 163.7 | **+24%** |
+| decode @8 | 18.3 | 14.4 | **+27%** |
+
+### Dense, 2×V100 (Qwable-27B, `-c 32768 -b/-ub 2048 -fa on`) — the cell PXQ4 still loses
+
+| | PXQ4-core (`PXA_PXQ_MMVQ=1`) | MXFP4-lite | result |
+|---|---|---|---|
+| prefill @3,121 | 798.1 | 364.0 | **+119%** |
+| prefill @20,801 | 577.0 | 312.9 | **+84%** |
+| decode @8 | 34.5 | 37.7 | **−8.3% — MXFP4 wins here** |
+
+Prefill's lead widened since the original table because the candidate engine's NCCL P2P fix
+(`docs/PXA-SM70-SERVING.md`) helps both quant types and PXQ4 was already ahead on prefill; the
+decode loss is the same structural DP4A-scale-fixup story as the original table, unchanged by
+the engine update.
+
+### MoE, 2×V100 (35B-A3B class, `-c 32768 -b/-ub 2048 -fa on`) — expert-codec delta
+
+| | PXA-Fusion4-35B PXQ4 | qwen36-35b MXFP4 | result |
+|---|---|---|---|
+| prefill @3,121 | 2,093.8 | 1,614.6 | **+30%** |
+| prefill @20,801 | 1,467.2 | 1,256.8 | **+17%** |
+| decode @8 | 218.4 | 188.0 | **+16%** |
+
+**Caveat, stated plainly:** the PXQ4 side is `PXA-Fusion4-35B`, a merge — not the same base
+weights as the stock 35B-A3B model on the MXFP4 side. Same architecture and size class, not
+byte-identical. The artifact's own codec census (`codec=PXQ4 (120 tensors; pxq4 120)`) shows only
+its expert stacks are actually PXQ4; the rest is other types. This supersedes an earlier
+MoE-decode row this repo withdrew after finding the same composition problem in a different
+artifact — the fix here is disclosure, not a different codec: the number is real for
+"PXQ4-quantized experts on this architecture," not for "PXQ4 the whole model."
