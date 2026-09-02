@@ -226,6 +226,17 @@ target_link_libraries(test-kv-mask-parity PRIVATE ggml)
 # PXA_TOPK_RAW shadow-compare harness (CPU only, takes a tiny gguf)
 llama_build(test-topk-raw-shadow.cpp)
 
+# PXQ x Q8 integer dot accuracy/agreement harness (CPU only, no model; needs AVX2/FMA/F16C, x86).
+# pxq-cpu.c and pxq-dot.c are already compiled into libggml (see ggml/src/CMakeLists.txt), so
+# this only needs their headers on the include path plus a link against ggml for the object code.
+llama_build(test-pxq-cpu-dot.cpp)
+target_include_directories(test-pxq-cpu-dot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+target_link_libraries(test-pxq-cpu-dot PRIVATE ggml)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    target_compile_options(test-pxq-cpu-dot PRIVATE -mavx2 -mfma -mf16c)
+endif()
+llama_test(test-pxq-cpu-dot)
+
 if (GGML_CUDA)
     llama_build(test-dsa-attn.cpp)
     target_link_libraries(test-dsa-attn PRIVATE ggml)

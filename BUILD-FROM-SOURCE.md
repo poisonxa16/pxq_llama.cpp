@@ -60,10 +60,10 @@ Then, **inside the container**:
 # the stock CUDA image ships nvcc, gcc and make but NOT cmake and NOT git
 apt-get update && apt-get install -y --no-install-recommends cmake git
 
-cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;70"
+cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70"
 
 cmake --build build \
-  --target llama-server llama-cli llama-bench llama-quantize \
+  --target llama-server llama-cli llama-bench llama-quantize llama-pxq-export \
   -j"$(nproc)"
 ```
 
@@ -78,10 +78,10 @@ time — each entry is a full recompile of every CUDA translation unit. Trim it 
 | P100 / GP100 | `"60"` |
 | GTX 10-series (1080 Ti etc.) | `"61"` |
 | V100 | `"70"` |
-| this release's target pair | `"60;70"` |
+| this release's target list | `"60;61;70"` |
 | the wide list (adds 3090- and 4090-class) | `"60;61;70;86;89"` |
 
-Expect roughly 25-45 min for `"60;70"` on a many-core box, and about twice that for the wide
+Expect roughly 25-45 min for `"60;61;70"` on a many-core box, and about twice that for the wide
 list. `nvcc` warns that pre-sm_75 offline compilation is deprecated — that is expected and
 harmless on CUDA 12.x.
 
@@ -113,12 +113,12 @@ Putting the stubs directory on `LIBRARY_PATH` therefore does not fix it. You nee
 ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 
 # 2. point the link at it
-cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;70" \
+cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70" \
   -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
   -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs"
 
 cmake --build build \
-  --target llama-server llama-cli llama-bench llama-quantize \
+  --target llama-server llama-cli llama-bench llama-quantize llama-pxq-export \
   -j"$(nproc)"
 ```
 
@@ -152,6 +152,26 @@ recommended configuration for a shipping build and it is not the path verified h
 recipe above is.
 
 ---
+
+## 3b. The tests
+
+Add `-DLLAMA_BUILD_TESTS=ON` to either configure line above and build the targets you want:
+
+```bash
+cmake --build build --target test-pxq-cpu-dot test-topk-raw-shadow test-kv-seq-shadow \
+  test-kv-mask-parity test-narrow-kernel-parity -j"$(nproc)"
+```
+
+| test | what it checks | needs |
+|---|---|---|
+| `test-pxq-cpu-dot` | the PXQ x Q8 integer dot on CPU agrees with the float reference | x86 with AVX2, no model |
+| `test-topk-raw-shadow` | the raw top-k fast path picks the same tokens as the reference sampler | a small GGUF |
+| `test-kv-seq-shadow` | the sequence-major KV bookkeeping matches the reference over 2M steps | nothing |
+| `test-kv-mask-parity` | dumps per-step state hashes of the padded KQ mask path for diffing | a small GGUF |
+| `test-narrow-kernel-parity` | get_rows, cpy, concat, rms_norm and l2_norm narrow kernels vs the generic ones | a CUDA device |
+
+`tests/test-pxq-export.sh` exercises `llama-pxq-export` end to end (CUDA vs CPU export, requantize
+gate, generation agreement) and needs a small GGUF plus a CUDA device.
 
 ## 4. Verify the build actually works
 
