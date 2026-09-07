@@ -1,3 +1,9 @@
+> # PXA moved
+>
+> **This repository is superseded by [github.com/poisonxa16/pxa](https://github.com/poisonxa16/pxa)** — same engine, new home, current release **[v2026.09.07-rc1](https://github.com/poisonxa16/pxa/releases/tag/v2026.09.07-rc1)**.
+>
+> This repo stays online for history. **New releases, docs and issues live in the new one.**
+
 <!-- GitHub README for pxq_llama. -->
 <p align="center"><img src="banner.png" alt="pxq_llama — PXQ quants and a MoE accelerator for landfill GPUs" width="100%"></p>
 
